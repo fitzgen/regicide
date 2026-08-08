@@ -31,6 +31,8 @@ mod sealed {
     pub trait NonZeroInt: sealed::NonZeroIntInner {
         type NonZero: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord;
 
+        const MAX: Self::NonZero;
+
         fn new(inner: Self) -> Option<Self::NonZero>;
 
         fn get(non_zero: Self::NonZero) -> Self;
@@ -57,6 +59,8 @@ mod sealed {
 
                 impl NonZeroInt for $t {
                     type NonZero = NonZero<Self>;
+
+                    const MAX: Self::NonZero = Self::NonZero::new(<$t>::MAX).unwrap();
 
                     #[inline]
                     fn new(inner: Self) -> Option<Self::NonZero> {
@@ -93,6 +97,9 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord {
     type Repr: EntityRepr;
 
     /// TODO FITZGEN
+    const MAX: Self;
+
+    /// TODO FITZGEN
     fn try_new(index: usize) -> Option<Self>;
 
     /// TODO FITZGEN
@@ -112,6 +119,8 @@ macro_rules! define_entities {
 
             impl<T: EntityRepr> Entity for $name<T> {
                 type Repr = T;
+
+                const MAX: Self = $name(T::MAX);
 
                 #[inline]
                 fn try_new(index: usize) -> Option<Self> {
@@ -137,11 +146,19 @@ define_entities! {
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Inst;
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Block;
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Inst;
+    pub struct Scc;
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Region;
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -150,6 +167,18 @@ define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SpillSlot;
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct LiveRange;
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Bundle;
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Allocation;
 }
 
 /// TODO FITZGEN
@@ -180,9 +209,14 @@ where
         }
     }
 
-    pub fn clear(&mut self) {
+    pub fn reset(&mut self) {
         let Self { elems, _phantom } = self;
         elems.clear();
+    }
+
+    pub fn is_reset(&self) -> bool {
+        let Self { elems, _phantom } = self;
+        elems.is_empty()
     }
 
     pub fn next_key(&self, output: &mut OutputInner<K::Repr>) -> IResult<K> {
@@ -278,12 +312,16 @@ where
         }
     }
 
-    pub fn clear(&mut self) {
+    pub fn reset(&mut self) {
         let Self {
             inner,
             default_value: _,
         } = self;
-        inner.clear();
+        inner.reset();
+    }
+
+    pub fn is_reset(&self) -> bool {
+        self.inner.is_reset()
     }
 
     pub fn get(&self, key: K) -> Option<&V> {

@@ -8,11 +8,13 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+mod btree;
 mod context;
 mod entity;
 mod error;
 mod function;
 mod live_ranges;
+mod liveness;
 mod output;
 mod partial_allocation;
 mod region_allocation;

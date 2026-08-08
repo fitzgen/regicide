@@ -39,10 +39,15 @@ where
         }
     }
 
-    pub fn clear(&mut self) {
+    pub fn reset(&mut self) {
         let Self { map, stack } = self;
-        map.clear();
+        map.reset();
         debug_assert!(stack.is_empty());
+    }
+
+    pub fn is_reset(&self) -> bool {
+        let Self { map, stack } = self;
+        map.is_reset() && stack.is_empty()
     }
 
     pub fn find(&mut self, entry: E) -> E {
