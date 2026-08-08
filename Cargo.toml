@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[dev-dependencies]
+regicide = { version = "0.1.0", path = ".", features = ["std"] }
+mutatis = { version = "0.5.2", features = ["check"] }
+
+[features]
+std = []
