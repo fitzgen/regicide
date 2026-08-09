@@ -1,4 +1,12 @@
-use crate::entity::Val;
+use crate::entity::{Block, EntityRepr, Inst, Val};
+
+/// TODO FITZGEN
+pub struct Operand<E = u32>
+where
+    E: EntityRepr,
+{
+    val: Val<E>,
+}
 
 /// TODO FITZGEN
 pub trait Function {
@@ -7,6 +15,28 @@ pub trait Function {
 
     /// TODO FITZGEN
     fn remat_cost(&self, val: Val) -> Option<RematCost>;
+
+    /// TODO FITZGEN
+    fn len_blocks(&self) -> usize;
+
+    /// TODO FITZGEN
+    type BlocksIter<'a>: Iterator<Item = Block>
+    where
+        Self: 'a;
+
+    /// TODO FITZGEN
+    fn blocks(&self) -> Self::BlocksIter<'_>;
+
+    /// TODO FITZGEN
+    fn block_insts_len(&self, block: Block) -> usize;
+
+    /// TODO FITZGEN
+    type BlockInstsIter<'a>: Iterator<Item = Inst>
+    where
+        Self: 'a;
+
+    /// TODO FITZGEN
+    fn block_insts(&self, block: Block) -> Self::BlockInstsIter<'_>;
 
     // TODO: ...
 }

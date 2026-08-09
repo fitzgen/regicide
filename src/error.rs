@@ -15,32 +15,32 @@ pub(crate) enum InternalError {
 /// An error encountered during register allocation.
 #[derive(Clone)]
 pub enum Error {
-    /// An invalid Static Single Assignment (SSA) use was encountered, such as a
+    /// An invalid Static Single Assignment (`SSA`) use was encountered, such as a
     /// value being used before it is defined.
     InvalidSsa {
-        /// The value that is invalid in SSA form.
+        /// The [`Val`] that is invalid in `SSA` form.
         val: Val,
-        /// The instruction where the invalid SSA value is used.
+        /// The [`Inst`] where the invalid `SSA` value is used.
         inst: Inst,
     },
 
     /// A basic block is missing a terminator instruction at its end.
     BlockWithoutTerminator {
-        /// The basic block missing a terminator.
+        /// The [`Block`] missing a terminator.
         block: Block,
     },
 
     /// A terminator instruction was found in the middle of a basic block.
     TerminatorInMiddleOfBlock {
-        /// The basic block containing the invalid instruction.
+        /// The [`Block`] containing the invalid instruction.
         block: Block,
-        /// The terminator instruction that is in the middle of the block.
+        /// The [`Inst`] terminator instruction that is in the middle of the block.
         inst: Inst,
     },
 
     /// An invalid branch instruction was encountered.
     InvalidBranch {
-        /// The invalid branch instruction.
+        /// The invalid [`Inst`] branch instruction.
         inst: Inst,
     },
 
@@ -49,7 +49,7 @@ pub enum Error {
 
     /// An instruction has more operands than supported.
     TooManyOperands {
-        /// The instruction with too many operands.
+        /// The [`Inst`] instruction with too many operands.
         inst: Inst,
     },
 }

@@ -23,8 +23,6 @@ macro_rules! trace {
 }
 
 mod btree;
-#[cfg(feature = "checker")]
-mod checker;
 mod context;
 mod counts;
 mod entity;
@@ -40,15 +38,18 @@ mod region_allocation;
 mod region_tree;
 mod sccs;
 mod spill_slots;
-#[cfg(test)]
-mod test;
 mod timing;
 mod union_find;
 
+#[cfg(feature = "checker")]
+pub mod checker;
+#[cfg(test)]
+pub mod test;
+
 pub use context::Context;
-pub use entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
+pub use entity::{Block, Entity, EntityRepr, PrimaryMap, PrimaryMapKeys, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
-pub use function::{Function, RematCost};
+pub use function::{Function, Operand, RematCost};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
 use context::ContextInner;

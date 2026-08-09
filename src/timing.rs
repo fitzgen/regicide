@@ -12,6 +12,8 @@ where
     start: Instant,
     #[cfg(feature = "timing")]
     label: T,
+    #[cfg(not(feature = "timing"))]
+    _phantom: core::marker::PhantomData<fn() -> T>,
 }
 
 impl<T> Timing<T>
@@ -27,6 +29,8 @@ where
             start: Instant::now(),
             #[cfg(feature = "timing")]
             label,
+            #[cfg(not(feature = "timing"))]
+            _phantom: core::marker::PhantomData,
         }
     }
 }
