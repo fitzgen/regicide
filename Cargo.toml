@@ -4,10 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+log = "0.4.33"
 
 [dev-dependencies]
-regicide = { version = "0.1.0", path = ".", features = ["std"] }
+regicide = { version = "0.1.0", path = ".", features = ["std", "checker", "timing"] }
 mutatis = { version = "0.5.2", features = ["check"] }
 
 [features]
 std = []
+checker = []
+timing = ["std"]
+trace-log = []

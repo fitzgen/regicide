@@ -1,3 +1,5 @@
+//! `regicide` is a register allocator.
+//!
 //! TODO FITZGEN
 
 #![deny(missing_docs)]
@@ -8,24 +10,46 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+// TODO: stats/counts instrumentation
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! trace {
+    ($($tt:tt)*) => {
+        if cfg!(any(feature = "trace-log", debug_assertions)) {
+            ::log::trace!($($tt)*);
+        }
+    };
+}
+
 mod btree;
+#[cfg(feature = "checker")]
+mod checker;
 mod context;
+mod counts;
 mod entity;
 mod error;
 mod function;
 mod live_ranges;
 mod liveness;
+mod move_elimination;
 mod output;
+mod parallel_moves;
 mod partial_allocation;
 mod region_allocation;
 mod region_tree;
+mod sccs;
+mod spill_slots;
+#[cfg(test)]
+mod test;
+mod timing;
 mod union_find;
 
 pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
-pub use function::Function;
-pub use output::{CriticalEdgeMove, Edit, Move, Output, Remat};
+pub use function::{Function, RematCost};
+pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
 use context::ContextInner;
 use error::{IResult, InternalError};
@@ -36,22 +60,26 @@ pub fn run(context: &mut Context, output: &mut Output, func: &impl Function) -> 
     assert!(context.is_reset());
     assert!(output.is_reset());
 
-    output.which = Some(WhichOutput::Output8);
-    match run_inner(&mut context.context8, &mut output.output8, func) {
-        Ok(()) => return Ok(()),
-        Err(()) => match output.output8.take_error() {
-            InternalError::EntityReprTooSmall => {}
-            InternalError::Error(e) => return Err(e),
-        },
+    if func.len_values() <= 1 << 7 {
+        output.which = Some(WhichOutput::Output8);
+        match run_inner(&mut context.context8, &mut output.output8, func) {
+            Ok(()) => return Ok(()),
+            Err(()) => match output.output8.take_error() {
+                InternalError::EntityReprTooSmall => {}
+                InternalError::Error(e) => return Err(e),
+            },
+        }
     }
 
-    output.which = Some(WhichOutput::Output16);
-    match run_inner(&mut context.context16, &mut output.output16, func) {
-        Ok(()) => return Ok(()),
-        Err(()) => match output.output16.take_error() {
-            InternalError::EntityReprTooSmall => {}
-            InternalError::Error(e) => return Err(e),
-        },
+    if func.len_values() <= 1 << 15 {
+        output.which = Some(WhichOutput::Output16);
+        match run_inner(&mut context.context16, &mut output.output16, func) {
+            Ok(()) => return Ok(()),
+            Err(()) => match output.output16.take_error() {
+                InternalError::EntityReprTooSmall => {}
+                InternalError::Error(e) => return Err(e),
+            },
+        }
     }
 
     output.which = Some(WhichOutput::Output32);
@@ -74,10 +102,20 @@ where
 {
     assert!(context.is_reset());
     assert!(output.is_reset());
-    region_tree::construct_region_tree(context, func)?;
-    live_ranges::construct_live_ranges(context, func)?;
-    partial_allocation::partial_allocation(context, func)?;
-    region_allocation::region_allocation(context, func)?;
+
+    context.region_tree.construct(func)?;
+    context.liveness.construct(func)?;
+    context
+        .live_ranges
+        .construct(func, &context.region_tree, &context.liveness)?;
+
+    partial_allocation::partial_allocate(context, func)?;
+    region_allocation::region_allocate(context, func)?;
+    spill_slots::allocate_spill_slots(context, func)?;
+    move_elimination::eliminate_moves(context, func)?;
+
     output.construct(context, func)?;
+
+    trace!("counts = {:#?}", context.counts);
     Ok(())
 }

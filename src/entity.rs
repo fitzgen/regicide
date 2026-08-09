@@ -175,10 +175,6 @@ define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Bundle;
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Allocation;
 }
 
 /// TODO FITZGEN
@@ -361,5 +357,32 @@ where
             self.inner.elems.push(self.default_value.clone());
         }
         &mut self.inner[key]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntityRange<K: Entity> {
+    pub start: K,
+    pub end: K,
+}
+
+impl<K> Default for EntityRange<K>
+where
+    K: Entity,
+{
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+impl<K> EntityRange<K>
+where
+    K: Entity,
+{
+    pub const fn empty() -> Self {
+        Self {
+            start: K::MAX,
+            end: K::MAX,
+        }
     }
 }

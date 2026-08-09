@@ -1,52 +1,55 @@
 use crate::entity::{Block, Inst, Val};
 use core::fmt;
 
-#[allow(dead_code)] // TODO FITZGEN
+/// An internal error, potentially recoverable by switching to a larger entity
+/// representation.
 pub(crate) enum InternalError {
+    /// The entity representation was too small to represent the problem's full
+    /// index space. Switch to a larger entity representation.
     EntityReprTooSmall,
+
+    /// An error that needs to be surfaced to the user.
     Error(Error),
 }
 
-/// TODO FITZGEN
+/// An error encountered during register allocation.
 #[derive(Clone)]
 pub enum Error {
-    /// TODO FITZGEN
-    EntityReprTooSmall,
-
-    /// TODO FITZGEN
+    /// An invalid Static Single Assignment (SSA) use was encountered, such as a
+    /// value being used before it is defined.
     InvalidSsa {
-        /// TODO FITZGEN
+        /// The value that is invalid in SSA form.
         val: Val,
-        /// TODO FITZGEN
+        /// The instruction where the invalid SSA value is used.
         inst: Inst,
     },
 
-    /// TODO FITZGEN
+    /// A basic block is missing a terminator instruction at its end.
     BlockWithoutTerminator {
-        /// TODO FITZGEN
+        /// The basic block missing a terminator.
         block: Block,
     },
 
-    /// TODO FITZGEN
+    /// A terminator instruction was found in the middle of a basic block.
     TerminatorInMiddleOfBlock {
-        /// TODO FITZGEN
+        /// The basic block containing the invalid instruction.
         block: Block,
-        /// TODO FITZGEN
+        /// The terminator instruction that is in the middle of the block.
         inst: Inst,
     },
 
-    /// TODO FITZGEN
+    /// An invalid branch instruction was encountered.
     InvalidBranch {
-        /// TODO FITZGEN
+        /// The invalid branch instruction.
         inst: Inst,
     },
 
-    /// TODO FITZGEN
+    /// Too many live registers were requested at a single program point.
     TooManyLiveRegs,
 
-    /// TODO FITZGEN
+    /// An instruction has more operands than supported.
     TooManyOperands {
-        /// TODO FITZGEN
+        /// The instruction with too many operands.
         inst: Inst,
     },
 }
@@ -54,29 +57,22 @@ pub enum Error {
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EntityReprTooSmall => write!(f, "EntityReprTooSmall"),
-            Self::InvalidSsa { val, inst } => f
-                .debug_struct("InvalidSsa")
-                .field("val", val)
-                .field("inst", inst)
-                .finish(),
-            Self::BlockWithoutTerminator { block } => f
-                .debug_struct("BlockWithoutTerminator")
-                .field("block", block)
-                .finish(),
-            Self::TerminatorInMiddleOfBlock { block, inst } => f
-                .debug_struct("TerminatorInMiddleOfBlock")
-                .field("block", block)
-                .field("inst", inst)
-                .finish(),
-            Self::InvalidBranch { inst } => {
-                f.debug_struct("InvalidBranch").field("inst", inst).finish()
+            Self::InvalidSsa { val, inst } => {
+                write!(f, "invalid SSA: {val:?} is used at {inst:?}")
             }
-            Self::TooManyLiveRegs => write!(f, "TooManyLiveRegs"),
-            Self::TooManyOperands { inst } => f
-                .debug_struct("TooManyOperands")
-                .field("inst", inst)
-                .finish(),
+            Self::BlockWithoutTerminator { block } => {
+                write!(f, "{block:?} is missing a terminator")
+            }
+            Self::TerminatorInMiddleOfBlock { block, inst } => {
+                write!(f, "terminator {inst:?} found in middle of {block:?}")
+            }
+            Self::InvalidBranch { inst } => {
+                write!(f, "invalid branch instruction {inst:?}")
+            }
+            Self::TooManyLiveRegs => write!(f, "too many live registers at a single point"),
+            Self::TooManyOperands { inst } => {
+                write!(f, "too many operands at instruction {inst:?}")
+            }
         }
     }
 }
@@ -89,7 +85,7 @@ impl fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// TODO FITZGEN
+/// A result of either `Ok(T)` or `Err(regicide::Error)`.
 pub type Result<T, E = Error> = ::core::result::Result<T, E>;
 
 /// A result type to use internally.
@@ -98,5 +94,6 @@ pub type Result<T, E = Error> = ::core::result::Result<T, E>;
 /// `crate::Result<T>`, but its ergonomics are worse, since we rely on a
 /// side-channel (an internal field on `Context`) to report the actual error to
 /// the user. We always convert from `InternalResult<T>` to `crate::Result<T>`
-/// before returning to the user.
+/// before returning to the user. See `OutputInner::error` and
+/// `OutputInner::take_error` for details.
 pub(crate) type IResult<T> = Result<T, ()>;

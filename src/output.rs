@@ -2,7 +2,20 @@ use crate::context::ContextInner;
 use crate::entity::{Block, EntityRepr, Reg, SpillSlot, Val};
 use crate::error::{IResult, InternalError};
 use crate::function::Function;
+use crate::timing::Timing;
 use alloc::vec::Vec;
+
+/// TODO FITZGEN
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Allocation<E = u32>
+where
+    E: EntityRepr,
+{
+    /// TODO FITZGEN
+    Reg(Reg<E>),
+    /// TODO FITZGEN
+    Stack(SpillSlot<E>),
+}
 
 /// TODO FITZGEN
 pub enum Move<E = u32>
@@ -35,7 +48,7 @@ where
 }
 
 /// TODO FITZGEN
-pub struct Remat<E>
+pub struct Remat<E = u32>
 where
     E: EntityRepr,
 {
@@ -166,28 +179,29 @@ impl<E: EntityRepr> OutputInner<E> {
         edits.clear();
     }
 
-    pub(crate) fn construct(
-        &mut self,
-        context: &mut ContextInner<E>,
-        func: &impl Function,
-    ) -> IResult<()> {
-        let _ = (self, context, func);
-        todo!()
-    }
-
-    pub(crate) fn is_reset(&self) -> bool {
+    pub fn is_reset(&self) -> bool {
         let Self { error, edits } = self;
         error.is_none() && edits.is_empty()
     }
 
+    pub fn construct(
+        &mut self,
+        context: &mut ContextInner<E>,
+        func: &impl Function,
+    ) -> IResult<()> {
+        let _timing = Timing::new("output");
+        let _ = (self, context, func);
+        todo!()
+    }
+
     #[allow(dead_code)] // TODO FITZGEN
-    pub(crate) fn error<T>(&mut self, error: impl Into<InternalError>) -> IResult<T> {
+    pub fn error<T>(&mut self, error: impl Into<InternalError>) -> IResult<T> {
         debug_assert!(self.error.is_none());
         self.error = Some(error.into());
         Err(())
     }
 
-    pub(crate) fn take_error(&mut self) -> InternalError {
+    pub fn take_error(&mut self) -> InternalError {
         self.error.take().unwrap()
     }
 }

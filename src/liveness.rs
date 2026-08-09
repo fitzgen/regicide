@@ -1,6 +1,9 @@
 use crate::{
     btree::{BTreeSet, BTreeSetArena},
     entity::{Block, EntityRepr, SecondaryMap, Val},
+    error::IResult,
+    function::Function,
+    timing::Timing,
 };
 use alloc::vec::Vec;
 
@@ -48,5 +51,12 @@ where
             worklist,
         } = self;
         arena.is_reset() && live_in.is_reset() && live_out.is_reset() && worklist.is_empty()
+    }
+
+    pub fn construct(&mut self, func: &impl Function) -> IResult<()> {
+        let _timing = Timing::new("liveness");
+        // TODO
+        let _ = func;
+        Ok(())
     }
 }

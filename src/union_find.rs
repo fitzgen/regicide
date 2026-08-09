@@ -65,7 +65,7 @@ where
         entry
     }
 
-    pub fn merge(&mut self, a: E, b: E) -> E {
+    pub fn union(&mut self, a: E, b: E) -> E {
         let a = self.find(a);
         let b = self.find(b);
         self.map[b] = Some(a);
@@ -112,28 +112,28 @@ mod tests {
             assert_eq!(x, y);
         }
 
-        let aa = uf.merge(a, a);
+        let aa = uf.union(a, a);
         assert_eq!(aa, a);
         assert_eq!(aa, uf.find(a));
 
-        let bc = uf.merge(b, c);
+        let bc = uf.union(b, c);
         assert_eq!(bc, b);
         assert_eq!(bc, uf.find(b));
         assert_eq!(bc, uf.find(c));
 
         assert_eq!(d, uf.find(d));
-        let dd = uf.merge(d, d);
+        let dd = uf.union(d, d);
         assert_eq!(dd, d);
         assert_eq!(dd, uf.find(d));
 
-        let bcd = uf.merge(bc, d);
+        let bcd = uf.union(bc, d);
         assert_eq!(bcd, b);
         assert_eq!(bcd, uf.find(b));
         assert_eq!(bcd, uf.find(c));
         assert_eq!(bcd, uf.find(d));
         assert_eq!(bcd, uf.find(bc));
 
-        let abcd = uf.merge(a, bcd);
+        let abcd = uf.union(a, bcd);
         assert_eq!(abcd, a);
         assert_eq!(abcd, uf.find(a));
         assert_eq!(abcd, uf.find(b));
@@ -165,7 +165,7 @@ mod tests {
                     let a = v(*a);
                     let b = v(*b);
 
-                    let c = uf.merge(a, b);
+                    let c = uf.union(a, b);
                     assert_eq!(uf.find(a), c);
                     assert_eq!(uf.find(b), c);
                     assert_eq!(uf.find(c), c);
