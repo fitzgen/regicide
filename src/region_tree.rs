@@ -11,7 +11,7 @@ use core::marker::PhantomData;
 use crate::context::ContextInner;
 use crate::entity::EntityRepr;
 use crate::error::IResult;
-use crate::function::Function;
+use crate::function::InputFunction;
 use crate::timing::Timing;
 
 pub struct RegionTree<E>
@@ -37,7 +37,7 @@ where
         true
     }
 
-    pub fn construct(&mut self, func: &impl Function) -> IResult<()> {
+    pub fn construct(&mut self, func: &impl InputFunction) -> IResult<()> {
         let _timing = Timing::new("region tree");
         // TODO
         let _ = func;

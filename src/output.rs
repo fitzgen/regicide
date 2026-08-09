@@ -1,7 +1,7 @@
 use crate::context::ContextInner;
 use crate::entity::{Block, EntityRepr, Reg, SpillSlot, Val};
 use crate::error::{IResult, InternalError};
-use crate::function::Function;
+use crate::function::InputFunction;
 use crate::timing::Timing;
 use alloc::vec::Vec;
 
@@ -147,7 +147,7 @@ impl Output {
     }
 
     /// TODO FITZGEN
-    pub fn block_insts_and_edits(&self, func: &impl Function, block: Block) -> OutputIter<'_> {
+    pub fn block_insts_and_edits(&self, func: &impl InputFunction, block: Block) -> OutputIter<'_> {
         let _ = (func, block);
         OutputIter { output: self }
     }
@@ -187,7 +187,7 @@ impl<E: EntityRepr> OutputInner<E> {
     pub fn construct(
         &mut self,
         context: &mut ContextInner<E>,
-        func: &impl Function,
+        func: &impl InputFunction,
     ) -> IResult<()> {
         let _timing = Timing::new("output");
         let _ = (self, context, func);

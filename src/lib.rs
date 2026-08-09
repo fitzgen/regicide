@@ -49,7 +49,7 @@ pub mod test;
 pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, PrimaryMap, PrimaryMapKeys, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
-pub use function::{Function, Operand, RematCost};
+pub use function::{InputBlock, InputFunction, InputInst, Operand, RematCost};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
 use context::ContextInner;
@@ -57,7 +57,7 @@ use error::{IResult, InternalError};
 use output::{OutputInner, WhichOutput};
 
 /// TODO FITZGEN
-pub fn run(context: &mut Context, output: &mut Output, func: &impl Function) -> Result<()> {
+pub fn run(context: &mut Context, output: &mut Output, func: &impl InputFunction) -> Result<()> {
     assert!(context.is_reset());
     assert!(output.is_reset());
 
@@ -96,7 +96,7 @@ pub fn run(context: &mut Context, output: &mut Output, func: &impl Function) -> 
 fn run_inner<E>(
     context: &mut ContextInner<E>,
     output: &mut OutputInner<E>,
-    func: &impl Function,
+    func: &impl InputFunction,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -104,6 +104,9 @@ where
     assert!(context.is_reset());
     assert!(output.is_reset());
 
+    // TODO: validate the input function's SSA, basic blocks, etc...
+
+    context.sccs.construct(func)?;
     context.region_tree.construct(func)?;
     context.liveness.construct(func)?;
     context

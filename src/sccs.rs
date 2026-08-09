@@ -1,6 +1,6 @@
 //! Strongly-connected components.
 
-use crate::{entity::EntityRepr, error::IResult, function::Function};
+use crate::{entity::EntityRepr, error::IResult, function::InputFunction};
 use core::marker::PhantomData;
 
 pub struct StronglyConnectedComponents<E>
@@ -27,7 +27,7 @@ where
         true
     }
 
-    pub fn construct(&mut self, func: &impl Function) -> IResult<()> {
+    pub fn construct(&mut self, func: &impl InputFunction) -> IResult<()> {
         // TODO
         let _ = func;
         Ok(())

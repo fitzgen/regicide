@@ -1,10 +1,10 @@
 use crate::context::ContextInner;
 use crate::entity::EntityRepr;
 use crate::error::IResult;
-use crate::function::Function;
+use crate::function::InputFunction;
 use crate::timing::Timing;
 
-pub(crate) fn region_allocate<E>(context: &mut ContextInner<E>, func: &impl Function) -> IResult<()>
+pub(crate) fn region_allocate<E>(context: &mut ContextInner<E>, func: &impl InputFunction) -> IResult<()>
 where
     E: EntityRepr,
 {

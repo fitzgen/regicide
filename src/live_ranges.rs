@@ -5,7 +5,7 @@ use crate::entity::{
     Bundle, Entity, EntityRange, EntityRepr, Inst, LiveRange, PrimaryMap, SecondaryMap, Val,
 };
 use crate::error::IResult;
-use crate::function::Function;
+use crate::function::InputFunction;
 use crate::liveness::Liveness;
 use crate::output::Allocation;
 use crate::region_tree::RegionTree;
@@ -117,7 +117,7 @@ where
 
     pub fn construct(
         &mut self,
-        func: &impl Function,
+        func: &impl InputFunction,
         region_tree: &RegionTree<E>,
         liveness: &Liveness<E>,
     ) -> IResult<()> {
