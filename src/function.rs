@@ -28,6 +28,9 @@ pub trait InputFunction {
     /// TODO: expand this
     fn remat_cost(&self, val: Val) -> Option<RematCost>;
 
+    /// The function's entry block.
+    fn entry_block(&self) -> Block;
+
     /// The number of basic blocks defined in this function.
     fn len_blocks(&self) -> usize;
 

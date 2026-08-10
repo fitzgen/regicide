@@ -15,16 +15,22 @@ impl fmt::Debug for Count {
     }
 }
 
-impl<T> core::ops::AddAssign<T> for Count
-where
-    T: Into<u64>,
-{
-    fn add_assign(&mut self, rhs: T) {
+impl core::ops::AddAssign<u64> for Count {
+    fn add_assign(&mut self, rhs: u64) {
         let _ = &rhs;
         #[cfg(feature = "trace-log")]
         {
-            let rhs = rhs.into();
             self.count += rhs;
+        }
+    }
+}
+
+impl core::ops::AddAssign<usize> for Count {
+    fn add_assign(&mut self, rhs: usize) {
+        let _ = &rhs;
+        #[cfg(feature = "trace-log")]
+        {
+            self.count += u64::try_from(rhs).unwrap();
         }
     }
 }
@@ -58,23 +64,26 @@ impl Count {
 
 #[derive(Debug)]
 pub struct Counts {
+    pub sccs: Count,
     pub live_ranges: Count,
 }
 
 impl Counts {
     pub const fn new() -> Self {
         Self {
+            sccs: Count::new(),
             live_ranges: Count::new(),
         }
     }
 
     pub fn reset(&mut self) {
-        let Self { live_ranges } = self;
+        let Self { sccs, live_ranges } = self;
+        *sccs = Count::new();
         *live_ranges = Count::new();
     }
 
     pub fn is_reset(&self) -> bool {
-        let Self { live_ranges } = self;
-        live_ranges.is_reset()
+        let Self { sccs, live_ranges } = self;
+        sccs.is_reset() && live_ranges.is_reset()
     }
 }

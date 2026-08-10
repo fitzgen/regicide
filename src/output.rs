@@ -1,5 +1,5 @@
 use crate::context::ContextInner;
-use crate::entity::{Block, EntityRepr, Reg, SpillSlot, Val};
+use crate::entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
 use crate::error::{IResult, InternalError};
 use crate::function::InputFunction;
 use crate::timing::Timing;
@@ -194,7 +194,27 @@ impl<E: EntityRepr> OutputInner<E> {
         todo!()
     }
 
-    #[allow(dead_code)] // TODO FITZGEN
+    pub fn entity<Ent>(&mut self, index: usize) -> IResult<Ent>
+    where
+        Ent: Entity,
+    {
+        match Ent::try_new(index) {
+            Some(e) => Ok(e),
+            None => self.error(InternalError::EntityReprTooSmall),
+        }
+    }
+
+    pub fn with_repr<R, Ent>(&mut self, entity: Ent) -> IResult<Ent::Family<R>>
+    where
+        Ent: Entity,
+        R: EntityRepr,
+    {
+        match entity.with_repr::<R>() {
+            Some(e) => Ok(e),
+            None => self.error(InternalError::EntityReprTooSmall),
+        }
+    }
+
     pub fn error<T>(&mut self, error: impl Into<InternalError>) -> IResult<T> {
         debug_assert!(self.error.is_none());
         self.error = Some(error.into());

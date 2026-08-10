@@ -25,6 +25,7 @@ macro_rules! trace {
 mod btree;
 mod context;
 mod counts;
+mod dfs;
 mod entity;
 mod error;
 mod function;
@@ -41,9 +42,9 @@ mod spill_slots;
 mod timing;
 mod union_find;
 
-#[cfg(feature = "checker")]
+#[cfg(any(test, feature = "checker"))]
 pub mod checker;
-#[cfg(test)]
+#[cfg(any(test, feature = "checker"))]
 pub mod test;
 
 pub use context::Context;
@@ -104,9 +105,11 @@ where
     assert!(context.is_reset());
     assert!(output.is_reset());
 
-    // TODO: validate the input function's SSA, basic blocks, etc...
+    validate(func, output)?;
 
-    context.sccs.construct(func)?;
+    context
+        .sccs
+        .construct(func, &mut context.counts, &mut context.dfs, output)?;
     context.region_tree.construct(func)?;
     context.liveness.construct(func)?;
     context
@@ -122,4 +125,12 @@ where
 
     trace!("counts = {:#?}", context.counts);
     Ok(())
+}
+
+fn validate<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    let _ = (func, output);
+    todo!("validate the input function's SSA, basic blocks, etc...")
 }

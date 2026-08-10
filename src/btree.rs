@@ -36,6 +36,10 @@ impl<E, T> BTreeSet<E, T> {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
     pub fn contains<Q>(&self, arena: &BTreeSetArena<E, T>, value: &Q) -> bool
     where
         T: Borrow<Q> + Ord,
@@ -62,5 +66,14 @@ impl<E, T> BTreeSet<E, T> {
     {
         let _ = arena;
         self.inner.insert(value)
+    }
+
+    pub fn remove<Q: ?Sized>(&mut self, arena: &mut BTreeSetArena<E, T>, value: &Q) -> bool
+    where
+        T: Borrow<Q> + Ord,
+        Q: Ord,
+    {
+        let _ = arena;
+        self.inner.remove(value)
     }
 }

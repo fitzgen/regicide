@@ -104,6 +104,25 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord {
 
     /// TODO FITZGEN
     fn index(self) -> usize;
+
+    #[doc(hidden)]
+    type Family<E>: Entity
+    where
+        E: EntityRepr;
+
+    #[doc(hidden)]
+    fn with_repr32(self) -> Self::Family<u32> {
+        self.with_repr::<u32>().unwrap()
+    }
+
+    #[doc(hidden)]
+    fn with_repr<E>(self) -> Option<Self::Family<E>>
+    where
+        E: EntityRepr,
+    {
+        let index = self.index();
+        <Self::Family<E> as Entity>::try_new(index)
+    }
 }
 
 macro_rules! define_entities {
@@ -119,6 +138,10 @@ macro_rules! define_entities {
 
             impl<T: EntityRepr> Entity for $name<T> {
                 type Repr = T;
+
+                type Family<E> = $name<E>
+                where
+                    E: EntityRepr;
 
                 const MAX: Self = $name(T::MAX);
 
@@ -155,6 +178,10 @@ define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Scc;
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SccBlockIndex;
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -216,6 +243,11 @@ where
     pub fn is_reset(&self) -> bool {
         let Self { elems, _phantom } = self;
         elems.is_empty()
+    }
+
+    /// Reserve space for at least `additional` more elements.
+    pub fn reserve(&mut self, additional: usize) {
+        self.elems.reserve(additional);
     }
 
     /// Returns the number of elements in the map.
@@ -403,6 +435,10 @@ where
 
     pub fn is_reset(&self) -> bool {
         self.inner.is_reset()
+    }
+
+    pub fn reserve(&mut self, additional: usize) {
+        self.inner.reserve(additional);
     }
 
     pub fn get(&self, key: K) -> Option<&V> {

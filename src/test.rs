@@ -22,12 +22,7 @@ pub enum InstData {
     Jump {
         target: BlockCall,
     },
-    If {
-        condition: Operand,
-        then_target: BlockCall,
-        else_target: BlockCall,
-    },
-    IndirectBr {
+    ConditionalBr {
         condition: Operand,
         targets: Vec<BlockCall>,
     },
@@ -36,7 +31,15 @@ pub enum InstData {
     },
 }
 
-pub enum ValData {}
+pub struct ValData {
+    ty: Type,
+    def: ValDef,
+}
+
+pub enum ValDef {
+    InstResult { inst: Inst, i: usize },
+    BlockParam { block: Block, i: usize },
+}
 
 pub enum Type {
     I32,
@@ -48,7 +51,7 @@ pub enum Type {
 }
 
 pub struct BlockData {
-    pub params: Vec<Type>,
+    pub params: Vec<Val>,
     pub insts: Vec<Inst>,
 }
 
@@ -147,6 +150,10 @@ impl InputFunction for TestFunction {
         None
     }
 
+    fn entry_block(&self) -> Block {
+        todo!()
+    }
+
     fn len_blocks(&self) -> usize {
         self.blocks.len()
     }
@@ -192,15 +199,15 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
     }
 
     fn immediate_dominator(&self) -> Option<Block> {
-        None
+        todo!()
     }
 
     fn dominates(&self, _other: Block) -> bool {
-        false
+        todo!()
     }
 
     fn len_successors(&self) -> usize {
-        0
+        todo!()
     }
 
     type SuccessorsIter<'b>
@@ -209,11 +216,11 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
         Self: 'b;
 
     fn successors(&self) -> core::iter::Empty<Block> {
-        core::iter::empty()
+        todo!()
     }
 
     fn len_successor_block_args(&self, _i: usize) -> usize {
-        0
+        todo!()
     }
 
     type SuccessorBlockArgsIter<'b>
@@ -222,7 +229,7 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
         Self: 'b;
 
     fn successor_block_args(&self, _successor: usize) -> core::iter::Empty<Val> {
-        core::iter::empty()
+        todo!()
     }
 }
 

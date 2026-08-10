@@ -1,6 +1,7 @@
 use crate::{
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
+    dfs::Dfs,
     entity::{
         Block, Bundle, Entity, EntityRepr, Inst, LiveRange, PrimaryMap, Region, Scc, SecondaryMap,
         Val,
@@ -67,6 +68,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub liveness: Liveness<E>,
     pub live_ranges: LiveRanges<E>,
     pub sccs: StronglyConnectedComponents<E>,
+    pub dfs: Dfs<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
@@ -77,6 +79,7 @@ impl<E: EntityRepr> ContextInner<E> {
             liveness: Liveness::new(),
             live_ranges: LiveRanges::new(),
             sccs: StronglyConnectedComponents::new(),
+            dfs: Dfs::new(),
         }
     }
 
@@ -87,12 +90,14 @@ impl<E: EntityRepr> ContextInner<E> {
             liveness,
             live_ranges,
             sccs,
+            dfs,
         } = self;
         counts.reset();
         region_tree.reset();
         liveness.reset();
         live_ranges.reset();
         sccs.reset();
+        dfs.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -102,11 +107,13 @@ impl<E: EntityRepr> ContextInner<E> {
             liveness,
             live_ranges,
             sccs,
+            dfs,
         } = self;
         counts.is_reset()
             && region_tree.is_reset()
             && liveness.is_reset()
             && live_ranges.is_reset()
             && sccs.is_reset()
+            && dfs.is_reset()
     }
 }
