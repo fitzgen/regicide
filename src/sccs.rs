@@ -20,7 +20,7 @@ use crate::{
     dfs::{Dfs, DfsEvent},
     entity::{Block, EntityRepr, Scc, SccBlockIndex, SecondaryMap},
     error::IResult,
-    function::InputFunction,
+    input::InputFunction,
     output::OutputInner,
 };
 use alloc::vec::Vec;

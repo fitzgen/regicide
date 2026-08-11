@@ -1,5 +1,6 @@
 use core::{
     fmt::Debug,
+    hash::Hash,
     marker::PhantomData,
     num::NonZero,
     ops::{Index, IndexMut, Sub},
@@ -29,7 +30,7 @@ mod sealed {
     }
 
     pub trait NonZeroInt: sealed::NonZeroIntInner {
-        type NonZero: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord;
+        type NonZero: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash;
 
         const MAX: Self::NonZero;
 
@@ -83,7 +84,7 @@ mod sealed {
 
 /// TODO FITZGEN
 pub trait EntityRepr:
-    sealed::NonZeroInt + Copy + Debug + PartialEq + Eq + PartialOrd + Ord
+    sealed::NonZeroInt + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash
 {
 }
 
@@ -92,7 +93,7 @@ impl EntityRepr for u16 {}
 impl EntityRepr for u32 {}
 
 /// TODO FITZGEN
-pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord {
+pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash {
     /// TODO FITZGEN
     type Repr: EntityRepr;
 
@@ -128,13 +129,25 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord {
 macro_rules! define_entities {
     ( $(
         $( #[$attr:meta] )*
-        $vis:vis struct $name:ident ;
+        $vis:vis struct $name:ident = $fmt:expr;
     )* ) => {
         $(
             $( #[$attr] )*
             $vis struct $name<T = u32> ( T::NonZero )
             where
                 T: EntityRepr;
+
+            impl<T: EntityRepr> Default for $name<T> {
+                fn default() -> Self {
+                    Self::MAX
+                }
+            }
+
+            impl<T: EntityRepr> core::fmt::Debug for $name<T> {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    write!(f, "{}{}", $fmt, self.index())
+                }
+            }
 
             impl<T: EntityRepr> Entity for $name<T> {
                 type Repr = T;
@@ -164,50 +177,61 @@ macro_rules! define_entities {
 
 define_entities! {
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Val;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Val = "v";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Inst;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Inst = "inst";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Block;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Block = "block";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Scc;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Scc = "scc";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct SccBlockIndex;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SccBlockIndex = "scc_block_index";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Region;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Region = "region";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Reg;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Reg = "r";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct SpillSlot;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SpillSlot = "spill_slot";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct LiveRange;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct LiveRange = "live_range";
 
     /// TODO FITZGEN
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Bundle;
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Bundle = "bundle";
 }
 
 /// A sequential map from entity keys (`K`) to values (`V`).
+#[derive(Clone, Hash)]
+#[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
 pub struct PrimaryMap<K, V> {
     elems: Vec<V>,
     _phantom: PhantomData<K>,
+}
+
+impl<K, V> Default for PrimaryMap<K, V> {
+    fn default() -> Self {
+        Self {
+            elems: Vec::default(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<K, V> Debug for PrimaryMap<K, V>
@@ -284,8 +308,16 @@ where
         }
     }
 
+    /// Returns a mutable iterator over the key-value pairs in the map.
+    pub fn iter_mut(&mut self) -> PrimaryMapIterMut<'_, K, V> {
+        PrimaryMapIterMut {
+            inner: self.elems.iter_mut().enumerate(),
+            _phantom: PhantomData,
+        }
+    }
+
     /// Returns an iterator over the keys in the map.
-    pub fn keys(&self) -> PrimaryMapKeys<'_, K> {
+    pub fn keys(&self) -> PrimaryMapKeys<K> {
         PrimaryMapKeys {
             pos: 0,
             len: self.elems.len(),
@@ -304,7 +336,7 @@ where
     }
 }
 
-/// TODO FITZGEN
+/// An iterator over key-value pairs in a `PrimaryMap`.
 pub struct PrimaryMapIter<'a, K, V> {
     inner: core::iter::Enumerate<core::slice::Iter<'a, V>>,
     _phantom: PhantomData<K>,
@@ -324,15 +356,35 @@ where
     }
 }
 
-/// An iterator over the keys of a [`PrimaryMap`].
-#[derive(Clone, Debug)]
-pub struct PrimaryMapKeys<'a, K> {
-    pos: usize,
-    len: usize,
-    _phantom: PhantomData<&'a K>,
+/// A mutable iterator over key-value pairs in a `PrimaryMap`.
+pub struct PrimaryMapIterMut<'a, K, V> {
+    inner: core::iter::Enumerate<core::slice::IterMut<'a, V>>,
+    _phantom: PhantomData<K>,
 }
 
-impl<'a, K> Iterator for PrimaryMapKeys<'a, K>
+impl<'a, K, V> Iterator for PrimaryMapIterMut<'a, K, V>
+where
+    K: Entity,
+{
+    type Item = (K, &'a mut V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let (idx, val) = self.inner.next()?;
+        let key = K::try_new(idx).unwrap();
+        Some((key, val))
+    }
+}
+
+/// An iterator over the keys of a [`PrimaryMap`].
+#[derive(Clone, Debug)]
+pub struct PrimaryMapKeys<K> {
+    pos: usize,
+    len: usize,
+    _phantom: PhantomData<fn() -> K>,
+}
+
+impl<K> Iterator for PrimaryMapKeys<K>
 where
     K: Entity,
 {
@@ -356,9 +408,9 @@ where
     }
 }
 
-impl<'a, K> ExactSizeIterator for PrimaryMapKeys<'a, K> where K: Entity {}
+impl<'a, K> ExactSizeIterator for PrimaryMapKeys<K> where K: Entity {}
 
-impl<'a, K> DoubleEndedIterator for PrimaryMapKeys<'a, K>
+impl<'a, K> DoubleEndedIterator for PrimaryMapKeys<K>
 where
     K: Entity,
 {

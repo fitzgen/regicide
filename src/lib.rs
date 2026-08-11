@@ -28,7 +28,7 @@ mod counts;
 mod dfs;
 mod entity;
 mod error;
-mod function;
+mod input;
 mod live_ranges;
 mod liveness;
 mod move_elimination;
@@ -41,16 +41,17 @@ mod sccs;
 mod spill_slots;
 mod timing;
 mod union_find;
+mod validation;
 
 #[cfg(any(test, feature = "checker"))]
 pub mod checker;
-#[cfg(any(test, feature = "checker"))]
+#[cfg(any(test, fuzz))]
 pub mod test;
 
 pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, PrimaryMap, PrimaryMapKeys, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
-pub use function::{InputBlock, InputFunction, InputInst, Operand, RematCost};
+pub use input::{Input, InputBlock, InputFunction, InputInst, InputMachine, Operand, RematCost};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
 use context::ContextInner;
@@ -58,13 +59,18 @@ use error::{IResult, InternalError};
 use output::{OutputInner, WhichOutput};
 
 /// TODO FITZGEN
-pub fn run(context: &mut Context, output: &mut Output, func: &impl InputFunction) -> Result<()> {
+pub fn run(
+    context: &mut Context,
+    output: &mut Output,
+    input: &Input<impl InputFunction>,
+) -> Result<()> {
     assert!(context.is_reset());
     assert!(output.is_reset());
 
-    if func.len_values() <= 1 << 7 {
+    #[cfg(feature = "entity-repr-8")]
+    if input.func.len_values() <= 1 << 7 {
         output.which = Some(WhichOutput::Output8);
-        match run_inner(&mut context.context8, &mut output.output8, func) {
+        match run_inner(&mut context.context8, &mut output.output8, input) {
             Ok(()) => return Ok(()),
             Err(()) => match output.output8.take_error() {
                 InternalError::EntityReprTooSmall => {}
@@ -73,9 +79,10 @@ pub fn run(context: &mut Context, output: &mut Output, func: &impl InputFunction
         }
     }
 
-    if func.len_values() <= 1 << 15 {
+    #[cfg(feature = "entity-repr-16")]
+    if input.func.len_values() <= 1 << 15 {
         output.which = Some(WhichOutput::Output16);
-        match run_inner(&mut context.context16, &mut output.output16, func) {
+        match run_inner(&mut context.context16, &mut output.output16, input) {
             Ok(()) => return Ok(()),
             Err(()) => match output.output16.take_error() {
                 InternalError::EntityReprTooSmall => {}
@@ -85,7 +92,7 @@ pub fn run(context: &mut Context, output: &mut Output, func: &impl InputFunction
     }
 
     output.which = Some(WhichOutput::Output32);
-    match run_inner(&mut context.context32, &mut output.output32, func) {
+    match run_inner(&mut context.context32, &mut output.output32, input) {
         Ok(()) => Ok(()),
         Err(()) => match output.output32.take_error() {
             InternalError::EntityReprTooSmall => unreachable!(),
@@ -97,7 +104,7 @@ pub fn run(context: &mut Context, output: &mut Output, func: &impl InputFunction
 fn run_inner<E>(
     context: &mut ContextInner<E>,
     output: &mut OutputInner<E>,
-    func: &impl InputFunction,
+    input: &Input<impl InputFunction>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -105,32 +112,33 @@ where
     assert!(context.is_reset());
     assert!(output.is_reset());
 
-    validate(func, output)?;
+    #[cfg(feature = "trace-log")]
+    trace!(
+        "====== register allocation input ======\n\
+         {input}\n\
+         ======================================="
+    );
+
+    if input.options.validate_input {
+        validation::validate(input.func, output)?;
+    }
 
     context
         .sccs
-        .construct(func, &mut context.counts, &mut context.dfs, output)?;
-    context.region_tree.construct(func)?;
-    context.liveness.construct(func)?;
+        .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
+    context.region_tree.construct(input.func)?;
+    context.liveness.construct(input.func)?;
     context
         .live_ranges
-        .construct(func, &context.region_tree, &context.liveness)?;
+        .construct(input.func, &context.region_tree, &context.liveness)?;
 
-    partial_allocation::partial_allocate(context, func)?;
-    region_allocation::region_allocate(context, func)?;
-    spill_slots::allocate_spill_slots(context, func)?;
-    move_elimination::eliminate_moves(context, func)?;
+    partial_allocation::partial_allocate(context, input.func)?;
+    region_allocation::region_allocate(context, input.func)?;
+    spill_slots::allocate_spill_slots(context, input.func)?;
+    move_elimination::eliminate_moves(context, input.func)?;
 
-    output.construct(context, func)?;
+    output.construct(context, input.func)?;
 
     trace!("counts = {:#?}", context.counts);
     Ok(())
-}
-
-fn validate<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
-where
-    E: EntityRepr,
-{
-    let _ = (func, output);
-    todo!("validate the input function's SSA, basic blocks, etc...")
 }

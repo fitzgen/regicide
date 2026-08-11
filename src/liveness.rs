@@ -2,7 +2,7 @@ use crate::{
     btree::{BTreeSet, BTreeSetArena},
     entity::{Block, EntityRepr, SecondaryMap, Val},
     error::IResult,
-    function::InputFunction,
+    input::InputFunction,
     timing::Timing,
 };
 use alloc::vec::Vec;

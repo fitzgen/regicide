@@ -1,7 +1,7 @@
 use crate::context::ContextInner;
 use crate::entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
 use crate::error::{IResult, InternalError};
-use crate::function::InputFunction;
+use crate::input::InputFunction;
 use crate::timing::Timing;
 use alloc::vec::Vec;
 
@@ -92,14 +92,18 @@ where
 /// TODO FITZGEN
 pub struct Output {
     pub(crate) which: Option<WhichOutput>,
+    #[cfg(feature = "entity-repr-8")]
     pub(crate) output8: OutputInner<u8>,
+    #[cfg(feature = "entity-repr-16")]
     pub(crate) output16: OutputInner<u16>,
     pub(crate) output32: OutputInner<u32>,
 }
 
 #[allow(dead_code)] // TODO FITZGEN
 pub(crate) enum WhichOutput {
+    #[cfg(feature = "entity-repr-8")]
     Output8,
+    #[cfg(feature = "entity-repr-16")]
     Output16,
     Output32,
 }
@@ -115,7 +119,9 @@ impl Output {
     pub const fn new() -> Self {
         Self {
             which: None,
+            #[cfg(feature = "entity-repr-8")]
             output8: OutputInner::new(),
+            #[cfg(feature = "entity-repr-16")]
             output16: OutputInner::new(),
             output32: OutputInner::new(),
         }
@@ -125,12 +131,16 @@ impl Output {
     pub fn reset(&mut self) {
         let Self {
             which,
+            #[cfg(feature = "entity-repr-8")]
             output8,
+            #[cfg(feature = "entity-repr-16")]
             output16,
             output32,
         } = self;
         *which = None;
+        #[cfg(feature = "entity-repr-8")]
         output8.reset();
+        #[cfg(feature = "entity-repr-16")]
         output16.reset();
         output32.reset();
     }
@@ -139,11 +149,24 @@ impl Output {
     pub fn is_reset(&self) -> bool {
         let Self {
             which,
+            #[cfg(feature = "entity-repr-8")]
             output8,
+            #[cfg(feature = "entity-repr-8")]
             output16,
             output32,
         } = self;
-        which.is_none() && output8.is_reset() && output16.is_reset() && output32.is_reset()
+
+        #[cfg(feature = "entity-repr-8")]
+        if !output8.is_reset() {
+            return false;
+        }
+
+        #[cfg(feature = "entity-repr-16")]
+        if !output16.is_reset() {
+            return false;
+        }
+
+        which.is_none() && output32.is_reset()
     }
 
     /// TODO FITZGEN
@@ -166,7 +189,7 @@ pub(crate) struct OutputInner<E: EntityRepr> {
 }
 
 impl<E: EntityRepr> OutputInner<E> {
-    const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             error: None,
             edits: Vec::new(),
@@ -194,6 +217,7 @@ impl<E: EntityRepr> OutputInner<E> {
         todo!()
     }
 
+    #[inline]
     pub fn entity<Ent>(&mut self, index: usize) -> IResult<Ent>
     where
         Ent: Entity,
@@ -204,6 +228,7 @@ impl<E: EntityRepr> OutputInner<E> {
         }
     }
 
+    #[inline]
     pub fn with_repr<R, Ent>(&mut self, entity: Ent) -> IResult<Ent::Family<R>>
     where
         Ent: Entity,
@@ -215,6 +240,18 @@ impl<E: EntityRepr> OutputInner<E> {
         }
     }
 
+    #[inline]
+    pub fn result<T, Err>(&mut self, result: Result<T, Err>) -> IResult<T>
+    where
+        Err: Into<InternalError>,
+    {
+        match result {
+            Ok(x) => Ok(x),
+            Err(e) => self.error(e),
+        }
+    }
+
+    #[inline]
     pub fn error<T>(&mut self, error: impl Into<InternalError>) -> IResult<T> {
         debug_assert!(self.error.is_none());
         self.error = Some(error.into());

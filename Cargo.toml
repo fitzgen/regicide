@@ -7,11 +7,19 @@ edition = "2024"
 log = "0.4.33"
 
 [dev-dependencies]
-regicide = { version = "0.1.0", path = ".", features = ["std", "checker", "timing"] }
-mutatis = { version = "0.5.2", features = ["check"] }
+regicide = {
+  version = "0.1.0", path = ".",
+  features = ["std", "checker", "timing", "trace-log", "entity-repr-8", "entity-repr-16"],
+}
+mutatis = { version = "0.5.2", features = ["check", "derive"] }
 
 [features]
 std = []
 checker = []
 timing = ["std"]
 trace-log = []
+entity-repr-8 = []
+entity-repr-16 = []
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(fuzz)'] }

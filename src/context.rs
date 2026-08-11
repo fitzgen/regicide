@@ -18,7 +18,9 @@ use core::ops::Range;
 
 /// TODO FITZGEN
 pub struct Context {
+    #[cfg(feature = "entity-repr-8")]
     pub(crate) context8: ContextInner<u8>,
+    #[cfg(feature = "entity-repr-16")]
     pub(crate) context16: ContextInner<u16>,
     pub(crate) context32: ContextInner<u32>,
 }
@@ -33,7 +35,9 @@ impl Context {
     /// TODO FITZGEN
     pub const fn new() -> Self {
         Self {
+            #[cfg(feature = "entity-repr-8")]
             context8: ContextInner::new(),
+            #[cfg(feature = "entity-repr-16")]
             context16: ContextInner::new(),
             context32: ContextInner::new(),
         }
@@ -42,11 +46,15 @@ impl Context {
     /// TODO FITZGEN
     pub fn reset(&mut self) {
         let Self {
+            #[cfg(feature = "entity-repr-8")]
             context8,
+            #[cfg(feature = "entity-repr-16")]
             context16,
             context32,
         } = self;
+        #[cfg(feature = "entity-repr-8")]
         context8.reset();
+        #[cfg(feature = "entity-repr-16")]
         context16.reset();
         context32.reset();
     }
@@ -54,11 +62,24 @@ impl Context {
     /// TODO FITZGEN
     pub fn is_reset(&self) -> bool {
         let Self {
+            #[cfg(feature = "entity-repr-8")]
             context8,
+            #[cfg(feature = "entity-repr-16")]
             context16,
             context32,
         } = self;
-        context8.is_reset() && context16.is_reset() && context32.is_reset()
+
+        #[cfg(feature = "entity-repr-8")]
+        if !context8.is_reset() {
+            return false;
+        }
+
+        #[cfg(feature = "entity-repr-16")]
+        if !context16.is_reset() {
+            return false;
+        }
+
+        context32.is_reset()
     }
 }
 

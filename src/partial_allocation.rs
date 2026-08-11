@@ -4,7 +4,7 @@
 use crate::context::ContextInner;
 use crate::entity::EntityRepr;
 use crate::error::IResult;
-use crate::function::InputFunction;
+use crate::input::InputFunction;
 use crate::timing::Timing;
 
 pub(crate) fn partial_allocate<E>(

@@ -3,6 +3,7 @@ use core::fmt;
 
 /// An internal error, potentially recoverable by switching to a larger entity
 /// representation.
+#[derive(Debug)]
 pub(crate) enum InternalError {
     /// The entity representation was too small to represent the problem's full
     /// index space. Switch to a larger entity representation.
@@ -10,6 +11,18 @@ pub(crate) enum InternalError {
 
     /// An error that needs to be surfaced to the user.
     Error(Error),
+}
+
+impl From<fmt::Error> for InternalError {
+    fn from(e: fmt::Error) -> Self {
+        Error::from(e).into()
+    }
+}
+
+impl From<Error> for InternalError {
+    fn from(e: Error) -> Self {
+        Self::Error(e)
+    }
 }
 
 /// An error encountered during register allocation.
@@ -52,6 +65,15 @@ pub enum Error {
         /// The [`Inst`] instruction with too many operands.
         inst: Inst,
     },
+
+    /// A formatting error.
+    FmtError(fmt::Error),
+}
+
+impl From<fmt::Error> for Error {
+    fn from(e: fmt::Error) -> Self {
+        Self::FmtError(e)
+    }
 }
 
 impl fmt::Debug for Error {
@@ -73,6 +95,7 @@ impl fmt::Debug for Error {
             Self::TooManyOperands { inst } => {
                 write!(f, "too many operands at instruction {inst:?}")
             }
+            Self::FmtError(e) => fmt::Debug::fmt(e, f),
         }
     }
 }

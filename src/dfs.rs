@@ -106,3 +106,21 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::*;
+    use mutatis::check::{Check, CheckResult};
+
+    #[test]
+    fn dfs_properties() -> CheckResult<TestFunction> {
+        Check::new()
+            .iters(100)
+            .run(|func: &TestFunction| -> Result<(), &'static str> {
+                std::eprintln!("{func:?}");
+                // TODO: assert properties
+                Ok(())
+            })
+    }
+}
