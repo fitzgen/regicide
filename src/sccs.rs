@@ -9,7 +9,8 @@
 //! not trust the input and cannot recurse over it for fear of blowing the
 //! stack. Therefore, this implementation is iterative.
 //!
-//! Derived from Wasmtime's implemenation.
+//! Derived from Wasmtime's implemenation in
+//! `wasmtime/crates/environ/src/graphs/scc.rs`.
 //!
 //! [Tarjan's algorithm]: https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm
 
@@ -18,7 +19,7 @@ use crate::{
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     dfs::{Dfs, DfsEvent},
-    entity::{Block, EntityRepr, Scc, SccBlockIndex, SecondaryMap},
+    entity::{Block, EntityRepr, PrimaryMapKeys, Scc, SccBlockIndex, SecondaryMap},
     error::IResult,
     input::InputFunction,
     output::OutputInner,
@@ -175,15 +176,14 @@ where
                     // structures.
                     if self.indices[block] == self.lowlinks[block] {
                         let start = self.component_blocks.next_key(output)?;
-                        let mut done = false;
                         while let Some(b) = self.scc_stack.pop() {
                             let was_on_stack =
                                 self.on_scc_stack.remove(&mut self.on_scc_stack_arena, &b);
                             debug_assert!(was_on_stack);
+                            self.component_blocks.push(output, b)?;
                             if b == block {
                                 break;
                             }
-                            self.component_blocks.push(output, b)?;
                         }
                         let end = self.component_blocks.next_key(output)?;
                         self.components.push(output, start..end)?;
@@ -195,5 +195,245 @@ where
         counts.sccs += self.components.len();
         dfs.reset();
         Ok(())
+    }
+
+    /// Get the number of strongly-connected components.
+    pub fn len(&self) -> usize {
+        self.components.len()
+    }
+
+    /// Are there no strongly-connected components?
+    pub fn is_empty(&self) -> bool {
+        self.components.is_empty()
+    }
+
+    /// Iterate over each strongly-connected component.
+    ///
+    /// Iteration happens in reverse-topological order: successors are visited
+    /// before predecessors in the resulting SCC DAG.
+    pub fn keys(&self) -> PrimaryMapKeys<Scc<E>> {
+        self.components.keys()
+    }
+
+    /// Get the blocks that make up the given strongly-connected component.
+    pub fn blocks(&self, scc: Scc<E>) -> impl ExactSizeIterator<Item = Block<E>> + '_ {
+        let Range { start, end } = self.components[scc].clone();
+        (start.index()..end.index()).map(|i| {
+            let i = SccBlockIndex::try_new(i).unwrap();
+            self.component_blocks[i]
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::TestFunction;
+    use mutatis::check::{Check, CheckResult};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        format,
+        string::{String, ToString},
+    };
+
+    /// Compute the strongly-connected components of `func`, returning each
+    /// component's blocks in the order that the components were found.
+    ///
+    /// Along the way, this checks the invariants of the internal representation
+    /// and of `reset`/`is_reset`, since those are not visible through the public
+    /// accessors.
+    fn components(func: &TestFunction) -> Result<Vec<Vec<Block>>, String> {
+        let mut sccs = StronglyConnectedComponents::<u32>::new();
+        let mut counts = Counts::new();
+        let mut dfs = Dfs::<u32>::new();
+        let mut output = OutputInner::<u32>::new();
+
+        assert!(sccs.is_reset());
+
+        if sccs
+            .construct(func, &mut counts, &mut dfs, &mut output)
+            .is_err()
+        {
+            return Err(format!("`construct` failed: {:?}", output.take_error()));
+        }
+
+        // `construct` is done with the `Dfs` when it returns, and resets it.
+        if !dfs.is_reset() {
+            return Err("`construct` left the `Dfs` un-reset".to_string());
+        }
+        if sccs.is_reset() {
+            return Err("`is_reset` is true after a successful `construct`".to_string());
+        }
+
+        // The components' block ranges must tile `component_blocks`
+        // contiguously, with no gaps and no overlap.
+        let mut expected_start = 0;
+        for scc in sccs.keys() {
+            let Range { start, end } = sccs.components[scc].clone();
+            if start.index() != expected_start {
+                return Err(format!(
+                    "{scc:?}'s blocks start at {} but the previous component's blocks \
+                     ended at {expected_start}",
+                    start.index(),
+                ));
+            }
+            if end.index() < start.index() {
+                return Err(format!(
+                    "{scc:?}'s block range {start:?}..{end:?} is backwards"
+                ));
+            }
+            expected_start = end.index();
+        }
+        if expected_start != sccs.component_blocks.len() {
+            return Err(format!(
+                "the components' block ranges cover {expected_start} blocks but \
+                 `component_blocks` holds {}",
+                sccs.component_blocks.len(),
+            ));
+        }
+
+        let result: Vec<Vec<Block>> = sccs.keys().map(|scc| sccs.blocks(scc).collect()).collect();
+
+        sccs.reset();
+        if !sccs.is_reset() {
+            return Err("`is_reset` is false after `reset`".to_string());
+        }
+
+        Ok(result)
+    }
+
+    /// Compute the reflexive-transitive reachability relation over `func`'s
+    /// control-flow graph.
+    ///
+    /// This deliberately uses neither `Dfs` nor `StronglyConnectedComponents`,
+    /// so that it is an independent oracle rather than a restatement of the
+    /// code under test.
+    fn reachability(func: &TestFunction) -> HashMap<Block, BTreeSet<Block>> {
+        let mut reachable = HashMap::new();
+
+        for (block, _) in func.blocks() {
+            let mut visited = BTreeSet::new();
+            visited.insert(block);
+
+            let mut worklist = alloc::vec![block];
+            while let Some(b) = worklist.pop() {
+                for succ in func.block(b).successors() {
+                    if visited.insert(succ) {
+                        worklist.push(succ);
+                    }
+                }
+            }
+
+            reachable.insert(block, visited);
+        }
+
+        reachable
+    }
+
+    #[test]
+    fn scc_properties() -> CheckResult<TestFunction> {
+        Check::new().iters(10_000).run(|func: &TestFunction| -> Result<(), String> {
+            let entry = func.entry_block();
+            let sccs = components(func)?;
+
+            // No component is empty, and no block appears in more than one
+            // component.
+            let mut scc_of = HashMap::<Block, usize>::new();
+            for (i, blocks) in sccs.iter().enumerate() {
+                if blocks.is_empty() {
+                    return Err(format!("component {i} of {sccs:?} is empty"));
+                }
+                for &block in blocks {
+                    if let Some(j) = scc_of.insert(block, i) {
+                        return Err(format!(
+                            "{block:?} appears in both component {j} and component {i} \
+                             of {sccs:?}"
+                        ));
+                    }
+                }
+            }
+
+            let reachable = reachability(func);
+
+            // `TestFunction::fixup` is supposed to make every block reachable
+            // from the entry block. If it didn't, that's a bug in the generator
+            // rather than in the SCCs, so check it on its own.
+            if reachable[&entry].len() != func.len_blocks() {
+                return Err(format!(
+                    "only {} of this function's {} blocks are reachable from {entry:?}; \
+                     `TestFunction::fixup` should have made them all reachable",
+                    reachable[&entry].len(),
+                    func.len_blocks(),
+                ));
+            }
+
+            // The components partition exactly the blocks that are reachable
+            // from the entry block: no more and no less.
+            let covered: BTreeSet<Block> = scc_of.keys().copied().collect();
+            if covered != reachable[&entry] {
+                return Err(format!(
+                    "the components cover {covered:?} but {:?} are reachable from {entry:?}",
+                    reachable[&entry],
+                ));
+            }
+
+            // The defining property of strongly-connected components: two
+            // blocks are members of the same component if and only if they are
+            // mutually reachable.
+            for (a, _) in func.blocks() {
+                for (b, _) in func.blocks() {
+                    let mutually_reachable =
+                        reachable[&a].contains(&b) && reachable[&b].contains(&a);
+                    let same_component = scc_of[&a] == scc_of[&b];
+                    if mutually_reachable != same_component {
+                        return Err(format!(
+                            "{a:?} is in component {} and {b:?} is in component {}, but they \
+                             are {}mutually reachable",
+                            scc_of[&a],
+                            scc_of[&b],
+                            if mutually_reachable { "" } else { "not " },
+                        ));
+                    }
+                }
+            }
+
+            // The components are found in reverse-topological order: for every
+            // control-flow edge, the successor's component is never numbered
+            // higher than the predecessor's.
+            for (a, input_block) in func.blocks() {
+                for b in input_block.successors() {
+                    if scc_of[&b] > scc_of[&a] {
+                        return Err(format!(
+                            "the edge {a:?} --> {b:?} goes from component {} to the later \
+                             component {}, so the components are not in reverse-topological \
+                             order",
+                            scc_of[&a], scc_of[&b],
+                        ));
+                    }
+                }
+            }
+
+            // The entry block is always the root of its own component (its
+            // lowlink can never be less than its index of zero) and its `Post`
+            // event is always the last one, so its component is always found
+            // last.
+            if scc_of[&entry] != sccs.len() - 1 {
+                return Err(format!(
+                    "{entry:?} is in component {} but should be in the last component, {}",
+                    scc_of[&entry],
+                    sccs.len() - 1,
+                ));
+            }
+
+            // Computing the components again gives the same answer.
+            let sccs_again = components(func)?;
+            if sccs != sccs_again {
+                return Err(format!(
+                    "computing the SCCs twice gave different answers: {sccs:?} vs {sccs_again:?}"
+                ));
+            }
+
+            Ok(())
+        })
     }
 }

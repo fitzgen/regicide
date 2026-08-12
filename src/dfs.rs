@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn dfs_properties() -> CheckResult<TestFunction> {
-        Check::new().run(|func: &TestFunction| {
+        Check::new().iters(10_000).run(|func: &TestFunction| {
             let entry = func.entry_block();
 
             let (events, visited) = run_dfs(func, BTreeSet::new());
