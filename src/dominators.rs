@@ -550,7 +550,7 @@ mod tests {
     fn dominator_tree_properties() -> CheckResult<TestFunction> {
         Check::new().iters(10_000).run(|func: &TestFunction| -> Result<(), String> {
             let entry = func.entry_block();
-            let dominators = &func.dominators;
+            let dominators = func.dominators();
             let blocks: Vec<Block> = func.blocks().map(|(b, _)| b).collect();
 
             // `TestFunction::fixup` is supposed to make every block reachable

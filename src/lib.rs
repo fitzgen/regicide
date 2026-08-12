@@ -26,6 +26,7 @@ mod btree;
 mod context;
 mod counts;
 mod dfs;
+mod dominators;
 mod entity;
 mod error;
 mod input;

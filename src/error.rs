@@ -37,6 +37,74 @@ pub enum Error {
         inst: Inst,
     },
 
+    /// A value was defined more than once, which `SSA` form forbids.
+    MultiplyDefinedValue {
+        /// The [`Val`] with more than one definition.
+        val: Val,
+    },
+
+    /// A value was never defined.
+    UndefinedValue {
+        /// The [`Val`] without a definition.
+        val: Val,
+    },
+
+    /// A reference to a value outside of the function's value index space.
+    ValOutOfBounds {
+        /// The out-of-bounds [`Val`].
+        val: Val,
+    },
+
+    /// A reference to a block outside of the function's block index space.
+    BlockOutOfBounds {
+        /// The out-of-bounds [`Block`].
+        block: Block,
+    },
+
+    /// A block is not reachable from the function's entry block.
+    UnreachableBlock {
+        /// The unreachable [`Block`].
+        block: Block,
+    },
+
+    /// A control-flow edge passes a different number of block arguments than
+    /// its target block has parameters.
+    BlockArgCountMismatch {
+        /// The [`Block`] the edge leaves.
+        block: Block,
+        /// The index of the successor edge within `block`.
+        successor: usize,
+        /// The number of parameters that the target block has.
+        expected: usize,
+        /// The number of arguments that the edge passes.
+        actual: usize,
+    },
+
+    /// A block's immediate dominator, as reported by the input, is not
+    /// its immediate dominator in the input's control-flow graph.
+    InvalidImmediateDominator {
+        /// The [`Block`] whose immediate dominator is wrong.
+        block: Block,
+    },
+
+    /// The input's dominance relation disagrees with its control-flow graph
+    /// about whether one block dominates another.
+    InvalidDominance {
+        /// The dominating [`Block`], according to the input.
+        a: Block,
+        /// The dominated [`Block`], according to the input.
+        b: Block,
+    },
+
+    /// An [`InputFunction`][crate::InputFunction] reported a length that
+    /// disagrees with the corresponding iterator.
+    InconsistentLen {
+        /// The name of the method that reported the wrong length.
+        method: &'static str,
+        /// The [`Block`] whose length was wrong.
+        block: Block,
+    },
+
     /// A basic block is missing a terminator instruction at its end.
     BlockWithoutTerminator {
         /// The [`Block`] missing a terminator.
@@ -80,8 +148,46 @@ impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSsa { val, inst } => {
-                write!(f, "invalid SSA: {val:?} is used at {inst:?}")
+                write!(
+                    f,
+                    "invalid SSA: {val:?} is used at {inst:?}, which its definition does \
+                     not dominate"
+                )
             }
+            Self::MultiplyDefinedValue { val } => {
+                write!(f, "invalid SSA: {val:?} is defined more than once")
+            }
+            Self::UndefinedValue { val } => write!(f, "{val:?} is never defined"),
+            Self::ValOutOfBounds { val } => {
+                write!(f, "{val:?} is outside the function's value index space")
+            }
+            Self::BlockOutOfBounds { block } => {
+                write!(f, "{block:?} is outside the function's block index space")
+            }
+            Self::UnreachableBlock { block } => {
+                write!(f, "{block:?} is not reachable from the entry block")
+            }
+            Self::BlockArgCountMismatch {
+                block,
+                successor,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{block:?}'s successor edge {successor} passes {actual} block arguments, \
+                 but its target block has {expected} parameters"
+            ),
+            Self::InvalidImmediateDominator { block } => {
+                write!(f, "{block:?}'s immediate dominator is wrong")
+            }
+            Self::InvalidDominance { a, b } => write!(
+                f,
+                "the input's dominance relation is wrong about whether {a:?} dominates {b:?}"
+            ),
+            Self::InconsistentLen { method, block } => write!(
+                f,
+                "`{method}` disagrees with the corresponding iterator for {block:?}"
+            ),
             Self::BlockWithoutTerminator { block } => {
                 write!(f, "{block:?} is missing a terminator")
             }

@@ -159,6 +159,25 @@ pub trait InputBlock<'a> {
     /// Get an iterator over all instructions within a block.
     fn insts(&self) -> Self::InstsIter<'_>;
 
+    /// The number of parameters that this block takes.
+    ///
+    /// Every control-flow edge into this block must pass exactly this many
+    /// block arguments, or the input is invalid. See
+    /// [`InputBlock::len_successor_block_args`], which is the other half of
+    /// this contract.
+    fn len_params(&self) -> usize;
+
+    /// The iterator type returned by [`InputBlock::params`].
+    type ParamsIter<'b>: Iterator<Item = Val>
+    where
+        Self: 'b;
+
+    /// Get this block's parameters.
+    ///
+    /// A parameter is defined upon entry to its block, and therefore its
+    /// definition dominates every instruction in the block.
+    fn params(&self) -> Self::ParamsIter<'_>;
+
     /// Get the given block's immediate dominator, or `None` if this is the
     /// function entry block (i.e. the root of the dominator tree).
     ///
@@ -190,8 +209,9 @@ pub trait InputBlock<'a> {
 
     /// The number of block arguments in the `i`th successor edge.
     ///
-    /// The `i`th block must have exactly this many block parameters, or the
-    /// input is invalid.
+    /// The `i`th successor block must have exactly this many block parameters,
+    /// or the input is invalid. That is, this must always equal
+    /// `self.successors().nth(i).len_params()`.
     fn len_successor_block_args(&self, i: usize) -> usize;
 
     /// The iterator type returned by [`InputBlock::successor_block_args`].
@@ -335,7 +355,9 @@ where
                 if block == entry {
                     output.result(write!(f, "entry "))?;
                 }
-                output.result(writeln!(f, "{block:?}:"))?;
+                output.result(write!(f, "{block:?}"))?;
+                fmt_val_list(f, output, input_block.params())?;
+                output.result(writeln!(f, ":"))?;
                 DisplayInputBlock(input_block).fmt_with_output(f, output)?;
                 output.result(writeln!(f))?;
             }
@@ -375,10 +397,36 @@ where
         if self.0.len_successors() == 0 {
             output.result(writeln!(f, "    --> returns"))?;
         } else {
-            for block in self.0.successors() {
-                output.result(writeln!(f, "    --> {block:?}"))?;
+            for (i, block) in self.0.successors().enumerate() {
+                output.result(write!(f, "    --> {block:?}"))?;
+                fmt_val_list(f, output, self.0.successor_block_args(i))?;
+                output.result(writeln!(f))?;
             }
         }
         Ok(())
     }
+}
+
+/// Format a parenthesized, comma-separated list of values, or nothing at all
+/// when the list is empty.
+fn fmt_val_list<E>(
+    f: &mut fmt::Formatter<'_>,
+    output: &mut OutputInner<E>,
+    vals: impl Iterator<Item = Val>,
+) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    let mut vals = vals.peekable();
+    if vals.peek().is_none() {
+        return Ok(());
+    }
+    output.result(write!(f, "("))?;
+    for (i, val) in vals.enumerate() {
+        if i > 0 {
+            output.result(write!(f, ", "))?;
+        }
+        output.result(write!(f, "{val:?}"))?;
+    }
+    output.result(write!(f, ")"))
 }

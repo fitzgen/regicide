@@ -324,6 +324,14 @@ where
         }
     }
 
+    /// Returns an owning iterator of the key-value pairs in the map.
+    pub fn into_iter(self) -> PrimaryMapIntoIter<K, V> {
+        PrimaryMapIntoIter {
+            inner: self.elems.into_iter().enumerate(),
+            _phantom: PhantomData,
+        }
+    }
+
     /// Returns an iterator over the keys in the map.
     pub fn keys(&self) -> PrimaryMapKeys<K> {
         PrimaryMapKeys {
@@ -375,6 +383,26 @@ where
     K: Entity,
 {
     type Item = (K, &'a mut V);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        let (idx, val) = self.inner.next()?;
+        let key = K::try_new(idx).unwrap();
+        Some((key, val))
+    }
+}
+
+/// A mutable iterator over key-value pairs in a `PrimaryMap`.
+pub struct PrimaryMapIntoIter<K, V> {
+    inner: core::iter::Enumerate<alloc::vec::IntoIter<V>>,
+    _phantom: PhantomData<K>,
+}
+
+impl<K, V> Iterator for PrimaryMapIntoIter<K, V>
+where
+    K: Entity,
+{
+    type Item = (K, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -502,6 +530,10 @@ where
         self.inner.reserve(additional);
     }
 
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     pub fn get(&self, key: K) -> Option<&V> {
         let index = key.index();
         self.inner.elems.get(index)
@@ -510,6 +542,14 @@ where
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         let index = key.index();
         self.inner.elems.get_mut(index)
+    }
+
+    pub fn iter(&self) -> PrimaryMapIter<'_, K, V> {
+        self.inner.iter()
+    }
+
+    pub fn into_iter(self) -> PrimaryMapIntoIter<K, V> {
+        self.inner.into_iter()
     }
 }
 

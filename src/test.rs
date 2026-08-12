@@ -2,11 +2,10 @@
 
 #![allow(missing_docs)]
 
-mod dominators;
-
 use crate::{
     Block, InputBlock, InputFunction, InputInst, Operand, Val,
     dfs::{Dfs, DfsEvent},
+    dominators::DominatorTree,
     entity::{Entity, EntityRepr, Inst, PrimaryMap},
     input::{DefUse, FmtWithOutput, OperandPos},
     output::OutputInner,
@@ -16,9 +15,8 @@ use core::{
     fmt::{self, Display},
     hash::Hasher,
     marker::PhantomData,
-    mem,
+    mem, slice,
 };
-use dominators::DominatorTree;
 use mutatis::{DefaultMutate, Generate, Mutate};
 use std::{
     collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
@@ -108,12 +106,11 @@ pub struct BlockCall {
 #[derive(Clone, Debug, Hash, Mutate)]
 pub enum InstData {
     Op {
-        args: Vec<Operand>,
-        results: Vec<Operand>,
+        operands: Vec<Operand>,
         side_effects: bool,
     },
     Branch {
-        args: Vec<Operand>,
+        operands: Vec<Operand>,
         targets: Vec<BlockCall>,
     },
 }
@@ -121,9 +118,41 @@ pub enum InstData {
 impl Default for InstData {
     fn default() -> Self {
         Self::Op {
-            results: vec![],
-            args: vec![],
+            operands: vec![],
             side_effects: false,
+        }
+    }
+}
+
+impl InstData {
+    /// This instruction's operands.
+    fn operands(&self) -> &[Operand] {
+        match self {
+            InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
+        }
+    }
+
+    /// Get mutable access to this instruction's operands.
+    fn operands_mut(&mut self) -> &mut [Operand] {
+        match self {
+            InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
+        }
+    }
+
+    /// This instruction's block calls: the control-flow edges it takes, and the
+    /// arguments passed along each of them.
+    fn block_calls(&self) -> &[BlockCall] {
+        match self {
+            InstData::Op { .. } => &[],
+            InstData::Branch { targets, .. } => targets,
+        }
+    }
+
+    /// Get mutable access to this instruction's block calls.
+    fn block_calls_mut(&mut self) -> &mut [BlockCall] {
+        match self {
+            InstData::Op { .. } => &mut [],
+            InstData::Branch { targets, .. } => targets,
         }
     }
 }
@@ -134,9 +163,13 @@ pub struct ValData {
     def: ValDef,
 }
 
-#[derive(Clone, Debug, Hash, Mutate)]
+/// Where a value is defined.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Mutate)]
 pub enum ValDef {
+    /// The value is defined by an instruction, as its `i`th definition.
     InstResult { inst: Inst, i: usize },
+
+    /// The value is `block`'s `i`th parameter.
     BlockParam { block: Block, i: usize },
 }
 
@@ -262,19 +295,33 @@ impl fmt::Debug for TestFunction {
 }
 
 impl TestFunction {
+    /// Get this function's dominator tree, which [`TestFunction::fixup`] keeps
+    /// up to date.
+    pub(crate) fn dominators(&self) -> &DominatorTree {
+        &self.dominators
+    }
+
+    /// Repair this function until it is well formed: a terminated,
+    /// fully-reachable control-flow graph in valid SSA form.
+    ///
+    /// Every pass below is idempotent, and none of the value-level passes
+    /// changes the control-flow graph, so the dominator tree computed in the
+    /// middle stays valid for the passes that follow it.
     pub fn fixup(&mut self) {
         let mut output = OutputInner::<u32>::new();
         self.ensure_non_empty(&mut output);
         let (old_to_new, old_insts) = self.ensure_unique_insts_in_layout(&mut output);
-        self.ensure_terminators(&mut output);
+        self.ensure_terminators();
         self.ensure_all_blocks_are_reachable(&mut output);
         self.fixup_dominator_tree();
-        self.ensure_values_in_bounds(&mut output);
-        // TODO: fixup values in bounds
-        // TODO: fixup values uses dominated by defs
-        // TODO: fixup block args
+        self.ensure_entry_param_when_needed();
+        self.ensure_unique_defs(&mut output);
+        self.ensure_block_call_arity();
+        self.ensure_uses_dominated_by_defs();
     }
 
+    /// Make sure that this function has at least one block, instruction, and
+    /// value, and that no block has an empty layout.
     fn ensure_non_empty(&mut self, output: &mut OutputInner<u32>) {
         if self.blocks.is_empty() {
             self.blocks
@@ -293,8 +340,7 @@ impl TestFunction {
                 .push(
                     output,
                     InstData::Op {
-                        args: vec![],
-                        results: vec![Operand {
+                        operands: vec![Operand {
                             pos: OperandPos::Early,
                             kind: DefUse::Def,
                             val: Val::try_new(0).unwrap(),
@@ -318,6 +364,14 @@ impl TestFunction {
                     },
                 )
                 .unwrap();
+        }
+
+        // `ensure_unique_insts_in_layout` gives each of these its own copy of
+        // the instruction data and its own `Inst`.
+        for (_block, block_data) in self.blocks.iter_mut() {
+            if block_data.insts.is_empty() {
+                block_data.insts.push(Inst::try_new(0).unwrap());
+            }
         }
     }
 
@@ -361,38 +415,46 @@ impl TestFunction {
 
     /// Make sure that every block ends in a terminator instruction, and that
     /// they name valid blocks as their successors.
-    fn ensure_terminators(&mut self, output: &mut OutputInner<u32>) {
+    fn ensure_terminators(&mut self) {
         let num_blocks = self.blocks.len();
         assert!(num_blocks > 0);
 
         for (_block, block_data) in self.blocks.iter_mut() {
-            match block_data.insts.last_mut() {
-                Some(inst) => match &mut self.insts[*inst] {
-                    inst_data @ InstData::Op { .. } => {
-                        *inst_data = InstData::Branch {
-                            args: vec![],
-                            targets: vec![],
-                        };
+            let (&terminator, rest) = block_data
+                .insts
+                .split_last()
+                .expect("`ensure_non_empty` gives every block an instruction");
+
+            // Only the last instruction in a block can be a terminator.
+            for inst in rest {
+                if let InstData::Branch {
+                    operands,
+                    targets: _,
+                } = &mut self.insts[*inst]
+                {
+                    let operands = mem::take(operands);
+                    self.insts[*inst] = InstData::Op {
+                        operands,
+                        side_effects: false,
+                    };
+                }
+            }
+
+            match &mut self.insts[terminator] {
+                InstData::Op { operands, .. } => {
+                    let operands = mem::take(operands);
+                    self.insts[terminator] = InstData::Branch {
+                        operands,
+                        targets: vec![],
+                    };
+                }
+                InstData::Branch {
+                    operands: _,
+                    targets,
+                } => {
+                    for target in targets {
+                        target.target = Block::try_new(target.target.index() % num_blocks).unwrap();
                     }
-                    InstData::Branch { args, targets } => {
-                        for target in targets {
-                            target.target =
-                                Block::try_new(target.target.index() % num_blocks).unwrap();
-                        }
-                    }
-                },
-                None => {
-                    let inst = self
-                        .insts
-                        .push(
-                            output,
-                            InstData::Branch {
-                                args: vec![],
-                                targets: vec![],
-                            },
-                        )
-                        .unwrap();
-                    block_data.insts.push(inst);
                 }
             }
         }
@@ -422,7 +484,10 @@ impl TestFunction {
             let from_inst = self.blocks[from].insts.last().copied().unwrap();
             match &mut self.insts[from_inst] {
                 InstData::Op { .. } => unreachable!(),
-                InstData::Branch { args: _, targets } => {
+                InstData::Branch {
+                    operands: _,
+                    targets,
+                } => {
                     targets.push(BlockCall {
                         target: block,
                         args: vec![],
@@ -438,32 +503,194 @@ impl TestFunction {
         self.dominators = dominators;
     }
 
-    fn ensure_values_in_bounds(&mut self, output: &mut OutputInner<u32>) {
-        let num_vals = self.values.len();
-        assert!(num_vals > 0);
+    /// Give the entry block a parameter if this function has any use that would
+    /// otherwise have no value in scope.
+    fn ensure_entry_param_when_needed(&mut self) {
+        let entry = self.entry_block();
+        let mut needs_param = false;
+        let mut scope_len = 0;
+        let mut stack = vec![ScopeFrame::Enter(entry)];
 
-        for (inst, inst_data) in self.insts.iter_mut() {
-            match inst_data {
-                InstData::Op {
-                    args,
-                    results,
-                    side_effects: _,
-                } => {
-                    for arg in args {
-                        arg.val = Val::try_new(arg.val.index() % num_vals).unwrap();
-                    }
-                    for arg in results {
-                        arg.val = Val::try_new(arg.val.index() % num_vals).unwrap();
-                    }
+        'walk: while let Some(frame) = stack.pop() {
+            let block = match frame {
+                ScopeFrame::Restore(len) => {
+                    scope_len = len;
+                    continue;
                 }
-                InstData::Branch { args, targets: _ } => {
-                    for arg in args {
-                        arg.val = Val::try_new(arg.val.index() % num_vals).unwrap();
+                ScopeFrame::Enter(block) => block,
+            };
+
+            stack.push(ScopeFrame::Restore(scope_len));
+            scope_len += self.blocks[block].params.len();
+
+            for inst in &self.blocks[block].insts {
+                let inst_data = &self.insts[*inst];
+
+                // The block calls' arguments count as uses, because
+                // `ensure_block_call_arity` is about to give each of them one
+                // argument per parameter of its target block.
+                let uses = inst_data
+                    .operands()
+                    .iter()
+                    .filter(|op| matches!(op.kind, DefUse::Use))
+                    .count()
+                    + inst_data
+                        .block_calls()
+                        .iter()
+                        .map(|call| self.blocks[call.target].params.len())
+                        .sum::<usize>();
+                if scope_len == 0 && uses > 0 {
+                    needs_param = true;
+                    break 'walk;
+                }
+
+                scope_len += inst_data
+                    .operands()
+                    .iter()
+                    .filter(|op| matches!(op.kind, DefUse::Def))
+                    .count();
+            }
+
+            stack.extend(self.dominators.children(block).map(ScopeFrame::Enter));
+        }
+
+        if needs_param {
+            // `ensure_unique_defs` mints this parameter's real value in a
+            // moment, along with every other definition.
+            self.blocks[entry].params.push(Val::default());
+        }
+    }
+
+    /// Rebuild `self.values` from the definition sites in the layout, so that
+    /// every value is defined exactly once and its [`ValData::def`] says where.
+    ///
+    /// A definition site and the `ValData::def` that describes it are
+    /// redundant, and mutation can make them disagree. Rather than reconcile
+    /// them, this discards the old value map and mints a fresh value at each
+    /// definition site, in layout order, which makes both invariants true by
+    /// construction.
+    fn ensure_unique_defs(&mut self, output: &mut OutputInner<u32>) {
+        let old_values = mem::take(&mut self.values);
+        let num_old_values = old_values.len();
+        assert!(num_old_values > 0, "`ensure_non_empty` runs first");
+
+        // Mint a fresh value for a definition site, keeping the type of
+        // whichever old value used to be named there so that mutating a value's
+        // type still means something.
+        let mut fresh_val = |values: &mut PrimaryMap<Val, ValData>, old: Val, def: ValDef| -> Val {
+            let old = Val::try_new(old.index() % num_old_values).unwrap();
+            let ty = old_values[old].ty.clone();
+            values.push(output, ValData { ty, def }).unwrap()
+        };
+
+        let Self {
+            values,
+            blocks,
+            insts,
+            ..
+        } = self;
+
+        for (block, block_data) in blocks.iter_mut() {
+            for (i, param) in block_data.params.iter_mut().enumerate() {
+                *param = fresh_val(values, *param, ValDef::BlockParam { block, i });
+            }
+
+            for inst in &block_data.insts {
+                let inst = *inst;
+                let mut i = 0;
+                for op in insts[inst].operands_mut() {
+                    if matches!(op.kind, DefUse::Def) {
+                        op.val = fresh_val(values, op.val, ValDef::InstResult { inst, i });
+                        i += 1;
                     }
                 }
             }
         }
     }
+
+    /// Make every block call pass exactly as many arguments as its target block
+    /// has parameters.
+    fn ensure_block_call_arity(&mut self) {
+        let Self { blocks, insts, .. } = self;
+        for (_block, block_data) in blocks.iter() {
+            for inst in &block_data.insts {
+                for call in insts[*inst].block_calls_mut() {
+                    let arity = blocks[call.target].params.len();
+                    call.args.resize(arity, Val::default());
+                }
+            }
+        }
+    }
+
+    /// Rewrite every use whose value is not defined by a definition that
+    /// dominates it.
+    fn ensure_uses_dominated_by_defs(&mut self) {
+        let entry = self.entry_block();
+        let Self {
+            blocks,
+            insts,
+            dominators,
+            ..
+        } = self;
+
+        let mut scope = Vec::<Val>::new();
+        let mut stack = vec![ScopeFrame::Enter(entry)];
+
+        while let Some(frame) = stack.pop() {
+            let block = match frame {
+                ScopeFrame::Restore(len) => {
+                    scope.truncate(len);
+                    continue;
+                }
+                ScopeFrame::Enter(block) => block,
+            };
+
+            stack.push(ScopeFrame::Restore(scope.len()));
+            scope.extend_from_slice(&blocks[block].params);
+
+            for inst in &blocks[block].insts {
+                let inst = *inst;
+
+                for op in insts[inst].operands_mut() {
+                    if matches!(op.kind, DefUse::Use) {
+                        op.val = in_scope(&scope, op.val);
+                    }
+                }
+                for call in insts[inst].block_calls_mut() {
+                    for arg in &mut call.args {
+                        *arg = in_scope(&scope, *arg);
+                    }
+                }
+
+                for op in insts[inst].operands() {
+                    if matches!(op.kind, DefUse::Def) {
+                        scope.push(op.val);
+                    }
+                }
+            }
+
+            // Every block is reachable, so this walk reaches every block.
+            stack.extend(dominators.children(block).map(ScopeFrame::Enter));
+        }
+    }
+}
+
+enum ScopeFrame {
+    Enter(Block),
+    Restore(usize),
+}
+
+/// Get `val` if it is in scope, or else some value that is.
+fn in_scope(scope: &[Val], val: Val) -> Val {
+    if scope.contains(&val) {
+        return val;
+    }
+    assert!(
+        !scope.is_empty(),
+        "`ensure_entry_param_when_needed` should have given the entry block a parameter \
+         so that at least one value is in scope at every use",
+    );
+    scope[val.index() % scope.len()]
 }
 
 pub struct TestBlock<'a> {
@@ -603,6 +830,19 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
         }
     }
 
+    fn len_params(&self) -> usize {
+        self.func.blocks[self.block].params.len()
+    }
+
+    type ParamsIter<'b>
+        = core::iter::Copied<core::slice::Iter<'b, Val>>
+    where
+        Self: 'b;
+
+    fn params(&self) -> Self::ParamsIter<'_> {
+        self.func.blocks[self.block].params.iter().copied()
+    }
+
     fn immediate_dominator(&self) -> Option<Block> {
         self.func.dominators.idom(self.block)
     }
@@ -621,28 +861,37 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
         Self: 'b;
 
     fn successors(&self) -> Self::SuccessorsIter<'_> {
-        let inst = self.func.blocks[self.block].insts.last().unwrap();
         TestBlockSuccessorsIter {
-            state: match &self.func.insts[*inst] {
-                InstData::Op { .. } => panic!("invalid function; should have called `fixup`"),
-                InstData::Branch { args, targets } => {
-                    TestBlockSuccessorsIterState::Many(targets.iter())
-                }
-            },
+            state: TestBlockSuccessorsIterState::Many(self.block_calls().iter()),
         }
     }
 
-    fn len_successor_block_args(&self, _i: usize) -> usize {
-        todo!()
+    fn len_successor_block_args(&self, i: usize) -> usize {
+        self.block_calls()[i].args.len()
     }
 
     type SuccessorBlockArgsIter<'b>
-        = core::iter::Empty<Val>
+        = core::iter::Copied<core::slice::Iter<'b, Val>>
     where
         Self: 'b;
 
-    fn successor_block_args(&self, _successor: usize) -> core::iter::Empty<Val> {
-        todo!()
+    fn successor_block_args(&self, successor: usize) -> Self::SuccessorBlockArgsIter<'_> {
+        self.block_calls()[successor].args.iter().copied()
+    }
+}
+
+impl<'a> TestBlock<'a> {
+    /// Get the block calls in this block's terminator, i.e. its outgoing
+    /// control-flow edges and the arguments passed along each of them.
+    fn block_calls(&self) -> &'a [BlockCall] {
+        let inst = *self.func.blocks[self.block].insts.last().unwrap();
+        match &self.func.insts[inst] {
+            InstData::Op { .. } => panic!("invalid function; should have called `fixup`"),
+            InstData::Branch {
+                operands: _,
+                targets,
+            } => targets,
+        }
     }
 }
 
@@ -684,29 +933,16 @@ impl<'a> InputInst<'a> for TestInst<'a> {
     }
 
     type OperandsIter<'b>
-        = TestOperandsIter<'b>
+        = core::iter::Cloned<slice::Iter<'b, Operand>>
     where
         Self: 'b;
 
     fn operands(&self) -> Self::OperandsIter<'_> {
-        match &self.func.insts[self.inst] {
-            InstData::Op {
-                args,
-                results,
-                side_effects: _,
-            } => TestOperandsIter {
-                args: args.iter(),
-                results: results.iter(),
-            },
-            InstData::Branch { args, targets: _ } => TestOperandsIter {
-                args: args.iter(),
-                results: (&[][..]).iter(),
-            },
-        }
+        self.func.insts[self.inst].operands().iter().cloned()
     }
 
     fn operand(&self, i: usize) -> Operand {
-        todo!()
+        self.func.insts[self.inst].operands()[i].clone()
     }
 
     fn clobbers(&self) -> crate::input::RegSet {
@@ -714,30 +950,74 @@ impl<'a> InputInst<'a> for TestInst<'a> {
     }
 }
 
-pub struct TestOperandsIter<'a> {
-    args: core::slice::Iter<'a, Operand>,
-    results: core::slice::Iter<'a, Operand>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::validation;
+    use mutatis::check::{Check, CheckResult};
+    use std::{format, string::String};
 
-impl Iterator for TestOperandsIter<'_> {
-    type Item = Operand;
+    /// Check that `func` is a well-formed function in valid SSA form, as
+    /// `TestFunction::fixup` is supposed to guarantee.
+    fn check_ssa(func: &TestFunction) -> Result<(), String> {
+        let mut output = OutputInner::<u32>::new();
+        if validation::validate(func, &mut output).is_err() {
+            return Err(format!("invalid input: {:?}", output.take_error()));
+        }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        self.args.next().or_else(|| self.results.next()).cloned()
+        // `ValData::def` describes where a value is defined, which is a
+        // `TestFunction` concept that the input traits have no notion of.
+        // `validate` has already established that these are exactly the
+        // function's definition sites, so all that is left is to check that
+        // each value's own record of its definition agrees.
+        for (block, block_data) in func.blocks.iter() {
+            for (i, &param) in block_data.params.iter().enumerate() {
+                let expected = ValDef::BlockParam { block, i };
+                let actual = &func.values[param].def;
+                if *actual != expected {
+                    return Err(format!(
+                        "{param:?} is {block:?}'s parameter {i}, but its `ValData::def` \
+                         says {actual:?}",
+                    ));
+                }
+            }
+            for &inst in &block_data.insts {
+                let mut i = 0;
+                for op in func.insts[inst].operands() {
+                    if !matches!(op.kind, DefUse::Def) {
+                        continue;
+                    }
+                    let expected = ValDef::InstResult { inst, i };
+                    let actual = &func.values[op.val].def;
+                    if *actual != expected {
+                        return Err(format!(
+                            "{:?} is definition {i} of {inst:?}, but its `ValData::def` \
+                             says {actual:?}",
+                            op.val,
+                        ));
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        // `fixup` reaches a fixed point.
+        let mut again = func.clone();
+        again.fixup();
+        if hash(&again) != hash(func) {
+            return Err(format!(
+                "`fixup` is not idempotent; running it a second time gives:\n{}",
+                again.display(),
+            ));
+        }
+
+        Ok(())
     }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let (args_min, args_max) = self.args.size_hint();
-        let (results_min, results_max) = self.results.size_hint();
-        (
-            args_min + results_min,
-            match (args_max, results_max) {
-                (None, None) => None,
-                (None, Some(_)) | (Some(_), None) => None,
-                (Some(a), Some(b)) => Some(a + b),
-            },
-        )
+    #[test]
+    fn fixup_produces_valid_ssa() -> CheckResult<TestFunction> {
+        Check::new()
+            .iters(10_000)
+            .run(|func: &TestFunction| check_ssa(func))
     }
 }
-
-impl ExactSizeIterator for TestOperandsIter<'_> {}
