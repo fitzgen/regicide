@@ -2,6 +2,8 @@
 
 #![allow(missing_docs)]
 
+mod dominators;
+
 use crate::{
     Block, InputBlock, InputFunction, InputInst, Operand, Val,
     dfs::{Dfs, DfsEvent},
@@ -16,6 +18,7 @@ use core::{
     marker::PhantomData,
     mem,
 };
+use dominators::DominatorTree;
 use mutatis::{DefaultMutate, Generate, Mutate};
 use std::{
     collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
@@ -169,6 +172,7 @@ pub struct TestFunction {
     values: PrimaryMap<Val, ValData>,
     blocks: PrimaryMap<Block, BlockData>,
     insts: PrimaryMap<Inst, InstData>,
+    dominators: DominatorTree,
 }
 
 impl Default for TestFunction {
@@ -178,6 +182,7 @@ impl Default for TestFunction {
             values: PrimaryMap::default(),
             blocks: PrimaryMap::default(),
             insts: PrimaryMap::default(),
+            dominators: DominatorTree::default(),
         };
         func.fixup();
         func
@@ -231,6 +236,7 @@ impl Generate<TestFunction> for TestFunctionMutator {
                 .generate(context)?,
             insts: <PrimaryMap<Inst, InstData> as DefaultMutate>::DefaultMutate::default()
                 .generate(context)?,
+            dominators: DominatorTree::default(),
         };
         func.fixup();
         Ok(func)
@@ -262,8 +268,8 @@ impl TestFunction {
         let (old_to_new, old_insts) = self.ensure_unique_insts_in_layout(&mut output);
         self.ensure_terminators(&mut output);
         self.ensure_all_blocks_are_reachable(&mut output);
+        self.fixup_dominator_tree();
         self.ensure_values_in_bounds(&mut output);
-        // TODO: compute dominator tree
         // TODO: fixup values in bounds
         // TODO: fixup values uses dominated by defs
         // TODO: fixup block args
@@ -424,6 +430,12 @@ impl TestFunction {
                 }
             }
         }
+    }
+
+    fn fixup_dominator_tree(&mut self) {
+        let mut dominators = mem::take(&mut self.dominators);
+        dominators.compute(self);
+        self.dominators = dominators;
     }
 
     fn ensure_values_in_bounds(&mut self, output: &mut OutputInner<u32>) {
@@ -592,11 +604,11 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
     }
 
     fn immediate_dominator(&self) -> Option<Block> {
-        todo!()
+        self.func.dominators.idom(self.block)
     }
 
-    fn dominates(&self, _other: Block) -> bool {
-        todo!()
+    fn dominates(&self, other: Block) -> bool {
+        self.func.dominators.block_dominates(self.block, other)
     }
 
     fn len_successors(&self) -> usize {

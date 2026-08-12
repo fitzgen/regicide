@@ -448,6 +448,7 @@ where
     }
 }
 
+#[derive(Clone, Hash)]
 pub(crate) struct SecondaryMap<K, V> {
     inner: PrimaryMap<K, V>,
     default_value: V,

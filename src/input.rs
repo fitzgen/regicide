@@ -161,9 +161,20 @@ pub trait InputBlock<'a> {
 
     /// Get the given block's immediate dominator, or `None` if this is the
     /// function entry block (i.e. the root of the dominator tree).
+    ///
+    /// This is also `None` for blocks that are not reachable from the entry
+    /// block, which are not part of the dominator tree at all.
     fn immediate_dominator(&self) -> Option<Block>;
 
     /// Does this block dominate the `other` block?
+    ///
+    /// That is, must every control-flow path from the function entry to `other`
+    /// go through this block?
+    ///
+    /// This is reflexive: a block always dominates itself.
+    ///
+    /// Dominance is ill-defined for blocks that are not reachable from the entry
+    /// block, and the result is unspecified when either block is unreachable.
     fn dominates(&self, other: Block) -> bool;
 
     /// How many successors does this block have in the control-flow graph?
