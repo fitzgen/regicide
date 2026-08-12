@@ -4,7 +4,10 @@ use crate::error::IResult;
 use crate::input::InputFunction;
 use crate::timing::Timing;
 
-pub(crate) fn eliminate_moves<E>(context: &mut ContextInner<E>, func: &impl InputFunction) -> IResult<()>
+pub(crate) fn eliminate_moves<E>(
+    context: &mut ContextInner<E>,
+    func: &impl InputFunction,
+) -> IResult<()>
 where
     E: EntityRepr,
 {

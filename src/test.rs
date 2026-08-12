@@ -163,12 +163,25 @@ pub struct BlockData {
     pub insts: Vec<Inst>,
 }
 
-#[derive(Clone, Default, Hash)]
+#[derive(Clone, Hash)]
 pub struct TestFunction {
     mutated: bool,
     values: PrimaryMap<Val, ValData>,
     blocks: PrimaryMap<Block, BlockData>,
     insts: PrimaryMap<Inst, InstData>,
+}
+
+impl Default for TestFunction {
+    fn default() -> Self {
+        let mut func = TestFunction {
+            mutated: false,
+            values: PrimaryMap::default(),
+            blocks: PrimaryMap::default(),
+            insts: PrimaryMap::default(),
+        };
+        func.fixup();
+        func
+    }
 }
 
 #[derive(Default)]
