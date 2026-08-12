@@ -202,6 +202,14 @@ define_entities! {
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct RegionBlocksStorageIndex = "region_blocks_storage_index";
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct RegionChildrenStorageIndex = "region_children_storage_index";
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Reg = "r";
 
     /// TODO FITZGEN
@@ -557,6 +565,27 @@ where
         Self {
             start: K::MAX,
             end: K::MAX,
+        }
+    }
+
+    /// Is this range empty?
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+
+    /// How many entities does this range cover?
+    pub fn len(&self) -> usize {
+        self.end.index() - self.start.index()
+    }
+
+    /// The `usize` indices that this range covers.
+    ///
+    /// Empty ranges give `0..0`, regardless of their actual `start` and `end`.
+    pub fn indices(&self) -> core::ops::Range<usize> {
+        if self.is_empty() {
+            0..0
+        } else {
+            self.start.index()..self.end.index()
         }
     }
 }

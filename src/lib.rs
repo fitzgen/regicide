@@ -126,7 +126,9 @@ where
     context
         .sccs
         .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
-    context.region_tree.construct(input.func)?;
+    context
+        .region_tree
+        .construct(input.func, &mut context.counts, &context.sccs, output)?;
     context.liveness.construct(input.func)?;
     context
         .live_ranges

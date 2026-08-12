@@ -65,6 +65,7 @@ impl Count {
 #[derive(Debug)]
 pub struct Counts {
     pub sccs: Count,
+    pub regions: Count,
     pub live_ranges: Count,
 }
 
@@ -72,18 +73,28 @@ impl Counts {
     pub const fn new() -> Self {
         Self {
             sccs: Count::new(),
+            regions: Count::new(),
             live_ranges: Count::new(),
         }
     }
 
     pub fn reset(&mut self) {
-        let Self { sccs, live_ranges } = self;
+        let Self {
+            sccs,
+            regions,
+            live_ranges,
+        } = self;
         *sccs = Count::new();
+        *regions = Count::new();
         *live_ranges = Count::new();
     }
 
     pub fn is_reset(&self) -> bool {
-        let Self { sccs, live_ranges } = self;
-        sccs.is_reset() && live_ranges.is_reset()
+        let Self {
+            sccs,
+            regions,
+            live_ranges,
+        } = self;
+        sccs.is_reset() && regions.is_reset() && live_ranges.is_reset()
     }
 }

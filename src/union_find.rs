@@ -50,6 +50,17 @@ where
         map.is_reset() && stack.is_empty()
     }
 
+    pub fn find_without_path_compression(&self, entry: E) -> E {
+        let mut entry = entry;
+        while let Some(e) = self.map[entry]
+            && e != entry
+        {
+            entry = e;
+        }
+        debug_assert!(self.map[entry].is_none_or(|e| e == entry));
+        entry
+    }
+
     pub fn find(&mut self, entry: E) -> E {
         let mut entry = entry;
         while let Some(e) = self.map[entry]

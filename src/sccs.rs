@@ -44,6 +44,10 @@ where
     /// The earliest on-stack block reachable from each block.
     lowlinks: SecondaryMap<Block<E>, Option<SccBlockIndex<E>>>,
 
+    /// The SCC that each block is a member of, or `None` for blocks that are not
+    /// reachable from the entry block.
+    block_sccs: SecondaryMap<Block<E>, Option<Scc<E>>>,
+
     /// The stack of blocks we are currently finding an SCC for. Not the same as
     /// the DFS stack: we only pop from this stack once we find the root of an
     /// SCC.
@@ -66,6 +70,7 @@ where
             component_blocks: PrimaryMap::new(),
             indices: SecondaryMap::new(None),
             lowlinks: SecondaryMap::new(None),
+            block_sccs: SecondaryMap::new(None),
             scc_stack: Vec::new(),
             on_scc_stack: BTreeSet::new(),
             on_scc_stack_arena: BTreeSetArena::new(),
@@ -78,6 +83,7 @@ where
             component_blocks,
             indices,
             lowlinks,
+            block_sccs,
             scc_stack,
             on_scc_stack,
             on_scc_stack_arena,
@@ -86,6 +92,7 @@ where
         component_blocks.reset();
         indices.reset();
         lowlinks.reset();
+        block_sccs.reset();
         scc_stack.clear();
         *on_scc_stack = BTreeSet::new();
         on_scc_stack_arena.reset();
@@ -97,6 +104,7 @@ where
             component_blocks,
             indices,
             lowlinks,
+            block_sccs,
             scc_stack,
             on_scc_stack,
             on_scc_stack_arena,
@@ -105,6 +113,7 @@ where
             && component_blocks.is_reset()
             && indices.is_reset()
             && lowlinks.is_reset()
+            && block_sccs.is_reset()
             && scc_stack.is_empty()
             && on_scc_stack.is_empty()
             && on_scc_stack_arena.is_reset()
@@ -175,18 +184,22 @@ where
                     // from the SCC stack and push them into our result data
                     // structures.
                     if self.indices[block] == self.lowlinks[block] {
+                        let scc = self.components.next_key(output)?;
                         let start = self.component_blocks.next_key(output)?;
                         while let Some(b) = self.scc_stack.pop() {
                             let was_on_stack =
                                 self.on_scc_stack.remove(&mut self.on_scc_stack_arena, &b);
                             debug_assert!(was_on_stack);
                             self.component_blocks.push(output, b)?;
+                            debug_assert!(self.block_sccs[b].is_none());
+                            self.block_sccs[b] = Some(scc);
                             if b == block {
                                 break;
                             }
                         }
                         let end = self.component_blocks.next_key(output)?;
-                        self.components.push(output, start..end)?;
+                        let pushed = self.components.push(output, start..end)?;
+                        debug_assert_eq!(pushed, scc);
                     }
                 }
             }
@@ -222,6 +235,15 @@ where
             let i = SccBlockIndex::try_new(i).unwrap();
             self.component_blocks[i]
         })
+    }
+
+    /// Get the strongly-connected component that the given block is a member
+    /// of.
+    ///
+    /// Panics if the block is not reachable from the entry block, since such
+    /// blocks are never assigned to a component.
+    pub fn scc(&self, block: Block<E>) -> Scc<E> {
+        self.block_sccs[block].expect("block is not reachable from the entry block")
     }
 }
 
@@ -293,6 +315,17 @@ mod tests {
         }
 
         let result: Vec<Vec<Block>> = sccs.keys().map(|scc| sccs.blocks(scc).collect()).collect();
+
+        // Every block's `scc` must name a component that actually contains it.
+        for (block, _) in func.blocks() {
+            let scc = sccs.scc(block);
+            if !sccs.blocks(scc).any(|b| b == block) {
+                return Err(format!(
+                    "`scc({block:?})` is {scc:?}, but that component's blocks are {:?}",
+                    sccs.blocks(scc).collect::<Vec<_>>(),
+                ));
+            }
+        }
 
         sccs.reset();
         if !sccs.is_reset() {
