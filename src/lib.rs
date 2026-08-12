@@ -10,8 +10,6 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
-// TODO: stats/counts instrumentation
-
 #[doc(hidden)]
 #[macro_export]
 macro_rules! trace {
@@ -52,6 +50,7 @@ pub mod test;
 pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, PrimaryMap, PrimaryMapKeys, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
+use input::DisplayWithOutput;
 pub use input::{Input, InputBlock, InputFunction, InputInst, InputMachine, Operand, RematCost};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
@@ -113,7 +112,6 @@ where
     assert!(context.is_reset());
     assert!(output.is_reset());
 
-    #[cfg(feature = "trace-log")]
     trace!(
         "====== register allocation input ======\n\
          {input}\n\
@@ -142,6 +140,12 @@ where
 
     output.construct(context, input.func)?;
 
+    trace!(
+        "====== register allocation output ======\n\
+         {}\n\
+         ========================================",
+        DisplayWithOutput::new(input.func.display(), output),
+    );
     trace!("counts = {:#?}", context.counts);
     Ok(())
 }

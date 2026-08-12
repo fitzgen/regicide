@@ -1,4 +1,4 @@
-use core::fmt;
+use core::{cell::RefCell, fmt};
 
 use crate::{
     Allocation, Output,
@@ -281,6 +281,46 @@ where
         f: &mut fmt::Formatter<'_>,
         output: &mut OutputInner<E>,
     ) -> IResult<()>;
+}
+
+/// Adapt a `FmtWithOutput` into a `Display` that formats with a particular
+/// output, rather than with an empty scratch output.
+pub(crate) struct DisplayWithOutput<'a, T, E>
+where
+    E: EntityRepr,
+{
+    value: T,
+    output: RefCell<&'a mut OutputInner<E>>,
+}
+
+impl<'a, T, E> DisplayWithOutput<'a, T, E>
+where
+    E: EntityRepr,
+{
+    /// Format `value` with `output`.
+    pub(crate) fn new(value: T, output: &'a mut OutputInner<E>) -> Self {
+        Self {
+            value,
+            output: RefCell::new(output),
+        }
+    }
+}
+
+impl<T, E> fmt::Display for DisplayWithOutput<'_, T, E>
+where
+    T: FmtWithOutput<E>,
+    E: EntityRepr,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut output = self.output.borrow_mut();
+        match self.value.fmt_with_output(f, &mut output) {
+            Ok(()) => Ok(()),
+            Err(()) => {
+                let _ = output.take_error();
+                Err(fmt::Error)
+            }
+        }
+    }
 }
 
 impl<F> fmt::Display for Input<'_, F>
