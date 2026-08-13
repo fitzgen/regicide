@@ -26,6 +26,10 @@ where
 {
     let _timing = Timing::new("validation");
 
+    // Nothing here indexes by entity, and everything below assumes that a block
+    // has a terminator to look at, so this goes first.
+    validate_insts(func, output)?;
+
     validate_entity_references(func, output)?;
 
     // Every check below this point indexes by entity, and computing the
@@ -142,6 +146,59 @@ fn check_block_references<'a>(
     Ok(())
 }
 
+/// Check that every block has at least one instruction, that each block's
+/// instructions are numbered contiguously, and that no instruction appears in
+/// more than one block.
+fn validate_insts<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    // The first and last instruction of each block.
+    let mut runs = Vec::new();
+
+    for (block, _) in func.blocks() {
+        match inst_run(&func.block(block)) {
+            Ok(Some(run)) => runs.push((run.0, run.1, block)),
+            // A block with no instructions has no terminator, and so no way to
+            // leave it.
+            Ok(None) => return output.error(Error::BlockWithoutTerminator { block }),
+            Err(inst) => return output.error(Error::NonContiguousInsts { block, inst }),
+        }
+    }
+
+    // After sorting, any overlap at all implies an overlap between neighbours:
+    // if `a` and `b` overlap and `a` sorts first, then whatever sorts
+    // immediately after `a` starts within `a` too.
+    runs.sort_unstable();
+    for pair in runs.windows(2) {
+        let (_, previous_last, _) = pair[0];
+        let (first, _, _) = pair[1];
+        if first <= previous_last {
+            return output.error(Error::InstInMultipleBlocks { inst: first });
+        }
+    }
+
+    Ok(())
+}
+
+/// Get the first and last instruction of `input_block`, or `None` if it has no
+/// instructions.
+fn inst_run<'a>(input_block: &impl InputBlock<'a>) -> Result<Option<(Inst, Inst)>, Inst> {
+    let mut first = None;
+    let mut previous: Option<Inst> = None;
+
+    for (inst, _input_inst) in input_block.insts() {
+        match previous {
+            None => first = Some(inst),
+            Some(previous) if inst.index() != previous.index() + 1 => return Err(inst),
+            Some(_) => {}
+        }
+        previous = Some(inst);
+    }
+
+    Ok(first.map(|first| (first, previous.unwrap())))
+}
+
 /// Check that the predecessors the input reports are the exact reverse of the
 /// successors it reports.
 fn validate_predecessors<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
@@ -191,8 +248,7 @@ where
     Ok(())
 }
 
-/// Check that every block is reachable from the entry block and ends in a
-/// terminator.
+/// Check that every block is reachable from the entry block.
 ///
 /// Unreachable blocks are not in the dominator tree, they are never assigned to
 /// a strongly-connected component, and their values have no meaningful live
@@ -209,9 +265,6 @@ where
     for (block, _) in func.blocks() {
         if !dominators.is_reachable(block) {
             return output.error(Error::UnreachableBlock { block });
-        }
-        if terminator(&func.block(block)).is_none() {
-            return output.error(Error::BlockWithoutTerminator { block });
         }
     }
 
@@ -357,6 +410,8 @@ where
             return output.error(e);
         }
 
+        // `validate_insts` has already checked that every block has at least
+        // one instruction.
         let (terminator, num_insts) = terminator(&func.block(block)).unwrap();
         let use_ = ProgramPoint::inst(block, num_insts - 1);
         for i in 0..func.block(block).len_successors() {

@@ -168,6 +168,18 @@ pub trait InputBlock<'a> {
         Self: 'b;
 
     /// Get an iterator over all instructions within a block.
+    ///
+    /// Instructions within a block must be numbered contiguously, in the order
+    /// that they are yielded here: each instruction's index must be exactly one
+    /// more than the index of the instruction before it. An instruction's index
+    /// therefore gives its position within its block, and one instruction comes
+    /// before another exactly when its index is smaller.
+    ///
+    /// A given instruction must only appear within one block. Together with the
+    /// above, this means that the blocks carve the instruction index space into
+    /// disjoint runs.
+    ///
+    /// A block must always have at least one instruction: its terminator.
     fn insts(&self) -> Self::InstsIter<'_>;
 
     /// The number of parameters that this block takes.

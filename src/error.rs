@@ -80,6 +80,21 @@ pub enum Error {
         actual: usize,
     },
 
+    /// A block's instructions are not numbered contiguously.
+    NonContiguousInsts {
+        /// The [`Block`] whose instructions are misnumbered.
+        block: Block,
+        /// The first [`Inst`] in that block that does not immediately follow the
+        /// instruction before it.
+        inst: Inst,
+    },
+
+    /// An instruction appears in more than one block.
+    InstInMultipleBlocks {
+        /// An [`Inst`] that appears in more than one block.
+        inst: Inst,
+    },
+
     /// A block's predecessors, as reported by the input, are not the exact
     /// reverse of the input's successor edges.
     InvalidPredecessors {
@@ -185,6 +200,13 @@ impl fmt::Debug for Error {
                 "{block:?}'s successor edge {successor} passes {actual} block arguments, \
                  but its target block has {expected} parameters"
             ),
+            Self::NonContiguousInsts { block, inst } => write!(
+                f,
+                "{inst:?} does not immediately follow the instruction before it in {block:?}"
+            ),
+            Self::InstInMultipleBlocks { inst } => {
+                write!(f, "{inst:?} appears in more than one block")
+            }
             Self::InvalidPredecessors { block } => write!(
                 f,
                 "{block:?}'s predecessors are not the reverse of the successor edges"
