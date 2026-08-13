@@ -50,12 +50,12 @@ pub mod test;
 pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
-use input::DisplayWithOutput;
 pub use input::{Input, InputBlock, InputFunction, InputInst, InputMachine, Operand, RematCost};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
 use context::ContextInner;
 use error::{IResult, InternalError};
+use input::DisplayWithOutput;
 use output::{OutputInner, WhichOutput};
 
 /// TODO FITZGEN

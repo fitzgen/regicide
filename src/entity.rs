@@ -1,9 +1,10 @@
 use core::{fmt::Debug, hash::Hash, num::NonZero, ops::Sub};
 
 mod map;
+mod set;
 
-pub(crate) use map::SecondaryMap;
-pub use map::{PrimaryMap, PrimaryMapIntoIter, PrimaryMapIter, PrimaryMapIterMut, PrimaryMapKeys};
+pub use map::*;
+pub use set::*;
 
 mod sealed {
     use super::*;

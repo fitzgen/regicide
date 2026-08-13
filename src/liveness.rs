@@ -60,7 +60,7 @@ use crate::{
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     dfs::{Dfs, DfsEvent},
-    entity::{Block, Entity as _, EntityRepr, SecondaryMap, Val},
+    entity::{Block, Entity as _, EntityRepr, EntitySet, SecondaryMap, Val},
     error::IResult,
     input::{DefUse, InputBlock, InputFunction, InputInst as _},
     output::OutputInner,
@@ -96,13 +96,13 @@ where
 
     /// Whether each block is already on the worklist, so that it is never
     /// enqueued twice.
-    on_worklist: SecondaryMap<Block<E>, bool>,
+    on_worklist: EntitySet<Block<E>>,
 
     /// Whether we've seen a block during our initial traversal that seeds the
     /// worklist.
     ///
     /// TODO: EntitySet<Block<E>>
-    seen: SecondaryMap<Block<E>, bool>,
+    seen: EntitySet<Block<E>>,
 }
 
 impl<E> Liveness<E>
@@ -117,8 +117,8 @@ where
             live: BTreeSet::new(),
             live_across_edge: BTreeSet::new(),
             worklist: Vec::new(),
-            seen: SecondaryMap::new(false),
-            on_worklist: SecondaryMap::new(false),
+            seen: EntitySet::new(),
+            on_worklist: EntitySet::new(),
         }
     }
 
@@ -244,11 +244,13 @@ where
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         dfs.construct(func, output)?;
-        while let Some(event) = dfs.next(func, output, |block| self.seen[block])? {
+        while let Some(event) = dfs.next(func, output, |block| self.seen.contains(block))? {
             match event {
-                DfsEvent::Pre(block) => self.seen[block] = true,
+                DfsEvent::Pre(block) => {
+                    self.seen.insert(block);
+                }
                 DfsEvent::Post(block) => {
-                    self.on_worklist[block] = true;
+                    self.on_worklist.insert(block);
                     self.worklist.push(block);
                 }
                 DfsEvent::AfterEdge(..) => {}
@@ -277,7 +279,7 @@ where
         } = self;
 
         while let Some(block) = worklist.pop() {
-            on_worklist[block] = false;
+            on_worklist.remove(block);
             counts.liveness_iterations += 1u64;
 
             // Recompute this block's live-out set from its successors.
@@ -302,8 +304,8 @@ where
             if live_in[block].union_with(arena, live) {
                 for pred in func.block(block.with_repr32()).predecessors() {
                     let pred = output.with_repr(pred)?;
-                    if seen[pred] && !on_worklist[pred] {
-                        on_worklist[pred] = true;
+                    if seen.contains(pred) && !on_worklist.contains(pred) {
+                        on_worklist.insert(pred);
                         worklist.push(pred);
                     }
                 }
