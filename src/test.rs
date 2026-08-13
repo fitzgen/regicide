@@ -3,10 +3,10 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Block, InputBlock, InputFunction, InputInst, Operand, PrimaryMapKeys, Val,
+    Block, InputBlock, InputFunction, InputInst, Operand, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
-    entity::{Entity, EntityRepr, Inst, PrimaryMap, SecondaryMap},
+    entity::{Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, SecondaryMap},
     input::{DefUse, FmtWithOutput, OperandPos},
     output::OutputInner,
 };

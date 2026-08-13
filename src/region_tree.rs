@@ -14,8 +14,8 @@
 
 use crate::counts::Counts;
 use crate::entity::{
-    EntityRange, EntityRepr, Region, RegionBlocksStorageIndex, RegionChildrenStorageIndex, Scc,
-    SecondaryMap,
+    EntityRange, EntityRepr, PrimaryMap, Region, RegionBlocksStorageIndex,
+    RegionChildrenStorageIndex, Scc, SecondaryMap,
 };
 use crate::error::IResult;
 use crate::input::InputFunction;
@@ -23,7 +23,7 @@ use crate::output::OutputInner;
 use crate::sccs::StronglyConnectedComponents;
 use crate::timing::Timing;
 use crate::union_find::UnionFind;
-use crate::{Block, Entity, InputBlock, PrimaryMap};
+use crate::{Block, Entity, InputBlock};
 use alloc::vec::Vec;
 
 /// The region tree for a function.

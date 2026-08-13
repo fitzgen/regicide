@@ -15,11 +15,11 @@
 //! [Tarjan's algorithm]: https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm
 
 use crate::{
-    Entity, InputBlock, PrimaryMap,
+    Entity, InputBlock,
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     dfs::{Dfs, DfsEvent},
-    entity::{Block, EntityRepr, PrimaryMapKeys, Scc, SccBlockIndex, SecondaryMap},
+    entity::{Block, EntityRepr, PrimaryMap, PrimaryMapKeys, Scc, SccBlockIndex, SecondaryMap},
     error::IResult,
     input::InputFunction,
     output::OutputInner,

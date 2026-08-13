@@ -48,7 +48,7 @@ pub mod checker;
 pub mod test;
 
 pub use context::Context;
-pub use entity::{Block, Entity, EntityRepr, PrimaryMap, PrimaryMapKeys, Reg, SpillSlot, Val};
+pub use entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
 pub use error::{Error, Result};
 use input::DisplayWithOutput;
 pub use input::{Input, InputBlock, InputFunction, InputInst, InputMachine, Operand, RematCost};
