@@ -80,6 +80,14 @@ pub enum Error {
         actual: usize,
     },
 
+    /// A block's predecessors, as reported by the input, are not the exact
+    /// reverse of the input's successor edges.
+    InvalidPredecessors {
+        /// A [`Block`] on the wrong end of an edge that one direction reports
+        /// and the other does not.
+        block: Block,
+    },
+
     /// A block's immediate dominator, as reported by the input, is not
     /// its immediate dominator in the input's control-flow graph.
     InvalidImmediateDominator {
@@ -176,6 +184,10 @@ impl fmt::Debug for Error {
                 f,
                 "{block:?}'s successor edge {successor} passes {actual} block arguments, \
                  but its target block has {expected} parameters"
+            ),
+            Self::InvalidPredecessors { block } => write!(
+                f,
+                "{block:?}'s predecessors are not the reverse of the successor edges"
             ),
             Self::InvalidImmediateDominator { block } => {
                 write!(f, "{block:?}'s immediate dominator is wrong")

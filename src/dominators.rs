@@ -245,9 +245,8 @@ impl DominatorTree {
     /// tree for `func`.
     pub fn compute(&mut self, func: &impl InputFunction) {
         self.clear();
-        let preds = predecessors(func);
         self.compute_spanning_tree(func);
-        self.compute_domtree(&preds);
+        self.compute_domtree(func);
         self.compute_domtree_preorder();
         self.valid = true;
     }
@@ -309,7 +308,7 @@ impl DominatorTree {
         }
     }
 
-    fn compute_domtree(&mut self, preds: &[Vec<Block>]) {
+    fn compute_domtree(&mut self, func: &impl InputFunction) {
         let mut eval_worklist = Vec::new();
 
         // Compute the semidominators.
@@ -321,7 +320,7 @@ impl DominatorTree {
 
             let last_linked = w + 1;
 
-            for &pred in &preds[block.index()] {
+            for pred in func.block(block).predecessors() {
                 // Skip unreachable blocks.
                 let pred_pre_number = self.nodes[pred].pre_number;
                 if pred_pre_number == NOT_VISITED {
@@ -413,17 +412,6 @@ impl DominatorTree {
             }
         }
     }
-}
-
-/// Compute each block's predecessors in the control-flow graph.
-fn predecessors(func: &impl InputFunction) -> Vec<Vec<Block>> {
-    let mut preds = vec![Vec::new(); func.len_blocks()];
-    for (block, input_block) in func.blocks() {
-        for succ in input_block.successors() {
-            preds[succ.index()].push(block);
-        }
-    }
-    preds
 }
 
 /// The eval-link procedure from the paper.

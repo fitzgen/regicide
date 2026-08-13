@@ -66,6 +66,7 @@ impl Count {
 pub struct Counts {
     pub sccs: Count,
     pub regions: Count,
+    pub liveness_iterations: Count,
     pub live_ranges: Count,
 }
 
@@ -74,6 +75,7 @@ impl Counts {
         Self {
             sccs: Count::new(),
             regions: Count::new(),
+            liveness_iterations: Count::new(),
             live_ranges: Count::new(),
         }
     }
@@ -82,10 +84,12 @@ impl Counts {
         let Self {
             sccs,
             regions,
+            liveness_iterations,
             live_ranges,
         } = self;
         *sccs = Count::new();
         *regions = Count::new();
+        *liveness_iterations = Count::new();
         *live_ranges = Count::new();
     }
 
@@ -93,8 +97,12 @@ impl Counts {
         let Self {
             sccs,
             regions,
+            liveness_iterations,
             live_ranges,
         } = self;
-        sccs.is_reset() && regions.is_reset() && live_ranges.is_reset()
+        sccs.is_reset()
+            && regions.is_reset()
+            && liveness_iterations.is_reset()
+            && live_ranges.is_reset()
     }
 }

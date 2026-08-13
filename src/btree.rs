@@ -28,6 +28,20 @@ pub struct BTreeSet<E, T> {
     _phantom: PhantomData<fn(BTreeSetArena<E, T>)>,
 }
 
+// Written out rather than derived, so that it does not demand `E: Clone` from
+// what is only ever a marker.
+impl<E, T> Clone for BTreeSet<E, T>
+where
+    T: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<E, T> BTreeSet<E, T> {
     pub const fn new() -> Self {
         Self {
@@ -38,6 +52,35 @@ impl<E, T> BTreeSet<E, T> {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn clear(&mut self, arena: &mut BTreeSetArena<E, T>) {
+        let _ = arena;
+        self.inner.clear();
+    }
+
+    /// Iterate over this set's elements in ascending order.
+    pub fn iter(&self, arena: &BTreeSetArena<E, T>) -> impl Iterator<Item = &T> {
+        let _ = arena;
+        self.inner.iter()
+    }
+
+    /// Add every element of `other` to this set, returning whether that added
+    /// anything that was not already here.
+    pub fn union_with(&mut self, arena: &mut BTreeSetArena<E, T>, other: &Self) -> bool
+    where
+        T: Clone + Ord,
+    {
+        let _ = arena;
+        let mut changed = false;
+        for value in other.inner.iter() {
+            changed |= self.inner.insert(value.clone());
+        }
+        changed
     }
 
     pub fn contains<Q>(&self, arena: &BTreeSetArena<E, T>, value: &Q) -> bool

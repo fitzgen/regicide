@@ -3,10 +3,10 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Block, InputBlock, InputFunction, InputInst, Operand, Val,
+    Block, InputBlock, InputFunction, InputInst, Operand, PrimaryMapKeys, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
-    entity::{Entity, EntityRepr, Inst, PrimaryMap},
+    entity::{Entity, EntityRepr, Inst, PrimaryMap, SecondaryMap},
     input::{DefUse, FmtWithOutput, OperandPos},
     output::OutputInner,
 };
@@ -205,6 +205,7 @@ pub struct TestFunction {
     values: PrimaryMap<Val, ValData>,
     blocks: PrimaryMap<Block, BlockData>,
     insts: PrimaryMap<Inst, InstData>,
+    predecessors: SecondaryMap<Block, Vec<Block>>,
     dominators: DominatorTree,
 }
 
@@ -215,6 +216,7 @@ impl Default for TestFunction {
             values: PrimaryMap::default(),
             blocks: PrimaryMap::default(),
             insts: PrimaryMap::default(),
+            predecessors: SecondaryMap::new(Vec::new()),
             dominators: DominatorTree::default(),
         };
         func.fixup();
@@ -269,6 +271,7 @@ impl Generate<TestFunction> for TestFunctionMutator {
                 .generate(context)?,
             insts: <PrimaryMap<Inst, InstData> as DefaultMutate>::DefaultMutate::default()
                 .generate(context)?,
+            predecessors: SecondaryMap::new(Vec::new()),
             dominators: DominatorTree::default(),
         };
         func.fixup();
@@ -313,6 +316,7 @@ impl TestFunction {
         let (old_to_new, old_insts) = self.ensure_unique_insts_in_layout(&mut output);
         self.ensure_terminators();
         self.ensure_all_blocks_are_reachable(&mut output);
+        self.fixup_predecessors();
         self.fixup_dominator_tree();
         self.ensure_entry_param_when_needed();
         self.ensure_unique_defs(&mut output);
@@ -493,6 +497,34 @@ impl TestFunction {
                         args: vec![],
                     });
                 }
+            }
+        }
+    }
+
+    /// Rebuild the control-flow graph's predecessors.
+    fn fixup_predecessors(&mut self) {
+        // Empty every entry rather than resetting the map, which would drop the
+        // vectors and their allocations. Cover both the blocks that exist now
+        // and any entries left over from when the function had more of them.
+        let len = self.predecessors.len().max(self.blocks.len());
+        for i in 0..len {
+            self.predecessors[Block::try_new(i).unwrap()].clear();
+        }
+
+        let Self {
+            blocks,
+            insts,
+            predecessors,
+            ..
+        } = self;
+        for (block, block_data) in blocks.iter() {
+            let terminator = *block_data.insts.last().unwrap();
+            // These are the same block calls that `successors` reads, so the
+            // two cannot disagree about what the edges are. One entry per edge,
+            // so a block that branches to the same target twice appears twice
+            // in that target's predecessors.
+            for call in insts[terminator].block_calls() {
+                predecessors[call.target].push(block);
             }
         }
     }
@@ -731,33 +763,38 @@ impl<'a> ExactSizeIterator for TestBlocksIter<'a> {}
 
 pub struct TestInstsIter<'b> {
     func: &'b TestFunction,
-    block: Block,
-    idx: usize,
+    insts: slice::Iter<'b, Inst>,
+}
+
+impl<'b> TestInstsIter<'b> {
+    fn item(&self, inst: &Inst) -> (Inst, TestInst<'b>) {
+        (
+            *inst,
+            TestInst {
+                func: self.func,
+                inst: *inst,
+            },
+        )
+    }
 }
 
 impl<'b> Iterator for TestInstsIter<'b> {
     type Item = (Inst, TestInst<'b>);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let insts = &self.func.blocks[self.block].insts;
-        if self.idx < insts.len() {
-            let inst = insts[self.idx];
-            self.idx += 1;
-            Some((
-                inst,
-                TestInst {
-                    func: self.func,
-                    inst,
-                },
-            ))
-        } else {
-            None
-        }
+        let inst = self.insts.next()?;
+        Some(self.item(inst))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let remaining = self.func.blocks[self.block].insts.len() - self.idx;
-        (remaining, Some(remaining))
+        self.insts.size_hint()
+    }
+}
+
+impl<'b> DoubleEndedIterator for TestInstsIter<'b> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let inst = self.insts.next_back()?;
+        Some(self.item(inst))
     }
 }
 
@@ -776,6 +813,15 @@ impl InputFunction for TestFunction {
 
     fn len_values(&self) -> usize {
         self.values.len()
+    }
+
+    type ValuesIter<'a>
+        = PrimaryMapKeys<Val>
+    where
+        Self: 'a;
+
+    fn values(&self) -> Self::ValuesIter<'_> {
+        self.values.keys()
     }
 
     fn remat_cost(&self, _val: Val) -> Option<crate::RematCost> {
@@ -825,8 +871,7 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
     fn insts(&self) -> TestInstsIter<'_> {
         TestInstsIter {
             func: self.func,
-            block: self.block,
-            idx: 0,
+            insts: self.func.blocks[self.block].insts.iter(),
         }
     }
 
@@ -864,6 +909,19 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
         TestBlockSuccessorsIter {
             state: TestBlockSuccessorsIterState::Many(self.block_calls().iter()),
         }
+    }
+
+    fn len_predecessors(&self) -> usize {
+        self.func.predecessors[self.block].len()
+    }
+
+    type PredecessorsIter<'b>
+        = core::iter::Copied<slice::Iter<'b, Block>>
+    where
+        Self: 'b;
+
+    fn predecessors(&self) -> Self::PredecessorsIter<'_> {
+        self.func.predecessors[self.block].iter().copied()
     }
 
     fn len_successor_block_args(&self, i: usize) -> usize {

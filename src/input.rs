@@ -111,6 +111,14 @@ pub trait InputFunction {
     /// The number of values defined in this function.
     fn len_values(&self) -> usize;
 
+    /// The iterator type returned by [`InputFunction::values`].
+    type ValuesIter<'a>: Iterator<Item = Val>
+    where
+        Self: 'a;
+
+    /// An iterator over the values defined in this function.
+    fn values(&self) -> Self::ValuesIter<'_>;
+
     /// Get the cost of rematerializing the given value, if possible.
     ///
     /// TODO: expand this
@@ -152,7 +160,10 @@ pub trait InputBlock<'a> {
     fn len_insts(&self, block: Block) -> usize;
 
     /// The iterator type returned by [`InputBlock::insts`].
-    type InstsIter<'b>: Iterator<Item = (Inst, Self::InputInst<'b>)>
+    ///
+    /// This is double-ended because backwards analyses, such as liveness, walk
+    /// a block's instructions in reverse.
+    type InstsIter<'b>: DoubleEndedIterator<Item = (Inst, Self::InputInst<'b>)>
     where
         Self: 'b;
 
@@ -206,6 +217,26 @@ pub trait InputBlock<'a> {
 
     /// Get an iterator over the successors of this block.
     fn successors(&self) -> Self::SuccessorsIter<'_>;
+
+    /// How many predecessors does this block have in the control-flow graph?
+    fn len_predecessors(&self) -> usize;
+
+    /// The iterator type returned by [`InputBlock::predecessors`].
+    type PredecessorsIter<'b>: Iterator<Item = Block>
+    where
+        Self: 'b;
+
+    /// Get an iterator over the predecessors of this block.
+    ///
+    /// This yields one entry per incoming control-flow edge, just as
+    /// [`InputBlock::successors`] yields one per outgoing edge, so a block that
+    /// branches to the same target twice appears twice in that target's
+    /// predecessors.
+    ///
+    /// These must be the exact reverse of the successor edges: for every block
+    /// `a` and every time that `a.successors()` yields `b`, `b.predecessors()`
+    /// must yield `a`, and vice versa. Otherwise the input is invalid.
+    fn predecessors(&self) -> Self::PredecessorsIter<'_>;
 
     /// The number of block arguments in the `i`th successor edge.
     ///

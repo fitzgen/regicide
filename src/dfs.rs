@@ -5,6 +5,10 @@ use crate::{
 use alloc::vec::Vec;
 
 /// An iterative depth-first traversal.
+///
+/// TODO: allow some mechanism for skipping `DfsEvent` variants that a
+/// particular traversal doesn't need, so we can avoid pushing/popping them from
+/// the stack and processing these events that are ignored.
 pub struct Dfs<E>
 where
     E: EntityRepr,

@@ -29,7 +29,12 @@ where
     validate_entity_references(func, output)?;
 
     // Every check below this point indexes by entity, and computing the
-    // dominator tree does too, so the bounds check has to come first.
+    // dominator tree does too, so the bounds check has to come first. The
+    // dominator tree is built from the input's predecessors, so those have to
+    // be checked before it, rather than alongside the rest of the dominance
+    // information below.
+    validate_predecessors(func, output)?;
+
     let mut dominators = DominatorTree::new();
     dominators.compute(func);
 
@@ -132,6 +137,55 @@ fn check_block_references<'a>(
                 block,
             });
         }
+    }
+
+    Ok(())
+}
+
+/// Check that the predecessors the input reports are the exact reverse of the
+/// successors it reports.
+fn validate_predecessors<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    // Every edge, as a `(from, to)` pair, collected once from each direction.
+    // Comparing whole pairs rather than per-block counts is what catches an
+    // edge whose endpoints have been swapped with another's.
+    let mut forward = Vec::new();
+    let mut backward = Vec::new();
+
+    for (block, _) in func.blocks() {
+        for successor in func.block(block).successors() {
+            forward.push((block, successor));
+        }
+
+        let mut len = 0;
+        for predecessor in func.block(block).predecessors() {
+            backward.push((predecessor, block));
+            len += 1;
+        }
+        if func.block(block).len_predecessors() != len {
+            return output.error(Error::InconsistentLen {
+                method: "len_predecessors",
+                block,
+            });
+        }
+    }
+
+    forward.sort_unstable();
+    backward.sort_unstable();
+
+    // Blame the first edge that one direction has and the other does not, which
+    // after sorting is the smaller of the two pairs at the first difference.
+    for i in 0..forward.len().max(backward.len()) {
+        let block = match (forward.get(i), backward.get(i)) {
+            (Some(f), Some(b)) if f == b => continue,
+            (Some(&(_, to)), None) => to,
+            (None, Some(&(_, to))) => to,
+            (Some(&f), Some(&b)) => core::cmp::min(f, b).1,
+            (None, None) => unreachable!(),
+        };
+        return output.error(Error::InvalidPredecessors { block });
     }
 
     Ok(())

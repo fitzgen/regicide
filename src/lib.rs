@@ -128,7 +128,9 @@ where
     context
         .region_tree
         .construct(input.func, &mut context.counts, &context.sccs, output)?;
-    context.liveness.construct(input.func)?;
+    context
+        .liveness
+        .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
     context
         .live_ranges
         .construct(input.func, &context.region_tree, &context.liveness)?;
