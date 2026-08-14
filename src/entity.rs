@@ -1,8 +1,10 @@
 use core::{fmt::Debug, hash::Hash, num::NonZero, ops::Sub};
 
+mod fixed_set;
 mod map;
 mod set;
 
+pub use fixed_set::*;
 pub use map::*;
 pub use set::*;
 
