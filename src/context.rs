@@ -2,11 +2,8 @@ use crate::{
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     dfs::Dfs,
-    entity::{
-        Block, Entity, EntityRepr, Inst, LiveBundle, LiveRange, PrimaryMap, Region, Scc,
-        SecondaryMap, Val,
-    },
-    live_ranges::{LiveBundleData, LiveRangeData, LiveRanges, ProgramPoint},
+    entity::{Block, Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SecondaryMap, Val},
+    live_ranges::{LiveBundle, LiveBundleData, LivePoint, LiveRanges, LiveSpan, LiveSpanData},
     liveness::Liveness,
     output::Allocation,
     region_tree::RegionTree,

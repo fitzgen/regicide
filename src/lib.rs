@@ -71,8 +71,10 @@ pub fn run(
     assert!(context.is_reset());
     assert!(output.is_reset());
 
+    let num_insts = input.func.len_insts();
+
     #[cfg(feature = "entity-repr-8")]
-    if input.func.len_values() <= 1 << 7 {
+    if entity_repr_can_likely_fit::<u8>(input) {
         output.which = Some(WhichOutput::Output8);
         match run_inner(&mut context.context8, &mut output.output8, input) {
             Ok(()) => return Ok(()),
@@ -84,7 +86,7 @@ pub fn run(
     }
 
     #[cfg(feature = "entity-repr-16")]
-    if input.func.len_values() <= 1 << 15 {
+    if entity_repr_can_likely_fit::<u16>(input) {
         output.which = Some(WhichOutput::Output16);
         match run_inner(&mut context.context16, &mut output.output16, input) {
             Ok(()) => return Ok(()),
@@ -103,6 +105,24 @@ pub fn run(
             InternalError::Error(e) => return Err(e),
         },
     }
+}
+
+fn entity_repr_can_likely_fit<E>(input: &Input<impl InputFunction>) -> bool
+where
+    E: EntityRepr,
+{
+    input.func.len_values() <= Val::<E>::MAX_REPRESENTABLE.index() + 1
+        && input.func.len_insts() <= max_representable_inst_index::<E>() + 1
+}
+
+fn max_representable_inst_index<E>() -> usize
+where
+    E: EntityRepr,
+{
+    core::cmp::min(
+        entity::Inst::<E>::MAX_REPRESENTABLE.index(),
+        live_ranges::LivePoint::<E>::MAX_INST_INDEX,
+    )
 }
 
 fn run_inner<E>(

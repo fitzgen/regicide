@@ -7,10 +7,11 @@ use crate::{
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
     entity::{
-        Entity, EntityRepr, Inst, LiveBundle, LiveRange, PrimaryMap, PrimaryMapKeys, Region, Scc,
-        SccBlockIndex, SecondaryMap, SpillSlot,
+        Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, Region, Scc, SccBlockIndex,
+        SecondaryMap, SpillSlot,
     },
-    input::{DefUse, FmtWithOutput, OperandPos},
+    input::{DefUse, FmtWithOutput, Position},
+    live_ranges::{LiveBundle, LiveSpan},
     output::OutputInner,
 };
 use alloc::{vec, vec::Vec};
@@ -96,7 +97,7 @@ entity_default_mutate! {
     Region
     Reg
     SpillSlot
-    LiveRange
+    LiveSpan
     LiveBundle
 }
 
@@ -348,7 +349,7 @@ impl TestFunction {
                     output,
                     InstData::Op {
                         operands: vec![Operand {
-                            pos: OperandPos::Early,
+                            pos: Position::Early,
                             kind: DefUse::Def,
                             val: Val::try_new(0).unwrap(),
                         }],
@@ -816,6 +817,10 @@ impl InputFunction for TestFunction {
 
     fn len_values(&self) -> usize {
         self.values.len()
+    }
+
+    fn len_insts(&self) -> usize {
+        self.insts.len()
     }
 
     type ValuesIter<'a>

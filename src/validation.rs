@@ -15,6 +15,7 @@ use crate::{
     entity::{Block, Entity, EntityRepr, Inst, SecondaryMap, Val},
     error::{Error, IResult, Result},
     input::{DefUse, InputBlock, InputFunction, InputInst, Operand},
+    live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST},
     output::OutputInner,
     timing::Timing,
 };
@@ -113,6 +114,28 @@ fn check_block_references<'a>(
         Ok(())
     })?;
 
+    // Live range construction indexes an instruction's operands with a `u16`,
+    // so an instruction may not have more operands than that can address.
+    //
+    // Count the operands actually yielded rather than trusting
+    // `operands_len`, since it is the yielded ones that get indexed; check the
+    // two agree while we are here, as we do for every other length.
+    for (inst, input_inst) in input_block.insts() {
+        let mut num_operands = 0;
+        for _ in input_inst.operands() {
+            num_operands += 1;
+            if num_operands > MAX_OPERANDS_PER_INST {
+                return Err(Error::TooManyOperands { inst });
+            }
+        }
+        if input_inst.operands_len() != num_operands {
+            return Err(Error::InconsistentLen {
+                method: "operands_len",
+                block,
+            });
+        }
+    }
+
     let mut num_successors = 0;
     for successor in input_block.successors() {
         if successor.index() >= num_blocks {
@@ -147,8 +170,8 @@ fn check_block_references<'a>(
 }
 
 /// Check that every block has at least one instruction, that each block's
-/// instructions are numbered contiguously, and that no instruction appears in
-/// more than one block.
+/// instructions are numbered contiguously, that no instruction appears in more
+/// than one block, and that no instruction index is out of range.
 fn validate_insts<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
 where
     E: EntityRepr,
@@ -158,7 +181,16 @@ where
 
     for (block, _) in func.blocks() {
         match inst_run(&func.block(block)) {
-            Ok(Some(run)) => runs.push((run.0, run.1, block)),
+            Ok(Some(run)) => {
+                // A block's instructions are contiguous and ascending, so its
+                // last one has the largest index in the block. Checking it here
+                // is what lets `LivePoint::new` pack an index and a position
+                // together without a fallible conversion.
+                if run.1.index() > MAX_INST_INDEX {
+                    return output.error(Error::TooManyInsts { inst: run.1 });
+                }
+                runs.push((run.0, run.1, block));
+            }
             // A block with no instructions has no terminator, and so no way to
             // leave it.
             Ok(None) => return output.error(Error::BlockWithoutTerminator { block }),

@@ -259,6 +259,12 @@ pub enum Error {
         inst: Inst,
     },
 
+    /// The function has an instruction index above the largest one supported.
+    TooManyInsts {
+        /// The first [`Inst`] found whose index is out of range.
+        inst: Inst,
+    },
+
     /// A formatting error.
     FmtError(fmt::Error),
 }
@@ -370,6 +376,13 @@ impl fmt::Debug for Error {
             Self::TooManyLiveRegs => write!(f, "too many live registers at a single point"),
             Self::TooManyOperands { inst } => {
                 write!(f, "too many operands at instruction {inst:?}")
+            }
+            Self::TooManyInsts { inst } => {
+                write!(
+                    f,
+                    "too many instructions: {inst:?}'s index exceeds the maximum of {}",
+                    crate::live_ranges::MAX_INST_INDEX
+                )
             }
             Self::FmtError(e) => fmt::Debug::fmt(e, f),
         }

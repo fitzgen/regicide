@@ -63,7 +63,7 @@ where
     E: EntityRepr,
 {
     /// TODO FITZGEN
-    pub pos: OperandPos,
+    pub pos: Position,
     /// TODO FITZGEN
     pub kind: DefUse,
     /// TODO FITZGEN
@@ -74,7 +74,7 @@ where
 #[derive(Clone, Debug, Hash)]
 #[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
 #[repr(u8)]
-pub enum OperandPos {
+pub enum Position {
     /// TODO FITZGEN
     Early = 0,
     /// TODO FITZGEN
@@ -125,6 +125,9 @@ pub trait InputFunction {
 
     /// The number of basic blocks defined in this function.
     fn len_blocks(&self) -> usize;
+
+    /// The number of instructions defined in this function.
+    fn len_insts(&self) -> usize;
 
     /// Get the given input block.
     fn block(&self, block: Block) -> Self::InputBlock<'_>;
@@ -463,8 +466,8 @@ where
             for arg in input_inst.operands() {
                 output.result(write!(f, "      "))?;
                 match arg.pos {
-                    OperandPos::Early => output.result(write!(f, "early "))?,
-                    OperandPos::Late => output.result(write!(f, "late "))?,
+                    Position::Early => output.result(write!(f, "early "))?,
+                    Position::Late => output.result(write!(f, "late "))?,
                 }
                 match arg.kind {
                     DefUse::Def => output.result(write!(f, "def "))?,

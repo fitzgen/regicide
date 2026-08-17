@@ -6,6 +6,7 @@ mod set;
 
 pub use fixed_set::*;
 pub use map::*;
+pub use sealed::WideInt;
 pub use set::*;
 
 mod sealed {
@@ -75,17 +76,81 @@ mod sealed {
     define_non_zero_ints! {
         u8, u16, u32
     }
+
+    /// An unsigned integer used as the packed backing store for a bit-packed
+    /// entity-derived value, such as a program point.
+    ///
+    /// Only exposes conversion to and from `usize`: everything bit-packed into
+    /// one of these is built out of entity indices, which are already `usize`.
+    pub trait WideInt: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash {
+        /// How many bits wide this integer is.
+        const BITS: u32;
+
+        /// Convert from a `usize`, or `None` if it does not fit.
+        fn try_from_usize(x: usize) -> Option<Self>;
+
+        /// Convert from a `usize`.
+        fn from_usize(x: usize) -> Self;
+
+        /// Convert to a `usize`.
+        fn to_usize(self) -> usize;
+    }
+
+    macro_rules! define_wide_ints {
+        ( $( $t:ty ),* ) => {
+            $(
+                impl WideInt for $t {
+                    const BITS: u32 = <$t>::BITS;
+
+                    #[inline]
+                    fn try_from_usize(x: usize) -> Option<Self> {
+                        <$t>::try_from(x).ok()
+                    }
+
+                    #[inline]
+                    fn from_usize(x: usize) -> Self {
+                        debug_assert!(Self::try_from_usize(x).is_some());
+                        x as $t
+                    }
+
+                    #[inline]
+                    fn to_usize(self) -> usize {
+                        <Self as TryInto<usize>>::try_into(self)
+                            .map_err(|_| ())
+                            .unwrap()
+                    }
+                }
+            )*
+        };
+    }
+
+    define_wide_ints! {
+        u16, u32
+    }
 }
 
-/// TODO FITZGEN
+/// The underlying representation of an [`Entity`].
+///
+/// This is a sealed trait and cannot be implemented outside of this crate.
 pub trait EntityRepr:
     sealed::NonZeroInt + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash
 {
+    /// An unsigned integer twice as wide as `Self`, maxing out at `u32`.
+    #[doc(hidden)]
+    type Wide: sealed::WideInt;
 }
 
-impl EntityRepr for u8 {}
-impl EntityRepr for u16 {}
-impl EntityRepr for u32 {}
+impl EntityRepr for u8 {
+    type Wide = u16;
+}
+
+impl EntityRepr for u16 {
+    type Wide = u32;
+}
+
+impl EntityRepr for u32 {
+    type Wide = u32;
+}
 
 /// TODO FITZGEN
 pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Hash {
@@ -208,18 +273,6 @@ define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SpillSlot = "spill_slot";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct LiveSegment = "segment";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct LiveRange = "range";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct LiveBundle = "bundle";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

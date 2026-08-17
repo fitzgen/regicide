@@ -152,7 +152,7 @@ impl Output {
             which,
             #[cfg(feature = "entity-repr-8")]
             output8,
-            #[cfg(feature = "entity-repr-8")]
+            #[cfg(feature = "entity-repr-16")]
             output16,
             output32,
         } = self;
