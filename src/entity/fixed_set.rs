@@ -85,6 +85,12 @@ impl<K, const WORDS: usize> FixedEntitySet<K, WORDS> {
         self.combine(rhs, |l, r| l | r)
     }
 
+    /// Create the set of entities that are in both `self` and `rhs`.
+    #[inline]
+    pub fn intersection(&self, rhs: &Self) -> Self {
+        self.combine(rhs, |l, r| l & r)
+    }
+
     /// Create the set of entities that are in `self` but not in `rhs`.
     #[inline]
     pub fn difference(&self, rhs: &Self) -> Self {
@@ -405,6 +411,10 @@ mod tests {
                 let union = a.union(&b);
                 let expected: BTreeSet<Val> = oracle_a.union(&oracle_b).copied().collect();
                 check_agree(&union, &expected)?;
+
+                let intersection = a.intersection(&b);
+                let expected: BTreeSet<Val> = oracle_a.intersection(&oracle_b).copied().collect();
+                check_agree(&intersection, &expected)?;
 
                 let difference = a.difference(&b);
                 let expected: BTreeSet<Val> = oracle_a.difference(&oracle_b).copied().collect();
