@@ -1,4 +1,7 @@
-use crate::entity::{Block, Inst, Val};
+use crate::{
+    entity::{Block, Inst, Val},
+    machine::{Reg, RegBank, RegClass, RegGroup},
+};
 use core::fmt;
 
 /// An internal error, potentially recoverable by switching to a larger entity
@@ -148,6 +151,105 @@ pub enum Error {
         inst: Inst,
     },
 
+    /// The machine description exceeds one of its capacity limits.
+    MachineCapacityExceeded {
+        /// What there were too many of.
+        what: &'static str,
+        /// The most of them that a machine may have.
+        max: usize,
+    },
+
+    /// A machine description named a register bank that was never declared.
+    UnknownRegBank {
+        /// The undeclared [`RegBank`].
+        bank: RegBank,
+    },
+
+    /// A register's range of register units is backwards, or reaches beyond the
+    /// unit index space.
+    BadRegUnitRange {
+        /// The [`Reg`] with the bad range.
+        reg: Reg,
+    },
+
+    /// Two registers in the same register bank cover overlapping register units.
+    ///
+    /// Registers may only overlap across banks. This is the invariant that lets
+    /// interference within a bank be a register-identity test rather than a unit
+    /// overlap test.
+    OverlappingRegsInBank {
+        /// The [`RegBank`] they are both in.
+        bank: RegBank,
+        /// One of the two overlapping [`Reg`]s.
+        a: Reg,
+        /// The other.
+        b: Reg,
+    },
+
+    /// A register was used by a register group or class belonging to a different
+    /// bank than the register itself.
+    RegInWrongBank {
+        /// The [`Reg`] in the wrong bank.
+        reg: Reg,
+        /// The [`RegBank`] it needed to be in.
+        expected: RegBank,
+    },
+
+    /// A register group was used by a register class belonging to a different
+    /// bank than the group itself.
+    RegGroupInWrongBank {
+        /// The [`RegGroup`] in the wrong bank.
+        group: RegGroup,
+        /// The [`RegBank`] it needed to be in.
+        expected: RegBank,
+    },
+
+    /// A register group has too few or too many registers in it.
+    BadRegGroupSize {
+        /// The [`RegGroup`] that is the wrong size.
+        group: RegGroup,
+        /// How many registers it has.
+        len: usize,
+    },
+
+    /// A register class of register groups mixes groups of different sizes.
+    MixedRegGroupSizes {
+        /// The [`RegClass`] with the mismatched groups.
+        class: RegClass,
+    },
+
+    /// A register class lists the same register more than once.
+    DuplicateRegClassMember {
+        /// The [`RegClass`] with the repeat.
+        class: RegClass,
+        /// The repeated [`Reg`].
+        reg: Reg,
+    },
+
+    /// A register group lists the same register more than once.
+    DuplicateRegGroupMember {
+        /// The [`RegGroup`] with the repeat.
+        group: RegGroup,
+        /// The repeated [`Reg`].
+        reg: Reg,
+    },
+
+    /// A register class has no members.
+    ///
+    /// A class is the set of registers an operand may be assigned to, so an
+    /// empty one could never be satisfied.
+    EmptyRegClass {
+        /// The empty [`RegClass`].
+        class: RegClass,
+    },
+
+    /// A register bank has no register that could serve as the scratch register
+    /// for resolving a stack-to-stack move.
+    NoStackToStackRegs {
+        /// The [`RegBank`] with no scratch register.
+        bank: RegBank,
+    },
+
     /// Too many live registers were requested at a single program point.
     TooManyLiveRegs,
 
@@ -231,6 +333,40 @@ impl fmt::Debug for Error {
             Self::InvalidBranch { inst } => {
                 write!(f, "invalid branch instruction {inst:?}")
             }
+            Self::MachineCapacityExceeded { what, max } => {
+                write!(f, "a machine may have at most {max} {what}")
+            }
+            Self::UnknownRegBank { bank } => write!(f, "{bank:?} was never declared"),
+            Self::BadRegUnitRange { reg } => {
+                write!(f, "{reg:?}'s range of register units is not valid")
+            }
+            Self::OverlappingRegsInBank { bank, a, b } => write!(
+                f,
+                "{a:?} and {b:?} are both in {bank:?} but cover overlapping register units"
+            ),
+            Self::RegInWrongBank { reg, expected } => {
+                write!(f, "{reg:?} is not in {expected:?}")
+            }
+            Self::RegGroupInWrongBank { group, expected } => {
+                write!(f, "{group:?} is not in {expected:?}")
+            }
+            Self::BadRegGroupSize { group, len } => {
+                write!(f, "{group:?} has {len} registers in it")
+            }
+            Self::MixedRegGroupSizes { class } => {
+                write!(f, "{class:?}'s register groups are not all the same size")
+            }
+            Self::DuplicateRegClassMember { class, reg } => {
+                write!(f, "{class:?} lists {reg:?} more than once")
+            }
+            Self::DuplicateRegGroupMember { group, reg } => {
+                write!(f, "{group:?} lists {reg:?} more than once")
+            }
+            Self::EmptyRegClass { class } => write!(f, "{class:?} has no members"),
+            Self::NoStackToStackRegs { bank } => write!(
+                f,
+                "{bank:?} has no register available for resolving stack-to-stack moves"
+            ),
             Self::TooManyLiveRegs => write!(f, "too many live registers at a single point"),
             Self::TooManyOperands { inst } => {
                 write!(f, "too many operands at instruction {inst:?}")

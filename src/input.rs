@@ -1,9 +1,9 @@
 use core::{cell::RefCell, fmt};
 
 use crate::{
-    Allocation, Output,
+    Allocation, Machine, Output, Reg,
     dfs::Dfs,
-    entity::{Block, EntityRepr, Inst, Val},
+    entity::{Block, EntityRepr, Inst, PrimaryMap, Val},
     error::IResult,
     output::OutputInner,
 };
@@ -17,7 +17,7 @@ where
     pub options: &'a InputOptions,
 
     /// The description of the machine whose registers we are allocating.
-    pub machine: &'a InputMachine,
+    pub machine: &'a Machine,
 
     /// The function to allocate registers for.
     pub func: &'a F,
@@ -54,10 +54,6 @@ impl InputOptions {
         }
     }
 }
-
-/// TODO FITZGEN
-#[derive(Clone, Debug)]
-pub struct InputMachine {}
 
 /// TODO FITZGEN
 #[derive(Clone, Debug, Hash)]

@@ -92,6 +92,16 @@ where
         Ok(key)
     }
 
+    pub(crate) fn next_key_unwrap(&self) -> K {
+        K::try_new(self.elems.len()).unwrap()
+    }
+
+    pub(crate) fn push_unwrap(&mut self, value: V) -> K {
+        let key = self.next_key_unwrap();
+        self.elems.push(value);
+        key
+    }
+
     /// Returns an iterator over the key-value pairs in the map.
     pub fn iter(&self) -> PrimaryMapIter<'_, K, V> {
         PrimaryMapIter {

@@ -93,13 +93,13 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Has
     type Repr: EntityRepr;
 
     /// TODO FITZGEN
-    const MAX: Self;
-
-    /// TODO FITZGEN
     fn try_new(index: usize) -> Option<Self>;
 
     /// TODO FITZGEN
     fn index(self) -> usize;
+
+    #[doc(hidden)]
+    const MAX_REPRESENTABLE: Self;
 
     #[doc(hidden)]
     type Family<E>: Entity
@@ -130,28 +130,30 @@ macro_rules! define_entities {
             $( #[$attr] )*
             $vis struct $name<T = u32> ( T::NonZero )
             where
-                T: EntityRepr;
+                T: crate::entity::EntityRepr;
 
-            impl<T: EntityRepr> Default for $name<T> {
+            impl<T: crate::entity::EntityRepr> Default for $name<T> {
                 fn default() -> Self {
-                    Self::MAX
+                    use crate::entity::Entity;
+                    Self::MAX_REPRESENTABLE
                 }
             }
 
-            impl<T: EntityRepr> core::fmt::Debug for $name<T> {
+            impl<T: crate::entity::EntityRepr> core::fmt::Debug for $name<T> {
                 fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    use crate::entity::Entity;
                     write!(f, "{}{}", $fmt, self.index())
                 }
             }
 
-            impl<T: EntityRepr> Entity for $name<T> {
+            impl<T: crate::entity::EntityRepr> crate::entity::Entity for $name<T> {
                 type Repr = T;
 
                 type Family<E> = $name<E>
                 where
-                    E: EntityRepr;
+                    E: crate::entity::EntityRepr;
 
-                const MAX: Self = $name(T::MAX);
+                const MAX_REPRESENTABLE: Self = $name(T::MAX);
 
                 #[inline]
                 fn try_new(index: usize) -> Option<Self> {
@@ -205,19 +207,19 @@ define_entities! {
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Reg = "r";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SpillSlot = "spill_slot";
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct LiveRange = "live_range";
+    pub struct LiveSegment = "segment";
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Bundle = "bundle";
+    pub struct LiveRange = "range";
+
+    /// TODO FITZGEN
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct LiveBundle = "bundle";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -241,8 +243,8 @@ where
 {
     pub const fn empty() -> Self {
         Self {
-            start: K::MAX,
-            end: K::MAX,
+            start: K::MAX_REPRESENTABLE,
+            end: K::MAX_REPRESENTABLE,
         }
     }
 

@@ -20,16 +20,19 @@ macro_rules! trace {
     };
 }
 
+#[macro_use]
+mod entity;
+
 mod btree;
 mod context;
 mod counts;
 mod dfs;
 mod dominators;
-mod entity;
 mod error;
 mod input;
 mod live_ranges;
 mod liveness;
+mod machine;
 mod move_elimination;
 mod output;
 mod parallel_moves;
@@ -48,9 +51,10 @@ pub mod checker;
 pub mod test;
 
 pub use context::Context;
-pub use entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
+pub use entity::{Block, Entity, EntityRepr, SpillSlot, Val};
 pub use error::{Error, Result};
-pub use input::{Input, InputBlock, InputFunction, InputInst, InputMachine, Operand, RematCost};
+pub use input::{Input, InputBlock, InputFunction, InputInst, Operand, RematCost};
+pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
 use context::ContextInner;

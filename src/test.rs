@@ -3,10 +3,13 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Block, InputBlock, InputFunction, InputInst, Operand, Val,
+    Block, InputBlock, InputFunction, InputInst, Operand, Reg, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
-    entity::{Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, SecondaryMap},
+    entity::{
+        Entity, EntityRepr, Inst, LiveBundle, LiveRange, PrimaryMap, PrimaryMapKeys, Region, Scc,
+        SccBlockIndex, SecondaryMap, SpillSlot,
+    },
     input::{DefUse, FmtWithOutput, OperandPos},
     output::OutputInner,
 };
@@ -65,7 +68,7 @@ where
 {
     fn generate(&mut self, ctx: &mut mutatis::Context) -> mutatis::Result<E> {
         let new_index = ctx.rng().gen_usize();
-        let max = E::MAX.index();
+        let max = E::MAX_REPRESENTABLE.index();
         let value = E::try_new(new_index % max).unwrap();
         Ok(value)
     }
@@ -74,7 +77,7 @@ where
 macro_rules! entity_default_mutate {
     ( $( $name:ident )* ) => {
         $(
-            impl<E> DefaultMutate for crate::entity::$name<E>
+            impl<E> DefaultMutate for $name<E>
             where
                 E: EntityRepr,
             {
@@ -94,7 +97,7 @@ entity_default_mutate! {
     Reg
     SpillSlot
     LiveRange
-    Bundle
+    LiveBundle
 }
 
 #[derive(Clone, Default, Debug, Hash, Mutate)]

@@ -1,5 +1,6 @@
+use crate::Reg;
 use crate::context::ContextInner;
-use crate::entity::{Block, Entity, EntityRepr, Reg, SpillSlot, Val};
+use crate::entity::{Block, Entity, EntityRepr, SpillSlot, Val};
 use crate::error::{IResult, InternalError};
 use crate::input::InputFunction;
 use crate::timing::Timing;

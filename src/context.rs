@@ -3,10 +3,10 @@ use crate::{
     counts::Counts,
     dfs::Dfs,
     entity::{
-        Block, Bundle, Entity, EntityRepr, Inst, LiveRange, PrimaryMap, Region, Scc, SecondaryMap,
-        Val,
+        Block, Entity, EntityRepr, Inst, LiveBundle, LiveRange, PrimaryMap, Region, Scc,
+        SecondaryMap, Val,
     },
-    live_ranges::{BundleData, LiveRangeData, LiveRanges, ProgramPoint},
+    live_ranges::{LiveBundleData, LiveRangeData, LiveRanges, ProgramPoint},
     liveness::Liveness,
     output::Allocation,
     region_tree::RegionTree,

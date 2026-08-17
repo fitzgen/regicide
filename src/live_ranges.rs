@@ -2,7 +2,7 @@
 
 use crate::context::ContextInner;
 use crate::entity::{
-    Bundle, Entity, EntityRange, EntityRepr, Inst, LiveRange, PrimaryMap, SecondaryMap, Val,
+    Entity, EntityRange, EntityRepr, Inst, LiveBundle, LiveRange, PrimaryMap, SecondaryMap, Val,
 };
 use crate::error::IResult;
 use crate::input::InputFunction;
@@ -28,7 +28,7 @@ where
     pub end: ProgramPoint<E>,
 }
 
-pub struct BundleData {
+pub struct LiveBundleData {
     // TODO
 }
 
@@ -43,13 +43,13 @@ where
     E: EntityRepr,
 {
     ranges: PrimaryMap<LiveRange<E>, Range<ProgramPoint<E>>>,
-    range_bundle: SecondaryMap<LiveRange<E>, Option<Bundle<E>>>,
+    range_bundle: SecondaryMap<LiveRange<E>, Option<LiveBundle<E>>>,
     range_val: SecondaryMap<LiveRange<E>, Val<E>>,
 
-    bundles: PrimaryMap<Bundle<E>, BundleData>,
-    bundle_pinned_ranges: SecondaryMap<Bundle<E>, ScalarBitSet>,
-    bundle_allocation: SecondaryMap<Bundle<E>, Option<Allocation<E>>>,
-    bundle_priority: SecondaryMap<Bundle<E>, Priority>,
+    bundles: PrimaryMap<LiveBundle<E>, LiveBundleData>,
+    bundle_pinned_ranges: SecondaryMap<LiveBundle<E>, ScalarBitSet>,
+    bundle_allocation: SecondaryMap<LiveBundle<E>, Option<Allocation<E>>>,
+    bundle_priority: SecondaryMap<LiveBundle<E>, Priority>,
 
     inst_ranges: SecondaryMap<Inst<E>, EntityRange<LiveRange<E>>>,
 }
@@ -62,7 +62,7 @@ where
         LiveRanges {
             ranges: PrimaryMap::new(),
             range_bundle: SecondaryMap::new(None),
-            range_val: SecondaryMap::new(Val::MAX),
+            range_val: SecondaryMap::new(Val::MAX_REPRESENTABLE),
 
             bundles: PrimaryMap::new(),
             bundle_pinned_ranges: SecondaryMap::new([0; 8]),
