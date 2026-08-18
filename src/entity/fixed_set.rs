@@ -1,7 +1,12 @@
 //! Fixed-capacity sets of entities.
 
 use super::Entity;
-use core::{fmt::Debug, marker::PhantomData};
+use core::{
+    cmp::Ordering,
+    fmt::Debug,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+};
 
 type Word = u64;
 const BITS: usize = Word::BITS as usize;
@@ -173,6 +178,35 @@ impl<K, const WORDS: usize> Clone for FixedEntitySet<K, WORDS> {
             words: self.words,
             _phantom: PhantomData,
         }
+    }
+}
+
+impl<K, const WORDS: usize> PartialEq for FixedEntitySet<K, WORDS> {
+    fn eq(&self, other: &Self) -> bool {
+        self.words == other.words
+    }
+}
+
+impl<K, const WORDS: usize> Eq for FixedEntitySet<K, WORDS> {}
+
+impl<K, const WORDS: usize> PartialOrd for FixedEntitySet<K, WORDS> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The order is not meaningful -- it is neither the subset order nor the order
+/// of the entities in the sets -- but it is total, which is all a map key
+/// needs.
+impl<K, const WORDS: usize> Ord for FixedEntitySet<K, WORDS> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.words.cmp(&other.words)
+    }
+}
+
+impl<K, const WORDS: usize> Hash for FixedEntitySet<K, WORDS> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.words.hash(state);
     }
 }
 

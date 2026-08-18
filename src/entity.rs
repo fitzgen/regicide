@@ -237,6 +237,68 @@ macro_rules! define_entities {
     };
 }
 
+/// Like `define_entities` but for fixed-size entities that are not
+/// parameterized on `E: EntityRepr`.
+macro_rules! define_fixed_size_entities {
+    ( $(
+        $( #[$attr:meta] )*
+        $vis:vis struct $name:ident : $repr:ty = $fmt:expr;
+    )* ) => {
+        $(
+            $( #[$attr] )*
+            $vis struct $name ( core::num::NonZero<$repr> );
+
+            const _: () = assert!(
+                $name::MAX <= <$repr>::MAX as usize,
+                concat!(
+                    stringify!($name),
+                    " must have a representation wide enough for every index below its MAX",
+                ),
+            );
+
+            impl Default for $name {
+                fn default() -> Self {
+                    use crate::entity::Entity;
+                    Self::MAX_REPRESENTABLE
+                }
+            }
+
+            impl core::fmt::Debug for $name {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    use crate::entity::Entity;
+                    write!(f, "{}{}", $fmt, self.index())
+                }
+            }
+
+            impl crate::entity::Entity for $name {
+                type Repr = $repr;
+
+                type Family<E> = Self
+                where
+                    E: crate::entity::EntityRepr;
+
+                const MAX_REPRESENTABLE: Self =
+                    $name(match core::num::NonZero::<$repr>::new(<$repr>::MAX) {
+                        Some(x) => x,
+                        None => unreachable!(),
+                    });
+
+                #[inline]
+                fn try_new(index: usize) -> Option<Self> {
+                    let inner = <$repr>::try_from(index.checked_add(1)?).ok()?;
+                    let non_zero = core::num::NonZero::<$repr>::new(inner)?;
+                    Some(Self(non_zero))
+                }
+
+                #[inline]
+                fn index(self) -> usize {
+                    usize::try_from(self.0.get() - 1).unwrap()
+                }
+            }
+        )*
+    };
+}
+
 define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -320,5 +382,49 @@ where
         } else {
             self.start.index()..self.end.index()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{RegClass, RegUnit, entity::Entity};
+    use core::mem;
+
+    /// The point of a fixed-repr entity is that it does not pay for indices it
+    /// can never hold.
+    #[test]
+    fn fixed_entities_are_as_small_as_they_claim() {
+        assert_eq!(mem::size_of::<RegClass>(), 1);
+        assert_eq!(mem::size_of::<RegUnit>(), 2);
+
+        // Being a `NonZero` inside is what makes the niche available, which is
+        // what keeps `Machine`'s intersection table one byte per entry.
+        assert_eq!(mem::size_of::<Option<RegClass>>(), 1);
+        assert_eq!(mem::size_of::<Option<RegUnit>>(), 2);
+    }
+
+    /// Indices are one-based inside and zero-based outside, at both ends of the
+    /// range, and the entity refuses an index it cannot represent.
+    #[test]
+    fn fixed_entities_round_trip() {
+        for i in [
+            0,
+            1,
+            2,
+            RegClass::MAX_INCLUDING_DERIVED - 1,
+            RegClass::MAX_REPRESENTABLE.index(),
+        ] {
+            assert_eq!(RegClass::try_new(i).unwrap().index(), i);
+        }
+
+        assert!(RegClass::try_new(RegClass::MAX_REPRESENTABLE.index() + 1).is_none());
+        assert!(RegClass::try_new(usize::MAX).is_none());
+
+        // `Family<E> = Self` for a fixed entity, so the repr conversions that
+        // `run` performs on the generic entities are the identity here.
+        let class = RegClass::try_new(7).unwrap();
+        assert_eq!(class.with_repr::<u8>(), Some(class));
+        assert_eq!(class.with_repr::<u16>(), Some(class));
+        assert_eq!(class.with_repr::<u32>(), Some(class));
     }
 }

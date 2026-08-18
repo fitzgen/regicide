@@ -35,6 +35,7 @@ mod liveness;
 mod machine;
 mod move_elimination;
 mod output;
+mod packed_float;
 mod parallel_moves;
 mod partial_allocation;
 mod region_allocation;
@@ -53,7 +54,10 @@ pub mod test;
 pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Inst, SpillSlot, Val};
 pub use error::{Error, Result};
-pub use input::{Input, InputBlock, InputFunction, InputInst, Operand, RematCost};
+pub use input::{
+    DefUse, Input, InputBlock, InputFunction, InputInst, Operand, OperandConstraint, Position,
+    RematCost,
+};
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
 
@@ -70,8 +74,6 @@ pub fn run(
 ) -> Result<()> {
     assert!(context.is_reset());
     assert!(output.is_reset());
-
-    let num_insts = input.func.len_insts();
 
     #[cfg(feature = "entity-repr-8")]
     if entity_repr_can_likely_fit::<u8>(input) {
@@ -107,12 +109,14 @@ pub fn run(
     }
 }
 
+/// Is `E` likely wide enough to describe this allocation problem?
 fn entity_repr_can_likely_fit<E>(input: &Input<impl InputFunction>) -> bool
 where
     E: EntityRepr,
 {
     input.func.len_values() <= Val::<E>::MAX_REPRESENTABLE.index() + 1
         && input.func.len_insts() <= max_representable_inst_index::<E>()
+        && input.machine.num_registers() <= Reg::<E>::MAX_REPRESENTABLE.index() + 1
 }
 
 fn max_representable_inst_index<E>() -> usize

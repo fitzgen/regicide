@@ -14,7 +14,7 @@ use crate::{
     dominators::DominatorTree,
     entity::{Block, Entity, EntityRepr, Inst, SecondaryMap, Val},
     error::{Error, IResult, Result},
-    input::{DefUse, InputBlock, InputFunction, InputInst, Operand},
+    input::{DefUse, InputBlock, InputFunction, InputInst, Operand, OperandConstraint},
     live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST},
     output::OutputInner,
     timing::Timing,
@@ -108,8 +108,8 @@ fn check_block_references<'a>(
     }
 
     for_each_operand(input_block, |_inst, _i, operand| {
-        if operand.val.index() >= num_values {
-            return Err(Error::ValOutOfBounds { val: operand.val });
+        if operand.val().index() >= num_values {
+            return Err(Error::ValOutOfBounds { val: operand.val() });
         }
         Ok(())
     })?;
@@ -133,6 +133,22 @@ fn check_block_references<'a>(
                 method: "operands_len",
                 block,
             });
+        }
+
+        // A `Reuse` must name a real operand of this instruction, and one that
+        // is not itself a `Reuse`.
+        for (i, operand) in input_inst.operands().enumerate() {
+            let OperandConstraint::Reuse(target) = operand.constraint() else {
+                continue;
+            };
+            let reuses_a_reuse = target < num_operands
+                && matches!(
+                    input_inst.operand(target).constraint(),
+                    OperandConstraint::Reuse(_)
+                );
+            if target >= num_operands || reuses_a_reuse {
+                return Err(Error::InvalidReuse { inst, operand: i });
+            }
         }
     }
 
@@ -394,9 +410,11 @@ where
             }
         }
 
-        let result = for_each_operand(&func.block(block), |_inst, i, operand| match operand.kind {
-            DefUse::Def => define(operand.val, ProgramPoint::inst(block, i)),
-            DefUse::Use => Ok(()),
+        let result = for_each_operand(&func.block(block), |_inst, i, operand| {
+            match operand.kind() {
+                DefUse::Def => define(operand.val(), ProgramPoint::inst(block, i)),
+                DefUse::Use => Ok(()),
+            }
         });
         if let Err(e) = result {
             return output.error(e);
@@ -424,16 +442,16 @@ where
 {
     for (block, _) in func.blocks() {
         let result = for_each_operand(&func.block(block), |inst, i, operand| {
-            if !matches!(operand.kind, DefUse::Use) {
+            if operand.kind() != DefUse::Use {
                 return Ok(());
             }
-            let def = defs[operand.val].unwrap();
+            let def = defs[operand.val()].unwrap();
             let use_ = ProgramPoint::inst(block, i);
             if def.dominates(use_, dominators) {
                 Ok(())
             } else {
                 Err(Error::InvalidSsa {
-                    val: operand.val,
+                    val: operand.val(),
                     inst,
                 })
             }

@@ -259,6 +259,20 @@ pub enum Error {
         inst: Inst,
     },
 
+    /// An operand's `Reuse` constraint does not name an operand that it can
+    /// reuse.
+    ///
+    /// A `Reuse` must name another operand of the same instruction, and one
+    /// whose own constraint is not a `Reuse`, so that a chain of reuses is never
+    /// more than one link long.
+    InvalidReuse {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of the operand whose `Reuse` constraint is invalid.
+        operand: usize,
+    },
+
     /// The function has an instruction index above the largest one supported.
     TooManyInsts {
         /// The first [`Inst`] found whose index is out of range.
@@ -377,6 +391,10 @@ impl fmt::Debug for Error {
             Self::TooManyOperands { inst } => {
                 write!(f, "too many operands at instruction {inst:?}")
             }
+            Self::InvalidReuse { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} reuses an operand that it may not reuse"
+            ),
             Self::TooManyInsts { inst } => {
                 write!(
                     f,

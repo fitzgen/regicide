@@ -3,15 +3,15 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Block, InputBlock, InputFunction, InputInst, Operand, Reg, Val,
+    Block, InputBlock, InputFunction, InputInst, Operand, Reg, RegClass, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
     entity::{
         Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, Region, Scc, SccBlockIndex,
         SecondaryMap, SpillSlot,
     },
-    input::{DefUse, FmtWithOutput, Position},
-    live_ranges::{LiveBundle, LiveSpan},
+    input::{BlockFrequency, DefUse, FmtWithOutput, OperandConstraint, Position},
+    live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
 };
 use alloc::{vec, vec::Vec};
@@ -99,6 +99,117 @@ entity_default_mutate! {
     SpillSlot
     LiveSpan
     LiveBundle
+}
+
+/// A mutator for [`Operand`].
+pub struct OperandMutator<E>(PhantomData<E>);
+
+impl<E> Default for OperandMutator<E> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
+
+/// Generate a constraint that the packed `Operand` encoding can represent.
+fn gen_operand_constraint(ctx: &mut mutatis::Context) -> mutatis::Result<OperandConstraint> {
+    Ok(match ctx.rng().gen_index(4).unwrap() {
+        0 => OperandConstraint::Any,
+        1 => {
+            let index = ctx
+                .rng()
+                .gen_index(RegClass::MAX_INCLUDING_DERIVED)
+                .unwrap();
+            OperandConstraint::Reg(RegClass::try_new(index).unwrap())
+        }
+        2 => OperandConstraint::Stack,
+        _ => {
+            let index = ctx.rng().gen_index(MAX_OPERANDS_PER_INST).unwrap();
+            OperandConstraint::Reuse(index)
+        }
+    })
+}
+
+impl<E> Mutate<Operand<E>> for OperandMutator<E>
+where
+    E: EntityRepr,
+{
+    fn mutate(
+        &mut self,
+        mutations: &mut mutatis::Candidates<'_>,
+        operand: &mut Operand<E>,
+    ) -> mutatis::Result<()> {
+        mutations.mutation(|ctx| {
+            let val = if ctx.shrink() {
+                let old_index = operand.val().index();
+                if old_index == 0 {
+                    return Err(mutatis::error::Error::exhausted());
+                }
+                Val::<E>::try_new(ctx.rng().gen_usize() % old_index).unwrap()
+            } else {
+                EntityMutator::<Val<E>>::default().generate(ctx)?
+            };
+            *operand = Operand::new(operand.pos(), operand.kind(), operand.constraint(), val);
+            Ok(())
+        })?;
+
+        mutations.mutation(|ctx| {
+            let pos = match operand.pos() {
+                Position::Early => Position::Late,
+                Position::Late => Position::Early,
+            };
+            *operand = Operand::new(pos, operand.kind(), operand.constraint(), operand.val());
+            Ok(())
+        })?;
+
+        mutations.mutation(|ctx| {
+            let kind = match operand.kind() {
+                DefUse::Def => DefUse::Use,
+                DefUse::Use => DefUse::Def,
+            };
+            *operand = Operand::new(operand.pos(), kind, operand.constraint(), operand.val());
+            Ok(())
+        })?;
+
+        // There is no order on constraints to shrink along, so this mutation
+        // simply does not apply when we are shrinking.
+        if !mutations.shrink() {
+            mutations.mutation(|ctx| {
+                let constraint = gen_operand_constraint(ctx)?;
+                *operand = Operand::new(operand.pos(), operand.kind(), constraint, operand.val());
+                Ok(())
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<E> Generate<Operand<E>> for OperandMutator<E>
+where
+    E: EntityRepr,
+{
+    fn generate(&mut self, ctx: &mut mutatis::Context) -> mutatis::Result<Operand<E>> {
+        let pos = if ctx.rng().gen_bool() {
+            Position::Early
+        } else {
+            Position::Late
+        };
+        let kind = if ctx.rng().gen_bool() {
+            DefUse::Def
+        } else {
+            DefUse::Use
+        };
+        let constraint = gen_operand_constraint(ctx)?;
+        let val = EntityMutator::<Val<E>>::default().generate(ctx)?;
+        Ok(Operand::new(pos, kind, constraint, val))
+    }
+}
+
+impl<E> DefaultMutate for Operand<E>
+where
+    E: EntityRepr,
+{
+    type DefaultMutate = OperandMutator<E>;
 }
 
 #[derive(Clone, Default, Debug, Hash, Mutate)]
@@ -201,7 +312,22 @@ pub enum Type {
 pub struct BlockData {
     pub params: Vec<Val>,
     pub insts: Vec<Inst>,
+    pub frequency: u8,
 }
+
+/// The block frequencies that a `TestFunction`'s blocks may take, indexed by
+/// `BlockData::frequency`.
+///
+/// `NORMAL` comes first so that a default, unmutated block is neither hot nor
+/// cold.
+const BLOCK_FREQUENCIES: [BlockFrequency; 6] = [
+    BlockFrequency::NORMAL,
+    BlockFrequency::COLD,
+    BlockFrequency::new(0.5),
+    BlockFrequency::new(10.0),
+    BlockFrequency::HOT,
+    BlockFrequency::new(10_000.0),
+];
 
 #[derive(Clone, Hash)]
 pub struct TestFunction {
@@ -326,6 +452,7 @@ impl TestFunction {
         self.ensure_unique_defs(&mut output);
         self.ensure_block_call_arity();
         self.ensure_uses_dominated_by_defs();
+        self.ensure_operand_constraints();
     }
 
     /// Make sure that this function has at least one block, instruction, and
@@ -338,6 +465,7 @@ impl TestFunction {
                     BlockData {
                         params: vec![],
                         insts: vec![],
+                        frequency: 0,
                     },
                 )
                 .unwrap();
@@ -348,11 +476,12 @@ impl TestFunction {
                 .push(
                     output,
                     InstData::Op {
-                        operands: vec![Operand {
-                            pos: Position::Early,
-                            kind: DefUse::Def,
-                            val: Val::try_new(0).unwrap(),
-                        }],
+                        operands: vec![Operand::new(
+                            Position::Early,
+                            DefUse::Def,
+                            OperandConstraint::Any,
+                            Val::try_new(0).unwrap(),
+                        )],
                         side_effects: true,
                     },
                 )
@@ -568,7 +697,7 @@ impl TestFunction {
                 let uses = inst_data
                     .operands()
                     .iter()
-                    .filter(|op| matches!(op.kind, DefUse::Use))
+                    .filter(|op| op.kind() == DefUse::Use)
                     .count()
                     + inst_data
                         .block_calls()
@@ -583,7 +712,7 @@ impl TestFunction {
                 scope_len += inst_data
                     .operands()
                     .iter()
-                    .filter(|op| matches!(op.kind, DefUse::Def))
+                    .filter(|op| op.kind() == DefUse::Def)
                     .count();
             }
 
@@ -635,8 +764,8 @@ impl TestFunction {
                 let inst = *inst;
                 let mut i = 0;
                 for op in insts[inst].operands_mut() {
-                    if matches!(op.kind, DefUse::Def) {
-                        op.val = fresh_val(values, op.val, ValDef::InstResult { inst, i });
+                    if op.kind() == DefUse::Def {
+                        op.set_val(fresh_val(values, op.val(), ValDef::InstResult { inst, i }));
                         i += 1;
                     }
                 }
@@ -654,6 +783,51 @@ impl TestFunction {
                     let arity = blocks[call.target].params.len();
                     call.args.resize(arity, Val::default());
                 }
+            }
+        }
+    }
+
+    /// Make every `Reuse` constraint name an operand that it is allowed to
+    /// name: one that exists, and whose own constraint is not a `Reuse`.
+    fn ensure_operand_constraints(&mut self) {
+        for (_inst, inst_data) in self.insts.iter_mut() {
+            let operands = inst_data.operands_mut();
+            let num_operands = operands.len();
+
+            // Where each operand's reuse points after wrapping, so that the
+            // walk below can chase it without borrowing `operands` again.
+            let targets: Vec<Option<usize>> = operands
+                .iter()
+                .map(|op| match op.constraint() {
+                    OperandConstraint::Reuse(i) => Some(i % num_operands),
+                    _ => None,
+                })
+                .collect();
+
+            for i in 0..num_operands {
+                let Some(mut target) = targets[i] else {
+                    continue;
+                };
+
+                let mut steps = 0;
+                while let Some(next) = targets[target] {
+                    steps += 1;
+                    if steps > num_operands {
+                        // Every operand reuses another one, so there is no
+                        // operand left for this one to legally name.
+                        target = i;
+                        break;
+                    }
+                    target = next;
+                }
+
+                let constraint = if target == i {
+                    OperandConstraint::Any
+                } else {
+                    OperandConstraint::Reuse(target)
+                };
+                let op = &mut operands[i];
+                *op = Operand::new(op.pos(), op.kind(), constraint, op.val());
             }
         }
     }
@@ -688,8 +862,8 @@ impl TestFunction {
                 let inst = *inst;
 
                 for op in insts[inst].operands_mut() {
-                    if matches!(op.kind, DefUse::Use) {
-                        op.val = in_scope(&scope, op.val);
+                    if op.kind() == DefUse::Use {
+                        op.set_val(in_scope(&scope, op.val()));
                     }
                 }
                 for call in insts[inst].block_calls_mut() {
@@ -699,8 +873,8 @@ impl TestFunction {
                 }
 
                 for op in insts[inst].operands() {
-                    if matches!(op.kind, DefUse::Def) {
-                        scope.push(op.val);
+                    if op.kind() == DefUse::Def {
+                        scope.push(op.val());
                     }
                 }
             }
@@ -867,6 +1041,11 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
     where
         Self: 'b;
 
+    fn frequency(&self) -> BlockFrequency {
+        let index = self.func.blocks[self.block].frequency;
+        BLOCK_FREQUENCIES[usize::from(index) % BLOCK_FREQUENCIES.len()]
+    }
+
     fn len_insts(&self, _block: Block) -> usize {
         self.func.blocks[self.block].insts.len()
     }
@@ -1008,10 +1187,10 @@ impl<'a> InputInst<'a> for TestInst<'a> {
     }
 
     fn operand(&self, i: usize) -> Operand {
-        self.func.insts[self.inst].operands()[i].clone()
+        self.func.insts[self.inst].operands()[i]
     }
 
-    fn clobbers(&self) -> crate::input::RegSet {
+    fn clobbers(&self) -> crate::RegSet {
         todo!()
     }
 }
@@ -1050,20 +1229,32 @@ mod tests {
             for &inst in &block_data.insts {
                 let mut i = 0;
                 for op in func.insts[inst].operands() {
-                    if !matches!(op.kind, DefUse::Def) {
+                    if !matches!(op.kind(), DefUse::Def) {
                         continue;
                     }
                     let expected = ValDef::InstResult { inst, i };
-                    let actual = &func.values[op.val].def;
+                    let actual = &func.values[op.val()].def;
                     if *actual != expected {
                         return Err(format!(
                             "{:?} is definition {i} of {inst:?}, but its `ValData::def` \
                              says {actual:?}",
-                            op.val,
+                            op.val(),
                         ));
                     }
                     i += 1;
                 }
+            }
+        }
+
+        // Every block reports one of the frequencies it can report, whatever
+        // the mutator did to the index.
+        for (block, _) in func.blocks() {
+            let frequency = func.block(block).frequency();
+            if !BLOCK_FREQUENCIES.contains(&frequency) {
+                return Err(format!(
+                    "{block:?} reports a frequency of {frequency:?}, which is not one of \
+                     {BLOCK_FREQUENCIES:?}",
+                ));
             }
         }
 

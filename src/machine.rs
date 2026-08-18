@@ -138,10 +138,10 @@ use crate::{
     Entity, Error, Result,
     entity::{Entity as _, FixedEntitySet, PrimaryMap, words_for},
 };
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use core::ops::Range;
 
-define_entities! {
+define_fixed_size_entities! {
     /// The smallest accessible portion of a register.
     ///
     /// Two different `RegUnit`s can never overlap.
@@ -176,8 +176,47 @@ define_entities! {
     /// then defining the `s` registers one-to-one with these units and each `d`
     /// register as covering the `[i*2, i*2+1]` units.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct RegUnit = "unit";
+    pub struct RegUnit: u16 = "unit";
 
+
+    /// A group of registers that may be named as a whole by a single
+    /// instruction operand.
+    ///
+    /// All registers in a group must be associated with the same [`RegBank`].
+    ///
+    /// This is useful for ISAs that have instructions that operate on, e.g.,
+    /// the `i`th and `i+1`th register at the same time, while only explicitly
+    /// naming the first. s390x has many instructions that name even or odd
+    /// pairs of registers: 0 and 2, 1 and 3, 4 and 6, 5 and 7, etc...
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct RegGroup: u16 = "group";
+
+
+    /// A set of [`Reg`]s or [`RegGroup`]s that are candidate operands to some
+    /// instruction.
+    ///
+    /// An instruction operand declares its valid candidates by naming a
+    /// `RegClass`.
+    ///
+    /// The members of a `RegClass` are named in most-to-least preferred order.
+    ///
+    /// A `RegClass` may not be empty.
+    ///
+    /// All registers in a `RegClass` must be associated with the same
+    /// [`RegBank`].
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct RegClass: u8 = "rc";
+
+
+    /// A set of registers of the same "kind".
+    ///
+    /// It must always be possible to move values between allocatable [`Reg`]s
+    /// within the same `RegBank` with a singe move instruction.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct RegBank: u8 = "bank";
+}
+
+define_entities! {
     /// A register.
     ///
     /// Instruction operands get allocated to [`Reg`]s (or, sometimes,
@@ -201,40 +240,6 @@ define_entities! {
     /// for stack-to-stack moves.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Reg = "r";
-
-    /// A group of registers that may be named as a whole by a single
-    /// instruction operand.
-    ///
-    /// All registers in a group must be associated with the same [`RegBank`].
-    ///
-    /// This is useful for ISAs that have instructions that operate on, e.g.,
-    /// the `i`th and `i+1`th register at the same time, while only explicitly
-    /// naming the first. s390x has many instructions that name even or odd
-    /// pairs of registers: 0 and 2, 1 and 3, 4 and 6, 5 and 7, etc...
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct RegGroup = "group";
-
-    /// A set of [`Reg`]s or [`RegGroup`]s that are candidate operands to some
-    /// instruction.
-    ///
-    /// An instruction operand declares its valid candidates by naming a
-    /// `RegClass`.
-    ///
-    /// The members of a `RegClass` are named in most-to-least preferred order.
-    ///
-    /// A `RegClass` may not be empty.
-    ///
-    /// All registers in a `RegClass` must be associated with the same
-    /// [`RegBank`].
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct RegClass = "rc";
-
-    /// A set of registers of the same "kind".
-    ///
-    /// It must always be possible to move values between allocatable [`Reg`]s
-    /// within the same `RegBank` with a singe move instruction.
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct RegBank = "bank";
 }
 
 impl RegUnit {
@@ -256,8 +261,12 @@ impl RegGroup {
 }
 
 impl RegClass {
-    /// The maximum number of `RegClass`es supported.
+    /// The maximum number of `RegClass`es that the user may define.
     pub const MAX: usize = 64;
+
+    /// The maximum number of `RegClass`es supported, including the ones that
+    /// `MachineBuilder::finish` derives.
+    pub(crate) const MAX_INCLUDING_DERIVED: usize = 2 * Self::MAX;
 }
 
 impl RegBank {
@@ -406,6 +415,51 @@ pub struct Machine {
     pub(crate) groups: PrimaryMap<RegGroup, RegGroupDef>,
     pub(crate) classes: PrimaryMap<RegClass, RegClassDef>,
     pub(crate) banks: PrimaryMap<RegBank, RegBankDef>,
+
+    /// For each pair of register classes, the class whose members are the
+    /// registers (or groups) in both of them, if there is one.
+    ///
+    /// Indexed by `a.index() * self.classes.len() + b.index()`, and symmetric.
+    /// `None` means the two classes have no members in common, and so no
+    /// operand can satisfy constraints naming both.
+    ///
+    /// Derived by `MachineBuilder::finish`.
+    class_intersections: Box<[Option<RegClass>]>,
+
+    /// How many of `self.classes` the user defined.
+    ///
+    /// The rest are the intersections that [`MachineBuilder::finish`] derived,
+    /// appended after them so that the [`RegClass`]es handed out while building
+    /// keep their indices.
+    num_user_classes: usize,
+}
+
+impl Machine {
+    /// The class whose members are the registers in both `a` and `b`, or `None`
+    /// when they have no members in common.
+    ///
+    /// This is what makes [`crate::input::OperandConstraint`]'s merge total: the
+    /// intersection of two classes is always either empty or itself a class.
+    #[inline]
+    pub(crate) fn intersect_classes(&self, a: RegClass, b: RegClass) -> Option<RegClass> {
+        let n = self.classes.len();
+        debug_assert!(a.index() < n);
+        debug_assert!(b.index() < n);
+        self.class_intersections[a.index() * n + b.index()]
+    }
+
+    /// How many registers this machine has.
+    #[inline]
+    pub fn num_registers(&self) -> usize {
+        self.registers.len()
+    }
+
+    /// How many register classes the user defined, as opposed to the ones
+    /// derived from them.
+    #[inline]
+    pub(crate) fn num_user_classes(&self) -> usize {
+        self.num_user_classes
+    }
 }
 
 /// Builds a `Machine`.
@@ -565,7 +619,10 @@ impl MachineBuilder {
                 non_allocatable: RegSet::new(),
             }))
         } else {
-            Err(todo!())
+            Err(Error::MachineCapacityExceeded {
+                what: "register banks",
+                max: RegBank::MAX,
+            })
         }
     }
 
@@ -772,7 +829,7 @@ impl MachineBuilder {
     }
 
     /// Validate the machine description and produce the [`Machine`].
-    pub fn finish(self) -> Result<Machine> {
+    pub fn finish(mut self) -> Result<Machine> {
         check_capacity(self.banks.len(), RegBank::MAX, "register banks")?;
 
         for (bank, def) in self.banks.iter() {
@@ -803,6 +860,9 @@ impl MachineBuilder {
             }
         }
 
+        let num_user_classes = self.classes.len();
+        let class_intersections = self.define_class_intersections()?;
+
         let Self {
             registers,
             groups,
@@ -814,7 +874,179 @@ impl MachineBuilder {
             groups,
             classes,
             banks,
+            class_intersections,
+            num_user_classes,
         })
+    }
+
+    /// Derive the register classes that name the intersections of the classes
+    /// the user defined, and tabulate them.
+    ///
+    /// Merging two operands' constraints (an operand that must be in class `a`
+    /// and, because of a reuse or a shared value, must also be in class `b`)
+    /// needs a class naming the registers in both. Therefore, the class list
+    /// has to be closed under intersection, and closed transitively:
+    /// intersecting two derived classes must land on a class too, or merging
+    /// could fail on constraints the user never wrote down. That is what the
+    /// worklist below gives, by intersecting each class, derived ones included,
+    /// against everything before it.
+    ///
+    /// This is affordable because, in practice, typical machines derive almost
+    /// nothing.
+    fn define_class_intersections(&mut self) -> Result<Box<[Option<RegClass>]>> {
+        let mut dedupe = BTreeMap::new();
+        for i in 0..self.classes.len() {
+            let class = RegClass::try_new(i).unwrap();
+            dedupe
+                .entry(self.class_key(&self.classes[class]))
+                .or_insert(class);
+        }
+
+        // Close the class list under intersection.
+        let mut next = 0;
+        while next < self.classes.len() {
+            for a in 0..next {
+                let a = RegClass::try_new(a).unwrap();
+                let b = RegClass::try_new(next).unwrap();
+                let Some(def) = self.intersect_class_defs(a, b) else {
+                    continue;
+                };
+                let key = self.class_key(&def);
+                if dedupe.contains_key(&key) {
+                    continue;
+                }
+                check_capacity(
+                    self.classes.len() + 1,
+                    RegClass::MAX_INCLUDING_DERIVED,
+                    "register classes, including the intersections derived from them",
+                )?;
+                let class = self.classes.push_unwrap(def);
+                dedupe.insert(key, class);
+            }
+            next += 1;
+        }
+
+        // Now tabulate.
+        let n = self.classes.len();
+        let mut table = vec![None; n * n];
+        for a in 0..n {
+            // A class is its own intersection with itself.
+            table[a * n + a] = Some(RegClass::try_new(a).unwrap());
+
+            for b in 0..a {
+                let (x, y) = (RegClass::try_new(b).unwrap(), RegClass::try_new(a).unwrap());
+                let Some(def) = self.intersect_class_defs(x, y) else {
+                    continue;
+                };
+                let class = dedupe.get(&self.class_key(&def)).copied();
+                debug_assert!(
+                    class.is_some(),
+                    "the register class list is closed under intersection",
+                );
+                table[a * n + b] = class;
+                table[b * n + a] = class;
+            }
+        }
+
+        Ok(table.into_boxed_slice())
+    }
+
+    /// The definition of the class holding exactly the members that both `a` and
+    /// `b` have, or `None` when they have none in common.
+    ///
+    /// `a`'s preference order is kept, which is what makes this symmetric up to
+    /// preference, and so makes merging two constraints commutative.
+    fn intersect_class_defs(&self, a: RegClass, b: RegClass) -> Option<RegClassDef> {
+        let (x, y) = (&self.classes[a], &self.classes[b]);
+
+        // Registers in different banks are always disjoint.
+        if x.bank != y.bank {
+            return None;
+        }
+
+        let members = match (&x.members, &y.members) {
+            (RegClassMembers::Regs(xs), RegClassMembers::Regs(_)) => {
+                let regs: Box<[Reg]> = xs
+                    .iter()
+                    .copied()
+                    .filter(|&reg| y.member_set.contains(reg))
+                    .collect();
+                if regs.is_empty() {
+                    return None;
+                }
+                RegClassMembers::Regs(regs)
+            }
+
+            (RegClassMembers::Groups(xs), RegClassMembers::Groups(ys)) => {
+                // A class of groups has a single group size, so classes of
+                // differently-sized groups fall out of this as empty.
+                let groups: Box<[RegGroup]> = xs
+                    .iter()
+                    .copied()
+                    .filter(|group| ys.contains(group))
+                    .collect();
+                if groups.is_empty() {
+                    return None;
+                }
+                RegClassMembers::Groups(groups)
+            }
+
+            // An operand names either one register or one whole group, never
+            // both, so these classes have no common members even when they cover
+            // the same registers.
+            (RegClassMembers::Regs(_), RegClassMembers::Groups(_))
+            | (RegClassMembers::Groups(_), RegClassMembers::Regs(_)) => return None,
+        };
+
+        Some(RegClassDef {
+            // The intersection is a subset of both, so it is at least as
+            // expensive to spill as either of them.
+            spill_cost: x.spill_cost.max(y.spill_cost),
+            member_set: self.member_set(&members),
+            members,
+            bank: x.bank,
+        })
+    }
+
+    /// The registers that `members` covers, as a set.
+    fn member_set(&self, members: &RegClassMembers) -> RegSet {
+        let mut set = RegSet::new();
+        match members {
+            RegClassMembers::Regs(regs) => {
+                for &reg in regs {
+                    set.insert(reg);
+                }
+            }
+            RegClassMembers::Groups(groups) => {
+                for &group in groups {
+                    for &reg in &self.groups[group].members {
+                        set.insert(reg);
+                    }
+                }
+            }
+        }
+        set
+    }
+
+    /// The key that identifies `class` in the hash-consing table.
+    fn class_key(&self, class: &RegClassDef) -> ClassKey {
+        match &class.members {
+            // Keyed on the member set, as the user's classes are: which
+            // registers an operand of this class may go in is what makes two
+            // classes the same class, and the order among them is only a
+            // preference.
+            RegClassMembers::Regs(_) => ClassKey::Regs(class.member_set.clone()),
+
+            // A class of groups needs more than that: a `RegSet` does not say
+            // how the registers are grouped, so two different group lists can
+            // cover the very same registers. Sorted, since the order is a
+            // preference here too.
+            RegClassMembers::Groups(groups) => {
+                let mut groups = groups.clone();
+                groups.sort_unstable();
+                ClassKey::Groups(groups)
+            }
+        }
     }
 
     fn check_bank(&self, bank: RegBank) -> Result<()> {
@@ -849,6 +1081,20 @@ impl MachineBuilder {
         check_capacity(self.classes.len() + 1, RegClass::MAX, "register classes")?;
         Ok(self.classes.next_key_unwrap())
     }
+}
+
+/// The identity of a register class, for deduplicating the classes that
+/// `MachineBuilder::define_class_intersections` derives.
+///
+/// Two classes with the same key are interchangeable, so only the first of them
+/// needs to exist.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ClassKey {
+    /// A class of individual registers, identified by the set.
+    Regs(RegSet),
+
+    /// A class of register groups, identified by sorted members.
+    Groups(Box<[RegGroup]>),
 }
 
 /// Check that having `len` of something is within its limit.
@@ -1048,6 +1294,151 @@ mod tests {
         assert!(matches!(
             builder.define_reg_group_class(bank, 1.0, []).unwrap_err(),
             Error::EmptyRegClass { .. }
+        ));
+    }
+
+    /// The classes a machine derives, and the table it answers intersection
+    /// queries from.
+    #[test]
+    fn derive_class_intersections() {
+        let mut builder = MachineBuilder::new();
+        let gpr = builder.declare_reg_bank().unwrap();
+        let vector = builder.declare_reg_bank().unwrap();
+
+        let r: Vec<Reg> = (0..4)
+            .map(|i| builder.define_reg(gpr, unit(i)..unit(i + 1)).unwrap())
+            .collect();
+        let v: Vec<Reg> = (0..2)
+            .map(|i| builder.define_reg(vector, unit(i)..unit(i + 1)).unwrap())
+            .collect();
+
+        // `nested` is a subset of `all`, so that pair derives nothing. `low` and
+        // `high` cross -- each holds a register the other lacks -- and so do
+        // `nested` and `high`, so those two pairs each derive a class.
+        //
+        // `all` and `low` cover the same registers in different orders, so their
+        // intersection dedups onto `low` and derives nothing: the cons table is
+        // keyed on the member *set*, which is exactly what makes the table
+        // symmetric.
+        let all = builder
+            .define_reg_class(gpr, 1.0, [r[0], r[1], r[2], r[3]])
+            .unwrap();
+        let nested = builder.define_reg_class(gpr, 2.0, [r[0], r[1]]).unwrap();
+        let low = builder
+            .define_reg_class(gpr, 3.0, [r[2], r[1], r[0]])
+            .unwrap();
+        let high = builder
+            .define_reg_class(gpr, 4.0, [r[1], r[2], r[3]])
+            .unwrap();
+
+        // In another bank, and reached by way of groups, so it intersects with
+        // nothing above it.
+        let group = builder.define_reg_group(vector, [v[0], v[1]]).unwrap();
+        let groups = builder
+            .define_reg_group_class(vector, 5.0, [group])
+            .unwrap();
+
+        let num_user_classes = 5;
+        let machine = builder.finish().expect("this machine is well formed");
+        assert_eq!(machine.num_user_classes(), num_user_classes);
+
+        // Two classes were derived, in the order the worklist reached them:
+        // `nested` and `high` intersect in `{r[1]}`, and `low` and `high` in
+        // `{r[1], r[2]}`.
+        assert_eq!(machine.classes.len(), num_user_classes + 2);
+        let singleton = machine.intersect_classes(nested, high).unwrap();
+        let crossing = machine.intersect_classes(low, high).unwrap();
+        assert_eq!(singleton.index(), num_user_classes);
+        assert_eq!(crossing.index(), num_user_classes + 1);
+
+        // And their own intersection is the smaller of them, which is the
+        // closure holding transitively: a derived class intersected with another
+        // derived class still lands on a class.
+        assert_eq!(
+            machine.intersect_classes(singleton, crossing),
+            Some(singleton)
+        );
+
+        // `low` is the lower-indexed of the pair, so its preference order is the
+        // one that survives -- which is what makes the table symmetric, and so
+        // `OperandConstraint::merge` commutative.
+        let RegClassMembers::Regs(members) = &machine.classes[crossing].members else {
+            panic!("intersecting two classes of registers gives a class of registers");
+        };
+        assert_eq!(&**members, &[r[2], r[1]]);
+        assert_eq!(machine.intersect_classes(high, low), Some(crossing));
+
+        // Spilling a subset is at least as expensive as spilling either class it
+        // came from.
+        assert_eq!(
+            machine.classes[crossing].spill_cost,
+            machine.classes[high].spill_cost,
+        );
+
+        // A subset relationship derives nothing: the intersection is the subset.
+        assert_eq!(machine.intersect_classes(all, nested), Some(nested));
+        assert_eq!(machine.intersect_classes(nested, low), Some(nested));
+
+        // Every class is its own intersection with itself, including the derived
+        // one, and including classes that would otherwise dedup onto each other.
+        for i in 0..machine.classes.len() {
+            let class = RegClass::try_new(i).unwrap();
+            assert_eq!(machine.intersect_classes(class, class), Some(class));
+        }
+
+        // Different banks, and registers against groups, have nothing in common.
+        assert_eq!(machine.intersect_classes(all, groups), None);
+        assert_eq!(machine.intersect_classes(groups, all), None);
+
+        // The closure property, which is what `merge` totality rests on:
+        // intersecting any two classes -- derived ones included -- either lands
+        // on a class or on nothing, never on a set that needs a new class.
+        for a in 0..machine.classes.len() {
+            let a = RegClass::try_new(a).unwrap();
+            for b in 0..machine.classes.len() {
+                let b = RegClass::try_new(b).unwrap();
+                assert_eq!(
+                    machine.intersect_classes(a, b),
+                    machine.intersect_classes(b, a),
+                    "the intersection table is symmetric",
+                );
+                if let Some(ab) = machine.intersect_classes(a, b) {
+                    // And it is a fixed point: intersecting the result with
+                    // either parent gives the result back.
+                    assert_eq!(machine.intersect_classes(ab, a), Some(ab));
+                    assert_eq!(machine.intersect_classes(ab, b), Some(ab));
+                }
+            }
+        }
+    }
+
+    /// Closing the class list under intersection can blow up, and when it does
+    /// `finish` must say so rather than derive its way past `RegClass::MAX`.
+    ///
+    /// Eight classes of the form "every register except `r_i`" have all 256
+    /// "every register except `S`" subsets in their closure.
+    #[test]
+    fn reject_too_many_derived_classes() {
+        let mut builder = MachineBuilder::new();
+        let bank = builder.declare_reg_bank().unwrap();
+        let r: Vec<Reg> = (0..16)
+            .map(|i| builder.define_reg(bank, unit(i)..unit(i + 1)).unwrap())
+            .collect();
+
+        for i in 0..8 {
+            let members: Vec<Reg> = r
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, reg)| reg)
+                .collect();
+            builder.define_reg_class(bank, 1.0, members).unwrap();
+        }
+
+        assert!(matches!(
+            builder.finish().unwrap_err(),
+            Error::MachineCapacityExceeded { .. }
         ));
     }
 

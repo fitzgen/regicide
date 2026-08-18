@@ -10,6 +10,7 @@ use crate::error::IResult;
 use crate::input::{DefUse, InputFunction, Position};
 use crate::liveness::Liveness;
 use crate::output::{Allocation, OutputInner};
+use crate::packed_float::PackedPositiveFloat;
 use crate::region_tree::RegionTree;
 use crate::timing::Timing;
 use crate::{RegClass, RegSet};
@@ -110,56 +111,24 @@ where
     }
 }
 
-/// Pack a non-negative `f32` into its most-significant `BITS` bits.
-///
-/// An `f32` is `[sign: 1, exponent: 8, mantissa: 23]`. Dropping the sign, which
-/// is always clear for the weights we store, leaves 31 bits; we keep the top
-/// `BITS` of those and truncate the rest.
-///
-/// Because the exponent sits immediately below the discarded sign, the packed
-/// bits of two weights compare in the same order as the weights themselves.
-///
-/// `BITS` must be within `1..=31`.
-#[inline]
-fn pack_positive_f32<const BITS: u32>(weight: f32) -> u32 {
-    debug_assert!(BITS >= 1 && BITS <= 31);
-    debug_assert!(
-        weight.is_sign_positive(),
-        "the sign bit is not stored, so it must be clear"
-    );
-    (weight.to_bits() >> (31 - BITS)) & ((1u32 << BITS) - 1)
-}
-
-/// Unpack an `f32` packed by [`pack_positive_f32`], with the truncated low
-/// mantissa bits restored as zeroes.
-#[inline]
-fn unpack_positive_f32<const BITS: u32>(bits: u32) -> f32 {
-    debug_assert!(BITS >= 1 && BITS <= 31);
-    debug_assert_eq!(bits >> BITS, 0, "bits above the packed field must be clear");
-    f32::from_bits(bits << (31 - BITS))
-}
-
+/// How much it would cost to spill a value, rather than keep it in a register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SpillWeight {
-    /// The top bits of an `f32`, except the sign bit, since weights are always
-    /// positive. This is basically the same as `bfloat16`, except with an extra
-    /// bit of mantissa instead of the sign.
-    bits: u16,
-}
+pub struct SpillWeight(PackedSpillWeight);
+
+const SPILL_WEIGHT_BITS: u32 = 16;
+type PackedSpillWeight = PackedPositiveFloat<u16, SPILL_WEIGHT_BITS>;
 
 impl SpillWeight {
-    const BITS: u32 = (core::mem::size_of::<Self>() * (u8::BITS as usize)) as u32;
-
+    /// Create a spill weight from `weight`, which must be positive.
     #[inline]
-    pub fn new(weight: f32) -> Self {
-        SpillWeight {
-            bits: pack_positive_f32::<{ Self::BITS }>(weight) as u16,
-        }
+    pub const fn new(weight: f32) -> Self {
+        SpillWeight(PackedSpillWeight::new(weight))
     }
 
+    /// This weight's value.
     #[inline]
-    pub fn as_f32(self) -> f32 {
-        unpack_positive_f32::<{ Self::BITS }>(u32::from(self.bits))
+    pub const fn as_f32(self) -> f32 {
+        self.0.as_f32()
     }
 }
 
@@ -320,7 +289,7 @@ where
     region: Region<E>,
 
     /// The registers that this bundle can be allocated to.
-    class: RegClass<E>,
+    class: RegClass,
 
     /// The subset of `self.candidates` that this bundle would prefer to be
     /// allocated within.
@@ -344,7 +313,7 @@ where
 }
 
 const BUNDLE_SPILL_WEIGHT_BITS: u32 = 29;
-const BUNDLE_SPILL_WEIGHT_MASK: u32 = (1 << BUNDLE_SPILL_WEIGHT_BITS) - 1;
+const BUNDLE_SPILL_WEIGHT_MASK: u32 = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::MASK;
 const BUNDLE_HAS_FIXED_USES: u32 = 1 << 29;
 const BUNDLE_PINNED: u32 = 1 << 30;
 const BUNDLE_MINIMAL: u32 = 1 << 31;
@@ -364,7 +333,7 @@ where
     }
 
     #[inline]
-    pub fn class(&self) -> RegClass<E> {
+    pub fn class(&self) -> RegClass {
         self.class
     }
 
@@ -395,9 +364,10 @@ where
 
     #[inline]
     pub fn spill_weight(&self) -> f32 {
-        unpack_positive_f32::<BUNDLE_SPILL_WEIGHT_BITS>(
+        PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
             self.weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
         )
+        .as_f32()
     }
 }
 
@@ -646,33 +616,19 @@ mod tests {
         one_past_the_end_is_representable::<u32>();
     }
 
+    /// There is one `UseData` per operand in the whole function, so its size is
+    /// worth pinning down: a `LivePoint` and an operand index and a weight, with
+    /// no padding at any entity representation.
     #[test]
-    fn spill_weight_round_trips_approximately() {
-        for weight in [0.0f32, 1e-20, 0.5, 1.0, 3.25, 123.456, 1e20] {
-            let unpacked = SpillWeight::new(weight).as_f32();
-            // Truncating the low mantissa bits only ever rounds towards zero,
-            // and keeps 8 bits of mantissa.
-            assert!(unpacked <= weight, "{unpacked} <= {weight}");
-            assert!(
-                unpacked >= weight * (1.0 - 1.0 / 256.0),
-                "{unpacked} >= {weight} * (1 - 1/256)"
-            );
-        }
-
-        // Infinity survives, since the exponent is kept whole.
-        assert_eq!(SpillWeight::new(f32::INFINITY).as_f32(), f32::INFINITY);
-    }
-
-    /// Packed weights must compare in the same order as the weights they encode,
-    /// since that is how they are used.
-    #[test]
-    fn spill_weight_bits_are_monotonic() {
-        let mut previous = SpillWeight::new(0.0).bits;
-        for weight in [1e-20f32, 0.5, 1.0, 2.0, 1000.0, 1e20] {
-            let bits = SpillWeight::new(weight).bits;
-            assert!(bits > previous, "{bits} > {previous} for {weight}");
-            previous = bits;
-        }
+    fn a_use_is_no_bigger_than_its_fields() {
+        assert_eq!(size_of::<SpillWeight>(), 2);
+        assert_eq!(
+            size_of::<UseData<u32>>(),
+            size_of::<LivePoint<u32>>() + size_of::<u16>() + size_of::<SpillWeight>(),
+        );
+        assert_eq!(size_of::<UseData<u32>>(), 8);
+        assert_eq!(size_of::<UseData<u16>>(), 8);
+        assert_eq!(size_of::<UseData<u8>>(), 6);
     }
 
     fn span(flags: u8) -> LiveSpanData<u32> {
@@ -714,7 +670,7 @@ mod tests {
 
     #[test]
     fn bundle_flags_do_not_disturb_the_weight() {
-        let weight = pack_positive_f32::<BUNDLE_SPILL_WEIGHT_BITS>(3.25);
+        let weight = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(3.25).bits();
 
         let plain = bundle(weight);
         assert!(!plain.is_minimal());
@@ -806,10 +762,10 @@ mod tests {
                 for (i, operand) in input_inst.operands().enumerate() {
                     operands.push((
                         block,
-                        LivePoint::new(inst, operand.pos),
+                        LivePoint::new(inst, operand.pos()),
                         i,
-                        operand.kind,
-                        operand.val,
+                        operand.kind(),
+                        operand.val(),
                     ));
                 }
             }

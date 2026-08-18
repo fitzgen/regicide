@@ -1,11 +1,13 @@
-use core::{cell::RefCell, fmt};
+use core::{cell::RefCell, fmt, marker::PhantomData};
 
 use crate::{
-    Allocation, Machine, Output, Reg,
+    Allocation, Machine, Output, Reg, RegClass, RegSet,
     dfs::Dfs,
-    entity::{Block, EntityRepr, Inst, PrimaryMap, Val},
+    entity::{Block, Entity as _, EntityRepr, Inst, PrimaryMap, Val},
     error::IResult,
+    live_ranges::MAX_OPERANDS_PER_INST,
     output::OutputInner,
+    packed_float::PackedPositiveFloat,
 };
 
 /// The input to register allocation.
@@ -55,29 +57,303 @@ impl InputOptions {
     }
 }
 
-/// TODO FITZGEN
-#[derive(Clone, Debug, Hash)]
-#[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
+/// The constraints describing where an operand may be located.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum OperandConstraint {
+    /// This operand may be placed in any location.
+    Any,
+
+    /// The register class describing the set of registers that this operand's
+    /// value may be placed in.
+    ///
+    /// If an instruction requires an operand in one particular, fixed register,
+    /// then create a singleton [`RegClass`] containing only that register and
+    /// use it here.
+    Reg(RegClass),
+
+    /// This operand must be placed on the stack.
+    Stack,
+
+    /// This operand must be in the same location as the `i`th operand of this
+    /// operand's associated instruction.
+    ///
+    /// The operand named by a `Reuse` must not itself have a `Reuse`
+    /// constraint.
+    Reuse(usize),
+}
+
+const TAG_ANY: u64 = 0;
+const TAG_REG: u64 = 1;
+const TAG_STACK: u64 = 2;
+const TAG_REUSE: u64 = 3;
+
+impl OperandConstraint {
+    fn to_bits(self) -> (u64, u64) {
+        match self {
+            Self::Any => (TAG_ANY, 0),
+            Self::Reg(class) => (TAG_REG, u64::try_from(class.index()).unwrap()),
+            Self::Stack => (TAG_STACK, 0),
+            Self::Reuse(i) => (TAG_REUSE, u64::try_from(i).unwrap()),
+        }
+    }
+
+    fn from_bits(tag: u64, payload: u64) -> Self {
+        match tag {
+            TAG_ANY => {
+                debug_assert_eq!(payload, 0);
+                Self::Any
+            }
+            TAG_REG => {
+                let index = usize::try_from(payload).unwrap();
+                Self::Reg(RegClass::try_new(index).unwrap())
+            }
+            TAG_STACK => {
+                debug_assert_eq!(payload, 0);
+                Self::Stack
+            }
+            TAG_REUSE => Self::Reuse(usize::try_from(payload).unwrap()),
+            _ => unreachable!("not an operand constraint tag: {tag}"),
+        }
+    }
+
+    /// The constraint that this instruction's `i`th operand imposes.
+    fn resolve(i: usize, sibling: &dyn Fn(usize) -> OperandConstraint) -> Option<Self> {
+        let constraint = sibling(i);
+        debug_assert!(
+            !matches!(constraint, Self::Reuse(_)),
+            "a reuse constraint must not point at another reuse constraint",
+        );
+        match constraint {
+            Self::Reuse(_) => None,
+            constraint => Some(constraint),
+        }
+    }
+
+    /// The weakest constraint that satisfies both `self` and `other`, or `None`
+    /// when nothing satisfies both.
+    ///
+    /// `sibling` gives the constraint on the `i`th operand of the instruction
+    /// that both of these constraints belong to, which is what a `Reuse` names.
+    ///
+    /// This is commutative: merging in either order gives the same answer,
+    /// which is why [`Machine::intersect_classes`] is a symmetric table.
+    pub(crate) fn merge(
+        &self,
+        other: &Self,
+        machine: &Machine,
+        sibling: &dyn Fn(usize) -> OperandConstraint,
+    ) -> Option<Self> {
+        match (self, other) {
+            (Self::Any, other) | (other, Self::Any) => Some(*other),
+
+            (Self::Reg(lhs), Self::Reg(rhs)) => {
+                machine.intersect_classes(*lhs, *rhs).map(Self::Reg)
+            }
+
+            (Self::Reg(_), Self::Stack) | (Self::Stack, Self::Reg(_)) => None,
+
+            (Self::Reg(rc), Self::Reuse(i)) | (Self::Reuse(i), Self::Reg(rc)) => {
+                match Self::resolve(*i, sibling)? {
+                    Self::Reg(target) if *rc == target => Some(Self::Reuse(*i)),
+                    _ => None,
+                }
+            }
+
+            (Self::Stack, Self::Stack) => Some(Self::Stack),
+
+            (Self::Stack, Self::Reuse(i)) | (Self::Reuse(i), Self::Stack) => {
+                match Self::resolve(*i, sibling)? {
+                    Self::Stack => Some(Self::Reuse(*i)),
+                    _ => None,
+                }
+            }
+
+            (Self::Reuse(lhs), Self::Reuse(rhs)) => {
+                if lhs == rhs {
+                    Some(Self::Reuse(*lhs))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// An instruction operand and its register constraints.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Operand<E = u32>
 where
     E: EntityRepr,
 {
-    /// TODO FITZGEN
-    pub pos: Position,
-    /// TODO FITZGEN
-    pub kind: DefUse,
-    /// TODO FITZGEN
-    pub val: Val<E>,
+    /// Bit-packed as follows:
+    ///
+    /// ```text
+    ///  63  ...  52 51  ...   36 35   34 33       32      31    ...     0
+    /// +-----------+------------+-------+--------+-------+---------------+
+    /// | unused:12 | payload:16 | tag:2 | kind:1 | pos:1 |    val:32     |
+    /// +-----------+------------+-------+--------+-------+---------------+
+    /// ```
+    bits: u64,
+
+    _repr: PhantomData<fn() -> E>,
 }
 
-/// TODO FITZGEN
+const VAL_BITS: u32 = 32;
+const VAL_SHIFT: u32 = 0;
+const VAL_MAX: u64 = (1 << VAL_BITS) - 1;
+
+const POS_BITS: u32 = 1;
+const POS_SHIFT: u32 = VAL_SHIFT + VAL_BITS;
+
+const KIND_BITS: u32 = 1;
+const KIND_SHIFT: u32 = POS_SHIFT + POS_BITS;
+
+const TAG_BITS: u32 = 2;
+const TAG_SHIFT: u32 = KIND_SHIFT + KIND_BITS;
+const TAG_MAX: u64 = (1 << TAG_BITS) - 1;
+
+const PAYLOAD_BITS: u32 = 16;
+const PAYLOAD_SHIFT: u32 = TAG_SHIFT + TAG_BITS;
+const PAYLOAD_MAX: u64 = (1 << PAYLOAD_BITS) - 1;
+
+const TOTAL_BITS: u32 = PAYLOAD_SHIFT + PAYLOAD_BITS;
+
+const _OPERAND_FITS_IN_U64: () = assert!(TOTAL_BITS <= u64::BITS);
+const _OPERAND_HOLDS_FULL_VAL: () = assert!(u32::BITS == VAL_BITS);
+
+const _: () = assert!((TAG_ANY & TAG_MAX) == TAG_ANY);
+const _: () = assert!((TAG_REG & TAG_MAX) == TAG_REG);
+const _: () = assert!((TAG_STACK & TAG_MAX) == TAG_STACK);
+const _: () = assert!((TAG_REUSE & TAG_MAX) == TAG_REUSE);
+const _: () = assert!(RegClass::MAX_INCLUDING_DERIVED as u64 <= PAYLOAD_MAX + 1);
+const _: () = assert!(MAX_OPERANDS_PER_INST as u64 <= PAYLOAD_MAX + 1);
+
+impl<E> fmt::Debug for Operand<E>
+where
+    E: EntityRepr,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Operand")
+            .field("pos", &self.pos())
+            .field("kind", &self.kind())
+            .field("constraint", &self.constraint())
+            .field("val", &self.val())
+            .finish()
+    }
+}
+
+impl<E> Operand<E>
+where
+    E: EntityRepr,
+{
+    /// Create an operand.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `constraint` is `Reuse(i)` and `i` is too large to be a
+    /// valid operand index.
+    #[inline]
+    pub fn new(pos: Position, kind: DefUse, constraint: OperandConstraint, val: Val<E>) -> Self {
+        let (tag, payload) = constraint.to_bits();
+        assert!(payload <= PAYLOAD_MAX);
+
+        let val = u64::try_from(val.index()).unwrap();
+        debug_assert!(val <= VAL_MAX);
+
+        Self {
+            bits: (val << VAL_SHIFT)
+                | ((pos as u64) << POS_SHIFT)
+                | ((kind as u64) << KIND_SHIFT)
+                | (tag << TAG_SHIFT)
+                | (payload << PAYLOAD_SHIFT),
+            _repr: PhantomData,
+        }
+    }
+
+    /// The position of its value's definition or use within this operand's
+    /// associated instruction.
+    #[inline]
+    pub fn pos(self) -> Position {
+        if (self.bits >> POS_SHIFT) & 1 == Position::Early as u64 {
+            Position::Early
+        } else {
+            Position::Late
+        }
+    }
+
+    /// Whether this operand defines or uses its value.
+    #[inline]
+    pub fn kind(self) -> DefUse {
+        if (self.bits >> KIND_SHIFT) & 1 == DefUse::Def as u64 {
+            DefUse::Def
+        } else {
+            DefUse::Use
+        }
+    }
+
+    /// The constraints on this operand's placement.
+    #[inline]
+    pub fn constraint(self) -> OperandConstraint {
+        OperandConstraint::from_bits(
+            (self.bits >> TAG_SHIFT) & TAG_MAX,
+            (self.bits >> PAYLOAD_SHIFT) & PAYLOAD_MAX,
+        )
+    }
+
+    /// The value that is defined or used by this operand.
+    #[inline]
+    pub fn val(self) -> Val<E> {
+        let index = usize::try_from((self.bits >> VAL_SHIFT) & VAL_MAX).unwrap();
+        Val::try_new(index).unwrap()
+    }
+
+    #[cfg(any(test, fuzz))]
+    pub(crate) fn set_val(&mut self, val: Val<E>) {
+        *self = Self::new(self.pos(), self.kind(), self.constraint(), val);
+    }
+
+    #[inline]
+    pub(crate) fn to_bits(self) -> u64 {
+        self.bits
+    }
+
+    #[inline]
+    pub(crate) fn from_bits(bits: u64) -> Self {
+        let operand = Self {
+            bits,
+            _repr: PhantomData,
+        };
+        if cfg!(debug_assertions) {
+            assert_eq!(
+                bits >> TOTAL_BITS,
+                0,
+                "an `Operand`'s unused bits must be clear",
+            );
+            // Round-tripping every field is what checks that the tag and
+            // payload agree and that the value index is representable here.
+            debug_assert_eq!(
+                Self::new(
+                    operand.pos(),
+                    operand.kind(),
+                    operand.constraint(),
+                    operand.val(),
+                )
+                .bits,
+                bits,
+            );
+        }
+        operand
+    }
+}
+
+/// The position of an operand's definition or use of its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
 #[repr(u8)]
 pub enum Position {
-    /// TODO FITZGEN
+    /// The operand is accessed early, just after entering the instruction.
     Early = 0,
-    /// TODO FITZGEN
+    /// The operand is accessed late, just before exiting the instruction.
     Late = 1,
 }
 
@@ -148,12 +424,53 @@ pub trait InputFunction {
     }
 }
 
+/// The estimated frequency that a block is executed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockFrequency(PackedBlockFrequency);
+
+const BLOCK_FREQUENCY_BITS: u32 = 16;
+type PackedBlockFrequency = PackedPositiveFloat<u16, BLOCK_FREQUENCY_BITS>;
+
+impl Default for BlockFrequency {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+impl BlockFrequency {
+    /// Construct a new frequency.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the given frequency value does not have a positive sign.
+    pub const fn new(frequency: f32) -> Self {
+        assert!(frequency.is_sign_positive());
+        Self(PackedBlockFrequency::new(frequency))
+    }
+
+    pub(crate) const fn as_f32(self) -> f32 {
+        self.0.as_f32()
+    }
+
+    /// The canonical "cold" block frequency.
+    pub const COLD: Self = BlockFrequency::new(f32::EPSILON);
+
+    /// The default block frequency that is neither "cold" nor "hot".
+    pub const NORMAL: Self = BlockFrequency::new(1.0);
+
+    /// The canonical "hot" block frequency.
+    pub const HOT: Self = BlockFrequency::new(100.0);
+}
+
 /// A block in an [`InputFunction`].
 pub trait InputBlock<'a> {
     /// The associated input instruction type.
     type InputInst<'b>: InputInst<'b>
     where
         Self: 'b;
+
+    /// Get the estimated frequency that this block is executed.
+    fn frequency(&self) -> BlockFrequency;
 
     /// The number of instructions in the given block.
     fn len_insts(&self, block: Block) -> usize;
@@ -263,12 +580,6 @@ pub trait InputBlock<'a> {
 
     /// Get the block arguments passed to this block's `i`th successor.
     fn successor_block_args(&self, successor: usize) -> Self::SuccessorBlockArgsIter<'_>;
-
-    // TODO: ...
-}
-
-pub struct RegSet {
-    // TODO FITZGEN: representation?
 }
 
 /// An instruction in a [`InputBlock`].
@@ -465,15 +776,24 @@ where
             output.result(writeln!(f, "    {inst:?}"))?;
             for arg in input_inst.operands() {
                 output.result(write!(f, "      "))?;
-                match arg.pos {
+                match arg.pos() {
                     Position::Early => output.result(write!(f, "early "))?,
                     Position::Late => output.result(write!(f, "late "))?,
                 }
-                match arg.kind {
+                match arg.kind() {
                     DefUse::Def => output.result(write!(f, "def "))?,
                     DefUse::Use => output.result(write!(f, "use "))?,
                 }
-                output.result(writeln!(f, "{:?}", arg.val))?;
+                output.result(write!(f, "{:?} ", arg.val()))?;
+                match arg.constraint() {
+                    OperandConstraint::Any => output.result(write!(f, "any"))?,
+                    OperandConstraint::Reg(class) => output.result(write!(f, "in {class:?}"))?,
+                    OperandConstraint::Stack => output.result(write!(f, "on stack"))?,
+                    OperandConstraint::Reuse(i) => {
+                        output.result(write!(f, "reusing operand {i}"))?
+                    }
+                }
+                output.result(writeln!(f))?;
             }
         }
         if self.0.len_successors() == 0 {
@@ -511,4 +831,305 @@ where
         output.result(write!(f, "{val:?}"))?;
     }
     output.result(write!(f, ")"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn canonical_block_frequencies_stay_ordered() {
+        assert!(BlockFrequency::COLD < BlockFrequency::NORMAL);
+        assert!(BlockFrequency::NORMAL < BlockFrequency::HOT);
+
+        // `COLD` is the smallest of them, so it is the one at risk of being
+        // truncated away to zero. It is a power of two, so it has no mantissa
+        // bits to lose and survives exactly.
+        assert_eq!(BlockFrequency::COLD.as_f32(), f32::EPSILON);
+        assert!(BlockFrequency::COLD.as_f32() > 0.0);
+
+        // These two are also exact, having short mantissas.
+        assert_eq!(BlockFrequency::NORMAL.as_f32(), 1.0);
+        assert_eq!(BlockFrequency::HOT.as_f32(), 100.0);
+
+        assert_eq!(BlockFrequency::default(), BlockFrequency::NORMAL);
+    }
+
+    fn every_operand<E>() -> impl Iterator<Item = Operand<E>>
+    where
+        E: EntityRepr,
+    {
+        let constraints = [
+            OperandConstraint::Any,
+            OperandConstraint::Reg(RegClass::try_new(0).unwrap()),
+            OperandConstraint::Reg(RegClass::try_new(RegClass::MAX_INCLUDING_DERIVED - 1).unwrap()),
+            OperandConstraint::Stack,
+            OperandConstraint::Reuse(0),
+            OperandConstraint::Reuse(MAX_OPERANDS_PER_INST - 1),
+        ];
+        let vals = [0, 1, Val::<E>::MAX_REPRESENTABLE.index()];
+
+        [Position::Early, Position::Late]
+            .into_iter()
+            .flat_map(move |pos| {
+                [DefUse::Def, DefUse::Use]
+                    .into_iter()
+                    .flat_map(move |kind| {
+                        constraints.into_iter().flat_map(move |constraint| {
+                            vals.into_iter().map(move |val| {
+                                Operand::new(pos, kind, constraint, Val::try_new(val).unwrap())
+                            })
+                        })
+                    })
+            })
+    }
+
+    #[test]
+    fn an_operand_is_eight_bytes() {
+        assert_eq!(core::mem::size_of::<Operand<u8>>(), 8);
+        assert_eq!(core::mem::size_of::<Operand<u16>>(), 8);
+        assert_eq!(core::mem::size_of::<Operand<u32>>(), 8);
+    }
+
+    fn operand_packing_round_trips<E>()
+    where
+        E: EntityRepr,
+    {
+        for operand in every_operand::<E>() {
+            let (pos, kind, constraint, val) = (
+                operand.pos(),
+                operand.kind(),
+                operand.constraint(),
+                operand.val(),
+            );
+
+            // Every field reads back as it was written, without disturbing any
+            // of the others.
+            assert_eq!(
+                Operand::<E>::new(pos, kind, constraint, val),
+                operand,
+                "{operand:?}",
+            );
+
+            // The unused high bits stay clear, which is what leaves room to add
+            // a field later.
+            assert_eq!(operand.to_bits() >> TOTAL_BITS, 0, "{operand:?}");
+            assert_eq!(Operand::<E>::from_bits(operand.to_bits()), operand);
+
+            // `set_val` is the one mutator, and it changes only the value.
+            let mut replaced = operand;
+            replaced.set_val(Val::try_new(0).unwrap());
+            assert_eq!(replaced.val(), Val::try_new(0).unwrap());
+            assert_eq!(replaced.pos(), pos);
+            assert_eq!(replaced.kind(), kind);
+            assert_eq!(replaced.constraint(), constraint);
+        }
+    }
+
+    #[test]
+    fn operand_packing_round_trips_at_every_repr() {
+        operand_packing_round_trips::<u8>();
+        operand_packing_round_trips::<u16>();
+        operand_packing_round_trips::<u32>();
+    }
+
+    /// `Operand` derives `PartialEq` and `Hash` on its raw bits, which is a lie
+    /// unless the encoding is canonical: the variants with nothing to say must
+    /// leave the payload at zero rather than at whatever was there before.
+    #[test]
+    fn constraints_without_a_payload_encode_canonically() {
+        let val = Val::<u32>::try_new(3).unwrap();
+        for constraint in [OperandConstraint::Any, OperandConstraint::Stack] {
+            let operand = Operand::new(Position::Early, DefUse::Def, constraint, val);
+            assert_eq!((operand.to_bits() >> PAYLOAD_SHIFT) & PAYLOAD_MAX, 0);
+
+            // Reached by way of a constraint that does have a payload, so the
+            // payload bits would survive if `new` did not overwrite them.
+            let mut other = Operand::new(
+                Position::Early,
+                DefUse::Def,
+                OperandConstraint::Reuse(9),
+                val,
+            );
+            other = Operand::new(other.pos(), other.kind(), constraint, other.val());
+            assert_eq!(other, operand);
+        }
+    }
+
+    /// A machine with two classes that cross, so that `merge` has an
+    /// intersection to find and a pair with none.
+    fn merge_test_machine() -> (Machine, RegClass, RegClass, RegClass) {
+        let mut builder = crate::MachineBuilder::new();
+        let bank = builder.declare_reg_bank().unwrap();
+        let r: Vec<crate::Reg> = (0..3)
+            .map(|i| {
+                let unit = |i| crate::RegUnit::try_new(i).unwrap();
+                builder.define_reg(bank, unit(i)..unit(i + 1)).unwrap()
+            })
+            .collect();
+
+        let low = builder.define_reg_class(bank, 1.0, [r[0], r[1]]).unwrap();
+        let high = builder.define_reg_class(bank, 1.0, [r[1], r[2]]).unwrap();
+        let disjoint = builder.define_reg_class(bank, 1.0, [r[0]]).unwrap();
+        let machine = builder.finish().unwrap();
+
+        // `low` and `high` share `r[1]`; `disjoint` and `high` share nothing.
+        assert!(machine.intersect_classes(low, high).is_some());
+        assert_eq!(machine.intersect_classes(disjoint, high), None);
+
+        (machine, low, high, disjoint)
+    }
+
+    #[test]
+    fn merge_intersects_register_classes() {
+        let (machine, low, high, disjoint) = merge_test_machine();
+        let no_siblings = |_: usize| -> OperandConstraint {
+            unreachable!("these constraints have no `Reuse` to resolve")
+        };
+
+        let both = machine.intersect_classes(low, high).unwrap();
+        assert_eq!(
+            OperandConstraint::Reg(low).merge(
+                &OperandConstraint::Reg(high),
+                &machine,
+                &no_siblings
+            ),
+            Some(OperandConstraint::Reg(both)),
+        );
+
+        // Nowhere left to put the operand.
+        assert_eq!(
+            OperandConstraint::Reg(disjoint).merge(
+                &OperandConstraint::Reg(high),
+                &machine,
+                &no_siblings
+            ),
+            None,
+        );
+
+        // A register and the stack are different places.
+        assert_eq!(
+            OperandConstraint::Reg(low).merge(&OperandConstraint::Stack, &machine, &no_siblings),
+            None,
+        );
+        assert_eq!(
+            OperandConstraint::Stack.merge(&OperandConstraint::Stack, &machine, &no_siblings),
+            Some(OperandConstraint::Stack),
+        );
+    }
+
+    /// Merging with a `Reuse` keeps the `Reuse`, so that the requirement to be
+    /// in the same place as another operand is never silently dropped.
+    #[test]
+    fn merge_keeps_reuse_constraints() {
+        let (machine, low, high, disjoint) = merge_test_machine();
+
+        // Operand 0 wants `low`, operand 1 wants the stack, operand 2 wants
+        // `high`.
+        let siblings = |i: usize| -> OperandConstraint {
+            match i {
+                0 => OperandConstraint::Reg(low),
+                1 => OperandConstraint::Stack,
+                _ => OperandConstraint::Reg(high),
+            }
+        };
+
+        // Pinning to operand 0 cannot also promise `disjoint`: operand 0's class
+        // is `low`, which is wider, so the allocator could satisfy the reuse by
+        // picking a register outside `disjoint`. `Reuse(0)` has nowhere to record
+        // the extra narrowing, so there is no merged constraint to give.
+        assert_eq!(
+            OperandConstraint::Reg(disjoint).merge(
+                &OperandConstraint::Reuse(0),
+                &machine,
+                &siblings
+            ),
+            None,
+        );
+
+        // But `low` narrows operand 0 not at all, so the reuse survives.
+        assert_eq!(
+            OperandConstraint::Reg(low).merge(&OperandConstraint::Reuse(0), &machine, &siblings),
+            Some(OperandConstraint::Reuse(0)),
+        );
+        assert_eq!(
+            OperandConstraint::Reuse(0).merge(&OperandConstraint::Reg(low), &machine, &siblings),
+            Some(OperandConstraint::Reuse(0)),
+        );
+
+        // A register constraint and an operand pinned to the stack cannot both
+        // hold, and vice versa.
+        assert_eq!(
+            OperandConstraint::Reg(low).merge(&OperandConstraint::Reuse(1), &machine, &siblings),
+            None,
+        );
+        assert_eq!(
+            OperandConstraint::Stack.merge(&OperandConstraint::Reuse(1), &machine, &siblings),
+            Some(OperandConstraint::Reuse(1)),
+        );
+        assert_eq!(
+            OperandConstraint::Stack.merge(&OperandConstraint::Reuse(0), &machine, &siblings),
+            None,
+        );
+
+        // "Same place as operand 0" and "same place as operand 2" is a
+        // requirement between two *other* operands, which one constraint cannot
+        // express.
+        assert_eq!(
+            OperandConstraint::Reuse(0).merge(&OperandConstraint::Reuse(2), &machine, &siblings),
+            None,
+        );
+        assert_eq!(
+            OperandConstraint::Reuse(0).merge(&OperandConstraint::Reuse(0), &machine, &siblings),
+            Some(OperandConstraint::Reuse(0)),
+        );
+    }
+
+    /// The algebra `merge`'s callers rely on: it is commutative, idempotent, and
+    /// `Any` is its identity.
+    #[test]
+    fn merge_is_a_commutative_idempotent_meet() {
+        let (machine, low, high, disjoint) = merge_test_machine();
+        let siblings = |i: usize| -> OperandConstraint {
+            match i {
+                0 => OperandConstraint::Reg(low),
+                1 => OperandConstraint::Stack,
+                _ => OperandConstraint::Reg(high),
+            }
+        };
+
+        let constraints = [
+            OperandConstraint::Any,
+            OperandConstraint::Reg(low),
+            OperandConstraint::Reg(high),
+            OperandConstraint::Reg(disjoint),
+            OperandConstraint::Stack,
+            OperandConstraint::Reuse(0),
+            OperandConstraint::Reuse(1),
+            OperandConstraint::Reuse(2),
+        ];
+
+        for a in constraints {
+            assert_eq!(a.merge(&a, &machine, &siblings), Some(a), "{a:?}");
+            assert_eq!(
+                OperandConstraint::Any.merge(&a, &machine, &siblings),
+                Some(a),
+                "{a:?}",
+            );
+            assert_eq!(
+                a.merge(&OperandConstraint::Any, &machine, &siblings),
+                Some(a),
+                "{a:?}",
+            );
+
+            for b in constraints {
+                assert_eq!(
+                    a.merge(&b, &machine, &siblings),
+                    b.merge(&a, &machine, &siblings),
+                    "merging {a:?} and {b:?} must not depend on the order",
+                );
+            }
+        }
+    }
 }

@@ -689,11 +689,11 @@ where
             let point = LivePoint::new(inst, pos);
             for i in (0..input_inst.operands_len()).rev() {
                 let operand = input_inst.operand(i);
-                if operand.pos != pos {
+                if operand.pos() != pos {
                     continue;
                 }
-                let val = output.with_repr(operand.val)?;
-                f(output, point, i, operand.kind, val)?;
+                let val = output.with_repr(operand.val())?;
+                f(output, point, i, operand.kind(), val)?;
             }
         }
     }
@@ -788,8 +788,8 @@ mod tests {
             }
             for (_inst, input_inst) in input_block.insts() {
                 for operand in input_inst.operands() {
-                    if matches!(operand.kind, DefUse::Def) {
-                        defs.insert(operand.val, block);
+                    if operand.kind() == DefUse::Def {
+                        defs.insert(operand.val(), block);
                     }
                 }
             }
@@ -803,8 +803,8 @@ mod tests {
         for (block, input_block) in func.blocks() {
             for (_inst, input_inst) in input_block.insts() {
                 for operand in input_inst.operands() {
-                    if matches!(operand.kind, DefUse::Use) {
-                        uses.entry(operand.val).or_default().insert(block);
+                    if operand.kind() == DefUse::Use {
+                        uses.entry(operand.val()).or_default().insert(block);
                     }
                 }
             }
@@ -844,8 +844,8 @@ mod tests {
         for (_block, input_block) in func.blocks() {
             for (_inst, input_inst) in input_block.insts() {
                 for operand in input_inst.operands() {
-                    if matches!(operand.kind, DefUse::Use) && needed.insert(operand.val) {
-                        worklist.push(operand.val);
+                    if operand.kind() == DefUse::Use && needed.insert(operand.val()) {
+                        worklist.push(operand.val());
                     }
                 }
             }
