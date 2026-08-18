@@ -144,6 +144,11 @@ where
     pub fn values_mut(&mut self) -> core::slice::IterMut<'_, V> {
         self.elems.iter_mut()
     }
+
+    /// Get a slice of the underlying values in this map.
+    pub fn as_slice(&self) -> &[V] {
+        &self.elems
+    }
 }
 
 /// An iterator over key-value pairs in a `PrimaryMap`.

@@ -67,7 +67,8 @@ pub struct Counts {
     pub sccs: Count,
     pub regions: Count,
     pub liveness_iterations: Count,
-    pub live_ranges: Count,
+    pub live_spans: Count,
+    pub uses: Count,
 }
 
 impl Counts {
@@ -76,7 +77,8 @@ impl Counts {
             sccs: Count::new(),
             regions: Count::new(),
             liveness_iterations: Count::new(),
-            live_ranges: Count::new(),
+            live_spans: Count::new(),
+            uses: Count::new(),
         }
     }
 
@@ -85,12 +87,14 @@ impl Counts {
             sccs,
             regions,
             liveness_iterations,
-            live_ranges,
+            live_spans,
+            uses,
         } = self;
         *sccs = Count::new();
         *regions = Count::new();
         *liveness_iterations = Count::new();
-        *live_ranges = Count::new();
+        *live_spans = Count::new();
+        *uses = Count::new();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -98,11 +102,13 @@ impl Counts {
             sccs,
             regions,
             liveness_iterations,
-            live_ranges,
+            live_spans,
+            uses,
         } = self;
         sccs.is_reset()
             && regions.is_reset()
             && liveness_iterations.is_reset()
-            && live_ranges.is_reset()
+            && live_spans.is_reset()
+            && uses.is_reset()
     }
 }

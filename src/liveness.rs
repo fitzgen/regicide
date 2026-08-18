@@ -57,12 +57,16 @@
 //! ultimately results in slower compiles and worse codegen.
 
 use crate::{
+    Inst,
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     dfs::{Dfs, DfsEvent},
-    entity::{Block, Entity as _, EntityRepr, EntitySet, SecondaryMap, Val},
+    entity::{
+        Block, Entity as _, EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap, Val,
+    },
     error::IResult,
-    input::{DefUse, InputBlock, InputFunction, InputInst as _},
+    input::{DefUse, InputBlock, InputFunction, InputInst as _, Position},
+    live_ranges::{LivePoint, SpillWeight, Use, UseData},
     output::OutputInner,
     timing::Timing,
 };
@@ -100,10 +104,37 @@ where
 
     /// Whether we've seen a block during our initial traversal that seeds the
     /// worklist.
-    ///
-    /// TODO: EntitySet<Block<E>>
     seen: EntitySet<Block<E>>,
+
+    /// Scratch for live span construction: where each currently-open span
+    /// ends, exclusive.
+    ///
+    /// An entry is only meaningful while `live` holds its value; stale entries
+    /// left behind by an earlier block are never read.
+    span_end: SecondaryMap<Val<E>, Option<LivePoint<E>>>,
+
+    /// Scratch for live span construction: the uses of values whose spans are
+    /// still open, each chained to the next-later use of the same value.
+    ///
+    /// The walk runs backwards and pushes at the head, so a chain reads out
+    /// head-to-tail in ascending program order for free. That is what lets each
+    /// span's uses land contiguously in the shared uses map even though
+    /// different values' uses interleave during the walk.
+    pending_uses: Vec<(UseData<E>, u32)>,
+
+    /// Scratch for live span construction: the head of each open value's chain
+    /// within `pending_uses`, or [`NO_PENDING_USE`].
+    ///
+    /// Only meaningful while `live` holds the value.
+    pending_head: SecondaryMap<Val<E>, u32>,
+
+    /// The spans finished for the block most recently walked, waiting to be
+    /// yielded by a [`BlockSpans`].
+    finished: Vec<(LivePoint<E>, LivePoint<E>, Val<E>, EntityRange<Use<E>>)>,
 }
+
+/// The sentinel that terminates a chain in `Liveness::pending_uses`.
+const NO_PENDING_USE: u32 = u32::MAX;
 
 impl<E> Liveness<E>
 where
@@ -119,6 +150,10 @@ where
             worklist: Vec::new(),
             seen: EntitySet::new(),
             on_worklist: EntitySet::new(),
+            span_end: SecondaryMap::new(None),
+            pending_head: SecondaryMap::new(NO_PENDING_USE),
+            pending_uses: Vec::new(),
+            finished: Vec::new(),
         }
     }
 
@@ -132,6 +167,10 @@ where
             worklist,
             seen,
             on_worklist,
+            span_end,
+            pending_uses,
+            pending_head,
+            finished,
         } = self;
         live.clear(arena);
         live_across_edge.clear(arena);
@@ -141,6 +180,10 @@ where
         worklist.clear();
         seen.reset();
         on_worklist.reset();
+        span_end.reset();
+        pending_uses.clear();
+        pending_head.reset();
+        finished.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -153,6 +196,10 @@ where
             worklist,
             seen,
             on_worklist,
+            span_end,
+            pending_uses,
+            pending_head,
+            finished,
         } = self;
         arena.is_reset()
             && live_in.is_reset()
@@ -162,6 +209,10 @@ where
             && worklist.is_empty()
             && seen.is_reset()
             && on_worklist.is_reset()
+            && span_end.is_reset()
+            && pending_uses.is_empty()
+            && pending_head.is_reset()
+            && finished.is_empty()
     }
 
     /// Get the values that are live on entry to `block`.
@@ -276,6 +327,10 @@ where
             worklist,
             seen,
             on_worklist,
+            span_end: _,
+            pending_uses: _,
+            pending_head: _,
+            finished: _,
         } = self;
 
         while let Some(block) = worklist.pop() {
@@ -312,8 +367,231 @@ where
             }
         }
 
+        live.clear(arena);
         Ok(())
     }
+
+    /// Build the live spans of every value that is live anywhere within
+    /// `block`, walking the block backwards from its exit to its entry.
+    ///
+    /// Each finished span's uses are appended to `uses` as the walk goes, and
+    /// the `EntityRange<Use<E>>` in each yielded span indexes into that map.
+    pub fn block_spans<'a>(
+        &'a mut self,
+        func: &impl InputFunction,
+        block: Block<E>,
+        uses: &mut PrimaryMap<Use<E>, UseData<E>>,
+        output: &mut OutputInner<E>,
+    ) -> IResult<BlockSpans<'a, E>> {
+        let Self {
+            arena,
+            live_in: _,
+            live_out,
+            live,
+            live_across_edge: _,
+            worklist: _,
+            seen: _,
+            on_worklist: _,
+            span_end,
+            pending_uses,
+            pending_head,
+            finished,
+        } = self;
+
+        debug_assert!(live.is_empty());
+        debug_assert!(pending_uses.is_empty());
+        debug_assert!(finished.is_empty());
+
+        let (first_inst, last_inst) = block_inst_bounds(&func.block(block.with_repr32()));
+        let first_inst = output.with_repr(first_inst)?;
+        let last_inst = output.with_repr(last_inst)?;
+
+        let block_start = LivePoint::new(first_inst, Position::Early);
+
+        // One past the block's last program point. Validation reserves an
+        // instruction index above the largest that any real instruction may
+        // take, so this is always representable.
+        let block_end = LivePoint::new(last_inst, Position::Late).next_point();
+
+        // Seed the walk with everything live at the block's exit. The
+        // arguments this block passes along its outgoing edges are already in
+        // here, courtesy of `transfer_edges`, which is why they need no `Use`
+        // record of their own: their spans reach the block's end regardless.
+        live.union_with(arena, &live_out[block]);
+        for val in live.iter(arena) {
+            span_end[*val] = Some(block_end);
+            pending_head[*val] = NO_PENDING_USE;
+        }
+
+        for_each_operand_rev(
+            &func.block(block.with_repr32()),
+            output,
+            |output, point, i, kind, val| {
+                let use_data = UseData::new(point, i, SpillWeight::new(0.0));
+                match kind {
+                    DefUse::Def if live.remove(arena, &val) => {
+                        // The value is live after this instruction, so its span
+                        // starts here and runs to wherever the backwards walk last
+                        // saw it.
+                        let end = span_end[val].unwrap();
+                        push_pending_use(pending_uses, pending_head, val, use_data);
+                        let span_uses =
+                            flush_pending_uses(pending_uses, pending_head, val, uses, output)?;
+                        finished.push((point, end, val, span_uses));
+                    }
+                    DefUse::Def => {
+                        // A dead def. The instruction may still have side effects,
+                        // so it stays in the program, and it generally must write
+                        // its result *somewhere* even though nothing reads it.
+                        // Giving it a span through the end of its instruction
+                        // reserves a register that nothing else may claim there.
+                        let end = LivePoint::new(point.inst(), Position::Late).next_point();
+                        pending_head[val] = NO_PENDING_USE;
+                        push_pending_use(pending_uses, pending_head, val, use_data);
+                        let span_uses =
+                            flush_pending_uses(pending_uses, pending_head, val, uses, output)?;
+                        finished.push((point, end, val, span_uses));
+                    }
+                    DefUse::Use => {
+                        if live.insert(arena, val) {
+                            // The first use the backwards walk has seen, so it
+                            // is the last one in program order, and the span
+                            // ends just after it.
+                            span_end[val] = Some(point.next_point());
+                            pending_head[val] = NO_PENDING_USE;
+                        }
+                        push_pending_use(pending_uses, pending_head, val, use_data);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+
+        // Whatever is still live once the walk reaches the block's entry is
+        // live-in, and its span reaches back to the first instruction. This
+        // handles a live block parameter with no special case of its own: a
+        // parameter is defined on the incoming edge, which is exactly the
+        // block's start.
+        //
+        // A *dead* block parameter, on the other hand, gets no span at all,
+        // unlike the dead instruction def above. A parameter is only the
+        // destination of a move along an edge, and `transfer_edges` already
+        // keeps an argument live only when the parameter it feeds is live-in,
+        // so a dead parameter generates no move and needs no register.
+        for val in live.iter(arena) {
+            let end = span_end[*val].unwrap();
+            let span_uses = flush_pending_uses(pending_uses, pending_head, *val, uses, output)?;
+            finished.push((block_start, end, *val, span_uses));
+        }
+        live.clear(arena);
+        pending_uses.clear();
+
+        if cfg!(debug_assertions) {
+            for (start, end, ..) in finished.iter() {
+                debug_assert!(start < end, "every span must cover at least one point");
+                debug_assert!(*start >= block_start);
+                debug_assert!(*end <= block_end);
+            }
+        }
+
+        Ok(BlockSpans {
+            liveness: self,
+            index: 0,
+        })
+    }
+}
+
+/// An iterator over the live spans of a single block, as built by
+/// [`Liveness::block_spans`].
+pub struct BlockSpans<'a, E>
+where
+    E: EntityRepr,
+{
+    liveness: &'a mut Liveness<E>,
+
+    /// How many of `self.liveness.finished`'s spans have been yielded already.
+    index: usize,
+}
+
+impl<E> Drop for BlockSpans<'_, E>
+where
+    E: EntityRepr,
+{
+    fn drop(&mut self) {
+        // Leave the scratch empty whether or not this iterator was drained, so
+        // that the next block starts clean and `Liveness::is_reset` stays
+        // honest.
+        self.liveness.finished.clear();
+        self.liveness.pending_uses.clear();
+    }
+}
+
+impl<E> Iterator for BlockSpans<'_, E>
+where
+    E: EntityRepr,
+{
+    /// A single live span, its value, and its uses: `(start, end, val, uses)`.
+    type Item = (LivePoint<E>, LivePoint<E>, Val<E>, EntityRange<Use<E>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let span = *self.liveness.finished.get(self.index)?;
+        self.index += 1;
+        Some(span)
+    }
+}
+
+impl<E> ExactSizeIterator for BlockSpans<'_, E>
+where
+    E: EntityRepr,
+{
+    fn len(&self) -> usize {
+        self.liveness.finished.len() - self.index
+    }
+}
+
+/// Push `use_data` onto the head of `val`'s chain of pending uses.
+fn push_pending_use<E>(
+    pending_uses: &mut Vec<(UseData<E>, u32)>,
+    pending_head: &mut SecondaryMap<Val<E>, u32>,
+    val: Val<E>,
+    use_data: UseData<E>,
+) where
+    E: EntityRepr,
+{
+    let index = u32::try_from(pending_uses.len()).unwrap();
+    debug_assert_ne!(index, NO_PENDING_USE);
+    pending_uses.push((use_data, pending_head[val]));
+    pending_head[val] = index;
+}
+
+/// Move `val`'s chain of pending uses into the shared `uses` map, and return
+/// the contiguous range they landed in.
+fn flush_pending_uses<E>(
+    pending_uses: &[(UseData<E>, u32)],
+    pending_head: &mut SecondaryMap<Val<E>, u32>,
+    val: Val<E>,
+    uses: &mut PrimaryMap<Use<E>, UseData<E>>,
+    output: &mut OutputInner<E>,
+) -> IResult<EntityRange<Use<E>>>
+where
+    E: EntityRepr,
+{
+    let start = uses.next_key(output)?;
+    let mut index = core::mem::replace(&mut pending_head[val], NO_PENDING_USE);
+    while index != NO_PENDING_USE {
+        let (use_data, next) = pending_uses[usize::try_from(index).unwrap()];
+        uses.push(output, use_data)?;
+        index = next;
+    }
+    let end = uses.next_key(output)?;
+
+    // The chain was already in ascending program order.
+    debug_assert!(
+        uses.as_slice()[start.index()..end.index()]
+            .is_sorted_by(|a, b| (a.point(), a.operand()) < (b.point(), b.operand())),
+    );
+
+    Ok(EntityRange { start, end })
 }
 
 /// Compute `live_out` for the block that `input_block` describes, from its
@@ -363,6 +641,66 @@ where
     Ok(())
 }
 
+fn block_inst_bounds<'a>(input_block: &impl InputBlock<'a>) -> (Inst, Inst) {
+    let mut insts = input_block.insts();
+
+    let first = insts
+        .next()
+        .expect("always have at least one instruction in a block: its terminator")
+        .0;
+
+    let last = match insts.next_back() {
+        Some((inst, _)) => inst,
+        None => first,
+    };
+
+    (first, last)
+}
+
+/// Visit `input_block`'s operands in reverse program order, walking from the
+/// block's exit towards its entry.
+///
+/// The callback receives each operand's program point, its index within its
+/// instruction, its kind, and its value.
+///
+/// This is the single definition of what a block's instructions do to the live
+/// set. Both the dataflow (`transfer_insts`) and live span construction
+/// (`Liveness::block_spans`) are written on top of it, so neither can drift
+/// from the other.
+///
+/// Within an instruction, `Late` operands are visited before `Early` ones, so
+/// that a value used late and defined early is seen in the order a backwards
+/// walk expects. Across instructions, later instructions come first. Operands
+/// sharing a slot are visited in descending index order, which is the same
+/// reversal applied one level down: the liveness dataflow does not care, but it
+/// keeps the uses that live span construction chains up in ascending order.
+fn for_each_operand_rev<'a, E, F>(
+    input_block: &impl InputBlock<'a>,
+    output: &mut OutputInner<E>,
+    mut f: F,
+) -> IResult<()>
+where
+    E: EntityRepr,
+    F: FnMut(&mut OutputInner<E>, LivePoint<E>, usize, DefUse, Val<E>) -> IResult<()>,
+{
+    for (inst, input_inst) in input_block.insts().rev() {
+        let inst = output.with_repr(inst)?;
+        for pos in [Position::Late, Position::Early] {
+            let point = LivePoint::new(inst, pos);
+            for i in (0..input_inst.operands_len()).rev() {
+                let operand = input_inst.operand(i);
+                if operand.pos != pos {
+                    continue;
+                }
+                let val = output.with_repr(operand.val)?;
+                f(output, point, i, operand.kind, val)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Walk `input_block`'s instructions backwards, removing defs and adding uses.
 fn transfer_insts<'a, E>(
     input_block: &impl InputBlock<'a>,
@@ -373,23 +711,19 @@ fn transfer_insts<'a, E>(
 where
     E: EntityRepr,
 {
-    for (_inst, input_inst) in input_block.insts().rev() {
+    for_each_operand_rev(input_block, output, |_output, _point, _i, kind, val| {
         // Note that we don't need to worry about the order of adding uses
         // vs. removing defs here because the input is in SSA.
-        for operand in input_inst.operands() {
-            let val = output.with_repr(operand.val)?;
-            match operand.kind {
-                DefUse::Def => {
-                    live.remove(arena, &val);
-                }
-                DefUse::Use => {
-                    live.insert(arena, val);
-                }
+        match kind {
+            DefUse::Def => {
+                live.remove(arena, &val);
+            }
+            DefUse::Use => {
+                live.insert(arena, val);
             }
         }
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

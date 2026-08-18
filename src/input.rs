@@ -71,7 +71,7 @@ where
 }
 
 /// TODO FITZGEN
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
 #[repr(u8)]
 pub enum Position {
@@ -81,14 +81,14 @@ pub enum Position {
     Late = 1,
 }
 
-/// TODO FITZGEN
-#[derive(Clone, Debug, Hash)]
+/// A definition or use of an associated value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
 #[repr(u8)]
 pub enum DefUse {
-    /// TODO FITZGEN
+    /// A definition.
     Def = 0,
-    /// TODO FITZGEN
+    /// A use.
     Use = 1,
 }
 

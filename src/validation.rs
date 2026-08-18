@@ -186,7 +186,7 @@ where
                 // last one has the largest index in the block. Checking it here
                 // is what lets `LivePoint::new` pack an index and a position
                 // together without a fallible conversion.
-                if run.1.index() > MAX_INST_INDEX {
+                if run.1.index() >= MAX_INST_INDEX {
                     return output.error(Error::TooManyInsts { inst: run.1 });
                 }
                 runs.push((run.0, run.1, block));

@@ -51,7 +51,7 @@ pub mod checker;
 pub mod test;
 
 pub use context::Context;
-pub use entity::{Block, Entity, EntityRepr, SpillSlot, Val};
+pub use entity::{Block, Entity, EntityRepr, Inst, SpillSlot, Val};
 pub use error::{Error, Result};
 pub use input::{Input, InputBlock, InputFunction, InputInst, Operand, RematCost};
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
@@ -112,7 +112,7 @@ where
     E: EntityRepr,
 {
     input.func.len_values() <= Val::<E>::MAX_REPRESENTABLE.index() + 1
-        && input.func.len_insts() <= max_representable_inst_index::<E>() + 1
+        && input.func.len_insts() <= max_representable_inst_index::<E>()
 }
 
 fn max_representable_inst_index<E>() -> usize
@@ -155,9 +155,13 @@ where
     context
         .liveness
         .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
-    context
-        .live_ranges
-        .construct(input.func, &context.region_tree, &context.liveness)?;
+    context.live_ranges.construct(
+        input.func,
+        &mut context.counts,
+        &context.region_tree,
+        &mut context.liveness,
+        output,
+    )?;
 
     partial_allocation::partial_allocate(context, input.func)?;
     region_allocation::region_allocate(context, input.func)?;

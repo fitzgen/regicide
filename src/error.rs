@@ -381,7 +381,7 @@ impl fmt::Debug for Error {
                 write!(
                     f,
                     "too many instructions: {inst:?}'s index exceeds the maximum of {}",
-                    crate::live_ranges::MAX_INST_INDEX
+                    crate::live_ranges::MAX_INST_INDEX - 1
                 )
             }
             Self::FmtError(e) => fmt::Debug::fmt(e, f),
