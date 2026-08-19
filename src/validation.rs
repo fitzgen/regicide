@@ -188,6 +188,12 @@ fn check_block_references<'a>(
 /// Check that every block has at least one instruction, that each block's
 /// instructions are numbered contiguously, that no instruction appears in more
 /// than one block, and that no instruction index is out of range.
+///
+/// Together these make each block's instructions a run, and the runs a
+/// partition of `0..func.len_insts()`, which is what makes
+/// [`InputFunction::inst`] well-defined at every index it accepts. Since this
+/// is the pass that walks every instruction of every block, it is also where
+/// each instruction is checked against the block it says it lies within.
 fn validate_insts<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
 where
     E: EntityRepr,
@@ -196,7 +202,7 @@ where
     let mut runs = Vec::new();
 
     for (block, _) in func.blocks() {
-        match inst_run(&func.block(block)) {
+        match inst_run(func, &func.block(block), block) {
             Ok(Some(run)) => {
                 // A block's instructions are contiguous and ascending, so its
                 // last one has the largest index in the block. Checking it here
@@ -210,7 +216,7 @@ where
             // A block with no instructions has no terminator, and so no way to
             // leave it.
             Ok(None) => return output.error(Error::BlockWithoutTerminator { block }),
-            Err(inst) => return output.error(Error::NonContiguousInsts { block, inst }),
+            Err(e) => return output.error(e),
         }
     }
 
@@ -226,22 +232,84 @@ where
         }
     }
 
+    // The runs are now known to be sorted, disjoint, and within
+    // `0..func.len_insts()`, so the only way left for them to miss part of that
+    // index space is a gap between two of them, or after the last one. Every
+    // index in the space must belong to some block, since that is the block
+    // that `InputInst::block` has to name and the block whose instruction list
+    // every pass walks to reach the instruction.
+    //
+    // Every index reported below is at most one past an instruction that some
+    // block reports, and every one of those is below `MAX_INST_INDEX`, so the
+    // conversions cannot fail.
+    let mut next = 0;
+    for &(first, last, _) in &runs {
+        if first.index() > next {
+            return output.error(Error::InstInNoBlock {
+                inst: Inst::try_new(next).unwrap(),
+            });
+        }
+        next = last.index() + 1;
+    }
+    if next < func.len_insts() {
+        return output.error(Error::InstInNoBlock {
+            inst: Inst::try_new(next).unwrap(),
+        });
+    }
+
     Ok(())
 }
 
 /// Get the first and last instruction of `input_block`, or `None` if it has no
 /// instructions.
-fn inst_run<'a>(input_block: &impl InputBlock<'a>) -> Result<Option<(Inst, Inst)>, Inst> {
+///
+/// This is the only walk over every instruction of every block, so it also
+/// checks each one as it goes: that the block's instructions are numbered
+/// contiguously, that each of them is an instruction the function declares, and
+/// that the two ways of reaching an instruction agree about which block it lies
+/// within and about what it is.
+fn inst_run<'a>(
+    func: &impl InputFunction,
+    input_block: &impl InputBlock<'a>,
+    block: Block,
+) -> Result<Option<(Inst, Inst)>, Error> {
     let mut first = None;
     let mut previous: Option<Inst> = None;
 
-    for (inst, _input_inst) in input_block.insts() {
+    for (inst, input_inst) in input_block.insts() {
         match previous {
             None => first = Some(inst),
-            Some(previous) if inst.index() != previous.index() + 1 => return Err(inst),
+            Some(previous) if inst.index() != previous.index() + 1 => {
+                return Err(Error::NonContiguousInsts { block, inst });
+            }
             Some(_) => {}
         }
         previous = Some(inst);
+
+        // Looking an instruction up is only defined within the index space that
+        // the function declares, so this bounds check comes before the lookup
+        // below.
+        if inst.index() >= func.len_insts() {
+            return Err(Error::InstOutOfBounds { inst });
+        }
+
+        if input_inst.block() != block {
+            return Err(Error::InvalidInstBlock {
+                inst,
+                block: input_inst.block(),
+            });
+        }
+
+        // The allocator reaches an instruction both by walking its block and by
+        // looking it up by index, so the two have to describe the same
+        // instruction.
+        let looked_up = func.inst(inst);
+        if looked_up.block() != block
+            || looked_up.operands_len() != input_inst.operands_len()
+            || looked_up.operands().ne(input_inst.operands())
+        {
+            return Err(Error::InconsistentInst { inst });
+        }
     }
 
     Ok(first.map(|first| (first, previous.unwrap())))

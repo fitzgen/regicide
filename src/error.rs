@@ -64,6 +64,13 @@ pub enum Error {
         block: Block,
     },
 
+    /// A reference to an instruction outside of the function's instruction
+    /// index space.
+    InstOutOfBounds {
+        /// The out-of-bounds [`Inst`].
+        inst: Inst,
+    },
+
     /// A block is not reachable from the function's entry block.
     UnreachableBlock {
         /// The unreachable [`Block`].
@@ -95,6 +102,30 @@ pub enum Error {
     /// An instruction appears in more than one block.
     InstInMultipleBlocks {
         /// An [`Inst`] that appears in more than one block.
+        inst: Inst,
+    },
+
+    /// An instruction that the function declares does not appear in any block.
+    InstInNoBlock {
+        /// An [`Inst`] within the function's instruction index space that no
+        /// block contains.
+        inst: Inst,
+    },
+
+    /// An instruction reports that it lies within a block other than the one
+    /// whose instructions contain it.
+    InvalidInstBlock {
+        /// The [`Inst`] that reported the wrong block.
+        inst: Inst,
+
+        /// The [`Block`] that the instruction claims to lie within.
+        block: Block,
+    },
+
+    /// Looking an instruction up by index gave a different instruction than
+    /// iterating over its block did.
+    InconsistentInst {
+        /// The [`Inst`] whose two access paths disagree.
         inst: Inst,
     },
 
@@ -309,6 +340,10 @@ impl fmt::Debug for Error {
             Self::BlockOutOfBounds { block } => {
                 write!(f, "{block:?} is outside the function's block index space")
             }
+            Self::InstOutOfBounds { inst } => write!(
+                f,
+                "{inst:?} is outside the function's instruction index space"
+            ),
             Self::UnreachableBlock { block } => {
                 write!(f, "{block:?} is not reachable from the entry block")
             }
@@ -329,6 +364,18 @@ impl fmt::Debug for Error {
             Self::InstInMultipleBlocks { inst } => {
                 write!(f, "{inst:?} appears in more than one block")
             }
+            Self::InstInNoBlock { inst } => {
+                write!(f, "{inst:?} does not appear in any block")
+            }
+            Self::InvalidInstBlock { inst, block } => write!(
+                f,
+                "{inst:?} reports that it lies within {block:?}, which is not the block \
+                 whose instructions contain it"
+            ),
+            Self::InconsistentInst { inst } => write!(
+                f,
+                "`InputFunction::inst` disagrees with `InputBlock::insts` about {inst:?}"
+            ),
             Self::InvalidPredecessors { block } => write!(
                 f,
                 "{block:?}'s predecessors are not the reverse of the successor edges"

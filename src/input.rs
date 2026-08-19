@@ -396,14 +396,17 @@ pub trait InputFunction {
     /// TODO: expand this
     fn remat_cost(&self, val: Val) -> Option<RematCost>;
 
+    /// The number of instructions defined in this function.
+    fn len_insts(&self) -> usize;
+
+    /// Get the given input instruction.
+    fn inst(&self, inst: Inst) -> Self::InputInst<'_>;
+
     /// The function's entry block.
     fn entry_block(&self) -> Block;
 
     /// The number of basic blocks defined in this function.
     fn len_blocks(&self) -> usize;
-
-    /// The number of instructions defined in this function.
-    fn len_insts(&self) -> usize;
 
     /// Get the given input block.
     fn block(&self, block: Block) -> Self::InputBlock<'_>;
@@ -600,6 +603,9 @@ pub trait InputInst<'a> {
 
     /// TODO FITZGEN
     fn clobbers(&self) -> RegSet;
+
+    /// Get the block that this instruction lies within.
+    fn block(&self) -> Block;
 }
 
 /// The cost of rematerializing a value, rather than shuffling it between

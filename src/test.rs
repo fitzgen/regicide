@@ -336,6 +336,7 @@ pub struct TestFunction {
     blocks: PrimaryMap<Block, BlockData>,
     insts: PrimaryMap<Inst, InstData>,
     predecessors: SecondaryMap<Block, Vec<Block>>,
+    inst_blocks: SecondaryMap<Inst, Option<Block>>,
     dominators: DominatorTree,
 }
 
@@ -347,6 +348,7 @@ impl Default for TestFunction {
             blocks: PrimaryMap::default(),
             insts: PrimaryMap::default(),
             predecessors: SecondaryMap::new(Vec::new()),
+            inst_blocks: SecondaryMap::new(None),
             dominators: DominatorTree::default(),
         };
         func.fixup();
@@ -402,6 +404,7 @@ impl Generate<TestFunction> for TestFunctionMutator {
             insts: <PrimaryMap<Inst, InstData> as DefaultMutate>::DefaultMutate::default()
                 .generate(context)?,
             predecessors: SecondaryMap::new(Vec::new()),
+            inst_blocks: SecondaryMap::new(None),
             dominators: DominatorTree::default(),
         };
         func.fixup();
@@ -443,7 +446,7 @@ impl TestFunction {
     pub fn fixup(&mut self) {
         let mut output = OutputInner::<u32>::new();
         self.ensure_non_empty(&mut output);
-        let (old_to_new, old_insts) = self.ensure_unique_insts_in_layout(&mut output);
+        self.ensure_unique_insts_in_layout(&mut output);
         self.ensure_terminators();
         self.ensure_all_blocks_are_reachable(&mut output);
         self.fixup_predecessors();
@@ -516,7 +519,8 @@ impl TestFunction {
     /// instructions as needed, and dropping instructions that aren't in the
     /// layout.
     ///
-    /// Returns a map from old `Inst`s to new `Inst`s.
+    /// Returns a map from old `Inst`s to new `Inst`s and the old `PrimaryMap`
+    /// of `Inst`s.
     fn ensure_unique_insts_in_layout(
         &mut self,
         output: &mut OutputInner<u32>,
@@ -531,7 +535,7 @@ impl TestFunction {
             self.insts.push(output, InstData::default()).unwrap();
         }
 
-        for (_block, block_data) in self.blocks.iter_mut() {
+        for (block, block_data) in self.blocks.iter_mut() {
             for inst in &mut block_data.insts {
                 let clamped_inst = Inst::<u32>::try_new(inst.index() % self.insts.len()).unwrap();
                 let cloned_inst = self.insts[clamped_inst].clone();
@@ -543,6 +547,7 @@ impl TestFunction {
                     }
                 };
                 *inst = new_inst;
+                self.inst_blocks[new_inst] = Some(block);
             }
         }
 
@@ -997,6 +1002,10 @@ impl InputFunction for TestFunction {
         self.insts.len()
     }
 
+    fn inst(&self, inst: Inst) -> Self::InputInst<'_> {
+        TestInst { func: self, inst }
+    }
+
     type ValuesIter<'a>
         = PrimaryMapKeys<Val>
     where
@@ -1193,12 +1202,20 @@ impl<'a> InputInst<'a> for TestInst<'a> {
     fn clobbers(&self) -> crate::RegSet {
         todo!()
     }
+
+    fn block(&self) -> Block {
+        self.func.inst_blocks[self.inst]
+            .expect("should have been inserted by `ensure_unique_insts_in_layout`")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validation;
+    use crate::{
+        error::{Error, InternalError},
+        validation,
+    };
     use mutatis::check::{Check, CheckResult};
     use std::{format, string::String};
 
@@ -1276,5 +1293,240 @@ mod tests {
         Check::new()
             .iters(10_000)
             .run(|func: &TestFunction| check_ssa(func))
+    }
+
+    /// Build a valid function of `num_blocks` blocks with `insts_per_block`
+    /// instructions each, for the checks below to break in specific ways.
+    ///
+    /// `fixup` is what makes it valid; this only has to hand it a layout of the
+    /// requested shape to lay out, since `ensure_unique_insts_in_layout` clones
+    /// an instruction for every slot in the layout.
+    fn valid_func(num_blocks: usize, insts_per_block: usize) -> TestFunction {
+        assert!(num_blocks > 0);
+        assert!(insts_per_block > 0);
+
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+        func.blocks = PrimaryMap::new();
+        for _ in 0..num_blocks {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts: vec![Inst::try_new(0).unwrap(); insts_per_block],
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+        func.fixup();
+
+        assert_eq!(func.len_blocks(), num_blocks);
+        assert_eq!(func.len_insts(), num_blocks * insts_per_block);
+        assert_eq!(check_ssa(&func), Ok(()));
+        func
+    }
+
+    /// Validate `func` and return the error that it is rejected with.
+    fn expect_invalid(func: &impl InputFunction) -> Error {
+        let mut output = OutputInner::<u32>::new();
+        assert!(
+            validation::validate(func, &mut output).is_err(),
+            "expected validation to reject this function",
+        );
+        match output.take_error() {
+            InternalError::Error(e) => e,
+            InternalError::EntityReprTooSmall => {
+                panic!("validation does not report a too-small entity representation")
+            }
+        }
+    }
+
+    /// Assert that validation rejects `$func` with an error matching
+    /// `$pattern`. `Error` is not `PartialEq`, so this matches rather than
+    /// compares, and reports what it got when the match fails.
+    macro_rules! assert_invalid {
+        ( $func:expr, $pattern:pat $( if $guard:expr )? $(,)? ) => {{
+            let actual = expect_invalid($func);
+            assert!(
+                matches!(actual, $pattern $( if $guard )?),
+                "expected `{}`, got {actual:?}",
+                stringify!($pattern),
+            );
+        }};
+    }
+
+    #[test]
+    fn every_instruction_reports_the_block_it_lies_within() {
+        let func = valid_func(3, 2);
+        for (block, block_data) in func.blocks.iter() {
+            // Both ways of reaching an instruction agree about its block: the
+            // one that walks a block's layout, and the one that looks the
+            // instruction up by index.
+            for (inst, input_inst) in func.block(block).insts() {
+                assert_eq!(input_inst.block(), block);
+                assert_eq!(func.inst(inst).block(), block);
+            }
+            assert_eq!(
+                block_data.insts.len(),
+                func.block(block).insts().count(),
+                "{block:?}'s layout is what `insts` walks",
+            );
+        }
+    }
+
+    #[test]
+    fn reject_an_instruction_that_names_the_wrong_block() {
+        let mut func = valid_func(2, 1);
+        let block = Block::try_new(1).unwrap();
+        let inst = func.blocks[Block::try_new(0).unwrap()].insts[0];
+
+        func.inst_blocks[inst] = Some(block);
+
+        assert_invalid!(
+            &func,
+            Error::InvalidInstBlock { inst: i, block: b } if i == inst && b == block,
+        );
+    }
+
+    #[test]
+    fn reject_an_instruction_that_no_block_contains() {
+        let mut func = valid_func(1, 2);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts.pop().unwrap();
+
+        // The instruction is still one that the function declares, so
+        // `InputFunction::inst` still hands it out; it is just no longer in any
+        // block's layout.
+        assert_eq!(func.len_insts(), 2);
+
+        assert_invalid!(&func, Error::InstInNoBlock { inst: i } if i == inst);
+    }
+
+    #[test]
+    fn reject_an_instruction_outside_the_index_space() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+
+        // One past the last instruction the function declares, and contiguous
+        // with the block's existing instruction, so that it is the index space
+        // check that rejects it and not the contiguity check.
+        let inst = Inst::try_new(func.len_insts()).unwrap();
+        func.blocks[block].insts.push(inst);
+
+        assert_invalid!(&func, Error::InstOutOfBounds { inst: i } if i == inst);
+    }
+
+    /// An input function that delegates to a `TestFunction`, except that asking
+    /// it for one particular instruction gives a different one, so that the two
+    /// ways of reaching an instruction disagree.
+    struct LyingLookup<'f> {
+        func: &'f TestFunction,
+        lie_about: Inst,
+        lie_with: Inst,
+    }
+
+    impl InputFunction for LyingLookup<'_> {
+        type InputBlock<'a>
+            = TestBlock<'a>
+        where
+            Self: 'a;
+
+        type InputInst<'a>
+            = TestInst<'a>
+        where
+            Self: 'a;
+
+        fn len_values(&self) -> usize {
+            self.func.len_values()
+        }
+
+        fn len_insts(&self) -> usize {
+            self.func.len_insts()
+        }
+
+        fn inst(&self, inst: Inst) -> Self::InputInst<'_> {
+            self.func.inst(if inst == self.lie_about {
+                self.lie_with
+            } else {
+                inst
+            })
+        }
+
+        type ValuesIter<'a>
+            = PrimaryMapKeys<Val>
+        where
+            Self: 'a;
+
+        fn values(&self) -> Self::ValuesIter<'_> {
+            self.func.values()
+        }
+
+        fn remat_cost(&self, val: Val) -> Option<crate::RematCost> {
+            self.func.remat_cost(val)
+        }
+
+        fn entry_block(&self) -> Block {
+            self.func.entry_block()
+        }
+
+        fn len_blocks(&self) -> usize {
+            self.func.len_blocks()
+        }
+
+        fn block(&self, block: Block) -> Self::InputBlock<'_> {
+            self.func.block(block)
+        }
+
+        type BlocksIter<'a>
+            = TestBlocksIter<'a>
+        where
+            Self: 'a;
+
+        fn blocks(&self) -> Self::BlocksIter<'_> {
+            self.func.blocks()
+        }
+    }
+
+    #[test]
+    fn reject_a_lookup_that_gives_an_instruction_from_another_block() {
+        let func = valid_func(2, 1);
+        let lie_about = func.blocks[Block::try_new(0).unwrap()].insts[0];
+        let lie_with = func.blocks[Block::try_new(1).unwrap()].insts[0];
+
+        let lying = LyingLookup {
+            func: &func,
+            lie_about,
+            lie_with,
+        };
+
+        assert_invalid!(&lying, Error::InconsistentInst { inst: i } if i == lie_about);
+    }
+
+    #[test]
+    fn reject_a_lookup_that_gives_another_instruction_from_the_same_block() {
+        let func = valid_func(1, 2);
+        let block = Block::try_new(0).unwrap();
+        let lie_about = func.blocks[block].insts[0];
+        let lie_with = func.blocks[block].insts[1];
+
+        // Both instructions are in the same block, so it is the operands that
+        // have to give the lie away. `ensure_unique_defs` is what makes them
+        // differ, so check that they do rather than let this pass vacuously.
+        assert!(
+            func.inst(lie_about)
+                .operands()
+                .ne(func.inst(lie_with).operands()),
+            "the two instructions must differ for this check to have any teeth",
+        );
+
+        let lying = LyingLookup {
+            func: &func,
+            lie_about,
+            lie_with,
+        };
+
+        assert_invalid!(&lying, Error::InconsistentInst { inst: i } if i == lie_about);
     }
 }
