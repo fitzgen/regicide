@@ -116,32 +116,37 @@ impl OperandConstraint {
     }
 
     /// The constraint that this instruction's `i`th operand imposes.
-    fn resolve(i: usize, sibling: &dyn Fn(usize) -> OperandConstraint) -> Option<Self> {
-        let constraint = sibling(i);
-        debug_assert!(
-            !matches!(constraint, Self::Reuse(_)),
-            "a reuse constraint must not point at another reuse constraint",
-        );
-        match constraint {
-            Self::Reuse(_) => None,
-            constraint => Some(constraint),
+    fn resolve(i: usize, sibling: impl Fn(usize) -> OperandConstraint) -> Self {
+        match sibling(i) {
+            Self::Reuse(_) => {
+                panic!("a reuse constraint may not point at another reuse constraint")
+            }
+            constraint => constraint,
+        }
+    }
+
+    /// This constraint with any `Reuse` replaced by the constraint on the
+    /// operand that `Reuse` names.
+    pub(crate) fn resolved(self, sibling: impl Fn(usize) -> OperandConstraint) -> Self {
+        match self {
+            Self::Reuse(i) => Self::resolve(i, sibling),
+            constraint => constraint,
         }
     }
 
     /// The weakest constraint that satisfies both `self` and `other`, or `None`
     /// when nothing satisfies both.
     ///
-    /// `sibling` gives the constraint on the `i`th operand of the instruction
-    /// that both of these constraints belong to, which is what a `Reuse` names.
+    /// `self_sibling` gives the constraint on the `i`th operand of the instruction
+    /// that `self` belongs to; `other_sibling` does the same for `other`.
     ///
-    /// This is commutative: merging in either order gives the same answer,
-    /// which is why [`Machine::intersect_classes`] is a symmetric table.
-    #[allow(dead_code, reason = "will need it")]
+    /// This is commutative: merging in either order gives the same answer.
     pub(crate) fn merge(
         &self,
         other: &Self,
         machine: &Machine,
-        sibling: &dyn Fn(usize) -> OperandConstraint,
+        self_sibling: impl Fn(usize) -> OperandConstraint,
+        other_sibling: impl Fn(usize) -> OperandConstraint,
     ) -> Option<Self> {
         match (self, other) {
             (Self::Any, other) | (other, Self::Any) => Some(*other),
@@ -152,21 +157,25 @@ impl OperandConstraint {
 
             (Self::Reg(_), Self::Stack) | (Self::Stack, Self::Reg(_)) => None,
 
-            (Self::Reg(rc), Self::Reuse(i)) | (Self::Reuse(i), Self::Reg(rc)) => {
-                match Self::resolve(*i, sibling)? {
-                    Self::Reg(target) if *rc == target => Some(Self::Reuse(*i)),
-                    _ => None,
-                }
-            }
+            (Self::Reg(rc), Self::Reuse(i)) => match Self::resolve(*i, other_sibling) {
+                Self::Reg(target) if *rc == target => Some(Self::Reuse(*i)),
+                _ => None,
+            },
+            (Self::Reuse(i), Self::Reg(rc)) => match Self::resolve(*i, self_sibling) {
+                Self::Reg(target) if *rc == target => Some(Self::Reuse(*i)),
+                _ => None,
+            },
 
             (Self::Stack, Self::Stack) => Some(Self::Stack),
 
-            (Self::Stack, Self::Reuse(i)) | (Self::Reuse(i), Self::Stack) => {
-                match Self::resolve(*i, sibling)? {
-                    Self::Stack => Some(Self::Reuse(*i)),
-                    _ => None,
-                }
-            }
+            (Self::Stack, Self::Reuse(i)) => match Self::resolve(*i, other_sibling) {
+                Self::Stack => Some(Self::Reuse(*i)),
+                _ => None,
+            },
+            (Self::Reuse(i), Self::Stack) => match Self::resolve(*i, self_sibling) {
+                Self::Stack => Some(Self::Reuse(*i)),
+                _ => None,
+            },
 
             (Self::Reuse(lhs), Self::Reuse(rhs)) => {
                 if lhs == rhs {
@@ -1002,6 +1011,7 @@ mod tests {
             OperandConstraint::Reg(low).merge(
                 &OperandConstraint::Reg(high),
                 &machine,
+                &no_siblings,
                 &no_siblings
             ),
             Some(OperandConstraint::Reg(both)),
@@ -1012,6 +1022,7 @@ mod tests {
             OperandConstraint::Reg(disjoint).merge(
                 &OperandConstraint::Reg(high),
                 &machine,
+                &no_siblings,
                 &no_siblings
             ),
             None,
@@ -1019,11 +1030,21 @@ mod tests {
 
         // A register and the stack are different places.
         assert_eq!(
-            OperandConstraint::Reg(low).merge(&OperandConstraint::Stack, &machine, &no_siblings),
+            OperandConstraint::Reg(low).merge(
+                &OperandConstraint::Stack,
+                &machine,
+                &no_siblings,
+                &no_siblings
+            ),
             None,
         );
         assert_eq!(
-            OperandConstraint::Stack.merge(&OperandConstraint::Stack, &machine, &no_siblings),
+            OperandConstraint::Stack.merge(
+                &OperandConstraint::Stack,
+                &machine,
+                &no_siblings,
+                &no_siblings
+            ),
             Some(OperandConstraint::Stack),
         );
     }
@@ -1052,33 +1073,59 @@ mod tests {
             OperandConstraint::Reg(disjoint).merge(
                 &OperandConstraint::Reuse(0),
                 &machine,
-                &siblings
+                &siblings,
+                &siblings,
             ),
             None,
         );
 
         // But `low` narrows operand 0 not at all, so the reuse survives.
         assert_eq!(
-            OperandConstraint::Reg(low).merge(&OperandConstraint::Reuse(0), &machine, &siblings),
+            OperandConstraint::Reg(low).merge(
+                &OperandConstraint::Reuse(0),
+                &machine,
+                &siblings,
+                &siblings,
+            ),
             Some(OperandConstraint::Reuse(0)),
         );
         assert_eq!(
-            OperandConstraint::Reuse(0).merge(&OperandConstraint::Reg(low), &machine, &siblings),
+            OperandConstraint::Reuse(0).merge(
+                &OperandConstraint::Reg(low),
+                &machine,
+                &siblings,
+                &siblings,
+            ),
             Some(OperandConstraint::Reuse(0)),
         );
 
         // A register constraint and an operand pinned to the stack cannot both
         // hold, and vice versa.
         assert_eq!(
-            OperandConstraint::Reg(low).merge(&OperandConstraint::Reuse(1), &machine, &siblings),
+            OperandConstraint::Reg(low).merge(
+                &OperandConstraint::Reuse(1),
+                &machine,
+                &siblings,
+                &siblings
+            ),
             None,
         );
         assert_eq!(
-            OperandConstraint::Stack.merge(&OperandConstraint::Reuse(1), &machine, &siblings),
+            OperandConstraint::Stack.merge(
+                &OperandConstraint::Reuse(1),
+                &machine,
+                &siblings,
+                &siblings
+            ),
             Some(OperandConstraint::Reuse(1)),
         );
         assert_eq!(
-            OperandConstraint::Stack.merge(&OperandConstraint::Reuse(0), &machine, &siblings),
+            OperandConstraint::Stack.merge(
+                &OperandConstraint::Reuse(0),
+                &machine,
+                &siblings,
+                &siblings
+            ),
             None,
         );
 
@@ -1086,11 +1133,21 @@ mod tests {
         // requirement between two *other* operands, which one constraint cannot
         // express.
         assert_eq!(
-            OperandConstraint::Reuse(0).merge(&OperandConstraint::Reuse(2), &machine, &siblings),
+            OperandConstraint::Reuse(0).merge(
+                &OperandConstraint::Reuse(2),
+                &machine,
+                &siblings,
+                &siblings
+            ),
             None,
         );
         assert_eq!(
-            OperandConstraint::Reuse(0).merge(&OperandConstraint::Reuse(0), &machine, &siblings),
+            OperandConstraint::Reuse(0).merge(
+                &OperandConstraint::Reuse(0),
+                &machine,
+                &siblings,
+                &siblings
+            ),
             Some(OperandConstraint::Reuse(0)),
         );
     }
@@ -1120,22 +1177,26 @@ mod tests {
         ];
 
         for a in constraints {
-            assert_eq!(a.merge(&a, &machine, &siblings), Some(a), "{a:?}");
             assert_eq!(
-                OperandConstraint::Any.merge(&a, &machine, &siblings),
+                a.merge(&a, &machine, &siblings, &siblings),
+                Some(a),
+                "{a:?}"
+            );
+            assert_eq!(
+                OperandConstraint::Any.merge(&a, &machine, &siblings, &siblings),
                 Some(a),
                 "{a:?}",
             );
             assert_eq!(
-                a.merge(&OperandConstraint::Any, &machine, &siblings),
+                a.merge(&OperandConstraint::Any, &machine, &siblings, &siblings),
                 Some(a),
                 "{a:?}",
             );
 
             for b in constraints {
                 assert_eq!(
-                    a.merge(&b, &machine, &siblings),
-                    b.merge(&a, &machine, &siblings),
+                    a.merge(&b, &machine, &siblings, &siblings),
+                    b.merge(&a, &machine, &siblings, &siblings),
                     "merging {a:?} and {b:?} must not depend on the order",
                 );
             }

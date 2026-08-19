@@ -3,14 +3,15 @@
 #![allow(missing_docs)]
 
 use crate::{
-    Block, InputBlock, InputFunction, InputInst, Operand, Reg, RegClass, Val,
+    Block, InputBlock, InputFunction, InputInst, Machine, MachineBuilder, Operand, Reg, RegClass,
+    RegGroup, RegUnit, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
     entity::{
         Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, Region, Scc, SccBlockIndex,
         SecondaryMap, SpillSlot,
     },
-    input::{BlockFrequency, DefUse, OperandConstraint, Position},
+    input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position},
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
 };
@@ -383,10 +384,12 @@ impl Mutate<TestFunction> for TestFunctionMutator {
     }
 }
 
-fn hash(func: &TestFunction) -> u64 {
-    use std::hash::Hash;
+fn hash<T>(value: &T) -> u64
+where
+    T: core::hash::Hash,
+{
     let mut hasher = std::hash::DefaultHasher::new();
-    <TestFunction as Hash>::hash(func, &mut hasher);
+    <T as core::hash::Hash>::hash(value, &mut hasher);
     hasher.finish()
 }
 
@@ -1192,6 +1195,477 @@ impl<'a> InputInst<'a> for TestInst<'a> {
     }
 }
 
+/// A description of a machine, in a form that `mutatis` can generate and
+/// mutate.
+#[derive(Clone, Debug, Hash)]
+pub struct TestMachine {
+    banks: Vec<TestBank>,
+}
+
+#[derive(Clone, Debug, Default, Hash, Mutate)]
+pub struct TestBank {
+    /// One entry per register the allocator owns: how many register units wide
+    /// it is.
+    regs: Vec<u8>,
+
+    /// How many further registers this bank has that the allocator does not own.
+    non_allocatable: u8,
+
+    /// This bank's register groups.
+    groups: Vec<TestGroup>,
+
+    /// This bank's register classes.
+    classes: Vec<TestClass>,
+}
+
+#[derive(Clone, Debug, Default, Hash, Mutate)]
+pub struct TestGroup {
+    /// Indices into the bank's `regs`, in the group's order.
+    members: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Hash, Mutate)]
+pub struct TestClass {
+    members: TestClassMembers,
+
+    /// Scaled into the `f32` spill cost that `define_reg_class` wants; an
+    /// integer here so that `TestMachine` can derive `Hash`.
+    spill_cost: u8,
+}
+
+/// What a class holds: either individual registers or whole register groups,
+/// never a mix of the two.
+#[derive(Clone, Debug, Hash, Mutate)]
+pub enum TestClassMembers {
+    /// Indices into the bank's `regs`, in preference order.
+    Regs(Vec<u8>),
+
+    /// Indices into the bank's `groups`, in preference order.
+    Groups(Vec<u8>),
+}
+
+impl Default for TestClassMembers {
+    fn default() -> Self {
+        Self::Regs(Vec::new())
+    }
+}
+
+impl Default for TestMachine {
+    fn default() -> Self {
+        let mut machine = TestMachine { banks: Vec::new() };
+        machine.fixup();
+        machine
+    }
+}
+
+impl TestMachine {
+    /// The ceilings on a generated machine's size.
+    ///
+    /// Well within the actual imposed limits so that, e.g., we will always have
+    /// entity capacity for the derived intersection register classes.
+    const MAX_BANKS: usize = 2;
+    const MAX_REGS_PER_BANK: usize = 4;
+    const MAX_NON_ALLOCATABLE_PER_BANK: u8 = 2;
+    const MAX_GROUPS_PER_BANK: usize = 3;
+    const MAX_CLASSES_PER_BANK: usize = 4;
+
+    /// The widest a generated register may be, in register units.
+    const MAX_REG_UNITS: u8 = 2;
+
+    /// A machine of one bank with two registers and three classes: `rc0` holds
+    /// the first register, `rc1` the second, and `rc2` both.
+    ///
+    /// `rc0` and `rc1` are disjoint, so nothing can satisfy both of them at
+    /// once.
+    pub fn two_registers() -> Self {
+        let one_reg = |i| TestClass {
+            members: TestClassMembers::Regs(vec![i]),
+            spill_cost: 0,
+        };
+        let mut machine = TestMachine {
+            banks: vec![TestBank {
+                regs: vec![1, 1],
+                non_allocatable: 0,
+                groups: Vec::new(),
+                classes: vec![
+                    one_reg(0),
+                    one_reg(1),
+                    TestClass {
+                        members: TestClassMembers::Regs(vec![0, 1]),
+                        spill_cost: 0,
+                    },
+                ],
+            }],
+        };
+        machine.fixup();
+        machine
+    }
+
+    /// How many register classes this machine defines, which is the number of
+    /// classes an operand may name.
+    ///
+    /// This counts only the classes described here, not the intersections that
+    /// `MachineBuilder::finish` derives from them.
+    pub fn num_classes(&self) -> usize {
+        self.banks.iter().map(|bank| bank.classes.len()).sum()
+    }
+
+    /// Repair this description so that [`TestMachine::build`] cannot fail.
+    pub fn fixup(&mut self) {
+        self.banks.truncate(Self::MAX_BANKS);
+        if self.banks.is_empty() {
+            self.banks.push(TestBank::default());
+        }
+
+        for bank in &mut self.banks {
+            // A bank needs a register that the allocator owns for
+            // stack-to-stack moves.
+            bank.regs.truncate(Self::MAX_REGS_PER_BANK);
+            if bank.regs.is_empty() {
+                bank.regs.push(1);
+            }
+            for units in &mut bank.regs {
+                // Clamped rather than reduced modulo, because `x % n` is not
+                // idempotent once shifted off zero.
+                *units = (*units).clamp(1, Self::MAX_REG_UNITS);
+            }
+            bank.non_allocatable %= Self::MAX_NON_ALLOCATABLE_PER_BANK + 1;
+
+            let num_regs = bank.regs.len();
+
+            // A group holds at least two distinct registers, so a bank with
+            // only one register has no groups at all.
+            bank.groups.truncate(Self::MAX_GROUPS_PER_BANK);
+            if num_regs < 2 {
+                bank.groups.clear();
+            }
+            for group in &mut bank.groups {
+                for member in &mut group.members {
+                    *member %= u8::try_from(num_regs).unwrap();
+                }
+                dedupe_keeping_first(&mut group.members);
+                group
+                    .members
+                    .truncate(core::cmp::min(RegGroup::MAX_SIZE, num_regs));
+                while group.members.len() < 2 {
+                    let next = (0..u8::try_from(num_regs).unwrap())
+                        .find(|reg| !group.members.contains(reg))
+                        .unwrap();
+                    group.members.push(next);
+                }
+            }
+
+            bank.classes.truncate(Self::MAX_CLASSES_PER_BANK);
+            if bank.classes.is_empty() {
+                bank.classes.push(TestClass::default());
+            }
+            for class in &mut bank.classes {
+                // A class of groups needs a group to name; the pass below
+                // gives the empty register list a member.
+                if bank.groups.is_empty() && matches!(class.members, TestClassMembers::Groups(_)) {
+                    class.members = TestClassMembers::Regs(Vec::new());
+                }
+
+                match &mut class.members {
+                    TestClassMembers::Regs(regs) => {
+                        for member in regs.iter_mut() {
+                            *member %= u8::try_from(num_regs).unwrap();
+                        }
+                        dedupe_keeping_first(regs);
+                        if regs.is_empty() {
+                            regs.push(0);
+                        }
+                    }
+
+                    TestClassMembers::Groups(groups) => {
+                        for member in groups.iter_mut() {
+                            *member %= u8::try_from(bank.groups.len()).unwrap();
+                        }
+                        dedupe_keeping_first(groups);
+                        if groups.is_empty() {
+                            groups.push(0);
+                        }
+                        // One class holds groups of one size, so keep the
+                        // groups that match the first one's size and drop the
+                        // rest.
+                        let size = bank.groups[usize::from(groups[0])].members.len();
+                        groups
+                            .retain(|&group| bank.groups[usize::from(group)].members.len() == size);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build the [`Machine`] this `TestMachine` describes.
+    pub fn build(&self) -> Machine {
+        let mut builder = MachineBuilder::new();
+
+        for bank in &self.banks {
+            let reg_bank = builder.declare_reg_bank().unwrap();
+
+            let mut next_unit = 0;
+            let regs: Vec<Reg> = bank
+                .regs
+                .iter()
+                .map(|&units| {
+                    let start = RegUnit::try_new(next_unit).unwrap();
+                    next_unit += usize::from(units);
+                    let end = RegUnit::try_new(next_unit).unwrap();
+                    builder.define_reg(reg_bank, start..end).unwrap()
+                })
+                .collect();
+
+            for _ in 0..bank.non_allocatable {
+                builder.define_non_allocatable_reg(reg_bank).unwrap();
+            }
+
+            let groups: Vec<RegGroup> = bank
+                .groups
+                .iter()
+                .map(|group| {
+                    let members = group.members.iter().map(|&m| regs[usize::from(m)]);
+                    builder.define_reg_group(reg_bank, members).unwrap()
+                })
+                .collect();
+
+            for class in &bank.classes {
+                let spill_cost = f32::from(class.spill_cost) + 1.0;
+                match &class.members {
+                    TestClassMembers::Regs(members) => {
+                        let members = members.iter().map(|&m| regs[usize::from(m)]);
+                        builder
+                            .define_reg_class(reg_bank, spill_cost, members)
+                            .unwrap();
+                    }
+                    TestClassMembers::Groups(members) => {
+                        let members = members.iter().map(|&m| groups[usize::from(m)]);
+                        builder
+                            .define_reg_group_class(reg_bank, spill_cost, members)
+                            .unwrap();
+                    }
+                }
+            }
+        }
+
+        builder.finish().unwrap()
+    }
+}
+
+fn dedupe_keeping_first(members: &mut Vec<u8>) {
+    let mut seen = [false; 256];
+    members.retain(|&member| !mem::replace(&mut seen[usize::from(member)], true));
+}
+
+#[derive(Default)]
+pub struct TestMachineMutator {}
+
+impl Mutate<TestMachine> for TestMachineMutator {
+    fn mutate(
+        &mut self,
+        mutations: &mut mutatis::Candidates<'_>,
+        machine: &mut TestMachine,
+    ) -> mutatis::Result<()> {
+        <Vec<TestBank> as DefaultMutate>::DefaultMutate::default()
+            .proj(|TestMachine { banks }: &mut TestMachine| banks)
+            .map(|_ctx, m| {
+                m.fixup();
+                Ok(())
+            })
+            .mutate(mutations, machine)
+    }
+}
+
+impl Generate<TestMachine> for TestMachineMutator {
+    fn generate(&mut self, context: &mut mutatis::Context) -> mutatis::Result<TestMachine> {
+        let mut machine = TestMachine {
+            banks: <Vec<TestBank> as DefaultMutate>::DefaultMutate::default().generate(context)?,
+        };
+        machine.fixup();
+        Ok(machine)
+    }
+}
+
+impl DefaultMutate for TestMachine {
+    type DefaultMutate = TestMachineMutator;
+}
+
+/// A whole register allocation problem for testing: a machine and a function to
+/// allocate registers in.
+#[derive(Clone, Debug, Hash)]
+pub struct TestInput {
+    pub machine: TestMachine,
+    pub func: TestFunction,
+}
+
+impl Default for TestInput {
+    fn default() -> Self {
+        let mut input = TestInput {
+            machine: TestMachine::default(),
+            func: TestFunction::default(),
+        };
+        input.fixup();
+        input
+    }
+}
+
+impl TestInput {
+    /// Repair this test input.
+    pub fn fixup(&mut self) {
+        self.machine.fixup();
+        self.func.fixup();
+
+        let num_classes = self.machine.num_classes();
+        for (_inst, inst_data) in self.func.insts.iter_mut() {
+            for operand in inst_data.operands_mut() {
+                let OperandConstraint::Reg(class) = operand.constraint() else {
+                    continue;
+                };
+                let class = RegClass::try_new(class.index() % num_classes).unwrap();
+                *operand = Operand::new(
+                    operand.pos(),
+                    operand.kind(),
+                    OperandConstraint::Reg(class),
+                    operand.val(),
+                );
+            }
+        }
+    }
+
+    /// A single-block input whose one value is defined by the first
+    /// instruction and then used once per entry in `constraints`, one use per
+    /// instruction, in that order.
+    ///
+    /// The machine is [`TestMachine::two_registers`], so `Reg(rc0)` and
+    /// `Reg(rc1)` are the pair of constraints that conflict and `Reg(rc2)` is
+    /// the one that can be met alongside either.
+    pub fn with_use_constraints(constraints: &[OperandConstraint]) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let def = Inst::try_new(0).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    ty: Type::default(),
+                    def: ValDef::InstResult { inst: def, i: 0 },
+                },
+            )
+            .unwrap();
+
+        func.insts = PrimaryMap::new();
+        func.insts
+            .push(
+                &mut output,
+                InstData::Op {
+                    operands: vec![Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Any,
+                        val,
+                    )],
+                    side_effects: true,
+                },
+            )
+            .unwrap();
+        for &constraint in constraints {
+            func.insts
+                .push(
+                    &mut output,
+                    InstData::Op {
+                        operands: vec![Operand::new(Position::Early, DefUse::Use, constraint, val)],
+                        side_effects: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        // `ensure_terminators` turns a block's last instruction into a branch,
+        // so hand it one of its own rather than letting it take the last use.
+        func.insts
+            .push(
+                &mut output,
+                InstData::Op {
+                    operands: vec![],
+                    side_effects: true,
+                },
+            )
+            .unwrap();
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// Build the [`Input`] that this describes and hand it to `f`.
+    ///
+    /// The `Machine` has to be built to be borrowed, hence the callback.
+    pub fn with_input<R>(&self, f: impl FnOnce(&Input<'_, TestFunction>) -> R) -> R {
+        let machine = self.machine.build();
+        let options = InputOptions::default();
+        f(&Input {
+            options: &options,
+            machine: &machine,
+            func: &self.func,
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct TestInputMutator {}
+
+impl Mutate<TestInput> for TestInputMutator {
+    fn mutate(
+        &mut self,
+        mutations: &mut mutatis::Candidates<'_>,
+        input: &mut TestInput,
+    ) -> mutatis::Result<()> {
+        let result = (|| -> mutatis::Result<()> {
+            TestMachineMutator::default().mutate(mutations, &mut input.machine)?;
+            TestFunctionMutator::default().mutate(mutations, &mut input.func)?;
+            Ok(())
+        })();
+
+        input.fixup();
+        result
+    }
+}
+
+impl Generate<TestInput> for TestInputMutator {
+    fn generate(&mut self, context: &mut mutatis::Context) -> mutatis::Result<TestInput> {
+        let mut input = TestInput {
+            machine: TestMachineMutator::default().generate(context)?,
+            func: TestFunctionMutator::default().generate(context)?,
+        };
+        input.fixup();
+        Ok(input)
+    }
+}
+
+impl DefaultMutate for TestInput {
+    type DefaultMutate = TestInputMutator;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,9 +1678,15 @@ mod tests {
 
     /// Check that `func` is a well-formed function in valid SSA form, as
     /// `TestFunction::fixup` is supposed to guarantee.
-    fn check_ssa(func: &TestFunction) -> Result<(), String> {
+    fn check_ssa(machine: &Machine, func: &TestFunction) -> Result<(), String> {
         let mut output = OutputInner::<u32>::new();
-        if validation::validate(func, &mut output).is_err() {
+        let options = InputOptions::default();
+        let input = Input {
+            options: &options,
+            machine,
+            func,
+        };
+        if validation::validate(&input, &mut output).is_err() {
             return Err(format!("invalid input: {:?}", output.take_error()));
         }
 
@@ -1272,10 +1752,79 @@ mod tests {
     }
 
     #[test]
-    fn fixup_produces_valid_ssa() -> CheckResult<TestFunction> {
+    fn fixup_produces_valid_ssa() -> CheckResult<TestInput> {
+        Check::new().iters(10_000).run(|input: &TestInput| {
+            check_ssa(&input.machine.build(), &input.func)?;
+
+            // `TestInput::fixup` reaches a fixed point too, and not just the
+            // function's half of it: the operand constraints it rewrites refer
+            // to the machine, so a second pass has to leave them alone.
+            let mut again = input.clone();
+            again.fixup();
+            if hash(&again) != hash(input) {
+                return Err(format!(
+                    "`TestInput::fixup` is not idempotent; running it a second time gives:\n{:#?}",
+                    again,
+                ));
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Every machine that `TestMachine` can describe is one that
+    /// `MachineBuilder` accepts, and one whose classes can all be intersected.
+    ///
+    /// This is what the `unwrap`s in `TestMachine::build` rest on, and what holds
+    /// the capacity argument next to `TestMachine`'s ceilings to account: running
+    /// out of register classes while closing the class list under intersection
+    /// would show up here as a `MachineCapacityExceeded` from `finish`.
+    #[test]
+    fn every_test_machine_builds() -> CheckResult<TestMachine> {
         Check::new()
             .iters(10_000)
-            .run(|func: &TestFunction| check_ssa(func))
+            .run(|test_machine: &TestMachine| -> Result<(), String> {
+                let machine = test_machine.build();
+
+                let num_classes = machine.num_user_classes();
+                if num_classes != test_machine.num_classes() {
+                    return Err(format!(
+                        "the machine defines {num_classes} classes, but the description says \
+                         {}",
+                        test_machine.num_classes(),
+                    ));
+                }
+                if num_classes == 0 {
+                    return Err(String::from("the machine defines no register classes"));
+                }
+
+                // The class list is closed under intersection, so asking about
+                // any pair of classes an operand could name has to be answerable
+                // rather than an out-of-bounds index.
+                for a in 0..num_classes {
+                    for b in 0..num_classes {
+                        let a = RegClass::try_new(a).unwrap();
+                        let b = RegClass::try_new(b).unwrap();
+                        assert_eq!(
+                            machine.intersect_classes(a, b),
+                            machine.intersect_classes(b, a),
+                            "intersecting classes is symmetric",
+                        );
+                    }
+                }
+
+                // `fixup` reaches a fixed point.
+                let mut again = test_machine.clone();
+                again.fixup();
+                if hash(&again) != hash(test_machine) {
+                    return Err(format!(
+                        "`TestMachine::fixup` is not idempotent; running it a second time \
+                         gives:\n{again:#?}",
+                    ));
+                }
+
+                Ok(())
+            })
     }
 
     /// Build a valid function of `num_blocks` blocks with `insts_per_block`
@@ -1307,15 +1856,55 @@ mod tests {
 
         assert_eq!(func.len_blocks(), num_blocks);
         assert_eq!(func.len_insts(), num_blocks * insts_per_block);
-        assert_eq!(check_ssa(&func), Ok(()));
+        assert_eq!(check_ssa(&test_machine(), &func), Ok(()));
         func
+    }
+
+    /// `with_use_constraints` is only useful if `fixup` leaves the operands it
+    /// writes down alone, so check the shape it produces rather than trusting
+    /// it.
+    #[test]
+    fn use_constraints_survive_fixup() {
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let constraints = [rc(0), rc(1), OperandConstraint::Stack];
+        let input = TestInput::with_use_constraints(&constraints);
+
+        assert_eq!(check_ssa(&input.machine.build(), &input.func), Ok(()));
+        assert_eq!(input.func.len_values(), 1);
+        assert_eq!(input.func.len_insts(), constraints.len() + 2);
+
+        let val = Val::try_new(0).unwrap();
+        for (i, &expected) in constraints.iter().enumerate() {
+            let inst = Inst::try_new(i + 1).unwrap();
+            let operands: Vec<Operand> = input.func.inst(inst).operands().collect();
+            assert_eq!(operands.len(), 1);
+            assert_eq!(operands[0].kind(), DefUse::Use);
+            assert_eq!(operands[0].val(), val);
+            assert_eq!(operands[0].constraint(), expected);
+        }
+    }
+
+    /// The machine that the checks below validate against.
+    ///
+    /// A `valid_func`'s operands are all unconstrained, so the machine hardly
+    /// matters to them; the smallest one `TestMachine` can describe keeps the
+    /// checks about the function.
+    fn test_machine() -> Machine {
+        TestMachine::default().build()
     }
 
     /// Validate `func` and return the error that it is rejected with.
     fn expect_invalid(func: &impl InputFunction) -> Error {
         let mut output = OutputInner::<u32>::new();
+        let machine = test_machine();
+        let options = InputOptions::default();
+        let input = Input {
+            options: &options,
+            machine: &machine,
+            func,
+        };
         assert!(
-            validation::validate(func, &mut output).is_err(),
+            validation::validate(&input, &mut output).is_err(),
             "expected validation to reject this function",
         );
         match output.take_error() {
@@ -1399,6 +1988,55 @@ mod tests {
         func.blocks[block].insts.push(inst);
 
         assert_invalid!(&func, Error::InstOutOfBounds { inst: i } if i == inst);
+    }
+
+    #[test]
+    fn reject_an_operand_naming_a_class_the_machine_does_not_define() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        // One past the last class the machine defines, which is a class the
+        // machine could have defined and so is representable in the packed
+        // operand.
+        let machine = test_machine();
+        let class = RegClass::try_new(machine.num_user_classes()).unwrap();
+
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(class),
+            operand.val(),
+        );
+
+        assert_invalid!(
+            &func,
+            Error::InvalidRegClass { inst: i, operand: 0 } if i == inst,
+        );
+    }
+
+    /// The class one *below* that is a class the machine really does define, so
+    /// the check above is about the bound and not about `Reg` constraints in
+    /// general.
+    #[test]
+    fn accept_an_operand_naming_the_last_class_the_machine_defines() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        let machine = test_machine();
+        let class = RegClass::try_new(machine.num_user_classes() - 1).unwrap();
+
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(class),
+            operand.val(),
+        );
+
+        assert_eq!(check_ssa(&machine, &func), Ok(()));
     }
 
     /// An input function that delegates to a `TestFunction`, except that asking

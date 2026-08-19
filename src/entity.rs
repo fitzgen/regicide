@@ -1,4 +1,4 @@
-use core::{fmt::Debug, hash::Hash, num::NonZero, ops::Sub};
+use core::{fmt::Debug, hash::Hash, marker::PhantomData, num::NonZero, ops::Sub};
 
 mod fixed_set;
 mod map;
@@ -377,6 +377,41 @@ where
         } else {
             self.start.index()..self.end.index()
         }
+    }
+}
+
+impl<K> IntoIterator for EntityRange<K>
+where
+    K: Entity,
+{
+    type Item = K;
+
+    type IntoIter = EntityRangeIter<K>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        EntityRangeIter {
+            indices: self.indices(),
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// An iterator over a range of `K` entities.
+pub struct EntityRangeIter<K> {
+    indices: core::ops::Range<usize>,
+    _phantom: PhantomData<K>,
+}
+
+impl<K> Iterator for EntityRangeIter<K>
+where
+    K: Entity,
+{
+    type Item = K;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.indices.next().map(|i| K::try_new(i).unwrap())
     }
 }
 

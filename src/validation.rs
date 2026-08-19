@@ -14,24 +14,29 @@ use crate::{
     dominators::DominatorTree,
     entity::{Block, Entity, EntityRepr, Inst, SecondaryMap, Val},
     error::{Error, IResult, Result},
-    input::{DefUse, InputBlock, InputFunction, InputInst, Operand, OperandConstraint},
+    input::{DefUse, Input, InputBlock, InputFunction, InputInst, Operand, OperandConstraint},
     live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST},
     output::OutputInner,
     timing::Timing,
 };
 use alloc::vec::Vec;
 
-pub(crate) fn validate<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
+pub(crate) fn validate<E>(
+    input: &Input<'_, impl InputFunction>,
+    output: &mut OutputInner<E>,
+) -> IResult<()>
 where
     E: EntityRepr,
 {
     let _timing = Timing::new("validation");
 
+    let func = input.func;
+
     // Nothing here indexes by entity, and everything below assumes that a block
     // has a terminator to look at, so this goes first.
     validate_insts(func, output)?;
 
-    validate_entity_references(func, output)?;
+    validate_entity_references(func, input.machine.num_user_classes(), output)?;
 
     // Every check below this point indexes by entity, and computing the
     // dominator tree does too, so the bounds check has to come first. The
@@ -60,6 +65,7 @@ where
 /// Every other check indexes by entity, so this one has to come first.
 fn validate_entity_references<E>(
     func: &impl InputFunction,
+    num_classes: usize,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
@@ -78,7 +84,13 @@ where
             return output.error(Error::BlockOutOfBounds { block });
         }
 
-        let result = check_block_references(&func.block(block), block, num_blocks, num_values);
+        let result = check_block_references(
+            &func.block(block),
+            block,
+            num_blocks,
+            num_values,
+            num_classes,
+        );
         if let Err(e) = result {
             return output.error(e);
         }
@@ -92,6 +104,7 @@ fn check_block_references<'a>(
     block: Block,
     num_blocks: usize,
     num_values: usize,
+    num_classes: usize,
 ) -> Result<()> {
     let mut num_params = 0;
     for param in input_block.params() {
@@ -135,19 +148,30 @@ fn check_block_references<'a>(
             });
         }
 
-        // A `Reuse` must name a real operand of this instruction, and one that
-        // is not itself a `Reuse`.
         for (i, operand) in input_inst.operands().enumerate() {
-            let OperandConstraint::Reuse(target) = operand.constraint() else {
-                continue;
-            };
-            let reuses_a_reuse = target < num_operands
-                && matches!(
-                    input_inst.operand(target).constraint(),
-                    OperandConstraint::Reuse(_)
-                );
-            if target >= num_operands || reuses_a_reuse {
-                return Err(Error::InvalidReuse { inst, operand: i });
+            match operand.constraint() {
+                // A `Reuse` must name a real operand of this instruction, and
+                // one that is not itself a `Reuse`.
+                OperandConstraint::Reuse(target) => {
+                    let reuses_a_reuse = target < num_operands
+                        && matches!(
+                            input_inst.operand(target).constraint(),
+                            OperandConstraint::Reuse(_)
+                        );
+                    if target >= num_operands || reuses_a_reuse {
+                        return Err(Error::InvalidReuse { inst, operand: i });
+                    }
+                }
+
+                // A `Reg` must name a class this machine defines. Merging
+                // constraints intersects their classes through a table indexed
+                // by class, so an undefined class would be an out-of-bounds
+                // index rather than a diagnosis.
+                OperandConstraint::Reg(class) if class.index() >= num_classes => {
+                    return Err(Error::InvalidRegClass { inst, operand: i });
+                }
+
+                OperandConstraint::Any | OperandConstraint::Reg(_) | OperandConstraint::Stack => {}
             }
         }
     }

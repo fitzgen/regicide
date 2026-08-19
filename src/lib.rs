@@ -146,7 +146,7 @@ where
     );
 
     if input.options.validate_input {
-        validation::validate(input.func, output)?;
+        validation::validate(input, output)?;
     }
 
     context
@@ -158,12 +158,9 @@ where
     context
         .liveness
         .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
-    context.live_ranges.construct(
-        input.func,
-        &mut context.counts,
-        &mut context.liveness,
-        output,
-    )?;
+    context
+        .live_ranges
+        .construct(input, &mut context.counts, &mut context.liveness, output)?;
 
     partial_allocation::partial_allocate(context, input.func)?;
     region_allocation::region_allocate(context, input.func)?;

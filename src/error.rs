@@ -304,6 +304,16 @@ pub enum Error {
         operand: usize,
     },
 
+    /// An operand's `Reg` constraint names a register class that the machine
+    /// does not define.
+    InvalidRegClass {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of the operand whose register class is not defined.
+        operand: usize,
+    },
+
     /// The function has an instruction index above the largest one supported.
     TooManyInsts {
         /// The first [`Inst`] found whose index is out of range.
@@ -441,6 +451,11 @@ impl fmt::Debug for Error {
             Self::InvalidReuse { inst, operand } => write!(
                 f,
                 "operand {operand} of {inst:?} reuses an operand that it may not reuse"
+            ),
+            Self::InvalidRegClass { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} names a register class that this machine does not \
+                 define"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

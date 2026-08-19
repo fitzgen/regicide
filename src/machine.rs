@@ -463,7 +463,6 @@ impl Machine {
     /// How many register classes the user defined, as opposed to the ones
     /// derived from them.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn num_user_classes(&self) -> usize {
         self.num_user_classes
     }
