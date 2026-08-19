@@ -136,7 +136,7 @@
 
 use crate::{
     Entity, Error, Result,
-    entity::{Entity as _, FixedEntitySet, PrimaryMap, words_for},
+    entity::{FixedEntitySet, PrimaryMap, words_for},
 };
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use core::ops::Range;
@@ -288,11 +288,13 @@ pub(crate) struct RegDef {
 
 impl RegDef {
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn is_allocatable(&self) -> bool {
         self.units.start != self.units.end
     }
 
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn is_non_allocatable(&self) -> bool {
         !self.is_allocatable()
     }
@@ -310,6 +312,7 @@ pub(crate) struct RegGroupDef {
 
     /// The same registers as `self.members`, as a set for fast membership and
     /// interference testing rather than in order.
+    #[expect(dead_code, reason = "will probably need it")]
     pub member_set: RegSet,
 
     /// This register group's associated register bank.
@@ -360,6 +363,7 @@ impl RegBankDef {
 }
 
 /// Trait for checking interference (conflict) between two things.
+#[allow(dead_code, reason = "will probably need it")]
 pub(crate) trait Interfere<Rhs = Self> {
     /// Does `lhs` interfere with `rhs`?
     fn interfere(machine: &Machine, lhs: Self, rhs: Rhs) -> bool;
@@ -412,8 +416,10 @@ impl Interfere for Range<RegUnit> {
 #[derive(Clone, Debug)]
 pub struct Machine {
     pub(crate) registers: PrimaryMap<Reg, RegDef>,
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) groups: PrimaryMap<RegGroup, RegGroupDef>,
     pub(crate) classes: PrimaryMap<RegClass, RegClassDef>,
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) banks: PrimaryMap<RegBank, RegBankDef>,
 
     /// For each pair of register classes, the class whose members are the
@@ -457,6 +463,7 @@ impl Machine {
     /// How many register classes the user defined, as opposed to the ones
     /// derived from them.
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn num_user_classes(&self) -> usize {
         self.num_user_classes
     }
@@ -1069,7 +1076,7 @@ impl MachineBuilder {
     }
 
     /// Check a register that is about to become a member of `class`.
-    fn check_class_member(&self, class: RegClass, reg: Reg, bank: RegBank) -> Result<()> {
+    fn check_class_member(&self, _class: RegClass, reg: Reg, bank: RegBank) -> Result<()> {
         self.check_reg_in_bank(reg, bank)?;
         Ok(())
     }

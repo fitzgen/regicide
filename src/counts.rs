@@ -43,14 +43,6 @@ impl Count {
         }
     }
 
-    pub fn reset(&mut self) {
-        #[cfg(feature = "trace-log")]
-        {
-            let Self { count } = self;
-            *count = 0;
-        }
-    }
-
     pub fn is_reset(&self) -> bool {
         #[cfg(not(feature = "trace-log"))]
         return true;
@@ -83,18 +75,7 @@ impl Counts {
     }
 
     pub fn reset(&mut self) {
-        let Self {
-            sccs,
-            regions,
-            liveness_iterations,
-            live_spans,
-            uses,
-        } = self;
-        *sccs = Count::new();
-        *regions = Count::new();
-        *liveness_iterations = Count::new();
-        *live_spans = Count::new();
-        *uses = Count::new();
+        *self = Self::new();
     }
 
     pub fn is_reset(&self) -> bool {

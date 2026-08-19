@@ -216,31 +216,37 @@ where
     }
 
     /// Get the values that are live on entry to `block`.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn live_in(&self, block: Block<E>) -> impl Iterator<Item = Val<E>> + '_ {
         self.live_in[block].iter(&self.arena).copied()
     }
 
     /// Get the values that are live at `block`'s exit.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn live_out(&self, block: Block<E>) -> impl Iterator<Item = Val<E>> + '_ {
         self.live_out[block].iter(&self.arena).copied()
     }
 
     /// Is `val` live on entry to `block`?
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn is_live_in(&self, block: Block<E>, val: Val<E>) -> bool {
         self.live_in[block].contains(&self.arena, &val)
     }
 
     /// Is `val` live at `block`'s exit?
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn is_live_out(&self, block: Block<E>, val: Val<E>) -> bool {
         self.live_out[block].contains(&self.arena, &val)
     }
 
     /// How many values are live on entry to `block`?
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn len_live_in(&self, block: Block<E>) -> usize {
         self.live_in[block].len()
     }
 
     /// How many values are live at `block`'s exit?
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn len_live_out(&self, block: Block<E>) -> usize {
         self.live_out[block].len()
     }
@@ -729,13 +735,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Entity as _, test::TestFunction};
+    use crate::test::TestFunction;
     use mutatis::check::{Check, CheckResult};
     use std::{
         collections::{BTreeSet as Set, HashMap},
         format,
         string::{String, ToString},
-        vec,
     };
 
     /// Compute `func`'s liveness.

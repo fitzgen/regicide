@@ -20,7 +20,8 @@ where
     // TODO: bottom-up, post-order traversal of the region tree
 
     // TODO: visit blocks within each region in greatest to least estimated
-    // frequency order
+    // frequency order. reuse the same temporary `Vec<Block<E>>` for sorting
+    // each region's blocks.
 
     // TODO: coalescing: never coalesce bundles across regions. never coalesce
     // bundles with conflicting pre-coloring or register preferences. never

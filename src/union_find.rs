@@ -89,15 +89,11 @@ mod tests {
     use super::UnionFind;
     use crate::{Entity, entity::Val};
     use mutatis::{
-        Mutate, MutateInRange,
-        check::{Check, CheckError, CheckResult},
+        Mutate,
+        check::{Check, CheckResult},
         mutators as m,
     };
-    use std::{
-        collections::{HashMap, HashSet},
-        string::String,
-        vec::Vec,
-    };
+    use std::{string::String, vec::Vec};
 
     type V = Val<u8>;
 
@@ -158,7 +154,7 @@ mod tests {
 
     #[test]
     fn smoke() -> CheckResult<Vec<(u8, u8)>> {
-        let mutator = m::default::<Vec<(u8, u8)>>().map(|ctx, vec| {
+        let mutator = m::default::<Vec<(u8, u8)>>().map(|_ctx, vec| {
             vec.truncate(20);
             let len = vec.len() as u8;
             for (a, b) in vec {

@@ -114,7 +114,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Entity as _;
     use crate::test::*;
     use mutatis::check::{Check, CheckResult};
     use std::collections::{BTreeSet, HashMap};

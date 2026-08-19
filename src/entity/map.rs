@@ -72,6 +72,7 @@ where
     }
 
     /// Returns `true` if the map contains no elements.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn is_empty(&self) -> bool {
         self.elems.is_empty()
     }
@@ -111,6 +112,7 @@ where
     }
 
     /// Returns a mutable iterator over the key-value pairs in the map.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn iter_mut(&mut self) -> PrimaryMapIterMut<'_, K, V> {
         PrimaryMapIterMut {
             inner: self.elems.iter_mut().enumerate(),
@@ -119,6 +121,7 @@ where
     }
 
     /// Returns an owning iterator of the key-value pairs in the map.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn into_iter(self) -> PrimaryMapIntoIter<K, V> {
         PrimaryMapIntoIter {
             inner: self.elems.into_iter().enumerate(),
@@ -127,6 +130,7 @@ where
     }
 
     /// Returns an iterator over the keys in the map.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn keys(&self) -> PrimaryMapKeys<K> {
         PrimaryMapKeys {
             pos: 0,
@@ -136,11 +140,13 @@ where
     }
 
     /// Returns an iterator over the values in the map.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn values(&self) -> core::slice::Iter<'_, V> {
         self.elems.iter()
     }
 
     /// Returns a mutable iterator over the values in the map.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn values_mut(&mut self) -> core::slice::IterMut<'_, V> {
         self.elems.iter_mut()
     }
@@ -329,6 +335,7 @@ where
         self.inner.reserve(additional);
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -338,6 +345,7 @@ where
         self.inner.elems.get(index)
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         let index = key.index();
         self.inner.elems.get_mut(index)
@@ -347,6 +355,7 @@ where
         self.inner.iter()
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn into_iter(self) -> PrimaryMapIntoIter<K, V> {
         self.inner.into_iter()
     }

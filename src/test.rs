@@ -10,7 +10,7 @@ use crate::{
         Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, Region, Scc, SccBlockIndex,
         SecondaryMap, SpillSlot,
     },
-    input::{BlockFrequency, DefUse, FmtWithOutput, OperandConstraint, Position},
+    input::{BlockFrequency, DefUse, OperandConstraint, Position},
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
 };
@@ -22,10 +22,7 @@ use core::{
     mem, slice,
 };
 use mutatis::{DefaultMutate, Generate, Mutate};
-use std::{
-    collections::{BTreeSet, HashMap, HashSet, hash_map::Entry},
-    dbg,
-};
+use std::collections::{BTreeSet, HashMap, hash_map::Entry};
 
 pub struct EntityMutator<E>(PhantomData<E>);
 
@@ -152,7 +149,7 @@ where
             Ok(())
         })?;
 
-        mutations.mutation(|ctx| {
+        mutations.mutation(|_ctx| {
             let pos = match operand.pos() {
                 Position::Early => Position::Late,
                 Position::Late => Position::Early,
@@ -161,7 +158,7 @@ where
             Ok(())
         })?;
 
-        mutations.mutation(|ctx| {
+        mutations.mutation(|_ctx| {
             let kind = match operand.kind() {
                 DefUse::Def => DefUse::Use,
                 DefUse::Use => DefUse::Def,
@@ -1103,7 +1100,7 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
 
     fn successors(&self) -> Self::SuccessorsIter<'_> {
         TestBlockSuccessorsIter {
-            state: TestBlockSuccessorsIterState::Many(self.block_calls().iter()),
+            inner: self.block_calls().iter(),
         }
     }
 
@@ -1150,32 +1147,18 @@ impl<'a> TestBlock<'a> {
 }
 
 pub struct TestBlockSuccessorsIter<'a> {
-    state: TestBlockSuccessorsIterState<'a>,
-}
-
-enum TestBlockSuccessorsIterState<'a> {
-    None,
-    Many(core::slice::Iter<'a, BlockCall>),
+    inner: core::slice::Iter<'a, BlockCall>,
 }
 
 impl Iterator for TestBlockSuccessorsIter<'_> {
     type Item = Block;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.state {
-            TestBlockSuccessorsIterState::None => None,
-            TestBlockSuccessorsIterState::Many(block_calls) => {
-                let call = block_calls.next()?;
-                Some(call.target)
-            }
-        }
+        Some(self.inner.next()?.target)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match &self.state {
-            TestBlockSuccessorsIterState::None => (0, Some(0)),
-            TestBlockSuccessorsIterState::Many(iter) => iter.size_hint(),
-        }
+        self.inner.size_hint()
     }
 }
 

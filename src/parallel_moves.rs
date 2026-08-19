@@ -8,6 +8,7 @@ use core::marker::PhantomData;
 // value from emergency stack slot. I think we should only ever need one
 // emergency spill slot?
 
+#[expect(dead_code, reason = "will probably need it")]
 pub struct ParallelMoveSolver<E>
 where
     E: EntityRepr,
@@ -17,8 +18,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::ParallelMoveSolver;
-
     // TODO: mutatis-based property test. take arbitrary set of moves (each dst
     // written exactly once), run them through the solver, interpret the result
     // and make sure it matches expectation.

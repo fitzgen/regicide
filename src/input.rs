@@ -1,9 +1,8 @@
 use core::{cell::RefCell, fmt, marker::PhantomData};
 
 use crate::{
-    Allocation, Machine, Output, Reg, RegClass, RegSet,
-    dfs::Dfs,
-    entity::{Block, Entity as _, EntityRepr, Inst, PrimaryMap, Val},
+    Machine, RegClass, RegSet,
+    entity::{Block, Entity as _, EntityRepr, Inst, Val},
     error::IResult,
     live_ranges::MAX_OPERANDS_PER_INST,
     output::OutputInner,
@@ -137,6 +136,7 @@ impl OperandConstraint {
     ///
     /// This is commutative: merging in either order gives the same answer,
     /// which is why [`Machine::intersect_classes`] is a symmetric table.
+    #[allow(dead_code, reason = "will need it")]
     pub(crate) fn merge(
         &self,
         other: &Self,
@@ -313,11 +313,13 @@ where
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn to_bits(self) -> u64 {
         self.bits
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn from_bits(bits: u64) -> Self {
         let operand = Self {
             bits,
@@ -451,6 +453,7 @@ impl BlockFrequency {
         Self(PackedBlockFrequency::new(frequency))
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) const fn as_f32(self) -> f32 {
         self.0.as_f32()
     }

@@ -11,7 +11,7 @@ fn word_and_bit(index: usize) -> (usize, u32) {
 }
 
 /// A set of entities of type `K`.
-pub(crate) struct EntitySet<K> {
+pub struct EntitySet<K> {
     words: Vec<Word>,
     len: usize,
     _phantom: PhantomData<fn() -> K>,
@@ -118,7 +118,7 @@ where
 }
 
 /// An iterator over the entities in an [`EntitySet`].
-pub(crate) struct Iter<'a, K> {
+pub struct Iter<'a, K> {
     words: core::iter::Enumerate<core::slice::Iter<'a, Word>>,
 
     /// The bits of the word we are part way through, with the ones we have

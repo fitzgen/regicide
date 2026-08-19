@@ -70,6 +70,7 @@ macro_rules! define_storages {
                 }
             }
 
+            #[allow(dead_code, reason = "macro-generated")]
             impl<const BITS: u32> PackedPositiveFloat<$t, BITS> {
                 pub const MASK: $t = Self::MASK_AS_U32 as $t;
 

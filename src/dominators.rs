@@ -8,7 +8,7 @@
 //! * *Linear-Time Algorithms for Dominators and Related Problems.* Loukas
 //!   Georgiadis, Princeton University, November 2005.
 
-use crate::{Block, Entity as _, InputBlock as _, InputFunction, entity::SecondaryMap};
+use crate::{Block, InputBlock as _, InputFunction, entity::SecondaryMap};
 use alloc::{vec, vec::Vec};
 use core::{
     cmp, mem,
@@ -176,6 +176,7 @@ impl DominatorTree {
 
     /// Get the CFG postorder of blocks that was used to compute this dominator
     /// tree.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn cfg_postorder(&self) -> &[Block] {
         debug_assert!(self.is_valid());
         &self.postorder
@@ -217,6 +218,7 @@ impl DominatorTree {
     ///
     /// These are the blocks whose immediate dominator is `block`, ordered by
     /// decreasing CFG postorder number.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn children(&self, block: Block) -> ChildIter<'_> {
         debug_assert!(self.is_valid());
         ChildIter {

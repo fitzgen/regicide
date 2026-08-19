@@ -368,11 +368,6 @@ where
         self.start == self.end
     }
 
-    /// How many entities does this range cover?
-    pub fn len(&self) -> usize {
-        self.end.index() - self.start.index()
-    }
-
     /// The `usize` indices that this range covers.
     ///
     /// Empty ranges give `0..0`, regardless of their actual `start` and `end`.

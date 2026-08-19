@@ -368,6 +368,7 @@ where
     }
 
     /// Get the root of the region tree: the function entry block's region.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn root(&self) -> Region<E> {
         self.root
             .expect("should always have a root after construction")
@@ -375,11 +376,13 @@ where
 
     /// Get the parent of the given region, or `None` if this is the top-level
     /// region.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn parent(&self, region: Region<E>) -> Option<Region<E>> {
         self.region_parent[region]
     }
 
     /// Get the immediate child regions of the given region.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn children(&self, region: Region<E>) -> impl ExactSizeIterator<Item = Region<E>> + '_ {
         self.region_children[region].indices().map(move |i| {
             let i = RegionChildrenStorageIndex::try_new(i).unwrap();

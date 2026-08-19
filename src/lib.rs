@@ -4,7 +4,6 @@
 
 #![deny(missing_docs)]
 #![no_std]
-#![allow(unused)] // TODO FITZGEN
 
 extern crate alloc;
 #[cfg(feature = "std")]
@@ -162,7 +161,6 @@ where
     context.live_ranges.construct(
         input.func,
         &mut context.counts,
-        &context.region_tree,
         &mut context.liveness,
         output,
     )?;

@@ -1,21 +1,16 @@
 //! Constructs live ranges and bundles.
 
-use crate::context::ContextInner;
 use crate::counts::Counts;
 use crate::entity::{
-    Entity, EntityRange, EntityRepr, FixedEntitySet, Inst, PrimaryMap, Region, SecondaryMap, Val,
-    WideInt, words_for,
+    Entity, EntityRange, EntityRepr, Inst, PrimaryMap, Region, SecondaryMap, Val, WideInt,
 };
 use crate::error::IResult;
-use crate::input::{DefUse, InputFunction, Position};
+use crate::input::{InputFunction, Position};
 use crate::liveness::Liveness;
 use crate::output::{Allocation, OutputInner};
 use crate::packed_float::PackedPositiveFloat;
-use crate::region_tree::RegionTree;
 use crate::timing::Timing;
 use crate::{RegClass, RegSet};
-use alloc::vec::Vec;
-use core::range::Range;
 
 define_entities! {
     /// A contiguous span `[start, end)` within which an associated value is
@@ -127,6 +122,7 @@ impl SpillWeight {
 
     /// This weight's value.
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub const fn as_f32(self) -> f32 {
         self.0.as_f32()
     }
@@ -185,6 +181,7 @@ where
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn weight(&self) -> SpillWeight {
         self.weight
     }
@@ -246,36 +243,43 @@ where
 
     /// This span's uses (and, possibly, def), in ascending program order.
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn uses(&self) -> EntityRange<Use<E>> {
         self.uses
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn start(&self) -> LivePoint<E> {
         self.start
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn end(&self) -> LivePoint<E> {
         self.end
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn val(&self) -> Val<E> {
         self.val
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn is_pinned(&self) -> bool {
         self.flags & SPAN_PINNED != 0
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn has_fixed_use(&self) -> bool {
         self.flags & SPAN_HAS_FIXED_USE != 0
     }
 }
 
+#[expect(dead_code, reason = "will probably need it")]
 pub struct LiveBundleData<E>
 where
     E: EntityRepr,
@@ -323,46 +327,55 @@ where
     E: EntityRepr,
 {
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn spans(&self) -> EntityRange<LiveSpan<E>> {
         self.spans
     }
 
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn region(&self) -> Region<E> {
         self.region
     }
 
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn class(&self) -> RegClass {
         self.class
     }
 
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn preferrence(&self) -> &RegSet {
         &self.preferrence
     }
 
     #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn allocation(&self) -> Option<Allocation<E>> {
         self.allocation
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn is_minimal(&self) -> bool {
         self.weight_and_flags & BUNDLE_MINIMAL != 0
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn is_pinned(&self) -> bool {
         self.weight_and_flags & BUNDLE_PINNED != 0
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn has_fixed_uses(&self) -> bool {
         self.weight_and_flags & BUNDLE_HAS_FIXED_USES != 0
     }
 
     #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn spill_weight(&self) -> f32 {
         PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
             self.weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
@@ -370,8 +383,6 @@ where
         .as_f32()
     }
 }
-
-type Priority = u32;
 
 pub struct LiveRanges<E>
 where
@@ -428,31 +439,37 @@ where
     }
 
     /// How many live spans have been constructed?
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn len_spans(&self) -> usize {
         self.spans.len()
     }
 
     /// Iterate over every live span that has been constructed.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn spans(&self) -> impl Iterator<Item = (LiveSpan<E>, &LiveSpanData<E>)> + '_ {
         self.spans.iter()
     }
 
     /// Get the data for one live span.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn span(&self, span: LiveSpan<E>) -> &LiveSpanData<E> {
         &self.spans[span]
     }
 
     /// How many uses have been recorded?
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn len_uses(&self) -> usize {
         self.uses.len()
     }
 
     /// Get the data for one use.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn use_data(&self, u: Use<E>) -> &UseData<E> {
         &self.uses[u]
     }
 
     /// Get the uses for the given span, in ascending program order.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn uses(&self, span: LiveSpan<E>) -> &[UseData<E>] {
         let indices = self.span(span).uses.indices();
         &self.uses.as_slice()[indices]
@@ -469,7 +486,6 @@ where
         &mut self,
         func: &impl InputFunction,
         counts: &mut Counts,
-        region_tree: &RegionTree<E>,
         liveness: &mut Liveness<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
@@ -501,9 +517,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DefUse;
     use crate::dfs::Dfs;
     use crate::entity::Block;
     use crate::input::{InputBlock as _, InputInst as _};
+    use crate::region_tree::RegionTree;
     use crate::sccs::StronglyConnectedComponents;
     use crate::test::TestFunction;
     use mutatis::check::{Check, CheckResult};
@@ -511,6 +529,7 @@ mod tests {
         collections::{BTreeSet as Set, HashMap},
         format,
         string::{String, ToString},
+        vec::Vec,
     };
 
     fn inst<E>(index: usize) -> Inst<E>
@@ -725,9 +744,7 @@ mod tests {
             .construct(func, &mut counts, &mut dfs, &mut output)
             .and_then(|()| region_tree.construct(func, &mut counts, &sccs, &mut output))
             .and_then(|()| liveness.construct(func, &mut counts, &mut dfs, &mut output))
-            .and_then(|()| {
-                live_ranges.construct(func, &mut counts, &region_tree, &mut liveness, &mut output)
-            });
+            .and_then(|()| live_ranges.construct(func, &mut counts, &mut liveness, &mut output));
         if result.is_err() {
             return Err(format!("construction failed: {:?}", output.take_error()));
         }

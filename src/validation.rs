@@ -19,7 +19,7 @@ use crate::{
     output::OutputInner,
     timing::Timing,
 };
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 pub(crate) fn validate<E>(func: &impl InputFunction, output: &mut OutputInner<E>) -> IResult<()>
 where
@@ -426,7 +426,7 @@ where
             return output.error(Error::InvalidImmediateDominator { block });
         }
 
-        let mut check = |a: Block, b: Block| -> Result<()> {
+        let check = |a: Block, b: Block| -> Result<()> {
             if func.block(a).dominates(b) == dominators.block_dominates(a, b) {
                 Ok(())
             } else {

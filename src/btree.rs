@@ -54,6 +54,7 @@ impl<E, T> BTreeSet<E, T> {
         self.inner.is_empty()
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -93,6 +94,7 @@ impl<E, T> BTreeSet<E, T> {
         self.inner.contains(value)
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn get<Q>(&self, arena: &BTreeSetArena<E, T>, value: &Q) -> Option<&T>
     where
         T: Borrow<Q> + Ord,

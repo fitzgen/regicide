@@ -15,7 +15,7 @@
 //! [Tarjan's algorithm]: https://en.wikipedia.org/wiki/Tarjan%27s_strongly_connected_components_algorithm
 
 use crate::{
-    Entity, InputBlock,
+    Entity,
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     dfs::{Dfs, DfsEvent},
@@ -25,7 +25,7 @@ use crate::{
     output::OutputInner,
 };
 use alloc::vec::Vec;
-use core::{cmp, marker::PhantomData, ops::Range};
+use core::{cmp, ops::Range};
 
 pub struct StronglyConnectedComponents<E>
 where
@@ -211,11 +211,13 @@ where
     }
 
     /// Get the number of strongly-connected components.
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn len(&self) -> usize {
         self.components.len()
     }
 
     /// Are there no strongly-connected components?
+    #[expect(dead_code, reason = "will probably need it")]
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
     }
@@ -224,6 +226,7 @@ where
     ///
     /// Iteration happens in reverse-topological order: successors are visited
     /// before predecessors in the resulting SCC DAG.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn keys(&self) -> PrimaryMapKeys<Scc<E>> {
         self.components.keys()
     }
@@ -250,7 +253,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::TestFunction;
+    use crate::{InputBlock as _, test::TestFunction};
     use mutatis::check::{Check, CheckResult};
     use std::{
         collections::{BTreeSet, HashMap},
