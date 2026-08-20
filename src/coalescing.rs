@@ -509,7 +509,7 @@ where
         // Build a map from this block's live-out values to their final spans in
         // this block.
         debug_assert_eq!(self.val_exit_span.len(), 0);
-        for span in live_ranges.live_out_spans(output, &input.func.block(block.with_repr32()))? {
+        for span in live_ranges.live_out_spans(block) {
             debug_assert_eq!(live_ranges.span(span).end(), block_end);
             self.val_exit_span[live_ranges.span(span).val()] = Some(span);
         }
@@ -523,7 +523,7 @@ where
             // spans in the successor.
             debug_assert_eq!(self.val_entry_span.len(), 0);
             let succ_start = block_start_point(input, output, succ_repr)?;
-            for span in live_ranges.live_in_spans(output, &input.func.block(succ))? {
+            for span in live_ranges.live_in_spans(succ_repr) {
                 debug_assert_eq!(live_ranges.span(span).start(), succ_start);
                 let val = live_ranges.span(span).val();
                 // We might already have an entry in `val_entry_span` because a
@@ -544,7 +544,7 @@ where
 
             // Create affinities between the spans of a value that is both live-in
             // to the successor and live-out of this block.
-            for span in live_ranges.live_in_spans(output, &input.func.block(succ))? {
+            for span in live_ranges.live_in_spans(succ_repr) {
                 let val = live_ranges.span(span).val();
                 if self.val_entry_span[val] != Some(span) {
                     // This span's value is not live-in to the successor; ignore it.

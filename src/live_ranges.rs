@@ -1,5 +1,6 @@
 //! Constructs live ranges and bundles.
 
+use crate::RegSet;
 use crate::counts::Counts;
 use crate::entity::{
     Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, Region, SecondaryMap, Val, WideInt,
@@ -11,7 +12,6 @@ use crate::machine::Machine;
 use crate::output::{Allocation, OutputInner};
 use crate::packed_float::PackedPositiveFloat;
 use crate::timing::Timing;
-use crate::{InputBlock, RegSet};
 
 define_entities! {
     /// A contiguous span `[start, end)` within which an associated value is
@@ -484,6 +484,18 @@ where
     /// allocation), as splitting invalidates this map.
     block_spans: SecondaryMap<Block<E>, EntityRange<LiveSpan<E>>>,
 
+    /// Map from a block to the spans that are live-in to it.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    live_in_spans: SecondaryMap<Block<E>, EntityRange<LiveSpan<E>>>,
+
+    /// Map from a block to the spans that are live-out of it.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    live_out_spans: SecondaryMap<Block<E>, EntityRange<LiveSpan<E>>>,
+
     /// Map from a block to the uses within it.
     block_uses: SecondaryMap<Block<E>, EntityRange<Use<E>>>,
 
@@ -503,6 +515,8 @@ where
             bundle_spans_storage: PrimaryMap::new(),
             span_bundle: SecondaryMap::new(None),
             block_spans: SecondaryMap::new(EntityRange::empty()),
+            live_in_spans: SecondaryMap::new(EntityRange::empty()),
+            live_out_spans: SecondaryMap::new(EntityRange::empty()),
             block_uses: SecondaryMap::new(EntityRange::empty()),
             use_span: SecondaryMap::new(LiveSpan::MAX_REPRESENTABLE),
         }
@@ -516,6 +530,8 @@ where
             bundle_spans_storage,
             span_bundle,
             block_spans,
+            live_in_spans,
+            live_out_spans,
             block_uses,
             use_span,
         } = self;
@@ -525,6 +541,8 @@ where
         bundle_spans_storage.reset();
         span_bundle.reset();
         block_spans.reset();
+        live_in_spans.reset();
+        live_out_spans.reset();
         block_uses.reset();
         use_span.reset();
     }
@@ -537,6 +555,8 @@ where
             bundle_spans_storage,
             span_bundle,
             block_spans,
+            live_in_spans,
+            live_out_spans,
             block_uses,
             use_span,
         } = self;
@@ -546,6 +566,8 @@ where
             && bundle_spans_storage.is_reset()
             && span_bundle.is_reset()
             && block_spans.is_reset()
+            && live_in_spans.is_reset()
+            && live_out_spans.is_reset()
             && block_uses.is_reset()
             && use_span.is_reset()
     }
@@ -596,63 +618,19 @@ where
     }
 
     /// Get the spans that are live-in to the given block.
-    pub fn live_in_spans<'a>(
-        &self,
-        output: &mut OutputInner<E>,
-        input_block: &impl InputBlock<'a>,
-    ) -> IResult<EntityRange<LiveSpan<E>>> {
-        let first_inst = block_first_inst(input_block);
-        let block_start = LivePoint::new(output.with_repr(first_inst)?, Position::Early);
-
-        let block = output.with_repr(input_block.block())?;
-        let block_spans = self.block_spans[block];
-
-        let start = block_spans.start;
-        let mut end = start;
-        for span in block_spans {
-            if self.spans[span].start() != block_start {
-                break;
-            }
-            end = LiveSpan::try_new(span.index() + 1).unwrap();
-        }
-        Ok(EntityRange { start, end })
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    pub fn live_in_spans(&self, block: Block<E>) -> EntityRange<LiveSpan<E>> {
+        self.live_in_spans[block]
     }
 
     /// Get the spans that are live-out of the given block.
-    pub fn live_out_spans<'a>(
-        &self,
-        output: &mut OutputInner<E>,
-        input_block: &impl InputBlock<'a>,
-    ) -> IResult<EntityRange<LiveSpan<E>>> {
-        let last_inst = block_last_inst(input_block);
-        let block_end = LivePoint::new(output.with_repr(last_inst)?, Position::Late).next_point();
-
-        let block = output.with_repr(input_block.block())?;
-        let block_spans = self.block_spans[block];
-
-        let mut start = None;
-        let mut end = block_spans.start;
-        for span in block_spans {
-            // TODO: we could have a `SecondaryMap<Block, u32>` or something
-            // that gives the index where the live-out spans start for each
-            // block, so we could avoid scanning over the live-in spans
-            // first. investigate whether this is worth it.
-            if self.spans[span].end() == block_end {
-                start.get_or_insert(span);
-                end = span;
-            } else if start.is_some() {
-                // The live-out spans are contiguous, so the run is over.
-                break;
-            }
-        }
-
-        match start {
-            Some(start) => {
-                let end = LiveSpan::try_new(end.index() + 1).unwrap();
-                Ok(EntityRange { start, end })
-            }
-            None => Ok(EntityRange::empty()),
-        }
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    pub fn live_out_spans(&self, block: Block<E>) -> EntityRange<LiveSpan<E>> {
+        self.live_out_spans[block]
     }
 
     /// Get the range of uses that construction recorded for the given `block`.
@@ -865,6 +843,8 @@ where
             bundle_spans_storage: _,
             span_bundle: _,
             block_spans,
+            live_in_spans,
+            live_out_spans,
             block_uses,
             use_span,
         } = self;
@@ -885,8 +865,8 @@ where
             let uses_end = uses.next_key(output)?;
             let spans_end = spans.next_key(output)?;
 
-            // Sort this block's spans into buckets that allow us to easily
-            // query for live-in and live-out spans.
+            // Sort this block's spans into buckets so that live-in and live-out
+            // spans are both in a contiguous run.
             //
             // See `live_in_spans` and `live_out_spans`.
             spans.as_mut_slice()[spans_start.index()..spans_end.index()].sort_unstable_by_key(
@@ -905,6 +885,10 @@ where
                 },
             );
 
+            let mut live_in_end = spans_start;
+            let mut live_out_start = None;
+            let mut live_out_end = spans_start;
+
             for span in (EntityRange {
                 start: spans_start,
                 end: spans_end,
@@ -912,21 +896,67 @@ where
                 for u in spans[span].uses() {
                     use_span[u] = span;
                 }
+
+                let next = LiveSpan::try_new(span.index() + 1).unwrap();
+                if spans[span].start() == block_start {
+                    live_in_end = next;
+                }
+                if spans[span].end() == block_end {
+                    live_out_start.get_or_insert(span);
+                    live_out_end = next;
+                }
             }
 
             block_spans[block] = EntityRange {
                 start: spans_start,
                 end: spans_end,
             };
+
             block_uses[block] = EntityRange {
                 start: uses_start,
                 end: uses_end,
             };
-
             debug_assert!(
                 block_uses[block]
                     .into_iter()
                     .all(|u| use_span[u] != LiveSpan::default())
+            );
+
+            live_in_spans[block] = EntityRange {
+                start: spans_start,
+                end: live_in_end,
+            };
+            debug_assert!(
+                live_in_spans[block]
+                    .into_iter()
+                    .all(|s| spans[s].start() == block_start)
+            );
+            debug_assert_eq!(
+                live_in_spans[block].into_iter().count(),
+                block_spans[block]
+                    .into_iter()
+                    .filter(|&s| spans[s].start() == block_start)
+                    .count(),
+            );
+
+            live_out_spans[block] = match live_out_start {
+                Some(start) => EntityRange {
+                    start,
+                    end: live_out_end,
+                },
+                None => EntityRange::empty(),
+            };
+            debug_assert!(
+                live_out_spans[block]
+                    .into_iter()
+                    .all(|s| spans[s].end() == block_end)
+            );
+            debug_assert_eq!(
+                live_out_spans[block].into_iter().count(),
+                block_spans[block]
+                    .into_iter()
+                    .filter(|&s| spans[s].end() == block_end)
+                    .count(),
             );
         }
 
