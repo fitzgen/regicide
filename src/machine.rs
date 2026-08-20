@@ -1123,6 +1123,14 @@ enum Allocatable {
 mod tests {
     use super::*;
 
+    #[test]
+    fn machine_is_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Machine>();
+        assert_sync::<Machine>();
+    }
+
     fn unit(i: usize) -> RegUnit {
         RegUnit::try_new(i).unwrap()
     }

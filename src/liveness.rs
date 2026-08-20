@@ -647,20 +647,26 @@ where
     Ok(())
 }
 
-fn block_inst_bounds<'a>(input_block: &impl InputBlock<'a>) -> (Inst, Inst) {
-    let mut insts = input_block.insts();
+pub(crate) fn block_inst_bounds<'a>(input_block: &impl InputBlock<'a>) -> (Inst, Inst) {
+    (block_first_inst(input_block), block_last_inst(input_block))
+}
 
-    let first = insts
+/// Get the first instruction in a block.
+pub(crate) fn block_first_inst<'a>(input_block: &impl InputBlock<'a>) -> Inst {
+    input_block
+        .insts()
         .next()
         .expect("always have at least one instruction in a block: its terminator")
-        .0;
+        .0
+}
 
-    let last = match insts.next_back() {
-        Some((inst, _)) => inst,
-        None => first,
-    };
-
-    (first, last)
+/// Get the last instruction in a block.
+pub(crate) fn block_last_inst<'a>(input_block: &impl InputBlock<'a>) -> Inst {
+    input_block
+        .insts()
+        .next_back()
+        .expect("always have at least one instruction in a block: its terminator")
+        .0
 }
 
 /// Visit `input_block`'s operands in reverse program order, walking from the

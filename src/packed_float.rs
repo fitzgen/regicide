@@ -72,6 +72,7 @@ macro_rules! define_storages {
 
             #[allow(dead_code, reason = "macro-generated")]
             impl<const BITS: u32> PackedPositiveFloat<$t, BITS> {
+                #[allow(trivial_numeric_casts, reason = "macro-generated")]
                 pub const MASK: $t = Self::MASK_AS_U32 as $t;
 
                 /// Pack `value`.
@@ -86,9 +87,13 @@ macro_rules! define_storages {
                         value.is_sign_positive(),
                         "the sign bit is not stored, so it must be clear",
                     );
-                    PackedPositiveFloat {
-                        bits: ((value.to_bits() >> Self::SHIFT) & Self::MASK_AS_U32) as $t,
-                    }
+
+                    let bits = (value.to_bits() >> Self::SHIFT) & Self::MASK_AS_U32;
+
+                    #[allow(trivial_numeric_casts, reason = "macro-generated")]
+                    let bits = bits as $t;
+
+                    PackedPositiveFloat { bits }
                 }
 
                 #[inline]
@@ -105,7 +110,9 @@ macro_rules! define_storages {
                 /// restored as zeroes.
                 #[inline]
                 pub const fn as_f32(self) -> f32 {
-                    f32::from_bits((self.bits as u32) << Self::SHIFT)
+                    #[allow(trivial_numeric_casts, reason = "macro-generated")]
+                    let bits = self.bits as u32;
+                    f32::from_bits(bits << Self::SHIFT)
                 }
 
                 /// This value's packed bits, which occupy only the low `BITS` of

@@ -62,6 +62,7 @@ pub struct Counts {
     pub live_spans: Count,
     pub uses: Count,
     pub eager_splits: Count,
+    pub bundles: Count,
 }
 
 impl Counts {
@@ -73,6 +74,7 @@ impl Counts {
             live_spans: Count::new(),
             uses: Count::new(),
             eager_splits: Count::new(),
+            bundles: Count::new(),
         }
     }
 
@@ -88,6 +90,7 @@ impl Counts {
             live_spans,
             uses,
             eager_splits,
+            bundles,
         } = self;
         sccs.is_reset()
             && regions.is_reset()
@@ -95,5 +98,6 @@ impl Counts {
             && live_spans.is_reset()
             && uses.is_reset()
             && eager_splits.is_reset()
+            && bundles.is_reset()
     }
 }

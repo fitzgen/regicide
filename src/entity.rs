@@ -413,6 +413,31 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.indices.next().map(|i| K::try_new(i).unwrap())
     }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.indices.size_hint()
+    }
+}
+
+impl<K> DoubleEndedIterator for EntityRangeIter<K>
+where
+    K: Entity,
+{
+    #[inline]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.indices.next_back().map(|i| K::try_new(i).unwrap())
+    }
+}
+
+impl<K> ExactSizeIterator for EntityRangeIter<K>
+where
+    K: Entity,
+{
+    #[inline]
+    fn len(&self) -> usize {
+        self.indices.len()
+    }
 }
 
 #[cfg(test)]

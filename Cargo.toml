@@ -21,5 +21,42 @@ trace-log = []
 entity-repr-8 = []
 entity-repr-16 = []
 
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(fuzz)'] }
+[lints]
+workspace = true
+
+# Turn on some lints which are otherwise allow-by-default in rustc.
+[workspace.lints.rust]
+unused_extern_crates = "warn"
+trivial_numeric_casts = "warn"
+unstable_features = "warn"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+
+[workspace.lints.rust.unexpected_cfgs]
+level = "warn"
+check-cfg = [
+  # `cfg(fuzz)` is set by `cargo fuzz`.
+  "cfg(fuzz)",
+]
+
+# The default set of lints in Clippy is too noisy, so allow them all by
+# default and then selectively enable useful ones below.
+[workspace.lints.clippy]
+all = { level = "allow", priority = -1 }
+clone_on_copy = "warn"
+map_clone = "warn"
+uninlined_format_args = "warn"
+unnecessary_to_owned = "warn"
+manual_strip = "warn"
+useless_conversion = "warn"
+unnecessary_mut_passed = "warn"
+unnecessary_fallible_conversions = "warn"
+unnecessary_cast = "warn"
+allow_attributes_without_reason = "warn"
+from_over_into = "warn"
+redundant_field_names = "warn"
+multiple_bound_locations = "warn"
+extra_unused_type_parameters = "warn"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"

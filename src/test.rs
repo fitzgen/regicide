@@ -1050,6 +1050,10 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
     where
         Self: 'b;
 
+    fn block(&self) -> Block {
+        self.block
+    }
+
     fn frequency(&self) -> BlockFrequency {
         let index = self.func.blocks[self.block].frequency;
         BLOCK_FREQUENCIES[usize::from(index) % BLOCK_FREQUENCIES.len()]
@@ -1168,6 +1172,10 @@ impl Iterator for TestBlockSuccessorsIter<'_> {
 impl ExactSizeIterator for TestBlockSuccessorsIter<'_> {}
 
 impl<'a> InputInst<'a> for TestInst<'a> {
+    fn inst(&self) -> Inst {
+        self.inst
+    }
+
     fn operands_len(&self) -> usize {
         self.operands().len()
     }
@@ -1608,6 +1616,98 @@ impl TestInput {
                 },
             )
             .unwrap();
+
+        let mut input = TestInput {
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A two-block input that passes one value along an edge as a block
+    /// argument, with a use of the argument constrained by `arg` and a use of
+    /// the parameter it feeds constrained by `param`.
+    ///
+    /// This is the smallest function that has a block argument-to-parameter
+    /// affinity for coalescing to find, and the constraints are the knob for
+    /// deciding whether it may take it. The machine is
+    /// [`TestMachine::two_registers`], so `Reg(rc0)` and `Reg(rc1)` are the
+    /// pair that conflict.
+    pub fn with_block_arg_constraints(arg: OperandConstraint, param: OperandConstraint) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let arg_val = Val::try_new(0).unwrap();
+        let param_val = Val::try_new(1).unwrap();
+        let def = Inst::try_new(0).unwrap();
+        let target = Block::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult { inst: def, i: 0 },
+            ValDef::BlockParam {
+                block: target,
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        ty: Type::default(),
+                        def,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // The definition, then a use that gives the argument's span its
+            // constraint, then the branch that passes it along.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, arg_val),
+            op(Position::Early, DefUse::Use, arg, arg_val),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target,
+                    args: vec![arg_val],
+                }],
+            },
+            // A use that gives the parameter's span its constraint, then a
+            // terminator of the target block's own, so that
+            // `ensure_terminators` does not take that use away.
+            op(Position::Early, DefUse::Use, param, param_val),
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param_val],
+                insts: vec![inst(3), inst(4)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
 
         let mut input = TestInput {
             machine: TestMachine::two_registers(),

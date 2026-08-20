@@ -484,6 +484,9 @@ pub trait InputBlock<'a> {
     where
         Self: 'b;
 
+    /// Get this block's `Block`.
+    fn block(&self) -> Block;
+
     /// Get the estimated frequency that this block is executed.
     fn frequency(&self) -> BlockFrequency;
 
@@ -599,6 +602,9 @@ pub trait InputBlock<'a> {
 
 /// An instruction in a [`InputBlock`].
 pub trait InputInst<'a> {
+    /// Get this instruction's `Inst`.
+    fn inst(&self) -> Inst;
+
     /// TODO FITZGEN
     fn operands_len(&self) -> usize;
 
@@ -855,6 +861,17 @@ where
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+
+    #[test]
+    fn input_is_send_sync() {
+        fn _with_send_sync_input_func<F: InputFunction + Send + Sync>() {
+            fn assert_send<T: Send>() {}
+            fn assert_sync<T: Sync>() {}
+
+            assert_send::<Input<'_, F>>();
+            assert_sync::<Input<'_, F>>();
+        }
+    }
 
     #[test]
     fn canonical_block_frequencies_stay_ordered() {

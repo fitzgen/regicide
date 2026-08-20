@@ -155,6 +155,12 @@ where
     pub fn as_slice(&self) -> &[V] {
         &self.elems
     }
+
+    /// Get this map's values as a mutable slice, in key order.
+    #[allow(dead_code, reason = "will probably need it")]
+    pub fn as_mut_slice(&mut self) -> &mut [V] {
+        &mut self.elems
+    }
 }
 
 /// An iterator over key-value pairs in a `PrimaryMap`.
@@ -249,9 +255,9 @@ where
     }
 }
 
-impl<'a, K> ExactSizeIterator for PrimaryMapKeys<K> where K: Entity {}
+impl<K> ExactSizeIterator for PrimaryMapKeys<K> where K: Entity {}
 
-impl<'a, K> DoubleEndedIterator for PrimaryMapKeys<K>
+impl<K> DoubleEndedIterator for PrimaryMapKeys<K>
 where
     K: Entity,
 {

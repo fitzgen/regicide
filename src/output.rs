@@ -263,3 +263,16 @@ impl<E: EntityRepr> OutputInner<E> {
         self.error.take().unwrap()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_is_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Output>();
+        assert_sync::<Output>();
+    }
+}

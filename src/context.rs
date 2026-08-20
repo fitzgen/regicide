@@ -1,6 +1,6 @@
 use crate::{
-    counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges, liveness::Liveness,
-    region_tree::RegionTree, sccs::StronglyConnectedComponents,
+    coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
+    liveness::Liveness, region_tree::RegionTree, sccs::StronglyConnectedComponents,
 };
 
 /// TODO FITZGEN
@@ -77,6 +77,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub live_ranges: LiveRanges<E>,
     pub sccs: StronglyConnectedComponents<E>,
     pub dfs: Dfs<E>,
+    pub coalescing: Coalescing<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
@@ -88,6 +89,7 @@ impl<E: EntityRepr> ContextInner<E> {
             live_ranges: LiveRanges::new(),
             sccs: StronglyConnectedComponents::new(),
             dfs: Dfs::new(),
+            coalescing: Coalescing::new(),
         }
     }
 
@@ -99,6 +101,7 @@ impl<E: EntityRepr> ContextInner<E> {
             live_ranges,
             sccs,
             dfs,
+            coalescing,
         } = self;
         counts.reset();
         region_tree.reset();
@@ -106,6 +109,7 @@ impl<E: EntityRepr> ContextInner<E> {
         live_ranges.reset();
         sccs.reset();
         dfs.reset();
+        coalescing.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -116,6 +120,7 @@ impl<E: EntityRepr> ContextInner<E> {
             live_ranges,
             sccs,
             dfs,
+            coalescing,
         } = self;
         counts.is_reset()
             && region_tree.is_reset()
@@ -123,5 +128,19 @@ impl<E: EntityRepr> ContextInner<E> {
             && live_ranges.is_reset()
             && sccs.is_reset()
             && dfs.is_reset()
+            && coalescing.is_reset()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_is_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<Context>();
+        assert_sync::<Context>();
     }
 }

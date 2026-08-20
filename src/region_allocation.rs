@@ -12,6 +12,10 @@ where
     E: EntityRepr,
 {
     let _timing = Timing::new("region allocate");
+
+    // TODO: reset `LiveRanges::block_spans`, since this pass can split spans,
+    // which invalidates that map.
+
     let _ = (context, func);
     todo!()
 }

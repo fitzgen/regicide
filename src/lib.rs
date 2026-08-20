@@ -23,6 +23,7 @@ macro_rules! trace {
 mod entity;
 
 mod btree;
+mod coalescing;
 mod context;
 mod counts;
 mod dfs;
@@ -36,7 +37,6 @@ mod move_elimination;
 mod output;
 mod packed_float;
 mod parallel_moves;
-mod partial_allocation;
 mod region_allocation;
 mod region_tree;
 mod sccs;
@@ -162,7 +162,7 @@ where
         .live_ranges
         .construct(input, &mut context.counts, &mut context.liveness, output)?;
 
-    partial_allocation::partial_allocate(context, input.func)?;
+    coalescing::coalesce(context, input, output)?;
     region_allocation::region_allocate(context, input.func)?;
     spill_slots::allocate_spill_slots(context, input.func)?;
     move_elimination::eliminate_moves(context, input.func)?;
