@@ -499,6 +499,12 @@ where
     /// Map from a block to the uses within it.
     block_uses: SecondaryMap<Block<E>, EntityRange<Use<E>>>,
 
+    /// Map from a region to the bundles that coalescing created for it.
+    ///
+    /// Does not include bundles created after coalescing, e.g. by splitting
+    /// during region allocation.
+    region_bundles: SecondaryMap<Region<E>, EntityRange<LiveBundle<E>>>,
+
     /// Map from a use to the span that contains it.
     use_span: SecondaryMap<Use<E>, LiveSpan<E>>,
 }
@@ -518,6 +524,7 @@ where
             live_in_spans: SecondaryMap::new(EntityRange::empty()),
             live_out_spans: SecondaryMap::new(EntityRange::empty()),
             block_uses: SecondaryMap::new(EntityRange::empty()),
+            region_bundles: SecondaryMap::new(EntityRange::empty()),
             use_span: SecondaryMap::new(LiveSpan::MAX_REPRESENTABLE),
         }
     }
@@ -534,6 +541,7 @@ where
             live_out_spans,
             block_uses,
             use_span,
+            region_bundles,
         } = self;
         uses.reset();
         spans.reset();
@@ -545,6 +553,7 @@ where
         live_out_spans.reset();
         block_uses.reset();
         use_span.reset();
+        region_bundles.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -559,6 +568,7 @@ where
             live_out_spans,
             block_uses,
             use_span,
+            region_bundles,
         } = self;
         uses.is_reset()
             && spans.is_reset()
@@ -570,6 +580,7 @@ where
             && live_out_spans.is_reset()
             && block_uses.is_reset()
             && use_span.is_reset()
+            && region_bundles.is_reset()
     }
 
     /// How many live spans have been constructed?
@@ -724,6 +735,25 @@ where
         self.span_bundle[span]
     }
 
+    /// Get the bundles that coalescing created for the given region.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting adds bundles outside this range.
+    pub fn region_bundles(&self, region: Region<E>) -> EntityRange<LiveBundle<E>> {
+        self.region_bundles[region]
+    }
+
+    /// Get the key that the next call to `push_bundle` will assign.
+    pub fn next_bundle(&self, output: &mut OutputInner<E>) -> IResult<LiveBundle<E>> {
+        self.bundles.next_key(output)
+    }
+
+    /// Record the bundles that were created for the given region.
+    pub fn set_region_bundles(&mut self, region: Region<E>, bundles: EntityRange<LiveBundle<E>>) {
+        debug_assert!(self.region_bundles[region].is_empty());
+        self.region_bundles[region] = bundles;
+    }
+
     /// Form a new bundle out of `spans`, which must be non-empty and in
     /// ascending program order.
     pub(crate) fn push_bundle(
@@ -847,6 +877,7 @@ where
             live_out_spans,
             block_uses,
             use_span,
+            region_bundles: _,
         } = self;
 
         // Construct a span for each value live in or across this block.

@@ -6,7 +6,7 @@
 use crate::{
     Entity, Input, InputFunction, Machine, OperandConstraint, RegUnit,
     context::ContextInner,
-    entity::{EntityRepr, EntitySet, Region, SecondaryMap},
+    entity::{EntityRepr, Region, SecondaryMap},
     error::IResult,
     live_ranges::{LiveBundle, LiveRanges, LiveSpan},
     machine::RegClassMembers,
@@ -39,7 +39,7 @@ where
     find_region_pre_order(&mut region_pre_order, region_tree);
 
     for region in region_pre_order.iter().copied().rev() {
-        region_allocation.allocate_region(&input.machine, region_tree, live_ranges, region);
+        region_allocation.allocate_region(&input.machine, live_ranges, region);
     }
 
     region_pre_order.clear();
@@ -81,11 +81,6 @@ where
     /// The main work queue of bundles that still need assignment.
     queue: BinaryHeap<PqEntry<E>>,
 
-    /// The set of bundles that are in `self.queue`, used only when initializing
-    /// the queue, as that is the only time where we don't know whether we
-    /// already enqueued a bundle or not.
-    in_queue: EntitySet<LiveBundle<E>>,
-
     /// Scratch space to hold a pre-order traversal of the region tree.
     region_pre_order: Vec<Region<E>>,
 }
@@ -99,7 +94,6 @@ where
             assignments: SecondaryMap::new(BTreeMap::new()),
             region_assignments: SecondaryMap::new(BTreeMap::new()),
             queue: BinaryHeap::new(),
-            in_queue: EntitySet::new(),
             region_pre_order: Vec::new(),
         }
     }
@@ -109,13 +103,11 @@ where
             assignments,
             region_assignments,
             queue,
-            in_queue,
             region_pre_order,
         } = self;
         assignments.reset();
         region_assignments.reset();
         queue.clear();
-        in_queue.reset();
         region_pre_order.clear();
     }
 
@@ -124,39 +116,29 @@ where
             assignments,
             region_assignments,
             queue,
-            in_queue,
             region_pre_order,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
             && queue.is_empty()
-            && in_queue.is_reset()
             && region_pre_order.is_empty()
     }
 
     fn allocate_region(
         &mut self,
         machine: &Machine,
-        region_tree: &RegionTree<E>,
         live_ranges: &mut LiveRanges<E>,
         region: Region<E>,
     ) {
         debug_assert!(self.queue.is_empty());
-        debug_assert!(self.in_queue.is_empty());
 
         // Insert each bundle in this region into the queue.
-        for block in region_tree.blocks(region) {
-            // Okay to call `block_spans` because we haven't split any spans in
-            // this block yet, because we haven't register allocated this region
-            // yet.
-            for span in live_ranges.block_spans(block) {
-                let bundle = live_ranges
-                    .span_bundle(span)
-                    .expect("always some after coalescing");
-                if self.in_queue.insert(bundle) {
-                    self.push_bundle(machine, live_ranges, bundle, Phase::default());
-                }
-            }
+        //
+        // Okay to call `region_bundles` because we haven't split any of this
+        // region's bundles yet, because we haven't allocated registers within
+        // this region yet.
+        for bundle in live_ranges.region_bundles(region) {
+            self.push_bundle(machine, live_ranges, bundle, Phase::default());
         }
 
         // Keep processing bundles until they've all been assigned!

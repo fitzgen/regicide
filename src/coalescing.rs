@@ -50,7 +50,7 @@
 //! allocation within the child region, at that point.
 
 use crate::context::ContextInner;
-use crate::entity::{Block, Entity, EntityRepr, Region, SecondaryMap, Val};
+use crate::entity::{Block, Entity, EntityRange, EntityRepr, Region, SecondaryMap, Val};
 use crate::error::IResult;
 use crate::input::{Input, InputBlock, InputFunction, InputInst, OperandConstraint, Position};
 use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan};
@@ -792,10 +792,7 @@ where
     while let Some(region) = coalescing.region_stack.pop() {
         coalescing.region_stack.extend(region_tree.children(region));
 
-        // TODO: record the `EntityRange<LiveBundle<E>>` for this region into
-        // some `SecondaryMap` somewhere, to enable fast access of all bundles
-        // in a region. allows us to get rid of the `in_queue` set in
-        // `RegionAllocation`, as well as speed up the initial queue filling.
+        let start = live_ranges.next_bundle(output)?;
 
         for block in region_tree.blocks(region) {
             for span in live_ranges.block_spans(block) {
@@ -815,6 +812,9 @@ where
                 live_ranges.push_bundle(output, region, constraint, false, 0.0, members)?;
             }
         }
+
+        let end = live_ranges.next_bundle(output)?;
+        live_ranges.set_region_bundles(region, EntityRange { start, end });
     }
 
     counts.bundles += live_ranges.len_bundles();
@@ -1175,7 +1175,33 @@ mod tests {
                     ));
                 }
 
-                // 6. Coalescing did its job: for every affinity, either the
+                // 6. Each region's recorded bundle range holds exactly the
+                // bundles in that region, and the ranges tile the bundle
+                // arena.
+                let mut counted = 0;
+                let mut regions = Vec::from([inner.region_tree.root()]);
+                while let Some(region) = regions.pop() {
+                    regions.extend(inner.region_tree.children(region));
+                    for bundle in live_ranges.region_bundles(region) {
+                        counted += 1;
+                        let actual = live_ranges.bundle(bundle).region();
+                        if actual != region {
+                            return Err(format!(
+                                "{region:?} lists {bundle:?} among its bundles, but that \
+                                 bundle is in {actual:?}",
+                            ));
+                        }
+                    }
+                }
+                if counted != live_ranges.len_bundles() {
+                    return Err(format!(
+                        "the regions' bundle ranges hold {counted} bundles, but there are \
+                         {} in all",
+                        live_ranges.len_bundles(),
+                    ));
+                }
+
+                // 7. Coalescing did its job: for every affinity, either the
                 // two spans share a bundle or there is a reason they cannot.
                 // Aggressive coalescing is order-dependent, so "an earlier
                 // merge made this one illegal" is one of those reasons -- but it
@@ -1218,7 +1244,7 @@ mod tests {
                     Ok(())
                 })?;
 
-                // 7. A register hint never widens what a bundle may be
+                // 8. A register hint never widens what a bundle may be
                 // allocated to, and only a cross-region affinity can put one
                 // there in the first place.
                 let cross_region: Vec<(LiveBundle, LiveBundle)> = test_input.with_input(|input| {
@@ -1267,7 +1293,7 @@ mod tests {
                     Ok(())
                 })?;
 
-                // 8. Every span belongs to exactly one block's span list, and
+                // 9. Every span belongs to exactly one block's span list, and
                 // lies inside that block's program points.
                 let mut seen = 0;
                 for (block, _) in func.blocks() {
@@ -1293,7 +1319,7 @@ mod tests {
                     ));
                 }
 
-                // 9. Coalescing twice gives exactly the same bundles.
+                // 10. Coalescing twice gives exactly the same bundles.
                 let again = coalesce_input(test_input)?;
                 let again = &again.context32.live_ranges;
                 if again.len_bundles() != live_ranges.len_bundles() {
@@ -1315,7 +1341,7 @@ mod tests {
                     }
                 }
 
-                // 10. Everything the pass touched resets cleanly.
+                // 11. Everything the pass touched resets cleanly.
                 context.reset();
                 if !context.is_reset() {
                     return Err("`Context::is_reset` is false after `reset`".to_string());
