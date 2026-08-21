@@ -13,5 +13,10 @@ where
 {
     let _timing = Timing::new("eliminate moves");
     let _ = (context, func);
+
+    // TODO: fixed-point data-flow analysis to find (a) moves that simply move
+    // the value that is already in that location into that location again, and
+    // (b) moves that can be replaced with rematerialization.
+
     todo!()
 }
