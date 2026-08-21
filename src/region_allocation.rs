@@ -1,21 +1,535 @@
-use crate::context::ContextInner;
-use crate::entity::EntityRepr;
-use crate::error::IResult;
-use crate::input::InputFunction;
-use crate::timing::Timing;
+//! Region-based allocation.
+//!
+//! We do a bottom-up walk of the region tree, allocating registers within each
+//! region.
 
-pub(crate) fn region_allocate<E>(
+use crate::{
+    Entity, Input, InputFunction, Machine, OperandConstraint, RegUnit,
+    context::ContextInner,
+    entity::{EntityRepr, EntitySet, Region, SecondaryMap},
+    error::IResult,
+    live_ranges::{LiveBundle, LiveRanges, LiveSpan},
+    machine::RegClassMembers,
+    region_tree::RegionTree,
+    timing::Timing,
+};
+use alloc::{collections::BinaryHeap, vec::Vec};
+use core::{fmt, marker::PhantomData};
+use std::collections::BTreeMap;
+
+pub fn region_allocate<E>(
     context: &mut ContextInner<E>,
-    func: &impl InputFunction,
+    input: &Input<'_, impl InputFunction>,
 ) -> IResult<()>
 where
     E: EntityRepr,
 {
     let _timing = Timing::new("region allocate");
 
-    // TODO: reset `LiveRanges::block_spans`, since this pass can split spans,
-    // which invalidates that map.
+    let ContextInner {
+        region_tree,
+        live_ranges,
+        region_allocation,
+        ..
+    } = context;
 
-    let _ = (context, func);
-    todo!()
+    let mut region_pre_order = core::mem::take(&mut region_allocation.region_pre_order);
+    find_region_pre_order(&mut region_pre_order, region_tree);
+
+    for region in region_pre_order.iter().copied().rev() {
+        region_allocation.allocate_region(&input.machine, region_tree, live_ranges, region);
+    }
+
+    region_pre_order.clear();
+    debug_assert!(region_allocation.region_pre_order.is_empty());
+    region_allocation.region_pre_order = region_pre_order;
+
+    // TODO: add final counts of spans and bundles
+
+    Ok(())
+}
+
+fn find_region_pre_order<E>(region_pre_order: &mut Vec<Region<E>>, region_tree: &RegionTree<E>)
+where
+    E: EntityRepr,
+{
+    let _ = (region_pre_order, region_tree);
+    todo!("fill `region_pre_order` with a pre-order traversal of the region tree")
+}
+
+struct Assignment<E>
+where
+    E: EntityRepr,
+{
+    #[allow(dead_code, reason = "will use it soon")]
+    bundle: LiveBundle<E>,
+}
+
+pub struct RegionAllocation<E>
+where
+    E: EntityRepr,
+{
+    /// The register allocation assignments we've committed to, across all regions.
+    assignments: SecondaryMap<RegUnit, BTreeMap<LiveSpan<E>, Assignment<E>>>,
+
+    /// The work-in-progress register allocation assignments for the current
+    /// region.
+    region_assignments: SecondaryMap<RegUnit, BTreeMap<LiveSpan<E>, Assignment<E>>>,
+
+    /// The main work queue of bundles that still need assignment.
+    queue: BinaryHeap<PqEntry<E>>,
+
+    /// The set of bundles that are in `self.queue`, used only when initializing
+    /// the queue, as that is the only time where we don't know whether we
+    /// already enqueued a bundle or not.
+    in_queue: EntitySet<LiveBundle<E>>,
+
+    /// Scratch space to hold a pre-order traversal of the region tree.
+    region_pre_order: Vec<Region<E>>,
+}
+
+impl<E> RegionAllocation<E>
+where
+    E: EntityRepr,
+{
+    pub const fn new() -> Self {
+        Self {
+            assignments: SecondaryMap::new(BTreeMap::new()),
+            region_assignments: SecondaryMap::new(BTreeMap::new()),
+            queue: BinaryHeap::new(),
+            in_queue: EntitySet::new(),
+            region_pre_order: Vec::new(),
+        }
+    }
+
+    pub fn reset(&mut self) {
+        let RegionAllocation {
+            assignments,
+            region_assignments,
+            queue,
+            in_queue,
+            region_pre_order,
+        } = self;
+        assignments.reset();
+        region_assignments.reset();
+        queue.clear();
+        in_queue.reset();
+        region_pre_order.clear();
+    }
+
+    pub fn is_reset(&self) -> bool {
+        let RegionAllocation {
+            assignments,
+            region_assignments,
+            queue,
+            in_queue,
+            region_pre_order,
+        } = self;
+        assignments.is_reset()
+            && region_assignments.is_reset()
+            && queue.is_empty()
+            && in_queue.is_reset()
+            && region_pre_order.is_empty()
+    }
+
+    fn allocate_region(
+        &mut self,
+        machine: &Machine,
+        region_tree: &RegionTree<E>,
+        live_ranges: &mut LiveRanges<E>,
+        region: Region<E>,
+    ) {
+        debug_assert!(self.queue.is_empty());
+        debug_assert!(self.in_queue.is_empty());
+
+        // Insert each bundle in this region into the queue.
+        for block in region_tree.blocks(region) {
+            // Okay to call `block_spans` because we haven't split any spans in
+            // this block yet, because we haven't register allocated this region
+            // yet.
+            for span in live_ranges.block_spans(block) {
+                let bundle = live_ranges
+                    .span_bundle(span)
+                    .expect("always some after coalescing");
+                if self.in_queue.insert(bundle) {
+                    self.push_bundle(machine, live_ranges, bundle, Phase::default());
+                }
+            }
+        }
+
+        // Keep processing bundles until they've all been assigned!
+        while let Some(entry) = self.queue.pop() {
+            debug_assert_eq!(entry.priority(), self.get_bundle_priority(entry.bundle()));
+
+            // TODO: increment `counts.queue_pops`
+
+            let phase = entry.phase();
+
+            if self.assign_to_preferred(entry) {
+                // TODO: increment `counts.preferred_assignments`
+                continue;
+            }
+
+            if self.assign_to_non_preferred(entry) {
+                // TODO: increment `counts.non_preferred_assignments`
+                continue;
+            }
+
+            if phase <= Phase::AssignEvict && self.assign_via_eviction(entry) {
+                // TODO: increment `counts.evictions`
+                continue;
+            }
+
+            if phase <= Phase::SplitOnce {
+                self.split_once(entry);
+                // TODO: increment `counts.split_once`
+                continue;
+            }
+
+            if phase <= Phase::SplitAtBlocks {
+                self.split_at_blocks(entry);
+                // TODO: increment `counts.split_at_blocks`
+                continue;
+            }
+
+            debug_assert_eq!(phase, Phase::SplitIntoMinimalOrSpill);
+            self.split_into_minimal_or_spill(entry);
+            // TODO: increment `counts.split_into_minimal_or_spill`
+        }
+    }
+
+    fn push_bundle(
+        &mut self,
+        machine: &Machine,
+        live_ranges: &LiveRanges<E>,
+        bundle: LiveBundle<E>,
+        phase: Phase,
+    ) {
+        let priority = compute_bundle_priority(machine, live_ranges, bundle);
+        self.set_bundle_priority(bundle, priority);
+        self.queue.push(PqEntry::new(phase, priority, bundle));
+    }
+
+    fn set_bundle_priority(&mut self, bundle: LiveBundle<E>, priority: Priority) {
+        let _ = (bundle, priority);
+        todo!("SecondaryMap<LiveBundle<E>, Priority> on self")
+    }
+
+    fn get_bundle_priority(&self, bundle: LiveBundle<E>) -> Priority {
+        let _ = bundle;
+        todo!("SecondaryMap<LiveBundle<E>, Priority> on self")
+    }
+
+    fn assign_to_preferred(&mut self, entry: PqEntry<E>) -> bool {
+        let bundle = entry.bundle();
+        let _ = bundle;
+        // TODO: if the bundle has a register preference, see if we can eagerly
+        // assign it to one of the preferred registers. If so, do that and
+        // return true.
+        todo!()
+    }
+
+    fn assign_to_non_preferred(&mut self, entry: PqEntry<E>) -> bool {
+        let bundle = entry.bundle();
+        let _ = bundle;
+        // TODO: optimistically assume that this bundle doesn't conflict
+        // with any existing assignment, and loop through its assignable
+        // registers (ignoring preferred registers from the first step, if any),
+        // assigning the first one that is not in use. If we assigned it, then
+        // return true.
+        todo!()
+    }
+
+    fn assign_via_eviction(&mut self, entry: PqEntry<E>) -> bool {
+        let bundle = entry.bundle();
+        let _ = bundle;
+
+        // TODO: otherwise, find the bundle with the least priority in any of
+        // this bundle's assignable registers where this bundle would be
+        // allocatable to the associated register if that other bundle were
+        // evicted. if there is no such bundle, or that bundle's priority is
+        // higher than this bundle's priority, then re-push this bundle with an
+        // `entry.priority().phase().inc()` phase. otherwise, if that bundle's
+        // priority is less than this bundle's priority, evict it, push it onto
+        // the queue with phase `AssignEvict`, and assign this bundle to that
+        // now-available register.
+
+        todo!()
+    }
+
+    fn split_once(&mut self, entry: PqEntry<E>) {
+        let bundle = entry.bundle();
+        let _ = bundle;
+        todo!()
+    }
+
+    fn split_at_blocks(&mut self, entry: PqEntry<E>) {
+        let bundle = entry.bundle();
+        let _ = bundle;
+        todo!()
+    }
+
+    fn split_into_minimal_or_spill(&mut self, entry: PqEntry<E>) {
+        let bundle = entry.bundle();
+        let _ = bundle;
+        todo!()
+    }
+}
+
+impl<E> Default for RegionAllocation<E>
+where
+    E: EntityRepr,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn compute_bundle_priority<E>(
+    machine: &Machine,
+    live_ranges: &LiveRanges<E>,
+    bundle: LiveBundle<E>,
+) -> Priority
+where
+    E: EntityRepr,
+{
+    let bundle = live_ranges.bundle(bundle);
+    Priority::new(
+        bundle.has_fixed_uses(),
+        bundle.is_minimal(),
+        bundle_group_size(machine, bundle),
+        bundle.spans().indices().len(),
+    )
+}
+
+fn bundle_group_size<E>(machine: &Machine, bundle: &crate::live_ranges::LiveBundleData<E>) -> usize
+where
+    E: EntityRepr,
+{
+    match bundle.constraint() {
+        OperandConstraint::Reg(rc) => match &machine.classes[rc].members {
+            RegClassMembers::Groups(groups) => machine.groups[groups[0]].members.len(),
+            RegClassMembers::Regs(_) => 0,
+        },
+        OperandConstraint::Any | OperandConstraint::Stack => 0,
+        OperandConstraint::Reuse(_) => unreachable!(),
+    }
+}
+
+/// What phase of allocation is the associated bundle in?
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Phase {
+    /// The initial phase.
+    ///
+    /// Try to assign the bundle, evicting another lower-priority bundle if
+    /// necessary.
+    #[default]
+    AssignEvict = 0,
+
+    /// The first split attempt.
+    ///
+    /// Split the bundle to resolve a conflict and then try allocating each half
+    /// again. This optimistically keeps bundles as large as possible, while
+    /// resolving the conflict.
+    SplitOnce = 1,
+
+    /// The second split attempt.
+    ///
+    /// We don't want to spend `N` queue-popping iterations on incrementally
+    /// splitting a large bundle into `N` pieces in a high-conflict scenario, so
+    /// eagerly split at basic block boundaries in addition to splitting to
+    /// resolve the current conflict, with the hope that this allows us to skip
+    /// a bunch of conflicts with a single step.
+    SplitAtBlocks = 2,
+
+    /// The final phase.
+    ///
+    /// If this is not a minimal bundle yet, we can still split on conflict, and
+    /// in this case we'll split into minimal bundles.
+    ///
+    /// If this is a minimal bundle, then we have to resort to spilling either
+    /// this bundle or one of the others it conflicts with to the stack.
+    SplitIntoMinimalOrSpill = 3,
+}
+
+impl Phase {
+    /// Get the next phase after this one.
+    #[allow(dead_code, reason = "will use it soon")]
+    fn next(self) -> Self {
+        Self::from_raw((self as u8) + 1).unwrap()
+    }
+
+    /// Construct a `Phase` from its raw bits.
+    fn from_raw(raw: u8) -> Option<Self> {
+        match raw {
+            0 => Some(Self::AssignEvict),
+            1 => Some(Self::SplitOnce),
+            2 => Some(Self::SplitAtBlocks),
+            3 => Some(Self::SplitIntoMinimalOrSpill),
+            _ => None,
+        }
+    }
+}
+
+/// A bundle's allocation priority.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Priority {
+    ///    Bit:   31   ...  30   29                28             27  ...   25   24  ...  0
+    ///         +--------------+-----------------+--------------+--------------+------------+
+    /// Fields: | (reserved):2 | has_fixed_use:1 | is_minimal:1 | group_size:3 |   size:25  |
+    ///         +--------------+-----------------+--------------+--------------+------------+
+    ///
+    /// Packed so that we sort/prioritize bundles by:
+    ///
+    /// 1. Those with fixed register uses (as they have the hardest constraints
+    ///    to satisfy)
+    ///
+    /// 2. Minimal bundles (as these can't be split any further, so allocating
+    ///    to a register, rather than a spill slot, is now-or-never).
+    ///
+    /// 3. The size of its register group constraint (because assigning a
+    ///    register groups assigns N registers at once, not just 1, so they are
+    ///    harder to place and have more constraints than regular bundles).
+    ///
+    /// 4. Finally, by the bundle's size (number of spans) because if we assign
+    ///    a larger bundle, then we get fewer moves and better codegen (and if
+    ///    assigning it fails, we can always split it and try again).
+    ///
+    /// NB: the upper bits are reserved for encoding a `Phase` when this is
+    /// packed inside a `PqEntry`.
+    bits: u32,
+}
+
+const PRIORITY_SIZE_BITS: u32 = 25;
+const PRIORITY_SIZE_SHIFT: u32 = 0;
+#[allow(dead_code, reason = "will use it soon")]
+const PRIORITY_SIZE_MASK: u32 = ((1 << PRIORITY_SIZE_BITS) - 1) << PRIORITY_SIZE_SHIFT;
+
+const PRIORITY_GROUP_SIZE_BITS: u32 = 3;
+const PRIORITY_GROUP_SIZE_SHIFT: u32 = PRIORITY_SIZE_SHIFT + PRIORITY_SIZE_BITS;
+#[allow(dead_code, reason = "will use it soon")]
+const PRIORITY_GROUP_SIZE_MASK: u32 =
+    ((1 << PRIORITY_GROUP_SIZE_BITS) - 1) << PRIORITY_GROUP_SIZE_SHIFT;
+
+const PRIORITY_IS_MINIMAL_BITS: u32 = 1;
+const PRIORITY_IS_MINIMAL_SHIFT: u32 = PRIORITY_GROUP_SIZE_SHIFT + PRIORITY_GROUP_SIZE_BITS;
+#[allow(dead_code, reason = "will use it soon")]
+const PRIORITY_IS_MINIMAL_MASK: u32 =
+    ((1 << PRIORITY_IS_MINIMAL_BITS) - 1) << PRIORITY_IS_MINIMAL_SHIFT;
+
+const PRIORITY_HAS_FIXED_USE_BITS: u32 = 1;
+const PRIORITY_HAS_FIXED_USE_SHIFT: u32 = PRIORITY_IS_MINIMAL_SHIFT + PRIORITY_IS_MINIMAL_BITS;
+#[allow(dead_code, reason = "will use it soon")]
+const PRIORITY_HAS_FIXED_USE_MASK: u32 =
+    ((1 << PRIORITY_HAS_FIXED_USE_BITS) - 1) << PRIORITY_HAS_FIXED_USE_SHIFT;
+
+/// A priority queue entry.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PqEntry<E> {
+    ///    Bit:   63   62   61  ...  32   31  ...  0
+    ///         +---------+-------------+------------+
+    /// Fields: | phase:2 | priority:30 |  bundle:32 |
+    ///         +---------+-------------+------------+
+    ///
+    /// Packed so that sort/prioritize by phase, then bundle priority, and
+    /// finally break ties with the bundle index.
+    bits: u64,
+
+    _phantom: PhantomData<E>,
+}
+
+const PQ_ENTRY_BUNDLE_BITS: u64 = 32;
+const PQ_ENTRY_BUNDLE_SHIFT: u64 = 0;
+const PQ_ENTRY_BUNDLE_MASK: u64 = ((1 << PQ_ENTRY_BUNDLE_BITS) - 1) << PQ_ENTRY_BUNDLE_SHIFT;
+
+const PQ_ENTRY_PRIORITY_BITS: u64 = 30;
+const PQ_ENTRY_PRIORITY_SHIFT: u64 = PQ_ENTRY_BUNDLE_SHIFT + PQ_ENTRY_BUNDLE_BITS;
+const PQ_ENTRY_PRIORITY_MASK: u64 = ((1 << PQ_ENTRY_PRIORITY_BITS) - 1) << PQ_ENTRY_PRIORITY_SHIFT;
+
+const PQ_ENTRY_PHASE_BITS: u64 = 2;
+const PQ_ENTRY_PHASE_SHIFT: u64 = PQ_ENTRY_PRIORITY_SHIFT + PQ_ENTRY_PRIORITY_BITS;
+const PQ_ENTRY_PHASE_MASK: u64 = ((1 << PQ_ENTRY_PHASE_BITS) - 1) << PQ_ENTRY_PHASE_SHIFT;
+
+impl fmt::Debug for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Priority")
+            .field("has_fixed_use", &self.has_fixed_use())
+            .field("is_minimal", &self.is_minimal())
+            .field("group_size", &self.group_size())
+            .field("size", &self.size())
+            .finish()
+    }
+}
+
+impl<E> fmt::Debug for PqEntry<E>
+where
+    E: EntityRepr,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PqEntry")
+            .field("phase", &self.phase())
+            .field("priority", &self.priority())
+            .field("bundle", &self.bundle())
+            .finish()
+    }
+}
+
+impl Priority {
+    fn new(has_fixed_use: bool, is_minimal: bool, group_size: usize, size: usize) -> Self {
+        let _ = (has_fixed_use, is_minimal, group_size, size);
+        todo!()
+    }
+
+    fn has_fixed_use(&self) -> bool {
+        todo!()
+    }
+
+    fn is_minimal(&self) -> bool {
+        todo!()
+    }
+
+    fn group_size(&self) -> usize {
+        todo!()
+    }
+
+    fn size(&self) -> usize {
+        todo!()
+    }
+}
+
+impl<E> PqEntry<E>
+where
+    E: EntityRepr,
+{
+    fn new(phase: Phase, priority: Priority, bundle: LiveBundle<E>) -> Self {
+        let phase = u64::from(phase as u8);
+        let phase = phase << PQ_ENTRY_PHASE_SHIFT;
+        debug_assert_eq!(phase & PQ_ENTRY_PHASE_MASK, phase);
+
+        let priority = u64::from(priority.bits);
+        let priority = priority << PQ_ENTRY_PRIORITY_SHIFT;
+        debug_assert_eq!(priority & PQ_ENTRY_PRIORITY_MASK, priority);
+
+        let bundle = u32::try_from(bundle.index()).unwrap();
+        let bundle = u64::from(bundle);
+        debug_assert_eq!(bundle & PQ_ENTRY_BUNDLE_MASK, bundle);
+
+        Self {
+            bits: phase | priority | bundle,
+            _phantom: PhantomData,
+        }
+    }
+
+    fn phase(&self) -> Phase {
+        todo!()
+    }
+
+    fn priority(&self) -> Priority {
+        todo!()
+    }
+
+    fn bundle(&self) -> LiveBundle<E> {
+        todo!()
+    }
 }

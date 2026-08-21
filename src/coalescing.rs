@@ -792,6 +792,11 @@ where
     while let Some(region) = coalescing.region_stack.pop() {
         coalescing.region_stack.extend(region_tree.children(region));
 
+        // TODO: record the `EntityRange<LiveBundle<E>>` for this region into
+        // some `SecondaryMap` somewhere, to enable fast access of all bundles
+        // in a region. allows us to get rid of the `in_queue` set in
+        // `RegionAllocation`, as well as speed up the initial queue filling.
+
         for block in region_tree.blocks(region) {
             for span in live_ranges.block_spans(block) {
                 let root = coalescing.span_sets.find(span);

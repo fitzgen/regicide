@@ -1,6 +1,7 @@
 use crate::{
     coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
-    liveness::Liveness, region_tree::RegionTree, sccs::StronglyConnectedComponents,
+    liveness::Liveness, region_allocation::RegionAllocation, region_tree::RegionTree,
+    sccs::StronglyConnectedComponents,
 };
 
 /// TODO FITZGEN
@@ -78,6 +79,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub sccs: StronglyConnectedComponents<E>,
     pub dfs: Dfs<E>,
     pub coalescing: Coalescing<E>,
+    pub region_allocation: RegionAllocation<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
@@ -90,6 +92,7 @@ impl<E: EntityRepr> ContextInner<E> {
             sccs: StronglyConnectedComponents::new(),
             dfs: Dfs::new(),
             coalescing: Coalescing::new(),
+            region_allocation: RegionAllocation::new(),
         }
     }
 
@@ -102,6 +105,7 @@ impl<E: EntityRepr> ContextInner<E> {
             sccs,
             dfs,
             coalescing,
+            region_allocation,
         } = self;
         counts.reset();
         region_tree.reset();
@@ -110,6 +114,7 @@ impl<E: EntityRepr> ContextInner<E> {
         sccs.reset();
         dfs.reset();
         coalescing.reset();
+        region_allocation.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -121,6 +126,7 @@ impl<E: EntityRepr> ContextInner<E> {
             sccs,
             dfs,
             coalescing,
+            region_allocation,
         } = self;
         counts.is_reset()
             && region_tree.is_reset()
@@ -129,6 +135,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && sccs.is_reset()
             && dfs.is_reset()
             && coalescing.is_reset()
+            && region_allocation.is_reset()
     }
 }
 
