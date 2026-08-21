@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch/PR.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add rustfmt
+          rustc --version
+      - run: cargo fmt --check
+
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            flags: --no-default-features
+          - name: all-features
+            flags: --all-features
+          - name: std
+            flags: --no-default-features --features std
+          - name: checker
+            flags: --no-default-features --features checker
+          - name: timing
+            flags: --no-default-features --features timing
+          - name: trace-log
+            flags: --no-default-features --features trace-log
+          - name: entity-repr-8
+            flags: --no-default-features --features entity-repr-8
+          - name: entity-repr-16
+            flags: --no-default-features --features entity-repr-16
+          - name: entity-repr-8,entity-repr-16
+            flags: --no-default-features --features entity-repr-8,entity-repr-16
+          - name: std,checker
+            flags: --no-default-features --features std,checker
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy
+          rustc --version
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ matrix.name }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ matrix.name }}-
+
+      # Check the library on its own, i.e. without the dev-dependencies pulling
+      # extra features in, so that the feature combination is actually exercised
+      # in isolation.
+      - name: Check
+        run: |
+          cargo check --locked --lib ${{ matrix.flags }}
+          cargo check --locked --all-targets ${{ matrix.flags }}
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets ${{ matrix.flags }} -- -Dwarnings
+
+      - name: Test
+        run: cargo test --locked ${{ matrix.flags }}
+
+  # A single job that depends on everything else, so that branch protection only
+  # needs to require this one status check rather than every matrix entry.
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [fmt, build]
+    steps:
+      - name: Check that all jobs succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
