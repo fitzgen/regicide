@@ -1,6 +1,6 @@
 //! Test utilities.
 
-#![allow(missing_docs)]
+#![allow(missing_docs, reason = "internal test utilities")]
 
 use crate::{
     Block, InputBlock, InputFunction, InputInst, Machine, MachineBuilder, Operand, Reg, RegClass,
@@ -1863,8 +1863,7 @@ mod tests {
             again.fixup();
             if hash(&again) != hash(input) {
                 return Err(format!(
-                    "`TestInput::fixup` is not idempotent; running it a second time gives:\n{:#?}",
-                    again,
+                    "`TestInput::fixup` is not idempotent; running it a second time gives:\n{again:#?}"
                 ));
             }
 

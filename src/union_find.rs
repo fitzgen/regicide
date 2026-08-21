@@ -156,7 +156,7 @@ mod tests {
     fn smoke() -> CheckResult<Vec<(u8, u8)>> {
         let mutator = m::default::<Vec<(u8, u8)>>().map(|_ctx, vec| {
             vec.truncate(20);
-            let len = vec.len() as u8;
+            let len = u8::try_from(vec.len()).unwrap();
             for (a, b) in vec {
                 *a %= len;
                 *b %= len;

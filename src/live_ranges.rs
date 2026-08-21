@@ -194,7 +194,7 @@ where
 
     #[inline]
     pub fn operand(&self) -> usize {
-        usize::try_from(self.operand).unwrap()
+        usize::from(self.operand)
     }
 
     #[inline]

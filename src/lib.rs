@@ -109,6 +109,7 @@ pub fn run(
 }
 
 /// Is `E` likely wide enough to describe this allocation problem?
+#[cfg(any(feature = "entity-repr-8", feature = "entity-repr-16"))]
 fn entity_repr_can_likely_fit<E>(input: &Input<impl InputFunction>) -> bool
 where
     E: EntityRepr,
@@ -118,6 +119,7 @@ where
         && input.machine.num_registers() <= Reg::<E>::MAX_REPRESENTABLE.index() + 1
 }
 
+#[cfg(any(feature = "entity-repr-8", feature = "entity-repr-16"))]
 fn max_representable_inst_index<E>() -> usize
 where
     E: EntityRepr,

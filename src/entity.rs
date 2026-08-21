@@ -108,6 +108,11 @@ mod sealed {
                     }
 
                     #[inline]
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "narrowing is intentional here; the `debug_assert!` catches it in \
+                                  debug builds"
+                    )]
                     fn from_usize(x: usize) -> Self {
                         debug_assert!(Self::try_from_usize(x).is_some());
                         x as $t

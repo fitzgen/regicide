@@ -9,6 +9,7 @@ pub struct Count {
 
 impl fmt::Debug for Count {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let _ = &f;
         #[cfg(feature = "trace-log")]
         fmt::Debug::fmt(&self.count, f)?;
         Ok(())

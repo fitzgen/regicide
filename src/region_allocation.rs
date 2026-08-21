@@ -13,9 +13,11 @@ use crate::{
     region_tree::RegionTree,
     timing::Timing,
 };
-use alloc::{collections::BinaryHeap, vec::Vec};
+use alloc::{
+    collections::{BTreeMap, BinaryHeap},
+    vec::Vec,
+};
 use core::{fmt, marker::PhantomData};
-use std::collections::BTreeMap;
 
 pub fn region_allocate<E>(
     context: &mut ContextInner<E>,

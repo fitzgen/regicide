@@ -6,6 +6,10 @@ type Word = u64;
 const BITS: usize = Word::BITS as usize;
 
 #[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the remainder is less than `BITS`"
+)]
 fn word_and_bit(index: usize) -> (usize, u32) {
     (index / BITS, (index % BITS) as u32)
 }
@@ -175,11 +179,11 @@ mod tests {
     /// Sixteen words, which is enough to cover the word boundaries at 63/64 and
     /// 127/128, growing into a high index from empty, and growing again after a
     /// `reset`, without making each iteration expensive.
-    const MAX_INDEX: u32 = 16 * BITS as u32;
+    const MAX_INDEX: u32 = 16 * Word::BITS;
 
     /// One entity index past every word that an operation can touch, so that
     /// probing up to here reaches past the end of the set's storage.
-    const PROBE_LIMIT: u32 = MAX_INDEX + BITS as u32;
+    const PROBE_LIMIT: u32 = MAX_INDEX + Word::BITS;
 
     #[derive(Clone, Debug, Mutate)]
     enum Op {

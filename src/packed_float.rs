@@ -72,7 +72,11 @@ macro_rules! define_storages {
 
             #[allow(dead_code, reason = "macro-generated")]
             impl<const BITS: u32> PackedPositiveFloat<$t, BITS> {
-                #[allow(trivial_numeric_casts, reason = "macro-generated")]
+                #[allow(
+                    trivial_numeric_casts,
+                    clippy::cast_possible_truncation,
+                    reason = "macro-generated; `VALID_BITS` keeps the mask within `$t`"
+                )]
                 pub const MASK: $t = Self::MASK_AS_U32 as $t;
 
                 /// Pack `value`.
@@ -90,7 +94,12 @@ macro_rules! define_storages {
 
                     let bits = (value.to_bits() >> Self::SHIFT) & Self::MASK_AS_U32;
 
-                    #[allow(trivial_numeric_casts, reason = "macro-generated")]
+                    #[allow(
+                        trivial_numeric_casts,
+                        clippy::cast_possible_truncation,
+                        reason = "macro-generated; the mask above keeps `bits` \
+                                  within `$t`"
+                    )]
                     let bits = bits as $t;
 
                     PackedPositiveFloat { bits }

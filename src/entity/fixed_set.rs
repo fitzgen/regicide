@@ -20,6 +20,10 @@ pub const fn words_for(capacity: usize) -> usize {
 /// Split an entity's index into the word that holds its bit and the bit within
 /// that word.
 #[inline]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "the remainder is less than `BITS`"
+)]
 fn word_and_bit(index: usize) -> (usize, u32) {
     (index / BITS, (index % BITS) as u32)
 }
@@ -276,6 +280,10 @@ mod tests {
 
     type TestSet = FixedEntitySet<Val, { words_for(256) }>;
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "`TestSet` has a 256-entity capacity"
+    )]
     const CAPACITY: u32 = TestSet::CAPACITY as u32;
 
     #[derive(Clone, Debug, Mutate)]

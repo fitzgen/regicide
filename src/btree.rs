@@ -113,10 +113,10 @@ impl<E, T> BTreeSet<E, T> {
         self.inner.insert(value)
     }
 
-    pub fn remove<Q: ?Sized>(&mut self, arena: &mut BTreeSetArena<E, T>, value: &Q) -> bool
+    pub fn remove<Q>(&mut self, arena: &mut BTreeSetArena<E, T>, value: &Q) -> bool
     where
         T: Borrow<Q> + Ord,
-        Q: Ord,
+        Q: Ord + ?Sized,
     {
         let _ = arena;
         self.inner.remove(value)

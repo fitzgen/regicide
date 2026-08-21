@@ -100,7 +100,7 @@ pub struct Output {
     pub(crate) output32: OutputInner<u32>,
 }
 
-#[allow(dead_code)] // TODO FITZGEN
+#[allow(dead_code, reason = "not consumed yet")] // TODO FITZGEN
 pub(crate) enum WhichOutput {
     #[cfg(feature = "entity-repr-8")]
     Output8,
@@ -179,7 +179,7 @@ impl Output {
 
 /// TODO FITZGEN
 pub struct OutputIter<'a> {
-    #[allow(dead_code)] // TODO FITZGEN
+    #[allow(dead_code, reason = "not consumed yet")] // TODO FITZGEN
     output: &'a Output,
     // TODO: ...
 }
