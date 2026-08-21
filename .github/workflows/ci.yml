@@ -21,7 +21,7 @@ jobs:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup update stable --no-self-update
@@ -53,19 +53,19 @@ jobs:
             flags: --no-default-features --features entity-repr-8
           - name: entity-repr-16
             flags: --no-default-features --features entity-repr-16
-          - name: entity-repr-8,entity-repr-16
+          - name: entity-repr-8+entity-repr-16
             flags: --no-default-features --features entity-repr-8,entity-repr-16
-          - name: std,checker
+          - name: std+checker
             flags: --no-default-features --features std,checker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup update stable --no-self-update
           rustup default stable
           rustup component add clippy
           rustc --version
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
