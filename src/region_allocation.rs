@@ -387,24 +387,20 @@ pub struct Priority {
 
 const PRIORITY_SIZE_BITS: u32 = 25;
 const PRIORITY_SIZE_SHIFT: u32 = 0;
-#[allow(dead_code, reason = "will use it soon")]
 const PRIORITY_SIZE_MASK: u32 = ((1 << PRIORITY_SIZE_BITS) - 1) << PRIORITY_SIZE_SHIFT;
 
 const PRIORITY_GROUP_SIZE_BITS: u32 = 3;
 const PRIORITY_GROUP_SIZE_SHIFT: u32 = PRIORITY_SIZE_SHIFT + PRIORITY_SIZE_BITS;
-#[allow(dead_code, reason = "will use it soon")]
 const PRIORITY_GROUP_SIZE_MASK: u32 =
     ((1 << PRIORITY_GROUP_SIZE_BITS) - 1) << PRIORITY_GROUP_SIZE_SHIFT;
 
 const PRIORITY_IS_MINIMAL_BITS: u32 = 1;
 const PRIORITY_IS_MINIMAL_SHIFT: u32 = PRIORITY_GROUP_SIZE_SHIFT + PRIORITY_GROUP_SIZE_BITS;
-#[allow(dead_code, reason = "will use it soon")]
 const PRIORITY_IS_MINIMAL_MASK: u32 =
     ((1 << PRIORITY_IS_MINIMAL_BITS) - 1) << PRIORITY_IS_MINIMAL_SHIFT;
 
 const PRIORITY_HAS_FIXED_USE_BITS: u32 = 1;
 const PRIORITY_HAS_FIXED_USE_SHIFT: u32 = PRIORITY_IS_MINIMAL_SHIFT + PRIORITY_IS_MINIMAL_BITS;
-#[allow(dead_code, reason = "will use it soon")]
 const PRIORITY_HAS_FIXED_USE_MASK: u32 =
     ((1 << PRIORITY_HAS_FIXED_USE_BITS) - 1) << PRIORITY_HAS_FIXED_USE_SHIFT;
 
@@ -461,24 +457,49 @@ where
 
 impl Priority {
     fn new(has_fixed_use: bool, is_minimal: bool, group_size: usize, size: usize) -> Self {
-        let _ = (has_fixed_use, is_minimal, group_size, size);
-        todo!()
+        let has_fixed_use = u32::from(has_fixed_use) << PRIORITY_HAS_FIXED_USE_SHIFT;
+        debug_assert_eq!(has_fixed_use & PRIORITY_HAS_FIXED_USE_MASK, has_fixed_use);
+
+        let is_minimal = u32::from(is_minimal) << PRIORITY_IS_MINIMAL_SHIFT;
+        debug_assert_eq!(is_minimal & PRIORITY_IS_MINIMAL_MASK, is_minimal);
+
+        let max_group_size = (1 << PRIORITY_GROUP_SIZE_BITS) - 1;
+        debug_assert!(group_size <= max_group_size);
+        let group_size = group_size as u32;
+        let group_size = group_size << PRIORITY_GROUP_SIZE_SHIFT;
+        debug_assert_eq!(group_size & PRIORITY_GROUP_SIZE_MASK, group_size);
+
+        let max_size = (1 << PRIORITY_SIZE_BITS) - 1;
+        debug_assert!(size <= max_size);
+        let size = size as u32;
+        let size = size << PRIORITY_SIZE_SHIFT;
+        debug_assert_eq!(size & PRIORITY_SIZE_MASK, size);
+
+        Priority {
+            bits: has_fixed_use | is_minimal | group_size | size,
+        }
     }
 
+    #[inline]
     fn has_fixed_use(&self) -> bool {
-        todo!()
+        self.bits & PRIORITY_HAS_FIXED_USE_MASK != 0
     }
 
+    #[inline]
     fn is_minimal(&self) -> bool {
-        todo!()
+        self.bits & PRIORITY_IS_MINIMAL_MASK != 0
     }
 
+    #[inline]
     fn group_size(&self) -> usize {
-        todo!()
+        let group_size = (self.bits & PRIORITY_GROUP_SIZE_MASK) >> PRIORITY_GROUP_SIZE_SHIFT;
+        usize::try_from(group_size).unwrap()
     }
 
+    #[inline]
     fn size(&self) -> usize {
-        todo!()
+        let size = (self.bits & PRIORITY_SIZE_MASK) >> PRIORITY_SIZE_SHIFT;
+        usize::try_from(size).unwrap()
     }
 }
 
@@ -505,15 +526,136 @@ where
         }
     }
 
+    #[inline]
     fn phase(&self) -> Phase {
-        todo!()
+        let phase = (self.bits & PQ_ENTRY_PHASE_MASK) >> PQ_ENTRY_PHASE_SHIFT;
+        let phase = u8::try_from(phase).unwrap();
+        Phase::from_raw(phase).expect("every value of the two-bit field is a phase")
     }
 
+    #[inline]
     fn priority(&self) -> Priority {
-        todo!()
+        let priority = (self.bits & PQ_ENTRY_PRIORITY_MASK) >> PQ_ENTRY_PRIORITY_SHIFT;
+        Priority {
+            bits: u32::try_from(priority).unwrap(),
+        }
     }
 
+    #[inline]
     fn bundle(&self) -> LiveBundle<E> {
-        todo!()
+        let bundle = (self.bits & PQ_ENTRY_BUNDLE_MASK) >> PQ_ENTRY_BUNDLE_SHIFT;
+        let bundle = usize::try_from(bundle).unwrap();
+        LiveBundle::try_new(bundle).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{vec, vec::Vec};
+
+    /// The widest value each saturating field can hold.
+    const MAX_GROUP_SIZE: usize = (1 << PRIORITY_GROUP_SIZE_BITS) - 1;
+    const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
+
+    /// Every phase, in ascending order.
+    const PHASES: [Phase; 4] = [
+        Phase::AssignEvict,
+        Phase::SplitOnce,
+        Phase::SplitAtBlocks,
+        Phase::SplitIntoMinimalOrSpill,
+    ];
+
+    fn bundle(index: usize) -> LiveBundle<u32> {
+        LiveBundle::try_new(index).unwrap()
+    }
+
+    /// A priority's fields survive the round trip through its packed bits.
+    #[test]
+    fn priority_round_trips_its_fields() {
+        for has_fixed_use in [false, true] {
+            for is_minimal in [false, true] {
+                for group_size in [0, 1, 2, MAX_GROUP_SIZE] {
+                    for size in [0, 1, 1000, MAX_SIZE] {
+                        let p = Priority::new(has_fixed_use, is_minimal, group_size, size);
+                        assert_eq!(p.has_fixed_use(), has_fixed_use, "{p:?}");
+                        assert_eq!(p.is_minimal(), is_minimal, "{p:?}");
+                        assert_eq!(p.group_size(), group_size.min(MAX_GROUP_SIZE), "{p:?}");
+                        assert_eq!(p.size(), size.min(MAX_SIZE), "{p:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Priorities compare by fixed uses first, then minimality, then register
+    /// group size, and only then by the bundle's own size.
+    #[test]
+    fn priority_compares_by_tier() {
+        let ascending = [
+            Priority::new(false, false, 0, 0),
+            Priority::new(false, false, 0, 1),
+            Priority::new(false, false, 0, MAX_SIZE),
+            Priority::new(false, false, 1, 0),
+            Priority::new(false, false, MAX_GROUP_SIZE, MAX_SIZE),
+            Priority::new(false, true, 0, 0),
+            Priority::new(false, true, MAX_GROUP_SIZE, MAX_SIZE),
+            Priority::new(true, false, 0, 0),
+            Priority::new(true, true, MAX_GROUP_SIZE, MAX_SIZE),
+        ];
+        for w in ascending.windows(2) {
+            assert!(w[0] < w[1], "{:?} should sort below {:?}", w[0], w[1]);
+        }
+    }
+
+    /// A queue entry's fields survive the round trip through its packed bits,
+    /// including the largest bundle index a `LiveBundle<u32>` can name.
+    #[test]
+    fn pq_entry_round_trips_its_fields() {
+        let priorities = [
+            Priority::new(false, false, 0, 0),
+            Priority::new(true, true, MAX_GROUP_SIZE, MAX_SIZE),
+            Priority::new(false, true, 2, 1000),
+        ];
+        for phase in PHASES {
+            for priority in priorities {
+                for index in [0, 1, 1000, LiveBundle::<u32>::MAX_REPRESENTABLE.index()] {
+                    let entry = PqEntry::new(phase, priority, bundle(index));
+                    assert_eq!(entry.phase(), phase, "{entry:?}");
+                    assert_eq!(entry.priority(), priority, "{entry:?}");
+                    assert_eq!(entry.bundle(), bundle(index), "{entry:?}");
+                }
+            }
+        }
+    }
+
+    /// Queue entries compare by phase first, then by priority, and break
+    /// remaining ties with the bundle index.
+    #[test]
+    fn pq_entry_compares_by_phase_then_priority_then_bundle() {
+        let low = Priority::new(false, false, 0, 0);
+        let high = Priority::new(true, true, MAX_GROUP_SIZE, MAX_SIZE);
+        let max_index = LiveBundle::<u32>::MAX_REPRESENTABLE.index();
+
+        let mut ascending = vec![
+            PqEntry::new(Phase::AssignEvict, low, bundle(0)),
+            PqEntry::new(Phase::AssignEvict, low, bundle(1)),
+            PqEntry::new(Phase::AssignEvict, low, bundle(max_index)),
+            PqEntry::new(Phase::AssignEvict, high, bundle(0)),
+        ];
+        // A later phase outranks any priority in an earlier one.
+        for phase in PHASES.into_iter().skip(1) {
+            ascending.push(PqEntry::new(phase, low, bundle(0)));
+            ascending.push(PqEntry::new(phase, high, bundle(max_index)));
+        }
+
+        for w in ascending.windows(2) {
+            assert!(w[0] < w[1], "{:?} should sort below {:?}", w[0], w[1]);
+        }
+
+        // And the queue pops the greatest entry first.
+        let mut queue: BinaryHeap<PqEntry<u32>> = ascending.iter().copied().collect();
+        let popped: Vec<_> = core::iter::from_fn(|| queue.pop()).collect();
+        assert!(ascending.iter().rev().eq(popped.iter()));
     }
 }
