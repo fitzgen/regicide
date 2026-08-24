@@ -1070,7 +1070,6 @@ mod tests {
     use crate::entity::Block;
     use crate::input::InputBlock as _;
     use crate::region_tree::RegionTree;
-    use crate::sccs::StronglyConnectedComponents;
     use crate::test::{TestFunction, TestInput};
     use mutatis::check::{Check, CheckResult};
     use std::{
@@ -1269,7 +1268,6 @@ mod tests {
     fn analyze_spans(test_input: &TestInput) -> Result<(Liveness<u32>, LiveRanges<u32>), String> {
         let mut counts = Counts::new();
         let mut dfs = Dfs::<u32>::new();
-        let mut sccs = StronglyConnectedComponents::<u32>::new();
         let mut region_tree = RegionTree::<u32>::new();
         let mut liveness = Liveness::<u32>::new();
         let mut live_ranges = LiveRanges::<u32>::new();
@@ -1279,8 +1277,8 @@ mod tests {
 
         let result = test_input.with_input(|input| {
             let func = input.func;
-            sccs.construct(func, &mut counts, &mut dfs, &mut output)
-                .and_then(|()| region_tree.construct(func, &mut counts, &sccs, &mut output))
+            region_tree
+                .construct(func, &mut counts, &mut dfs, &mut output)
                 .and_then(|()| liveness.construct(func, &mut counts, &mut dfs, &mut output))
                 .and_then(|()| {
                     live_ranges.construct(input, &mut counts, &mut liveness, &mut output)

@@ -60,7 +60,6 @@ use crate::liveness::{block_first_inst, block_last_inst};
 use crate::machine::Machine;
 use crate::output::OutputInner;
 use crate::region_tree::RegionTree;
-use crate::sccs::StronglyConnectedComponents;
 use crate::timing::Timing;
 use crate::union_find::UnionFind;
 use alloc::vec::Vec;
@@ -415,7 +414,6 @@ where
         counts,
         region_tree,
         live_ranges,
-        sccs,
         coalescing,
         ..
     } = context;
@@ -426,7 +424,7 @@ where
     coalescing.region_stack.push(region_tree.root());
     while let Some(region) = coalescing.region_stack.pop() {
         coalescing.region_stack.extend(region_tree.children(region));
-        coalescing.coalesce_region(region_tree, sccs, live_ranges, input, output, region)?;
+        coalescing.coalesce_region(region_tree, live_ranges, input, output, region)?;
     }
 
     // Then build our bundles from the merged span sets.
@@ -448,7 +446,6 @@ where
     fn coalesce_region(
         &mut self,
         region_tree: &RegionTree<E>,
-        sccs: &StronglyConnectedComponents<E>,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
         output: &mut OutputInner<E>,
@@ -469,15 +466,7 @@ where
         // details).
         region_blocks_by_priority(input, region_tree, region, &mut region_blocks);
         for block in region_blocks.iter() {
-            self.coalesce_block(
-                region_tree,
-                sccs,
-                live_ranges,
-                input,
-                output,
-                region,
-                *block,
-            )?;
+            self.coalesce_block(region_tree, live_ranges, input, output, region, *block)?;
         }
 
         region_blocks.clear();
@@ -491,7 +480,6 @@ where
     fn coalesce_block(
         &mut self,
         region_tree: &RegionTree<E>,
-        sccs: &StronglyConnectedComponents<E>,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
         output: &mut OutputInner<E>,
@@ -519,7 +507,7 @@ where
         let block_data = input.func.block(block.with_repr32());
         for (i, succ) in block_data.successors().enumerate() {
             let succ_repr = output.with_repr(succ)?;
-            let is_same_region = region_tree.block_region(sccs, succ_repr) == region;
+            let is_same_region = region_tree.block_region(succ_repr) == region;
 
             // Build a map from the successor's live-in values to their initial
             // spans in the successor.
@@ -903,12 +891,12 @@ mod tests {
         let result = test_input.with_input(|input| -> IResult<()> {
             let context = &mut context.context32;
             let func = input.func;
-            context
-                .sccs
-                .construct(func, &mut context.counts, &mut context.dfs, &mut output)?;
-            context
-                .region_tree
-                .construct(func, &mut context.counts, &context.sccs, &mut output)?;
+            context.region_tree.construct(
+                func,
+                &mut context.counts,
+                &mut context.dfs,
+                &mut output,
+            )?;
             context
                 .liveness
                 .construct(func, &mut context.counts, &mut context.dfs, &mut output)?;
@@ -1125,7 +1113,7 @@ mod tests {
                     for span in live_ranges.bundle_spans(bundle) {
                         let block = inst_block[&live_ranges.span(span).start().inst()];
                         let block = Block::try_new(block.index()).unwrap();
-                        let region = inner.region_tree.block_region(&inner.sccs, block);
+                        let region = inner.region_tree.block_region(block);
                         if region != data.region() {
                             return Err(format!(
                                 "{bundle:?} is in {:?}, but holds {span:?}, which is in {region:?}",

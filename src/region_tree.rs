@@ -13,6 +13,7 @@
 //! loop's region when the loop dominates it.
 
 use crate::counts::Counts;
+use crate::dfs::Dfs;
 use crate::entity::{
     EntityRange, EntityRepr, PrimaryMap, Region, RegionBlocksStorageIndex,
     RegionChildrenStorageIndex, Scc, SecondaryMap,
@@ -31,6 +32,10 @@ pub struct RegionTree<E>
 where
     E: EntityRepr,
 {
+    /// The strongly-connected components of the control-flow graph, which are
+    /// what define the regions.
+    sccs: StronglyConnectedComponents<E>,
+
     /// The root of the region tree: the function entry block's region.
     root: Option<Region<E>>,
 
@@ -82,6 +87,7 @@ where
 {
     pub const fn new() -> Self {
         RegionTree {
+            sccs: StronglyConnectedComponents::new(),
             root: None,
             regions: UnionFind::new(),
             region_blocks: SecondaryMap::new(EntityRange::empty()),
@@ -97,6 +103,7 @@ where
 
     pub fn reset(&mut self) {
         let Self {
+            sccs,
             root,
             regions,
             region_blocks,
@@ -108,6 +115,7 @@ where
             distinct_regions,
             children_by_parent,
         } = self;
+        sccs.reset();
         *root = None;
         regions.reset();
         region_blocks.reset();
@@ -122,6 +130,7 @@ where
 
     pub fn is_reset(&self) -> bool {
         let Self {
+            sccs,
             root,
             regions,
             region_blocks,
@@ -133,7 +142,8 @@ where
             distinct_regions,
             children_by_parent,
         } = self;
-        root.is_none()
+        sccs.is_reset()
+            && root.is_none()
             && regions.is_reset()
             && region_blocks.is_reset()
             && region_blocks_storage.is_reset()
@@ -149,7 +159,7 @@ where
         &mut self,
         func: &impl InputFunction,
         counts: &mut Counts,
-        sccs: &StronglyConnectedComponents<E>,
+        dfs: &mut Dfs<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         let _timing = Timing::new("region tree");
@@ -158,9 +168,10 @@ where
         debug_assert!(self.distinct_regions.is_empty());
         debug_assert!(self.children_by_parent.is_empty());
 
-        self.construct_regions(func, sccs, output)?;
-        self.construct_region_blocks(func, sccs, output)?;
-        self.construct_region_tree(func, sccs, output)?;
+        self.sccs.construct(func, counts, dfs, output)?;
+        self.construct_regions(func, output)?;
+        self.construct_region_blocks(func, output)?;
+        self.construct_region_tree(func, output)?;
 
         counts.regions += self.distinct_regions.len();
         self.distinct_regions.clear();
@@ -170,24 +181,23 @@ where
     fn construct_regions(
         &mut self,
         func: &impl InputFunction,
-        sccs: &StronglyConnectedComponents<E>,
         output: &mut OutputInner<E>,
     ) -> Result<(), ()> {
         let entry = output.with_repr(func.entry_block())?;
-        let entry_scc = sccs.scc(entry);
+        let entry_scc = self.sccs.scc(entry);
         self.root = Some(Region::try_new(entry_scc.index()).unwrap());
 
         for (block, _) in func.blocks() {
             let block = output.with_repr(block)?;
             let mut dom: Block<E> = block;
-            let mut dom_scc = sccs.scc(block);
-            while dom_scc != entry_scc && sccs.blocks(dom_scc).len() == 1 {
+            let mut dom_scc = self.sccs.scc(block);
+            while dom_scc != entry_scc && self.sccs.blocks(dom_scc).len() == 1 {
                 dom = output.with_repr(
                     func.block(dom.with_repr32())
                         .immediate_dominator()
                         .expect("handled root already above"),
                 )?;
-                let next_dom_scc = sccs.scc(dom);
+                let next_dom_scc = self.sccs.scc(dom);
 
                 // `dom_scc` is a single-block component, so `dom`'s immediate
                 // dominator is necessarily in some other component, and the walk
@@ -215,7 +225,6 @@ where
     fn construct_region_blocks(
         &mut self,
         func: &impl InputFunction,
-        sccs: &StronglyConnectedComponents<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         // We learn each block's region in layout order, but any one region's
@@ -224,7 +233,7 @@ where
         self.blocks_by_region.reserve(func.len_blocks());
         for (block, _) in func.blocks() {
             let block = output.with_repr(block)?;
-            let region = self.block_region(sccs, block);
+            let region = self.block_region(block);
             self.blocks_by_region.push((region, block));
         }
         self.blocks_by_region.sort_unstable();
@@ -257,13 +266,12 @@ where
     fn construct_region_tree(
         &mut self,
         func: &impl InputFunction,
-        sccs: &StronglyConnectedComponents<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         self.children_by_parent.reserve(self.distinct_regions.len());
         for i in 0..self.distinct_regions.len() {
             let region = self.distinct_regions[i];
-            let parent = self.compute_parent(func, sccs, region, output)?;
+            let parent = self.compute_parent(func, region, output)?;
             self.region_parent[region] = parent;
             if let Some(parent) = parent {
                 self.children_by_parent.push((parent, region));
@@ -314,7 +322,6 @@ where
     fn compute_parent(
         &self,
         func: &impl InputFunction,
-        sccs: &StronglyConnectedComponents<E>,
         region: Region<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<Option<Region<E>>> {
@@ -331,7 +338,7 @@ where
         // immediate dominator. Only the top-level region contains the function's
         // entry block, and only the entry block has no immediate dominator, so
         // only the top-level region ends up without a parent.
-        let outside = if self.block_region(sccs, ncd) == region {
+        let outside = if self.block_region(ncd) == region {
             match func.block(ncd.with_repr32()).immediate_dominator() {
                 Some(idom) => output.with_repr(idom)?,
                 None => return Ok(None),
@@ -340,16 +347,12 @@ where
             ncd
         };
 
-        Ok(Some(self.block_region(sccs, outside)))
+        Ok(Some(self.block_region(outside)))
     }
 
     /// Get the region containing the given block.
-    pub fn block_region(
-        &self,
-        sccs: &StronglyConnectedComponents<E>,
-        block: Block<E>,
-    ) -> Region<E> {
-        let scc = sccs.scc(block);
+    pub fn block_region(&self, block: Block<E>) -> Region<E> {
+        let scc = self.sccs.scc(block);
         self.scc_region(scc)
     }
 
@@ -420,7 +423,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dfs::Dfs;
     use crate::test::TestFunction;
     use mutatis::check::{Check, CheckResult};
     use std::{
@@ -437,30 +439,16 @@ mod tests {
     /// things.
     type RegionId = BTreeSet<Block>;
 
-    /// Construct the strongly-connected components and the region tree for
-    /// `func`.
-    fn construct(
-        func: &TestFunction,
-    ) -> Result<(StronglyConnectedComponents<u32>, RegionTree<u32>), String> {
+    /// Construct the region tree for `func`.
+    fn construct(func: &TestFunction) -> Result<RegionTree<u32>, String> {
         let mut counts = Counts::new();
         let mut output = OutputInner::<u32>::new();
-
         let mut dfs = Dfs::<u32>::new();
-        let mut sccs = StronglyConnectedComponents::<u32>::new();
-        if sccs
-            .construct(func, &mut counts, &mut dfs, &mut output)
-            .is_err()
-        {
-            return Err(format!(
-                "`StronglyConnectedComponents::construct` failed: {:?}",
-                output.take_error()
-            ));
-        }
 
         let mut tree = RegionTree::<u32>::new();
         assert!(tree.is_reset());
         if tree
-            .construct(func, &mut counts, &sccs, &mut output)
+            .construct(func, &mut counts, &mut dfs, &mut output)
             .is_err()
         {
             return Err(format!(
@@ -472,7 +460,7 @@ mod tests {
             return Err("`is_reset` is true after a successful `construct`".to_string());
         }
 
-        Ok((sccs, tree))
+        Ok(tree)
     }
 
     /// Compute the set of blocks reachable from the entry block without ever
@@ -625,7 +613,7 @@ mod tests {
                 ));
             }
 
-            let (sccs, tree) = construct(func)?;
+            let tree = construct(func)?;
 
             let dominators = dominators_oracle(func);
             let idoms = idoms_oracle(&dominators);
@@ -641,7 +629,7 @@ mod tests {
             let mut actual_groups: BTreeMap<Region, BTreeSet<Block>> = BTreeMap::new();
             for b in &blocks {
                 actual_groups
-                    .entry(tree.block_region(&sccs, *b))
+                    .entry(tree.block_region(*b))
                     .or_default()
                     .insert(*b);
             }
@@ -686,12 +674,12 @@ mod tests {
                 let defining = *oracle_regions[b]
                     .first()
                     .expect("a region is defined by a non-empty component");
-                let expected = Region::try_new(sccs.scc(defining).index()).unwrap();
-                if tree.block_region(&sccs, *b) != expected {
+                let expected = Region::try_new(tree.sccs.scc(defining).index()).unwrap();
+                if tree.block_region(*b) != expected {
                     return Err(format!(
                         "{b:?}'s region is {:?}, but its region is defined by the component \
                          {:?}, so it should be {expected:?}",
-                        tree.block_region(&sccs, *b),
+                        tree.block_region(*b),
                         oracle_regions[b],
                     ));
                 }
@@ -699,14 +687,14 @@ mod tests {
 
             // Property 3: a loop is never split across regions.
             for b in &blocks {
-                let region = tree.block_region(&sccs, *b);
+                let region = tree.block_region(*b);
                 for &other in &oracle_sccs[b] {
-                    if tree.block_region(&sccs, other) != region {
+                    if tree.block_region(other) != region {
                         return Err(format!(
                             "{b:?} and {other:?} are in the same strongly-connected component \
                              {:?}, but {b:?} is in {region:?} and {other:?} is in {:?}",
                             oracle_sccs[b],
-                            tree.block_region(&sccs, other),
+                            tree.block_region(other),
                         ));
                     }
                 }
@@ -761,10 +749,10 @@ mod tests {
             // containing the entry block, which is the region that `root`
             // reports.
             let root = tree.root();
-            if root != tree.block_region(&sccs, entry) {
+            if root != tree.block_region(entry) {
                 return Err(format!(
                     "`root()` is {root:?} but {entry:?}'s region is {:?}",
-                    tree.block_region(&sccs, entry),
+                    tree.block_region(entry),
                 ));
             }
             if !tree.blocks(root).any(|b| b == entry) {
@@ -847,10 +835,10 @@ mod tests {
                     d = ncd(d, b);
                 }
 
-                let expected = if tree.block_region(&sccs, d) == *region {
-                    idoms[&d].map(|idom| tree.block_region(&sccs, idom))
+                let expected = if tree.block_region(d) == *region {
+                    idoms[&d].map(|idom| tree.block_region(idom))
                 } else {
-                    Some(tree.block_region(&sccs, d))
+                    Some(tree.block_region(d))
                 };
 
                 if tree.parent(*region) != expected {
@@ -890,7 +878,7 @@ mod tests {
 
             // Property 9: constructing the region tree again gives the same
             // answer, and it resets cleanly.
-            let (sccs_again, tree_again) = construct(func)?;
+            let tree_again = construct(func)?;
             if tree_again.root() != root {
                 return Err(format!(
                     "constructing twice gave the roots {root:?} and {:?}",
@@ -898,11 +886,11 @@ mod tests {
                 ));
             }
             for b in &blocks {
-                if tree_again.block_region(&sccs_again, *b) != tree.block_region(&sccs, *b) {
+                if tree_again.block_region(*b) != tree.block_region(*b) {
                     return Err(format!(
                         "constructing twice put {b:?} in {:?} and then {:?}",
-                        tree.block_region(&sccs, *b),
-                        tree_again.block_region(&sccs_again, *b),
+                        tree.block_region(*b),
+                        tree_again.block_region(*b),
                     ));
                 }
             }
