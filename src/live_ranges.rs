@@ -694,7 +694,7 @@ where
     pub fn bundle_spans(
         &self,
         bundle: LiveBundle<E>,
-    ) -> impl ExactSizeIterator<Item = LiveSpan<E>> + '_ {
+    ) -> impl ExactSizeIterator<Item = LiveSpan<E>> + Clone + '_ {
         self.bundles[bundle]
             .spans
             .into_iter()

@@ -6,7 +6,7 @@ mod set;
 
 pub use fixed_set::*;
 pub use map::*;
-pub use sealed::WideInt;
+pub use sealed::{NonZeroInt, WideInt};
 pub use set::*;
 
 mod sealed {
@@ -168,6 +168,12 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Has
     /// TODO FITZGEN
     fn index(self) -> usize;
 
+    /// TODO FITZGEN
+    fn from_bits(bits: <Self::Repr as sealed::NonZeroInt>::NonZero) -> Self;
+
+    /// TODO FITZGEN
+    fn to_bits(self) -> <Self::Repr as sealed::NonZeroInt>::NonZero;
+
     #[doc(hidden)]
     const MAX_REPRESENTABLE: Self;
 
@@ -237,6 +243,16 @@ macro_rules! define_entities {
                     let index = T::get(self.0) - T::one();
                     <T as TryInto<usize>>::try_into(index).map_err(|_| ()).unwrap()
                 }
+
+                #[inline]
+                fn from_bits(bits: <Self::Repr as crate::entity::NonZeroInt>::NonZero) -> Self {
+                    Self(bits)
+                }
+
+                #[inline]
+                fn to_bits(self) -> <Self::Repr as crate::entity::NonZeroInt>::NonZero {
+                    self.0
+                }
             }
         )*
     };
@@ -298,6 +314,16 @@ macro_rules! define_fixed_size_entities {
                 #[inline]
                 fn index(self) -> usize {
                     usize::try_from(self.0.get() - 1).unwrap()
+                }
+
+                #[inline]
+                fn from_bits(bits: <Self::Repr as crate::entity::NonZeroInt>::NonZero) -> Self {
+                    Self(bits)
+                }
+
+                #[inline]
+                fn to_bits(self) -> <Self::Repr as crate::entity::NonZeroInt>::NonZero {
+                    self.0
                 }
             }
         )*
@@ -403,6 +429,7 @@ where
 }
 
 /// An iterator over a range of `K` entities.
+#[derive(Clone, Debug)]
 pub struct EntityRangeIter<K> {
     indices: core::ops::Range<usize>,
     _phantom: PhantomData<K>,

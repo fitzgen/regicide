@@ -3,20 +3,20 @@
 //! We do a bottom-up walk of the region tree, allocating registers within each
 //! region.
 
+mod assignments;
+
 use crate::{
-    Entity, Input, InputFunction, Machine, OperandConstraint, RegUnit,
+    Entity, Input, InputFunction, Machine, OperandConstraint,
     context::ContextInner,
-    entity::{EntityRepr, Region, SecondaryMap},
+    entity::{EntityRepr, Region},
     error::IResult,
-    live_ranges::{LiveBundle, LiveRanges, LiveSpan},
+    live_ranges::{LiveBundle, LiveRanges},
     machine::RegClassMembers,
     region_tree::RegionTree,
     timing::Timing,
 };
-use alloc::{
-    collections::{BTreeMap, BinaryHeap},
-    vec::Vec,
-};
+use alloc::{collections::BinaryHeap, vec::Vec};
+use assignments::Assignments;
 use core::{fmt, marker::PhantomData};
 
 pub fn region_allocate<E>(
@@ -59,24 +59,16 @@ where
     todo!("fill `region_pre_order` with a pre-order traversal of the region tree")
 }
 
-struct Assignment<E>
-where
-    E: EntityRepr,
-{
-    #[allow(dead_code, reason = "will use it soon")]
-    bundle: LiveBundle<E>,
-}
-
 pub struct RegionAllocation<E>
 where
     E: EntityRepr,
 {
     /// The register allocation assignments we've committed to, across all regions.
-    assignments: SecondaryMap<RegUnit, BTreeMap<LiveSpan<E>, Assignment<E>>>,
+    assignments: Assignments<E>,
 
     /// The work-in-progress register allocation assignments for the current
     /// region.
-    region_assignments: SecondaryMap<RegUnit, BTreeMap<LiveSpan<E>, Assignment<E>>>,
+    region_assignments: Assignments<E>,
 
     /// The main work queue of bundles that still need assignment.
     queue: BinaryHeap<PqEntry<E>>,
@@ -91,8 +83,8 @@ where
 {
     pub const fn new() -> Self {
         Self {
-            assignments: SecondaryMap::new(BTreeMap::new()),
-            region_assignments: SecondaryMap::new(BTreeMap::new()),
+            assignments: Assignments::new(),
+            region_assignments: Assignments::new(),
             queue: BinaryHeap::new(),
             region_pre_order: Vec::new(),
         }
@@ -149,12 +141,12 @@ where
 
             let phase = entry.phase();
 
-            if self.assign_to_preferred(entry) {
+            if self.assign_to_preferred(machine, live_ranges, entry) {
                 // TODO: increment `counts.preferred_assignments`
                 continue;
             }
 
-            if self.assign_to_non_preferred(entry) {
+            if self.assign_to_non_preferred(machine, live_ranges, entry) {
                 // TODO: increment `counts.non_preferred_assignments`
                 continue;
             }
@@ -204,24 +196,78 @@ where
         todo!("SecondaryMap<LiveBundle<E>, Priority> on self")
     }
 
-    fn assign_to_preferred(&mut self, entry: PqEntry<E>) -> bool {
+    fn assign_to_preferred(
+        &mut self,
+        machine: &Machine,
+        live_ranges: &LiveRanges<E>,
+        entry: PqEntry<E>,
+    ) -> bool {
         let bundle = entry.bundle();
-        let _ = bundle;
-        // TODO: if the bundle has a register preference, see if we can eagerly
-        // assign it to one of the preferred registers. If so, do that and
-        // return true.
-        todo!()
+        let pref = live_ranges.bundle(bundle).preference();
+
+        if pref.is_empty() {
+            return false;
+        }
+
+        // If this bundle has a register preference, then that preference had
+        // better match its constraints.
+        if cfg!(debug_assertions) {
+            match live_ranges.bundle(bundle).constraint() {
+                OperandConstraint::Any => {}
+                OperandConstraint::Reg(rc) => {
+                    let class = &machine.classes[rc];
+                    debug_assert!(pref.is_subset_of(&class.member_set));
+                    debug_assert!(matches!(class.members, RegClassMembers::Regs(_)));
+                }
+                OperandConstraint::Stack => {
+                    panic!("should not have reg preference with stack constraint")
+                }
+                OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
+            }
+        }
+
+        self.region_assignments.try_assign_to_reg(
+            bundle,
+            pref.iter(),
+            |r| machine.registers[r].units.clone(),
+            live_ranges.bundle_spans(bundle).map(|s| {
+                let span = live_ranges.span(s);
+                span.start()..span.end()
+            }),
+        )
     }
 
-    fn assign_to_non_preferred(&mut self, entry: PqEntry<E>) -> bool {
+    fn assign_to_non_preferred(
+        &mut self,
+        machine: &Machine,
+        live_ranges: &LiveRanges<E>,
+        entry: PqEntry<E>,
+    ) -> bool {
         let bundle = entry.bundle();
-        let _ = bundle;
-        // TODO: optimistically assume that this bundle doesn't conflict
-        // with any existing assignment, and loop through its assignable
-        // registers (ignoring preferred registers from the first step, if any),
-        // assigning the first one that is not in use. If we assigned it, then
-        // return true.
-        todo!()
+
+        let bundle_data = live_ranges.bundle(bundle);
+        let pref = bundle_data.preference();
+
+        match bundle_data.constraint() {
+            OperandConstraint::Any => todo!(),
+            OperandConstraint::Reg(rc) => {
+                let class = &machine.classes[rc];
+                match &class.members {
+                    RegClassMembers::Regs(regs) => self.region_assignments.try_assign_to_reg(
+                        bundle,
+                        regs.iter().copied().filter(|r| !pref.contains(*r)),
+                        |r| machine.registers[r].units.clone(),
+                        live_ranges.bundle_spans(bundle).map(|s| {
+                            let span = live_ranges.span(s);
+                            span.start()..span.end()
+                        }),
+                    ),
+                    RegClassMembers::Groups(_groups) => todo!(),
+                }
+            }
+            OperandConstraint::Stack => todo!(),
+            OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
+        }
     }
 
     fn assign_via_eviction(&mut self, entry: PqEntry<E>) -> bool {
