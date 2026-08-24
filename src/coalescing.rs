@@ -1281,6 +1281,19 @@ mod tests {
                                 ));
                             }
                         }
+
+                        // Hints stay inside the class its values live in.
+                        for span in live_ranges.bundle_spans(bundle) {
+                            let val = live_ranges.span(span).val();
+                            let class = input.func.value(val).reg_class();
+                            let members = &input.machine.classes[class].member_set;
+                            if !data.preference().is_subset_of(members) {
+                                return Err(format!(
+                                    "{bundle:?} prefers registers that {val:?}, one of its own \
+                                     values, may not live in",
+                                ));
+                            }
+                        }
                         if !cross_region.iter().any(|&(parent, _)| parent == bundle) {
                             return Err(format!(
                                 "{bundle:?} has a register hint but no cross-region affinity \

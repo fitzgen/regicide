@@ -6,7 +6,7 @@
 mod assignments;
 
 use crate::{
-    Entity, Input, InputFunction, InputValue, Machine, OperandConstraint, RegClass,
+    Entity, Input, InputFunction, InputValue, OperandConstraint, RegClass,
     context::ContextInner,
     entity::{EntityRepr, Region},
     error::IResult,
@@ -152,7 +152,7 @@ where
 
             let phase = entry.phase();
 
-            if self.assign_to_preferred(input.machine, live_ranges, entry) {
+            if self.assign_to_preferred(input, live_ranges, entry) {
                 // TODO: increment `counts.preferred_assignments`
                 continue;
             }
@@ -209,10 +209,11 @@ where
 
     fn assign_to_preferred(
         &mut self,
-        machine: &Machine,
+        input: &Input<'_, impl InputFunction>,
         live_ranges: &LiveRanges<E>,
         entry: PqEntry<E>,
     ) -> bool {
+        let machine = input.machine;
         let bundle = entry.bundle();
         let pref = live_ranges.bundle(bundle).preference();
 
@@ -224,7 +225,11 @@ where
         // better match its constraints.
         if cfg!(debug_assertions) {
             match live_ranges.bundle(bundle).constraint() {
-                OperandConstraint::Any => {}
+                OperandConstraint::Any => {
+                    let class = &machine.classes[bundle_reg_class(input, live_ranges, bundle)];
+                    debug_assert!(pref.is_subset_of(&class.member_set));
+                    debug_assert!(matches!(class.members, RegClassMembers::Regs(_)));
+                }
                 OperandConstraint::Reg(rc) => {
                     let class = &machine.classes[rc];
                     debug_assert!(pref.is_subset_of(&class.member_set));

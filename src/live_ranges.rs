@@ -8,7 +8,7 @@ use crate::entity::{
 use crate::error::IResult;
 use crate::input::{Input, InputFunction, InputInst, OperandConstraint, Position};
 use crate::liveness::{Liveness, block_first_inst, block_last_inst};
-use crate::machine::Machine;
+use crate::machine::{Machine, RegClassMembers};
 use crate::output::{Allocation, OutputInner};
 use crate::packed_float::PackedPositiveFloat;
 use crate::timing::Timing;
@@ -411,6 +411,28 @@ where
         &self.preference
     }
 
+    /// Fold `hint` into this bundle's preference.
+    fn add_hint(&mut self, hint: RegSet) {
+        debug_assert!(!hint.is_empty());
+
+        if self.preference.is_empty() {
+            // Nothing has hinted this bundle yet, so take the hint whole rather
+            // than intersecting it with an empty set and losing it.
+            self.preference = hint;
+            return;
+        }
+
+        let narrowed = self.preference.intersection(&hint);
+
+        if narrowed.is_empty() {
+            // Conflicting hints: keep the existing hint, rather than replacing it
+            // with an equally arbitrary alternative.
+            return;
+        }
+
+        self.preference = narrowed;
+    }
+
     #[inline]
     #[allow(dead_code, reason = "will probably need it")]
     pub fn allocation(&self) -> Option<Allocation<E>> {
@@ -801,30 +823,25 @@ where
         let data = &mut self.bundles[bundle];
 
         let already_resolved = |_| unreachable!("constraints should already be resolved");
-        let hint =
+        let class =
             match data
                 .constraint
                 .merge(&constraint, machine, &already_resolved, &already_resolved)
             {
-                Some(OperandConstraint::Reg(intersection)) => {
-                    machine.classes[intersection].member_set.clone()
-                }
+                Some(OperandConstraint::Reg(intersection)) => &machine.classes[intersection],
                 Some(OperandConstraint::Any) | Some(OperandConstraint::Stack) | None => return,
                 Some(OperandConstraint::Reuse(_)) => {
                     unreachable!("constraints should already be resolved")
                 }
             };
 
-        debug_assert!(!hint.is_empty());
-        let hint = data.preference.intersection(&hint);
-
-        if hint.is_empty() {
-            // Conflicting hints: keep the existing hint, rather than replacing it
-            // with an equally arbitrary alternative.
+        // We only hint for registers (the common case) and not register groups.
+        let RegClassMembers::Regs(_) = class.members else {
             return;
-        }
+        };
 
-        data.preference = hint;
+        debug_assert!(!class.member_set.is_empty());
+        data.add_hint(class.member_set.clone());
     }
 
     /// Construct the live spans for `func`'s values.
@@ -1065,6 +1082,7 @@ where
 mod tests {
     use super::*;
     use crate::DefUse;
+    use crate::Reg;
     use crate::RegClass;
     use crate::dfs::Dfs;
     use crate::entity::Block;
@@ -1262,6 +1280,53 @@ mod tests {
         for flag in [BUNDLE_HAS_FIXED_USES, BUNDLE_MINIMAL] {
             assert_eq!(flag & BUNDLE_SPILL_WEIGHT_MASK, 0);
         }
+    }
+
+    /// The set holding exactly the registers with these indices.
+    fn regs(indices: &[usize]) -> RegSet {
+        let mut set = RegSet::new();
+        for &index in indices {
+            set.insert(Reg::try_new(index).unwrap());
+        }
+        set
+    }
+
+    /// A bundle takes its first hint whole: a fresh bundle's empty preference
+    /// means that nothing has hinted it yet, so there is nothing to narrow the
+    /// hint against.
+    #[test]
+    fn the_first_hint_is_adopted_whole() {
+        let mut bundle = bundle(0);
+        assert!(bundle.preference().is_empty());
+
+        bundle.add_hint(regs(&[0, 2]));
+        assert_eq!(*bundle.preference(), regs(&[0, 2]));
+    }
+
+    /// A second hint narrows the preference to the registers both hints want.
+    #[test]
+    fn a_later_hint_narrows_the_preference() {
+        let mut bundle = bundle(0);
+        bundle.add_hint(regs(&[0, 2]));
+
+        bundle.add_hint(regs(&[2, 3]));
+        assert_eq!(*bundle.preference(), regs(&[2]));
+
+        // And narrowing again keeps narrowing, rather than starting over from
+        // the newest hint.
+        bundle.add_hint(regs(&[1, 2]));
+        assert_eq!(*bundle.preference(), regs(&[2]));
+    }
+
+    /// ... but a hint that wants none of the registers the preference does is
+    /// dropped, rather than replacing one arbitrary choice with another.
+    #[test]
+    fn a_conflicting_hint_leaves_the_preference_alone() {
+        let mut bundle = bundle(0);
+        bundle.add_hint(regs(&[0, 2]));
+
+        bundle.add_hint(regs(&[1, 3]));
+        assert_eq!(*bundle.preference(), regs(&[0, 2]));
     }
 
     /// Compute the liveness and live spans of `test_input`'s function.

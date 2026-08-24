@@ -1645,10 +1645,8 @@ impl TestInput {
             val_data.reg_class %= num_classes;
         }
 
-        // An operand cannot be constrained to a class that shares no register
-        // with its value's class, so retarget the ones that are. Narrowing to
-        // the value's own class always intersects, which is also what makes
-        // this idempotent.
+        // An operand constraint must name a subset of its value's register
+        // class.
         let machine = self.machine.build();
         for (_inst, inst_data) in self.func.insts.iter_mut() {
             for operand in inst_data.operands_mut() {
@@ -1658,7 +1656,7 @@ impl TestInput {
                 let val_class =
                     RegClass::try_new(usize::from(self.func.values[operand.val()].reg_class))
                         .unwrap();
-                if machine.intersect_classes(class, val_class).is_some() {
+                if machine.intersect_classes(class, val_class) == Some(class) {
                     continue;
                 }
                 *operand = Operand::new(
@@ -2310,11 +2308,12 @@ mod tests {
         );
     }
 
-    /// The same operand against a value in `rc2`, which shares a register with
-    /// `rc1`, so the check above is about the classes overlapping and not about
-    /// `Reg` constraints in general.
+    /// The same operand against a value in `rc2`, which holds both registers
+    /// and so contains `rc1`, showing that the check above is about where the
+    /// constraint's registers sit relative to the value's and not about `Reg`
+    /// constraints in general.
     #[test]
-    fn accept_an_operand_whose_class_overlaps_its_value() {
+    fn accept_an_operand_whose_class_is_inside_its_value() {
         let mut func = valid_func(1, 1);
         let block = Block::try_new(0).unwrap();
         let inst = func.blocks[block].insts[0];
@@ -2332,6 +2331,34 @@ mod tests {
         );
 
         assert_eq!(check_ssa(&machine, &func), Ok(()));
+    }
+
+    /// ... and overlapping is not enough: `rc2` holds a register that a value
+    /// in `rc0` may not live in, and allocation would be free to hand that
+    /// register out.
+    #[test]
+    fn reject_an_operand_whose_class_is_wider_than_its_value() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        let machine = TestMachine::two_registers().build();
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        func.values[operand.val()].reg_class = 0;
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(
+                RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+            ),
+            operand.val(),
+        );
+
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(actual, Error::IncompatibleRegClass { inst: i, operand: 0 } if i == inst),
+            "expected an `IncompatibleRegClass`, got {actual:?}",
+        );
     }
 
     #[test]

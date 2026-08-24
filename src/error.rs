@@ -355,9 +355,9 @@ pub enum Error {
         val: Val,
     },
 
-    /// An operand's `Reg` constraint names a register class that has no
-    /// register in common with its value's register class, so no location
-    /// satisfies the operand.
+    /// An operand's `Reg` constraint names a register class that is not
+    /// contained in its value's register class, so the constraint admits at
+    /// least one register that the operand's value may not live in.
     IncompatibleRegClass {
         /// The instruction with the offending operand.
         inst: Inst,
@@ -536,8 +536,8 @@ impl fmt::Debug for Error {
             ),
             Self::IncompatibleRegClass { inst, operand } => write!(
                 f,
-                "operand {operand} of {inst:?} names a register class that shares no register \
-                 with its value's register class"
+                "operand {operand} of {inst:?} names a register class that is not contained in \
+                 its value's register class"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

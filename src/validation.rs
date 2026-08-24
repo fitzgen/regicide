@@ -505,17 +505,10 @@ fn check_block_reg_classes<'a>(
     for (inst, input_inst) in input_block.insts() {
         for (i, operand) in input_inst.operands().enumerate() {
             match operand.constraint() {
-                // The allocator has to satisfy the meet of everything
-                // constraining this value, which is empty unless the two
-                // classes share a register. Only a literal `Reg` is checked
-                // here: a `Reuse`'s effective constraint is its target's, which
-                // is checked in its own right, and the reuse check below forces
-                // the two values into one class.
+                // The register class we are constraining a value to must be a
+                // subset of the value's register class.
                 OperandConstraint::Reg(class) => {
-                    if machine
-                        .intersect_classes(class, class_of(operand.val()))
-                        .is_none()
-                    {
+                    if machine.intersect_classes(class, class_of(operand.val())) != Some(class) {
                         return Err(Error::IncompatibleRegClass { inst, operand: i });
                     }
                 }
