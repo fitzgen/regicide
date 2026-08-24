@@ -3,17 +3,17 @@
 #![allow(missing_docs, reason = "internal test utilities")]
 
 use crate::{
-    Block, InputBlock, InputFunction, InputInst, Machine, MachineBuilder, Operand, Reg, RegClass,
-    RegGroup, RegUnit, Val,
+    Block, InputBlock, InputFunction, InputInst, InputValue, Machine, MachineBuilder, Operand, Reg,
+    RegClass, RegGroup, RegUnit, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
     entity::{
-        Entity, EntityRepr, Inst, PrimaryMap, PrimaryMapKeys, Region, Scc, SccBlockIndex,
-        SecondaryMap, SpillSlot,
+        Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SccBlockIndex, SecondaryMap, SpillSlot,
     },
     input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position},
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
+    union_find::UnionFind,
 };
 use alloc::{vec, vec::Vec};
 use core::{
@@ -270,9 +270,16 @@ impl InstData {
     }
 }
 
+/// The most register classes any `TestMachine` can define, and so the range a
+/// `TestFunction`'s value classes are reduced to before `TestInput::fixup`
+/// narrows them further to one particular machine's classes.
+const MAX_REG_CLASSES: usize = TestMachine::MAX_BANKS * TestMachine::MAX_CLASSES_PER_BANK;
+
 #[derive(Clone, Default, Debug, Hash, Mutate)]
 pub struct ValData {
-    ty: Type,
+    /// An index into the machine's register classes, narrowed to a class the
+    /// machine really defines by `TestInput::fixup`.
+    reg_class: u8,
     def: ValDef,
 }
 
@@ -293,17 +300,6 @@ impl Default for ValDef {
             i: 0,
         }
     }
-}
-
-#[derive(Clone, Default, Debug, Hash, Mutate)]
-pub enum Type {
-    #[default]
-    I32,
-    I64,
-    F32,
-    F64,
-    V128,
-    V256,
 }
 
 #[derive(Clone, Default, Debug, Hash, Mutate)]
@@ -456,6 +452,7 @@ impl TestFunction {
         self.ensure_block_call_arity();
         self.ensure_uses_dominated_by_defs();
         self.ensure_operand_constraints();
+        self.ensure_reg_classes_agree();
     }
 
     /// Make sure that this function has at least one block, instruction, and
@@ -496,7 +493,7 @@ impl TestFunction {
                 .push(
                     output,
                     ValData {
-                        ty: Type::I32,
+                        reg_class: 0,
                         def: ValDef::InstResult {
                             inst: Inst::try_new(0).unwrap(),
                             i: 0,
@@ -744,13 +741,13 @@ impl TestFunction {
         let num_old_values = old_values.len();
         assert!(num_old_values > 0, "`ensure_non_empty` runs first");
 
-        // Mint a fresh value for a definition site, keeping the type of
+        // Mint a fresh value for a definition site, keeping the register class of
         // whichever old value used to be named there so that mutating a value's
-        // type still means something.
+        // class still means something.
         let mut fresh_val = |values: &mut PrimaryMap<Val, ValData>, old: Val, def: ValDef| -> Val {
             let old = Val::try_new(old.index() % num_old_values).unwrap();
-            let ty = old_values[old].ty.clone();
-            values.push(output, ValData { ty, def }).unwrap()
+            let reg_class = old_values[old].reg_class;
+            values.push(output, ValData { reg_class, def }).unwrap()
         };
 
         let Self {
@@ -837,6 +834,50 @@ impl TestFunction {
         }
     }
 
+    /// Make the values that this function pins to a single location agree about
+    /// which register class they belong to.
+    fn ensure_reg_classes_agree(&mut self) {
+        let Self {
+            values,
+            blocks,
+            insts,
+            ..
+        } = self;
+
+        let mut sets = UnionFind::<Val>::new();
+
+        for (_block, block_data) in blocks.iter() {
+            for inst in &block_data.insts {
+                let inst_data = &insts[*inst];
+
+                // Block-call arguments and block params must agree.
+                for call in inst_data.block_calls() {
+                    for (arg, param) in call.args.iter().zip(&blocks[call.target].params) {
+                        sets.union(*arg, *param);
+                    }
+                }
+
+                // Reuse operands must agree.
+                let operands = inst_data.operands();
+                for op in operands {
+                    let OperandConstraint::Reuse(i) = op.constraint() else {
+                        continue;
+                    };
+                    sets.union(op.val(), operands[i].val());
+                }
+            }
+        }
+
+        let max_reg_classes = u8::try_from(MAX_REG_CLASSES).unwrap();
+        for i in 0..values.len() {
+            let val = Val::try_new(i).unwrap();
+            let root = sets.find(val);
+            debug_assert!(root.index() < values.len());
+            let reg_class = values[root].reg_class % max_reg_classes;
+            values[val].reg_class = reg_class;
+        }
+    }
+
     /// Rewrite every use whose value is not defined by a definition that
     /// dominates it.
     fn ensure_uses_dominated_by_defs(&mut self) {
@@ -918,6 +959,51 @@ pub struct TestInst<'a> {
     inst: Inst,
 }
 
+pub struct TestValue<'a> {
+    func: &'a TestFunction,
+    val: Val,
+}
+
+pub struct TestValuesIter<'a> {
+    func: &'a TestFunction,
+    keys: crate::entity::PrimaryMapKeys<Val>,
+}
+
+impl<'a> Iterator for TestValuesIter<'a> {
+    type Item = (Val, TestValue<'a>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let val = self.keys.next()?;
+        Some((
+            val,
+            TestValue {
+                func: self.func,
+                val,
+            },
+        ))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.keys.size_hint()
+    }
+}
+
+impl<'a> ExactSizeIterator for TestValuesIter<'a> {}
+
+impl<'a> InputValue<'a> for TestValue<'a> {
+    fn val(&self) -> Val {
+        self.val
+    }
+
+    fn remat_cost(&self) -> Option<crate::RematCost> {
+        None
+    }
+
+    fn reg_class(&self) -> RegClass {
+        RegClass::try_new(usize::from(self.func.values[self.val].reg_class)).unwrap()
+    }
+}
+
 pub struct TestBlocksIter<'a> {
     func: &'a TestFunction,
     keys: crate::entity::PrimaryMapKeys<Block>,
@@ -994,6 +1080,11 @@ impl InputFunction for TestFunction {
     where
         Self: 'a;
 
+    type InputValue<'a>
+        = TestValue<'a>
+    where
+        Self: 'a;
+
     fn len_values(&self) -> usize {
         self.values.len()
     }
@@ -1007,16 +1098,19 @@ impl InputFunction for TestFunction {
     }
 
     type ValuesIter<'a>
-        = PrimaryMapKeys<Val>
+        = TestValuesIter<'a>
     where
         Self: 'a;
 
     fn values(&self) -> Self::ValuesIter<'_> {
-        self.values.keys()
+        TestValuesIter {
+            func: self,
+            keys: self.values.keys(),
+        }
     }
 
-    fn remat_cost(&self, _val: Val) -> Option<crate::RematCost> {
-        None
+    fn value(&self, val: Val) -> Self::InputValue<'_> {
+        TestValue { func: self, val }
     }
 
     fn entry_block(&self) -> Block {
@@ -1280,6 +1374,11 @@ impl TestMachine {
     /// The widest a generated register may be, in register units.
     const MAX_REG_UNITS: u8 = 2;
 
+    /// The class holding both of [`TestMachine::two_registers`]' registers,
+    /// and so the only one of its classes that a value can belong to while
+    /// still meeting either an `rc0` or an `rc1` operand constraint.
+    pub const BOTH_REGS_CLASS: u8 = 2;
+
     /// A machine of one bank with two registers and three classes: `rc0` holds
     /// the first register, `rc1` the second, and `rc2` both.
     ///
@@ -1538,6 +1637,38 @@ impl TestInput {
                 );
             }
         }
+
+        // One modulus applied uniformly, so the classes that
+        // `TestFunction::ensure_reg_classes_agree` made equal stay equal.
+        let num_classes = u8::try_from(num_classes).unwrap();
+        for (_val, val_data) in self.func.values.iter_mut() {
+            val_data.reg_class %= num_classes;
+        }
+
+        // An operand cannot be constrained to a class that shares no register
+        // with its value's class, so retarget the ones that are. Narrowing to
+        // the value's own class always intersects, which is also what makes
+        // this idempotent.
+        let machine = self.machine.build();
+        for (_inst, inst_data) in self.func.insts.iter_mut() {
+            for operand in inst_data.operands_mut() {
+                let OperandConstraint::Reg(class) = operand.constraint() else {
+                    continue;
+                };
+                let val_class =
+                    RegClass::try_new(usize::from(self.func.values[operand.val()].reg_class))
+                        .unwrap();
+                if machine.intersect_classes(class, val_class).is_some() {
+                    continue;
+                }
+                *operand = Operand::new(
+                    operand.pos(),
+                    operand.kind(),
+                    OperandConstraint::Reg(val_class),
+                    operand.val(),
+                );
+            }
+        }
     }
 
     /// A single-block input whose one value is defined by the first
@@ -1559,7 +1690,7 @@ impl TestInput {
             .push(
                 &mut output,
                 ValData {
-                    ty: Type::default(),
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
                     def: ValDef::InstResult { inst: def, i: 0 },
                 },
             )
@@ -1655,7 +1786,7 @@ impl TestInput {
                 .push(
                     &mut output,
                     ValData {
-                        ty: Type::default(),
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
                         def,
                     },
                 )
@@ -1994,12 +2125,15 @@ mod tests {
 
     /// Validate `func` and return the error that it is rejected with.
     fn expect_invalid(func: &impl InputFunction) -> Error {
+        expect_invalid_with(&test_machine(), func)
+    }
+
+    fn expect_invalid_with(machine: &Machine, func: &impl InputFunction) -> Error {
         let mut output = OutputInner::<u32>::new();
-        let machine = test_machine();
         let options = InputOptions::default();
         let input = Input {
             options: &options,
-            machine: &machine,
+            machine,
             func,
         };
         assert!(
@@ -2138,6 +2272,316 @@ mod tests {
         assert_eq!(check_ssa(&machine, &func), Ok(()));
     }
 
+    #[test]
+    fn reject_a_value_in_a_class_the_machine_does_not_define() {
+        let mut func = valid_func(1, 1);
+
+        // One past the last class the machine defines, as in the operand case
+        // above.
+        let machine = test_machine();
+        func.values[Val::try_new(0).unwrap()].reg_class =
+            u8::try_from(machine.num_user_classes()).unwrap();
+
+        assert_invalid!(&func, Error::InvalidValRegClass { val } if val.index() == 0);
+    }
+
+    #[test]
+    fn reject_an_operand_whose_class_cannot_hold_its_value() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        // `rc0` and `rc1` share no register, so constraining a value in one of
+        // them to the other leaves the operand with nowhere to go.
+        let machine = TestMachine::two_registers().build();
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        func.values[operand.val()].reg_class = 0;
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+            operand.val(),
+        );
+
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(actual, Error::IncompatibleRegClass { inst: i, operand: 0 } if i == inst),
+            "expected an `IncompatibleRegClass`, got {actual:?}",
+        );
+    }
+
+    /// The same operand against a value in `rc2`, which shares a register with
+    /// `rc1`, so the check above is about the classes overlapping and not about
+    /// `Reg` constraints in general.
+    #[test]
+    fn accept_an_operand_whose_class_overlaps_its_value() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        let machine = TestMachine::two_registers().build();
+        for (_val, val_data) in func.values.iter_mut() {
+            val_data.reg_class = TestMachine::BOTH_REGS_CLASS;
+        }
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+            operand.val(),
+        );
+
+        assert_eq!(check_ssa(&machine, &func), Ok(()));
+    }
+
+    #[test]
+    fn reject_a_block_argument_in_a_different_class_than_its_parameter() {
+        let mut input =
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Any);
+
+        // Both values are in `rc2` when this input is built; move the parameter
+        // out from under the argument.
+        let param = Val::try_new(1).unwrap();
+        assert!(matches!(
+            input.func.values[param].def,
+            ValDef::BlockParam { .. }
+        ));
+        input.func.values[param].reg_class = 0;
+
+        let actual = expect_invalid_with(&input.machine.build(), &input.func);
+        assert!(
+            matches!(
+                actual,
+                Error::BlockArgRegClassMismatch {
+                    block,
+                    successor: 0,
+                    index: 0,
+                } if block.index() == 0
+            ),
+            "expected a `BlockArgRegClassMismatch`, got {actual:?}",
+        );
+    }
+
+    /// A single-block function whose second instruction defines a value that
+    /// must reuse the register of one of its own operands, tying the two values
+    /// together.
+    fn func_with_a_reuse() -> TestFunction {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        let val = |i| Val::try_new(i).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in 0..2 {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: 0,
+                        def: ValDef::InstResult {
+                            inst: inst(i),
+                            i: 0,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    val(0),
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, val(0)),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        val(1),
+                    ),
+                ],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: vec![inst(0), inst(1)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        func.fixup();
+        func
+    }
+
+    #[test]
+    fn reject_a_reuse_whose_operands_are_in_different_classes() {
+        let mut func = func_with_a_reuse();
+
+        let (inst, j) = func
+            .insts
+            .iter()
+            .find_map(|(inst, inst_data)| {
+                let j = inst_data
+                    .operands()
+                    .iter()
+                    .position(|op| matches!(op.constraint(), OperandConstraint::Reuse(_)))?;
+                Some((inst, j))
+            })
+            .expect("`func_with_a_reuse` has a reuse operand");
+
+        let operands = func.insts[inst].operands();
+        let OperandConstraint::Reuse(target) = operands[j].constraint() else {
+            unreachable!("just found this operand by its `Reuse` constraint")
+        };
+        let (reusing, reused) = (operands[j].val(), operands[target].val());
+        assert_ne!(reusing, reused);
+
+        // `fixup` put both in one class; take the reusing operand's value out
+        // of it.
+        let machine = TestMachine::two_registers().build();
+        func.values[reusing].reg_class = 1;
+
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(
+                actual,
+                Error::ReuseRegClassMismatch { inst: i, operand } if i == inst && operand == j
+            ),
+            "expected a `ReuseRegClassMismatch`, got {actual:?}",
+        );
+    }
+
+    /// An input function that delegates to a `TestFunction`, except that it
+    /// claims `extra_values` more values than it has, and that asking it for
+    /// `lie_about` by index gives `lie_with` instead, so that the two ways of
+    /// reaching a value disagree.
+    struct LyingValues<'f> {
+        func: &'f TestFunction,
+        lie_about: Option<Val>,
+        lie_with: Val,
+        extra_values: usize,
+    }
+
+    impl InputFunction for LyingValues<'_> {
+        type InputBlock<'a>
+            = TestBlock<'a>
+        where
+            Self: 'a;
+
+        type InputInst<'a>
+            = TestInst<'a>
+        where
+            Self: 'a;
+
+        type InputValue<'a>
+            = TestValue<'a>
+        where
+            Self: 'a;
+
+        fn len_values(&self) -> usize {
+            self.func.len_values() + self.extra_values
+        }
+
+        fn len_insts(&self) -> usize {
+            self.func.len_insts()
+        }
+
+        fn inst(&self, inst: Inst) -> Self::InputInst<'_> {
+            self.func.inst(inst)
+        }
+
+        type ValuesIter<'a>
+            = TestValuesIter<'a>
+        where
+            Self: 'a;
+
+        fn values(&self) -> Self::ValuesIter<'_> {
+            self.func.values()
+        }
+
+        fn value(&self, val: Val) -> Self::InputValue<'_> {
+            self.func.value(if self.lie_about == Some(val) {
+                self.lie_with
+            } else {
+                val
+            })
+        }
+
+        fn entry_block(&self) -> Block {
+            self.func.entry_block()
+        }
+
+        fn len_blocks(&self) -> usize {
+            self.func.len_blocks()
+        }
+
+        fn block(&self, block: Block) -> Self::InputBlock<'_> {
+            self.func.block(block)
+        }
+
+        type BlocksIter<'a>
+            = TestBlocksIter<'a>
+        where
+            Self: 'a;
+
+        fn blocks(&self) -> Self::BlocksIter<'_> {
+            self.func.blocks()
+        }
+    }
+
+    #[test]
+    fn reject_a_value_lookup_that_disagrees_with_the_values_iterator() {
+        let func = valid_func(1, 2);
+        assert!(func.len_values() >= 2);
+
+        let lie_about = Val::try_new(0).unwrap();
+        let lying = LyingValues {
+            func: &func,
+            lie_about: Some(lie_about),
+            lie_with: Val::try_new(1).unwrap(),
+            extra_values: 0,
+        };
+
+        assert_invalid!(&lying, Error::InconsistentVal { val } if val == lie_about);
+    }
+
+    #[test]
+    fn reject_a_values_iterator_that_disagrees_with_len_values() {
+        let func = valid_func(1, 1);
+        let lying = LyingValues {
+            func: &func,
+            lie_about: None,
+            lie_with: Val::try_new(0).unwrap(),
+            extra_values: 1,
+        };
+
+        assert_invalid!(
+            &lying,
+            Error::InconsistentLen {
+                method: "len_values",
+                block: None,
+            },
+        );
+    }
+
     /// An input function that delegates to a `TestFunction`, except that asking
     /// it for one particular instruction gives a different one, so that the two
     /// ways of reaching an instruction disagree.
@@ -2158,6 +2602,11 @@ mod tests {
         where
             Self: 'a;
 
+        type InputValue<'a>
+            = TestValue<'a>
+        where
+            Self: 'a;
+
         fn len_values(&self) -> usize {
             self.func.len_values()
         }
@@ -2175,7 +2624,7 @@ mod tests {
         }
 
         type ValuesIter<'a>
-            = PrimaryMapKeys<Val>
+            = TestValuesIter<'a>
         where
             Self: 'a;
 
@@ -2183,8 +2632,8 @@ mod tests {
             self.func.values()
         }
 
-        fn remat_cost(&self, val: Val) -> Option<crate::RematCost> {
-            self.func.remat_cost(val)
+        fn value(&self, val: Val) -> Self::InputValue<'_> {
+            self.func.value(val)
         }
 
         fn entry_block(&self) -> Block {

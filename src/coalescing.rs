@@ -52,7 +52,9 @@
 use crate::context::ContextInner;
 use crate::entity::{Block, Entity, EntityRange, EntityRepr, Region, SecondaryMap, Val};
 use crate::error::IResult;
-use crate::input::{Input, InputBlock, InputFunction, InputInst, OperandConstraint, Position};
+use crate::input::{
+    Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
+};
 use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan};
 use crate::liveness::{block_first_inst, block_last_inst};
 use crate::machine::Machine;
@@ -561,6 +563,10 @@ where
             // their associated block parameters in the successor block.
             let succ_data = input.func.block(succ);
             for (arg, param) in block_data.successor_block_args(i).zip(succ_data.params()) {
+                debug_assert_eq!(
+                    input.func.value(arg).reg_class(),
+                    input.func.value(param).reg_class()
+                );
                 let arg = output.with_repr(arg)?;
                 let param = output.with_repr(param)?;
                 let (Some(arg_span), Some(param_span)) =
@@ -610,6 +616,10 @@ where
                 let OperandConstraint::Reuse(i) = input_inst.operand(j).constraint() else {
                     continue;
                 };
+                debug_assert_eq!(
+                    input.func.value(input_inst.operand(j).val()).reg_class(),
+                    input.func.value(input_inst.operand(i).val()).reg_class()
+                );
                 let inst = output.with_repr(inst)?;
                 let (Some(a), Some(b)) = (
                     live_ranges.inst_operand_span(block, inst, j),

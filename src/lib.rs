@@ -54,8 +54,8 @@ pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Inst, SpillSlot, Val};
 pub use error::{Error, Result};
 pub use input::{
-    DefUse, Input, InputBlock, InputFunction, InputInst, Operand, OperandConstraint, Position,
-    RematCost,
+    DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand, OperandConstraint,
+    Position, RematCost,
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};

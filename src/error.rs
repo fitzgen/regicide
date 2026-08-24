@@ -90,6 +90,20 @@ pub enum Error {
         actual: usize,
     },
 
+    /// A control-flow edge passes a block argument whose register class differs
+    /// from that of the parameter it feeds.
+    ///
+    /// The two are distinct values that coalescing places in a single location,
+    /// so there is nothing that satisfies both when their classes disagree.
+    BlockArgRegClassMismatch {
+        /// The [`Block`] the edge leaves.
+        block: Block,
+        /// The index of the successor edge within `block`.
+        successor: usize,
+        /// The position of the offending argument along the edge.
+        index: usize,
+    },
+
     /// A block's instructions are not numbered contiguously.
     NonContiguousInsts {
         /// The [`Block`] whose instructions are misnumbered.
@@ -129,6 +143,13 @@ pub enum Error {
         inst: Inst,
     },
 
+    /// Looking a value up by index gave a different value than iterating over
+    /// the function's values did.
+    InconsistentVal {
+        /// The [`Val`] whose two access paths disagree.
+        val: Val,
+    },
+
     /// A block's predecessors, as reported by the input, are not the exact
     /// reverse of the input's successor edges.
     InvalidPredecessors {
@@ -158,8 +179,9 @@ pub enum Error {
     InconsistentLen {
         /// The name of the method that reported the wrong length.
         method: &'static str,
-        /// The [`Block`] whose length was wrong.
-        block: Block,
+        /// The [`Block`] whose length was wrong, or `None` when the length
+        /// describes the whole function rather than any one block.
+        block: Option<Block>,
     },
 
     /// A basic block is missing a terminator instruction at its end.
@@ -304,6 +326,19 @@ pub enum Error {
         operand: usize,
     },
 
+    /// Two operands tied together by a `Reuse` constraint have values of
+    /// differing register classes.
+    ///
+    /// A reuse makes the allocator give both operands one location, so there is
+    /// nothing that satisfies both when their classes disagree.
+    ReuseRegClassMismatch {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of the operand carrying the `Reuse` constraint.
+        operand: usize,
+    },
+
     /// An operand's `Reg` constraint names a register class that the machine
     /// does not define.
     InvalidRegClass {
@@ -311,6 +346,23 @@ pub enum Error {
         inst: Inst,
 
         /// The index of the operand whose register class is not defined.
+        operand: usize,
+    },
+
+    /// A value's register class is one that the machine does not define.
+    InvalidValRegClass {
+        /// The [`Val`] whose register class is not defined.
+        val: Val,
+    },
+
+    /// An operand's `Reg` constraint names a register class that has no
+    /// register in common with its value's register class, so no location
+    /// satisfies the operand.
+    IncompatibleRegClass {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of the operand whose class cannot hold its value.
         operand: usize,
     },
 
@@ -367,6 +419,15 @@ impl fmt::Debug for Error {
                 "{block:?}'s successor edge {successor} passes {actual} block arguments, \
                  but its target block has {expected} parameters"
             ),
+            Self::BlockArgRegClassMismatch {
+                block,
+                successor,
+                index,
+            } => write!(
+                f,
+                "block argument {index} of {block:?}'s successor edge {successor} is in a \
+                 different register class than the parameter it feeds"
+            ),
             Self::NonContiguousInsts { block, inst } => write!(
                 f,
                 "{inst:?} does not immediately follow the instruction before it in {block:?}"
@@ -386,6 +447,10 @@ impl fmt::Debug for Error {
                 f,
                 "`InputFunction::inst` disagrees with `InputBlock::insts` about {inst:?}"
             ),
+            Self::InconsistentVal { val } => write!(
+                f,
+                "`InputFunction::value` disagrees with `InputFunction::values` about {val:?}"
+            ),
             Self::InvalidPredecessors { block } => write!(
                 f,
                 "{block:?}'s predecessors are not the reverse of the successor edges"
@@ -397,10 +462,13 @@ impl fmt::Debug for Error {
                 f,
                 "the input's dominance relation is wrong about whether {a:?} dominates {b:?}"
             ),
-            Self::InconsistentLen { method, block } => write!(
-                f,
-                "`{method}` disagrees with the corresponding iterator for {block:?}"
-            ),
+            Self::InconsistentLen { method, block } => match block {
+                Some(block) => write!(
+                    f,
+                    "`{method}` disagrees with the corresponding iterator for {block:?}"
+                ),
+                None => write!(f, "`{method}` disagrees with the corresponding iterator"),
+            },
             Self::BlockWithoutTerminator { block } => {
                 write!(f, "{block:?} is missing a terminator")
             }
@@ -452,10 +520,24 @@ impl fmt::Debug for Error {
                 f,
                 "operand {operand} of {inst:?} reuses an operand that it may not reuse"
             ),
+            Self::ReuseRegClassMismatch { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} reuses an operand whose value is in a different \
+                 register class"
+            ),
             Self::InvalidRegClass { inst, operand } => write!(
                 f,
                 "operand {operand} of {inst:?} names a register class that this machine does not \
                  define"
+            ),
+            Self::InvalidValRegClass { val } => write!(
+                f,
+                "{val:?} is in a register class that this machine does not define"
+            ),
+            Self::IncompatibleRegClass { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} names a register class that shares no register \
+                 with its value's register class"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

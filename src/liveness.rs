@@ -904,7 +904,7 @@ mod tests {
             .map(|&(src, arg, _param)| (src, arg))
             .collect();
 
-        for val in func.values() {
+        for (val, _) in func.values() {
             let Some(&def_block) = defs.get(&val) else {
                 continue;
             };

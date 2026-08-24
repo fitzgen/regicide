@@ -6,7 +6,9 @@
 //! * entity references are in bounds,
 //! * every block is reachable and terminated,
 //! * the function is in valid SSA form,
-//! * control-flow edges and block parameters agree, and
+//! * control-flow edges and block parameters agree,
+//! * every register class named is one the machine defines, and can hold the
+//!   value it is named for, and
 //! * the dominance relation the input reports really is the dominance relation
 //!   of the control-flow graph it reports.
 
@@ -14,8 +16,11 @@ use crate::{
     dominators::DominatorTree,
     entity::{Block, Entity, EntityRepr, Inst, SecondaryMap, Val},
     error::{Error, IResult, Result},
-    input::{DefUse, Input, InputBlock, InputFunction, InputInst, Operand, OperandConstraint},
+    input::{
+        DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand, OperandConstraint,
+    },
     live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST},
+    machine::Machine,
     output::OutputInner,
     timing::Timing,
 };
@@ -50,6 +55,7 @@ where
 
     validate_reachability(func, &dominators, output)?;
     validate_block_args(func, output)?;
+    validate_reg_classes(func, input.machine, output)?;
     validate_dominance(func, &dominators, output)?;
 
     let defs = validate_definitions(func, output)?;
@@ -77,6 +83,39 @@ where
     let entry = func.entry_block();
     if entry.index() >= num_blocks {
         return output.error(Error::BlockOutOfBounds { block: entry });
+    }
+
+    let mut num_values_seen = 0;
+    for (val, input_val) in func.values() {
+        if val.index() >= num_values {
+            return output.error(Error::ValOutOfBounds { val });
+        }
+        num_values_seen += 1;
+
+        // A value's class is intersected with its operands' classes through a
+        // table indexed by class, so an undefined class would be an
+        // out-of-bounds index rather than a diagnosis.
+        if input_val.reg_class().index() >= num_classes {
+            return output.error(Error::InvalidValRegClass { val });
+        }
+
+        // The allocator reaches a value both by iterating over the function's
+        // values and by looking one up by index, so the two have to describe
+        // the same value.
+        let looked_up = func.value(val);
+        if input_val.val() != val
+            || looked_up.val() != val
+            || looked_up.reg_class() != input_val.reg_class()
+            || looked_up.remat_cost() != input_val.remat_cost()
+        {
+            return output.error(Error::InconsistentVal { val });
+        }
+    }
+    if num_values_seen != num_values {
+        return output.error(Error::InconsistentLen {
+            method: "len_values",
+            block: None,
+        });
     }
 
     for (block, _) in func.blocks() {
@@ -116,7 +155,7 @@ fn check_block_references<'a>(
     if input_block.len_params() != num_params {
         return Err(Error::InconsistentLen {
             method: "len_params",
-            block,
+            block: Some(block),
         });
     }
 
@@ -144,7 +183,7 @@ fn check_block_references<'a>(
         if input_inst.operands_len() != num_operands {
             return Err(Error::InconsistentLen {
                 method: "operands_len",
-                block,
+                block: Some(block),
             });
         }
 
@@ -186,7 +225,7 @@ fn check_block_references<'a>(
     if input_block.len_successors() != num_successors {
         return Err(Error::InconsistentLen {
             method: "len_successors",
-            block,
+            block: Some(block),
         });
     }
 
@@ -201,7 +240,7 @@ fn check_block_references<'a>(
         if input_block.len_successor_block_args(i) != num_args {
             return Err(Error::InconsistentLen {
                 method: "len_successor_block_args",
-                block,
+                block: Some(block),
             });
         }
     }
@@ -364,7 +403,7 @@ where
         if func.block(block).len_predecessors() != len {
             return output.error(Error::InconsistentLen {
                 method: "len_predecessors",
-                block,
+                block: Some(block),
             });
         }
     }
@@ -427,6 +466,83 @@ where
                     successor: i,
                     expected,
                     actual,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Check that every register class the input names can actually hold the value
+/// it is named for, and that values the input pins to a single location agree
+/// about which class they may live in.
+fn validate_reg_classes<E>(
+    func: &impl InputFunction,
+    machine: &Machine,
+    output: &mut OutputInner<E>,
+) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    for (block, _) in func.blocks() {
+        if let Err(e) = check_block_reg_classes(func, machine, &func.block(block), block) {
+            return output.error(e);
+        }
+    }
+
+    Ok(())
+}
+
+fn check_block_reg_classes<'a>(
+    func: &impl InputFunction,
+    machine: &Machine,
+    input_block: &impl InputBlock<'a>,
+    block: Block,
+) -> Result<()> {
+    let class_of = |val: Val| func.value(val).reg_class();
+
+    for (inst, input_inst) in input_block.insts() {
+        for (i, operand) in input_inst.operands().enumerate() {
+            match operand.constraint() {
+                // The allocator has to satisfy the meet of everything
+                // constraining this value, which is empty unless the two
+                // classes share a register. Only a literal `Reg` is checked
+                // here: a `Reuse`'s effective constraint is its target's, which
+                // is checked in its own right, and the reuse check below forces
+                // the two values into one class.
+                OperandConstraint::Reg(class) => {
+                    if machine
+                        .intersect_classes(class, class_of(operand.val()))
+                        .is_none()
+                    {
+                        return Err(Error::IncompatibleRegClass { inst, operand: i });
+                    }
+                }
+
+                // `validate_entity_references` has already shown that `target`
+                // names a real operand of this instruction.
+                OperandConstraint::Reuse(target) => {
+                    let target = input_inst.operand(target);
+                    if class_of(operand.val()) != class_of(target.val()) {
+                        return Err(Error::ReuseRegClassMismatch { inst, operand: i });
+                    }
+                }
+
+                OperandConstraint::Any | OperandConstraint::Stack => {}
+            }
+        }
+    }
+
+    for (i, successor) in input_block.successors().enumerate() {
+        let params = func.block(successor);
+        let args = input_block.successor_block_args(i);
+        for (index, (arg, param)) in args.zip(params.params()).enumerate() {
+            if class_of(arg) != class_of(param) {
+                return Err(Error::BlockArgRegClassMismatch {
+                    block,
+                    successor: i,
+                    index,
                 });
             }
         }

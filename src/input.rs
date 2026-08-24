@@ -59,7 +59,7 @@ impl InputOptions {
 /// The constraints describing where an operand may be located.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum OperandConstraint {
-    /// This operand may be placed in any location.
+    /// This operand may be placed in any location: register or stack.
     Any,
 
     /// The register class describing the set of registers that this operand's
@@ -391,21 +391,24 @@ pub trait InputFunction {
     where
         Self: 'a;
 
+    /// The associated input value type.
+    type InputValue<'a>: InputValue<'a>
+    where
+        Self: 'a;
+
     /// The number of values defined in this function.
     fn len_values(&self) -> usize;
 
     /// The iterator type returned by [`InputFunction::values`].
-    type ValuesIter<'a>: Iterator<Item = Val>
+    type ValuesIter<'a>: Iterator<Item = (Val, Self::InputValue<'a>)>
     where
         Self: 'a;
 
     /// An iterator over the values defined in this function.
     fn values(&self) -> Self::ValuesIter<'_>;
 
-    /// Get the cost of rematerializing the given value, if possible.
-    ///
-    /// TODO: expand this
-    fn remat_cost(&self, val: Val) -> Option<RematCost>;
+    /// Get the given input value.
+    fn value(&self, val: Val) -> Self::InputValue<'_>;
 
     /// The number of instructions defined in this function.
     fn len_insts(&self) -> usize;
@@ -600,6 +603,20 @@ pub trait InputBlock<'a> {
     fn successor_block_args(&self, successor: usize) -> Self::SuccessorBlockArgsIter<'_>;
 }
 
+/// A value defined in an [`InputFunction`].
+pub trait InputValue<'a> {
+    /// Get this value's `Val`.
+    fn val(&self) -> Val;
+
+    /// Get the cost of rematerializing this value, if possible.
+    ///
+    /// TODO: expand this
+    fn remat_cost(&self) -> Option<RematCost>;
+
+    /// Get the register class that this value naturally belongs within.
+    fn reg_class(&self) -> RegClass;
+}
+
 /// An instruction in a [`InputBlock`].
 pub trait InputInst<'a> {
     /// Get this instruction's `Inst`.
@@ -628,6 +645,7 @@ pub trait InputInst<'a> {
 
 /// The cost of rematerializing a value, rather than shuffling it between
 /// registers or reloading it from a spill slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RematCost {
     /// Always rematerialize this value on demand.
     ///
