@@ -220,7 +220,7 @@ mod tests {
             (u32, 31),
             // The two widths the crate actually uses.
             (u16, 16),
-            (u32, 29),
+            (u32, 30),
             // A storage wider than the field it holds.
             (u32, 16),
         }
@@ -233,6 +233,6 @@ mod tests {
     fn a_packing_is_as_wide_as_its_storage() {
         assert_eq!(size_of::<PackedPositiveFloat<u16, 9>>(), 2);
         assert_eq!(size_of::<PackedPositiveFloat<u16, 16>>(), 2);
-        assert_eq!(size_of::<PackedPositiveFloat<u32, 29>>(), 4);
+        assert_eq!(size_of::<PackedPositiveFloat<u32, 30>>(), 4);
     }
 }

@@ -513,6 +513,7 @@ const PRIORITY_GROUP_SIZE_BITS: u32 = 3;
 const PRIORITY_GROUP_SIZE_SHIFT: u32 = PRIORITY_SIZE_SHIFT + PRIORITY_SIZE_BITS;
 const PRIORITY_GROUP_SIZE_MASK: u32 =
     ((1 << PRIORITY_GROUP_SIZE_BITS) - 1) << PRIORITY_GROUP_SIZE_SHIFT;
+const PRIORITY_GROUP_SIZE_MAX: usize = (1 << PRIORITY_GROUP_SIZE_BITS) - 1;
 
 const PRIORITY_IS_MINIMAL_BITS: u32 = 1;
 const PRIORITY_IS_MINIMAL_SHIFT: u32 = PRIORITY_GROUP_SIZE_SHIFT + PRIORITY_GROUP_SIZE_BITS;
@@ -583,9 +584,7 @@ impl Priority {
         let is_minimal = u32::from(is_minimal) << PRIORITY_IS_MINIMAL_SHIFT;
         debug_assert_eq!(is_minimal & PRIORITY_IS_MINIMAL_MASK, is_minimal);
 
-        let max_group_size = (1 << PRIORITY_GROUP_SIZE_BITS) - 1;
-        debug_assert!(group_size <= max_group_size);
-        let group_size = group_size as u32;
+        let group_size = u32::try_from(group_size.min(PRIORITY_GROUP_SIZE_MAX)).unwrap();
         let group_size = group_size << PRIORITY_GROUP_SIZE_SHIFT;
         debug_assert_eq!(group_size & PRIORITY_GROUP_SIZE_MASK, group_size);
 
@@ -672,11 +671,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine::RegGroup;
     use std::{vec, vec::Vec};
 
-    /// The widest value each saturating field can hold.
-    const MAX_GROUP_SIZE: usize = (1 << PRIORITY_GROUP_SIZE_BITS) - 1;
     const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
+    const MAX_GROUP_SIZE: usize = PRIORITY_GROUP_SIZE_MAX;
 
     /// Every phase, in ascending order.
     const PHASES: [Phase; 4] = [
@@ -695,7 +694,7 @@ mod tests {
     fn priority_round_trips_its_fields() {
         for has_fixed_use in [false, true] {
             for is_minimal in [false, true] {
-                for group_size in [0, 1, 2, MAX_GROUP_SIZE] {
+                for group_size in [0, 1, 2, MAX_GROUP_SIZE, RegGroup::MAX_SIZE] {
                     for size in [0, 1, 1000, MAX_SIZE] {
                         let p = Priority::new(has_fixed_use, is_minimal, group_size, size);
                         assert_eq!(p.has_fixed_use(), has_fixed_use, "{p:?}");

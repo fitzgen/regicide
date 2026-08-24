@@ -223,15 +223,14 @@ where
     /// The value that this span is associated with.
     val: Val<E>,
 
-    /// Bit:     1                  0
-    ///        +------------------+-----------+
-    /// Field: | has_fixed_use: 1 | pinned: 1 |
-    ///        +------------------+-----------+
+    /// Bit:     0
+    ///        +------------------+
+    /// Field: | has_fixed_use: 1 |
+    ///        +------------------+
     flags: u8,
 }
 
-const SPAN_PINNED: u8 = 1 << 0;
-const SPAN_HAS_FIXED_USE: u8 = 1 << 1;
+const SPAN_HAS_FIXED_USE: u8 = 1 << 0;
 
 impl<E> LiveSpanData<E>
 where
@@ -239,8 +238,8 @@ where
 {
     /// Create a span covering `[start, end)` for `val`, with the given uses.
     ///
-    /// The flags all start clear: pinning happens later, and `has_fixed_use`
-    /// needs register constraints that `Operand` does not carry yet.
+    /// The flags all start clear: `has_fixed_use` needs register constraints
+    /// that `Operand` does not carry yet.
     ///
     /// The constraints are reachable now; see [`UseData::new`] for what is still
     /// missing before `has_fixed_use` can be set here.
@@ -294,12 +293,6 @@ where
 
     #[inline]
     #[allow(dead_code, reason = "will probably need it")]
-    pub fn is_pinned(&self) -> bool {
-        self.flags & SPAN_PINNED != 0
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub fn has_fixed_use(&self) -> bool {
         self.flags & SPAN_HAS_FIXED_USE != 0
     }
@@ -340,17 +333,16 @@ where
     /// `weight_and_flags`, rather than under a rule that every comparison site
     /// has to remember to apply.
     ///
-    /// Bit:     31           30          29                  28     ...     0
-    ///        +------------+-----------+-------------------+------------------+
-    /// Field: | minimal: 1 | pinned: 1 | has_fixed_uses: 1 | spill_weight: 29 |
-    ///        +------------+-----------+-------------------+------------------+
+    /// Bit:     31           30                  29     ...     0
+    ///        +------------+-------------------+------------------+
+    /// Field: | minimal: 1 | has_fixed_uses: 1 | spill_weight: 30 |
+    ///        +------------+-------------------+------------------+
     weight_and_flags: u32,
 }
 
-const BUNDLE_SPILL_WEIGHT_BITS: u32 = 29;
+const BUNDLE_SPILL_WEIGHT_BITS: u32 = 30;
 const BUNDLE_SPILL_WEIGHT_MASK: u32 = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::MASK;
-const BUNDLE_HAS_FIXED_USES: u32 = 1 << 29;
-const BUNDLE_PINNED: u32 = 1 << 30;
+const BUNDLE_HAS_FIXED_USES: u32 = 1 << 30;
 const BUNDLE_MINIMAL: u32 = 1 << 31;
 
 impl<E> LiveBundleData<E>
@@ -368,7 +360,6 @@ where
         region: Region<E>,
         constraint: OperandConstraint,
         is_minimal: bool,
-        is_pinned: bool,
         has_fixed_uses: bool,
         spill_weight: f32,
     ) -> Self {
@@ -383,9 +374,6 @@ where
         debug_assert_eq!(weight_and_flags & !BUNDLE_SPILL_WEIGHT_MASK, 0);
         if is_minimal {
             weight_and_flags |= BUNDLE_MINIMAL;
-        }
-        if is_pinned {
-            weight_and_flags |= BUNDLE_PINNED;
         }
         if has_fixed_uses {
             weight_and_flags |= BUNDLE_HAS_FIXED_USES;
@@ -433,12 +421,6 @@ where
     #[allow(dead_code, reason = "will probably need it")]
     pub fn is_minimal(&self) -> bool {
         self.weight_and_flags & BUNDLE_MINIMAL != 0
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn is_pinned(&self) -> bool {
-        self.weight_and_flags & BUNDLE_PINNED != 0
     }
 
     #[inline]
@@ -767,7 +749,6 @@ where
     ) -> IResult<LiveBundle<E>> {
         let bundle = self.bundles.next_key(output)?;
 
-        let mut is_pinned = false;
         let mut has_fixed_uses = false;
 
         let start = self.bundle_spans_storage.next_key(output)?;
@@ -775,7 +756,6 @@ where
             debug_assert!(self.span_bundle[span].is_none());
             self.span_bundle[span] = Some(bundle);
 
-            is_pinned |= self.spans[span].is_pinned();
             has_fixed_uses |= self.spans[span].has_fixed_use();
 
             self.bundle_spans_storage.push(output, span)?;
@@ -790,7 +770,6 @@ where
                 region,
                 constraint,
                 is_minimal,
-                is_pinned,
                 has_fixed_uses,
                 spill_weight,
             ),
@@ -1231,19 +1210,9 @@ mod tests {
     }
 
     #[test]
-    fn span_flags_are_independent() {
-        assert!(!span(0).is_pinned());
+    fn span_has_fixed_use_flag_round_trips() {
         assert!(!span(0).has_fixed_use());
-
-        assert!(span(SPAN_PINNED).is_pinned());
-        assert!(!span(SPAN_PINNED).has_fixed_use());
-
-        assert!(!span(SPAN_HAS_FIXED_USE).is_pinned());
         assert!(span(SPAN_HAS_FIXED_USE).has_fixed_use());
-
-        let both = span(SPAN_PINNED | SPAN_HAS_FIXED_USE);
-        assert!(both.is_pinned());
-        assert!(both.has_fixed_use());
     }
 
     fn bundle(weight_and_flags: u32) -> LiveBundleData<u32> {
@@ -1263,13 +1232,11 @@ mod tests {
 
         let plain = bundle(weight);
         assert!(!plain.is_minimal());
-        assert!(!plain.is_pinned());
         assert!(!plain.has_fixed_uses());
         assert_eq!(plain.spill_weight(), 3.25);
 
-        let all = bundle(weight | BUNDLE_MINIMAL | BUNDLE_PINNED | BUNDLE_HAS_FIXED_USES);
+        let all = bundle(weight | BUNDLE_MINIMAL | BUNDLE_HAS_FIXED_USES);
         assert!(all.is_minimal());
-        assert!(all.is_pinned());
         assert!(all.has_fixed_uses());
         assert_eq!(all.spill_weight(), 3.25);
     }
@@ -1290,10 +1257,10 @@ mod tests {
     #[test]
     fn bundle_weight_and_flags_tile_a_u32() {
         assert_eq!(
-            BUNDLE_SPILL_WEIGHT_MASK | BUNDLE_HAS_FIXED_USES | BUNDLE_PINNED | BUNDLE_MINIMAL,
+            BUNDLE_SPILL_WEIGHT_MASK | BUNDLE_HAS_FIXED_USES | BUNDLE_MINIMAL,
             u32::MAX
         );
-        for flag in [BUNDLE_HAS_FIXED_USES, BUNDLE_PINNED, BUNDLE_MINIMAL] {
+        for flag in [BUNDLE_HAS_FIXED_USES, BUNDLE_MINIMAL] {
             assert_eq!(flag & BUNDLE_SPILL_WEIGHT_MASK, 0);
         }
     }
