@@ -75,6 +75,12 @@ where
 
     /// Scratch space to hold a pre-order traversal of the region tree.
     region_pre_order: Vec<Region<E>>,
+
+    /// The set of bundles that must be allocated to stack slots.
+    ///
+    /// We just remember the set for now, and actually allocate the stack slots
+    /// in later passes.
+    stack_bundles: Vec<LiveBundle<E>>,
 }
 
 impl<E> RegionAllocation<E>
@@ -87,6 +93,7 @@ where
             region_assignments: Assignments::new(),
             queue: BinaryHeap::new(),
             region_pre_order: Vec::new(),
+            stack_bundles: Vec::new(),
         }
     }
 
@@ -96,11 +103,13 @@ where
             region_assignments,
             queue,
             region_pre_order,
+            stack_bundles,
         } = self;
         assignments.reset();
         region_assignments.reset();
         queue.clear();
         region_pre_order.clear();
+        stack_bundles.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -109,11 +118,13 @@ where
             region_assignments,
             queue,
             region_pre_order,
+            stack_bundles,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
             && queue.is_empty()
             && region_pre_order.is_empty()
+            && stack_bundles.is_empty()
     }
 
     fn allocate_region(
@@ -262,10 +273,29 @@ where
                             span.start()..span.end()
                         }),
                     ),
-                    RegClassMembers::Groups(_groups) => todo!(),
+                    RegClassMembers::Groups(groups) => {
+                        debug_assert!(pref.is_empty());
+                        self.region_assignments.try_assign_to_reg_group(
+                            bundle,
+                            groups.iter().copied(),
+                            |g| {
+                                machine.groups[g]
+                                    .members
+                                    .iter()
+                                    .map(|r| machine.registers[*r].units.clone())
+                            },
+                            live_ranges.bundle_spans(bundle).map(|s| {
+                                let span = live_ranges.span(s);
+                                span.start()..span.end()
+                            }),
+                        )
+                    }
                 }
             }
-            OperandConstraint::Stack => todo!(),
+            OperandConstraint::Stack => {
+                self.stack_bundles.push(bundle);
+                true
+            }
             OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
         }
     }

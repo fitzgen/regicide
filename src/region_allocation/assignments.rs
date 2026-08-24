@@ -1,7 +1,7 @@
 //! The set of assignments of live bundles to register units.
 
 use crate::{
-    Entity, Reg, RegUnit,
+    Entity, Reg, RegGroup, RegUnit,
     entity::{EntityRepr, SecondaryMap},
     live_ranges::{LiveBundle, LivePoint},
 };
@@ -60,9 +60,13 @@ where
     assignments: SecondaryMap<RegUnit, RegUnitAssignments<E>>,
 }
 
-fn iter_reg_units(reg_units: Range<RegUnit>) -> impl ExactSizeIterator<Item = RegUnit> {
-    debug_assert!(reg_units.start <= reg_units.end);
-    (reg_units.start.to_bits()..reg_units.end.to_bits()).map(|i| RegUnit::from_bits(i))
+fn iter_reg_units(
+    reg_units: impl Iterator<Item = Range<RegUnit>>,
+) -> impl Iterator<Item = RegUnit> {
+    reg_units.flat_map(|units| {
+        debug_assert!(units.start <= units.end);
+        (units.start.to_bits()..units.end.to_bits()).map(|i| RegUnit::from_bits(i))
+    })
 }
 
 impl<E> Assignments<E>
@@ -88,7 +92,7 @@ where
     /// Do the given spans conflict with any existing assignments in `reg_units`?
     fn conflicts(
         &self,
-        reg_units: Range<RegUnit>,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
     ) -> bool {
         for unit in iter_reg_units(reg_units) {
@@ -119,7 +123,7 @@ where
     fn insert_assignment(
         &mut self,
         bundle: LiveBundle<E>,
-        reg_units: Range<RegUnit>,
+        reg_units: impl Iterator<Item = Range<RegUnit>> + Clone,
         spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
     ) {
         debug_assert!(!self.conflicts(reg_units.clone(), spans.clone()));
@@ -153,8 +157,39 @@ where
         debug_assert!(spans.len() > 0);
 
         for reg in candidates {
-            if !self.conflicts(reg_units(reg), spans.clone()) {
-                self.insert_assignment(bundle, reg_units(reg), spans);
+            let units = core::iter::once(reg_units(reg));
+            if !self.conflicts(units.clone(), spans.clone()) {
+                self.insert_assignment(bundle, units, spans);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Try to insert an assignment of `bundle` to one of the candidate register
+    /// groups.
+    ///
+    /// If the proposed assignment does not conflict with any existing
+    /// assignments, insert it and return `true`. Otherwise, when it does
+    /// conflict with an existing assignment, return `false` and leave `self`
+    /// unmodified.
+    pub fn try_assign_to_reg_group<GroupUnits>(
+        &mut self,
+        bundle: LiveBundle<E>,
+        candidates: impl IntoIterator<Item = RegGroup>,
+        group_units: impl Fn(RegGroup) -> GroupUnits,
+        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    ) -> bool
+    where
+        GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
+    {
+        debug_assert!(spans.len() > 0);
+
+        for group in candidates {
+            let units = group_units(group);
+            if !self.conflicts(units.clone(), spans.clone()) {
+                self.insert_assignment(bundle, units, spans);
                 return true;
             }
         }
@@ -220,9 +255,39 @@ mod tests {
     const R5: u8 = 5;
     const R6: u8 = 6;
 
+    const REG_GROUPS: [&[u8]; 8] = [
+        // g0: an adjacent pair, exactly the units of r4.
+        &[R0, R1],
+        // g1: the other pair, exactly the units of r5.
+        &[R2, R3],
+        // g2: straddles the r4/r5 boundary.
+        &[R1, R2],
+        // g3: out of unit order and non-contiguous.
+        &[R3, R0],
+        // g4: the two wide registers, so every unit.
+        &[R4, R5],
+        // g5: one real member and one that covers no units.
+        &[R0, R6],
+        // g6: three members.
+        &[R0, R1, R2],
+        // g7: three members, shifted down one from g6.
+        &[R1, R2, R3],
+    ];
+
+    const G0: u8 = 0;
+    const G1: u8 = 1;
+    const G2: u8 = 2;
+    const G3: u8 = 3;
+    const G4: u8 = 4;
+    const G5: u8 = 5;
+    const G6: u8 = 6;
+    const G7: u8 = 7;
+
+    const NUM_GROUPS: usize = REG_GROUPS.len();
+
     const MAX_OPS: usize = 12;
-    const MAX_CANDIDATES: usize = 3;
-    const MAX_SPANS: usize = 3;
+    const MAX_CANDIDATES: usize = 4;
+    const MAX_SPANS: usize = 4;
     const NUM_BUNDLES: u8 = 4;
 
     fn unit(index: usize) -> RegUnit {
@@ -240,6 +305,14 @@ mod tests {
         } else {
             unit(units.start)..unit(units.end)
         }
+    }
+
+    fn group(index: u8) -> RegGroup {
+        RegGroup::try_new(usize::from(index)).unwrap()
+    }
+
+    fn group_units(group: RegGroup) -> impl Iterator<Item = Range<RegUnit>> + Clone {
+        REG_GROUPS[group.index()].iter().map(|&r| reg_units(reg(r)))
     }
 
     fn point(index: u8) -> LivePoint<u32> {
@@ -272,11 +345,11 @@ mod tests {
     /// conflict.
     fn oracle_conflicts(
         oracle: &[OracleEntry],
-        reg_units: Range<RegUnit>,
+        reg_units: &[Range<RegUnit>],
         spans: &[Range<LivePoint<u32>>],
     ) -> bool {
         oracle.iter().any(|existing| {
-            reg_units.contains(&existing.unit)
+            reg_units.iter().any(|units| units.contains(&existing.unit))
                 && spans.iter().any(|span| {
                     LivePoint::spans_overlap(span.start, span.end, existing.start, existing.end)
                 })
@@ -286,12 +359,12 @@ mod tests {
     fn oracle_insert(
         oracle: &mut Vec<OracleEntry>,
         bundle: LiveBundle<u32>,
-        reg_units: Range<RegUnit>,
+        reg_units: &[Range<RegUnit>],
         spans: &[Range<LivePoint<u32>>],
     ) {
         for index in 0..NUM_UNITS {
             let unit = unit(index);
-            if !reg_units.contains(&unit) {
+            if !reg_units.iter().any(|units| units.contains(&unit)) {
                 continue;
             }
             for span in spans {
@@ -305,20 +378,21 @@ mod tests {
         }
     }
 
-    /// Brute-force version of `Assignments::try_assign_to_reg`.
+    /// Brute-force version of `Assignments::try_assign_to_reg` and
+    /// `Assignments::try_assign_to_reg_group`.
     ///
-    /// Returns the register that the bundle was assigned to.
+    /// Returns the index of the candidate that the bundle was assigned to.
     fn oracle_try_assign(
         oracle: &mut Vec<OracleEntry>,
         bundle: LiveBundle<u32>,
-        candidates: &[Reg],
+        candidates: &[Vec<Range<RegUnit>>],
         spans: &[Range<LivePoint<u32>>],
-    ) -> Option<Reg> {
-        let reg = *candidates
+    ) -> Option<usize> {
+        let index = candidates
             .iter()
-            .find(|&&reg| !oracle_conflicts(oracle, reg_units(reg), spans))?;
-        oracle_insert(oracle, bundle, reg_units(reg), spans);
-        Some(reg)
+            .position(|units| !oracle_conflicts(oracle, units, spans))?;
+        oracle_insert(oracle, bundle, &candidates[index], spans);
+        Some(index)
     }
 
     /// Check that `assignments` records exactly what `oracle` does.
@@ -395,21 +469,42 @@ mod tests {
         Ok(())
     }
 
+    /// Every unit set that `conflicts` can be asked about: the registers first,
+    /// then the register groups.
+    fn probe_unit_sets() -> Vec<Vec<Range<RegUnit>>> {
+        (0..NUM_REGS)
+            .map(|index| vec![reg_units(reg(u8::try_from(index).unwrap()))])
+            .chain(
+                (0..NUM_GROUPS)
+                    .map(|index| group_units(group(u8::try_from(index).unwrap())).collect()),
+            )
+            .collect()
+    }
+
+    /// Name the `index`th entry of `probe_unit_sets`.
+    fn probe_name(index: usize) -> String {
+        if index < NUM_REGS {
+            format!("{:?}", reg(u8::try_from(index).unwrap()))
+        } else {
+            format!("{:?}", group(u8::try_from(index - NUM_REGS).unwrap()))
+        }
+    }
+
     fn check_conflicts_agree(
         assignments: &Assignments<u32>,
         oracle: &[OracleEntry],
     ) -> Result<(), String> {
-        for index in 0..NUM_REGS {
-            let reg = reg(u8::try_from(index).unwrap());
-            let units = reg_units(reg);
+        for (index, units) in probe_unit_sets().iter().enumerate() {
             for start in 0..NUM_POINTS {
                 for end in start + 1..=NUM_POINTS {
                     let probe = [span(start, end)];
-                    let actual = assignments.conflicts(units.clone(), probe.iter().cloned());
-                    let expected = oracle_conflicts(oracle, units.clone(), &probe);
+                    let actual =
+                        assignments.conflicts(units.iter().cloned(), probe.iter().cloned());
+                    let expected = oracle_conflicts(oracle, units, &probe);
                     if actual != expected {
                         return Err(format!(
-                            "`conflicts({reg:?}, {:?})` is {actual} but should be {expected}",
+                            "`conflicts({}, {:?})` is {actual} but should be {expected}",
+                            probe_name(index),
                             probe[0],
                         ));
                     }
@@ -419,9 +514,51 @@ mod tests {
         Ok(())
     }
 
+    fn check_try_assign(
+        assignments: &Assignments<u32>,
+        what: &str,
+        candidates: &[Vec<Range<RegUnit>>],
+        spans: &[Range<LivePoint<u32>>],
+        actual: bool,
+        expected: Option<usize>,
+    ) -> Result<(), String> {
+        if actual != expected.is_some() {
+            return Err(match expected {
+                Some(index) => format!(
+                    "assigning {what} for {spans:?} returned {actual}, but it should have gone \
+                     in candidate {index}, which covers {:?}",
+                    candidates[index],
+                ),
+                None => format!(
+                    "assigning {what} for {spans:?} returned {actual}, but every candidate is \
+                     in conflict",
+                ),
+            });
+        }
+
+        if let Some(index) = expected {
+            let units = &candidates[index];
+            let no_units = units.iter().all(|units| units.start == units.end);
+            let taken = assignments.conflicts(units.iter().cloned(), spans.iter().cloned());
+            if taken == no_units {
+                return Err(format!(
+                    "after assigning {what} for {spans:?}, `conflicts` on candidate {index}, \
+                     which covers {units:?}, for those same spans is {taken}",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     #[derive(Clone, Debug, Mutate)]
     enum Op {
         TryAssign {
+            bundle: u8,
+            candidates: Vec<u8>,
+            spans: Vec<(u8, u8)>,
+        },
+        TryAssignGroup {
             bundle: u8,
             candidates: Vec<u8>,
             spans: Vec<(u8, u8)>,
@@ -445,7 +582,9 @@ mod tests {
 
         for (start, end) in spans.iter_mut() {
             *start %= NUM_POINTS;
-            *end = *start + 1 + (*end % (NUM_POINTS - *start));
+            if !(*start < *end && *end <= NUM_POINTS) {
+                *end = *start + 1 + (*end % (NUM_POINTS - *start));
+            }
         }
 
         spans.sort_unstable();
@@ -469,28 +608,41 @@ mod tests {
     /// Ensure that our test ops are valid.
     fn fixup_ops(ops: &mut Vec<Op>) {
         let num_regs = u8::try_from(NUM_REGS).unwrap();
+        let num_groups = u8::try_from(NUM_GROUPS).unwrap();
         ops.truncate(MAX_OPS);
         for op in ops.iter_mut() {
-            match op {
+            let (bundle, candidates, spans, num_candidates) = match op {
                 Op::TryAssign {
                     bundle,
                     candidates,
                     spans,
-                } => {
-                    *bundle %= NUM_BUNDLES;
-                    candidates.truncate(MAX_CANDIDATES);
-                    for candidate in candidates.iter_mut() {
-                        *candidate %= num_regs;
-                    }
-                    fixup_spans(spans);
-                }
-                Op::Reset => {}
+                } => (bundle, candidates, spans, num_regs),
+                Op::TryAssignGroup {
+                    bundle,
+                    candidates,
+                    spans,
+                } => (bundle, candidates, spans, num_groups),
+                Op::Reset => continue,
+            };
+            *bundle %= NUM_BUNDLES;
+            candidates.truncate(MAX_CANDIDATES);
+            for candidate in candidates.iter_mut() {
+                *candidate %= num_candidates;
             }
+            fixup_spans(spans);
         }
     }
 
     fn try_assign(bundle: u8, candidates: &[u8], spans: &[(u8, u8)]) -> Op {
         Op::TryAssign {
+            bundle,
+            candidates: candidates.to_vec(),
+            spans: spans.to_vec(),
+        }
+    }
+
+    fn try_assign_group(bundle: u8, candidates: &[u8], spans: &[(u8, u8)]) -> Op {
+        Op::TryAssignGroup {
             bundle,
             candidates: candidates.to_vec(),
             spans: spans.to_vec(),
@@ -574,6 +726,108 @@ mod tests {
                 Op::Reset,
                 try_assign(0, &[R4], &[(0, 6)]),
             ],
+            // A register blocks every group that contains it, but leaves a
+            // group whose members are all disjoint from it alone.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign_group(1, &[G0], &[(0, 6)]),
+                try_assign_group(2, &[G1], &[(0, 6)]),
+            ],
+            // And the other way around: a group blocks each of its members and
+            // the wide register that covers them, but nothing else.
+            vec![
+                try_assign_group(0, &[G0], &[(0, 6)]),
+                try_assign(1, &[R0], &[(0, 6)]),
+                try_assign(2, &[R1], &[(0, 6)]),
+                try_assign(3, &[R4], &[(0, 6)]),
+                try_assign(0, &[R2], &[(0, 6)]),
+            ],
+            // Only the *second* member of the group is taken, so the group as a
+            // whole is unusable and we fall through to the next candidate.
+            vec![
+                try_assign(0, &[R1], &[(0, 6)]),
+                try_assign_group(1, &[G0, G1], &[(0, 6)]),
+            ],
+            // Aliasing through the wide registers: r4 covers exactly g0's
+            // units, so it blocks g0 and g4, but leaves g1 alone.
+            vec![
+                try_assign(0, &[R4], &[(0, 6)]),
+                try_assign_group(1, &[G0], &[(0, 6)]),
+                try_assign_group(2, &[G4], &[(0, 6)]),
+                try_assign_group(3, &[G1], &[(0, 6)]),
+            ],
+            // A group whose members are out of unit order and not adjacent,
+            // against the registers it covers and the ones it leaves between
+            // them.
+            vec![
+                try_assign_group(0, &[G3], &[(0, 6)]),
+                try_assign(1, &[R0], &[(0, 6)]),
+                try_assign(2, &[R3], &[(0, 6)]),
+                try_assign_group(3, &[G2], &[(0, 6)]),
+            ],
+            // A group with a member that covers no units. Unlike the bare
+            // register r6, which never conflicts with anything, g5 records r0's
+            // unit and so conflicts with itself the second time around.
+            vec![
+                try_assign_group(0, &[G5], &[(0, 6)]),
+                try_assign_group(1, &[G5], &[(0, 6)]),
+                try_assign(2, &[R6], &[(0, 6)]),
+                try_assign(3, &[R1], &[(0, 6)]),
+            ],
+            // Exact-boundary abutment, for groups: `[0, 3)` ends where `[3, 6)`
+            // begins, so both fit in g0; the span that reaches one point
+            // further does conflict.
+            vec![
+                try_assign_group(0, &[G0], &[(0, 3)]),
+                try_assign_group(1, &[G0], &[(3, 6)]),
+                try_assign_group(2, &[G0], &[(2, 4)]),
+            ],
+            // A group assignment that *encloses* the queried span -- the case a
+            // forward range query cannot see -- probed on the group itself, on
+            // one of its members, and on a group that overlaps it in part.
+            vec![
+                try_assign_group(0, &[G0], &[(0, 6)]),
+                try_assign_group(1, &[G0], &[(2, 4)]),
+                try_assign(2, &[R1], &[(2, 4)]),
+                try_assign_group(3, &[G2], &[(2, 4)]),
+            ],
+            // A group bundle with a hole between its spans, which a register
+            // can slot into, and then a span covering the whole thing, which
+            // cannot.
+            vec![
+                try_assign_group(0, &[G1], &[(0, 2), (4, 6)]),
+                try_assign(1, &[R2], &[(2, 4)]),
+                try_assign_group(2, &[G1], &[(0, 6)]),
+            ],
+            // Preference order for groups: the first candidate is taken, so the
+            // second one wins; and an empty candidate list assigns nothing.
+            vec![
+                try_assign_group(0, &[G0], &[(0, 6)]),
+                try_assign_group(1, &[G0, G1], &[(0, 6)]),
+                try_assign_group(2, &[], &[(0, 6)]),
+                try_assign(3, &[R3], &[(0, 6)]),
+            ],
+            // A three-member group, and what it does and does not leave free.
+            vec![
+                try_assign_group(0, &[G6], &[(0, 6)]),
+                try_assign(1, &[R3], &[(0, 6)]),
+                try_assign_group(2, &[G1], &[(0, 6)]),
+                try_assign_group(3, &[G4], &[(0, 6)]),
+            ],
+            // Two three-member groups.
+            vec![
+                try_assign_group(0, &[G6, G7], &[(0, 3)]),
+                try_assign(1, &[R0, R1, R2, R3], &[(0, 4)]),
+                try_assign_group(2, &[G6, G7], &[(3, 6)]),
+                try_assign(3, &[R0, R1, R2, R3], &[(4, 6)]),
+            ],
+            // Reset frees a group's units again, just as it does a register's.
+            vec![
+                try_assign_group(0, &[G4], &[(0, 6)]),
+                try_assign(1, &[R0], &[(0, 6)]),
+                Op::Reset,
+                try_assign_group(0, &[G4], &[(0, 6)]),
+            ],
         ];
         for ops in seeds.iter_mut() {
             fixup_ops(ops);
@@ -613,42 +867,56 @@ mod tests {
                                 candidates.iter().map(|&index| reg(index)).collect();
                             let spans: Vec<Range<LivePoint<u32>>> =
                                 spans.iter().map(|&(start, end)| span(start, end)).collect();
+                            let units: Vec<Vec<Range<RegUnit>>> =
+                                candidates.iter().map(|&r| vec![reg_units(r)]).collect();
 
-                            let expected = oracle_try_assign(&mut oracle, b, &candidates, &spans);
+                            let expected = oracle_try_assign(&mut oracle, b, &units, &spans);
                             let actual = assignments.try_assign_to_reg(
                                 b,
                                 candidates.iter().copied(),
                                 reg_units,
                                 spans.iter().cloned(),
                             );
-                            if actual != expected.is_some() {
-                                return Err(match expected {
-                                    Some(reg) => format!(
-                                        "assigning {b:?} to one of {candidates:?} for {spans:?} \
-                                         returned {actual}, but it should have gone in {reg:?}",
-                                    ),
-                                    None => format!(
-                                        "assigning {b:?} to one of {candidates:?} for {spans:?} \
-                                         returned {actual}, but every candidate is in conflict",
-                                    ),
-                                });
-                            }
+                            check_try_assign(
+                                &assignments,
+                                &format!("{b:?} to one of {candidates:?}"),
+                                &units,
+                                &spans,
+                                actual,
+                                expected,
+                            )?;
+                        }
 
-                            // Those spans are taken now, so asking about them
-                            // again reports a conflict -- unless the register
-                            // covers no units, in which case there was nothing
-                            // to take and nothing ever conflicts with it.
-                            if let Some(reg) = expected {
-                                let units = reg_units(reg);
-                                let taken =
-                                    assignments.conflicts(units.clone(), spans.iter().cloned());
-                                if taken == units.is_empty() {
-                                    return Err(format!(
-                                        "after assigning {b:?} to {reg:?} for {spans:?}, \
-                                         `conflicts` on {reg:?} for those same spans is {taken}",
-                                    ));
-                                }
-                            }
+                        Op::TryAssignGroup {
+                            bundle: b,
+                            candidates,
+                            spans,
+                        } => {
+                            let b = bundle(usize::from(*b));
+                            let candidates: Vec<RegGroup> =
+                                candidates.iter().map(|&index| group(index)).collect();
+                            let spans: Vec<Range<LivePoint<u32>>> =
+                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+                            let units: Vec<Vec<Range<RegUnit>>> = candidates
+                                .iter()
+                                .map(|&g| group_units(g).collect())
+                                .collect();
+
+                            let expected = oracle_try_assign(&mut oracle, b, &units, &spans);
+                            let actual = assignments.try_assign_to_reg_group(
+                                b,
+                                candidates.iter().copied(),
+                                group_units,
+                                spans.iter().cloned(),
+                            );
+                            check_try_assign(
+                                &assignments,
+                                &format!("{b:?} to one of {candidates:?}"),
+                                &units,
+                                &spans,
+                                actual,
+                                expected,
+                            )?;
                         }
 
                         Op::Reset => {
