@@ -151,9 +151,7 @@ impl OperandConstraint {
         match (self, other) {
             (Self::Any, other) | (other, Self::Any) => Some(*other),
 
-            (Self::Reg(lhs), Self::Reg(rhs)) => {
-                machine.intersect_classes(*lhs, *rhs).map(Self::Reg)
-            }
+            (Self::Reg(lhs), Self::Reg(rhs)) => lhs.intersect(machine, *rhs).map(Self::Reg),
 
             (Self::Reg(_), Self::Stack) | (Self::Stack, Self::Reg(_)) => None,
 
@@ -1026,8 +1024,8 @@ mod tests {
         let machine = builder.finish().unwrap();
 
         // `low` and `high` share `r[1]`; `disjoint` and `high` share nothing.
-        assert!(machine.intersect_classes(low, high).is_some());
-        assert_eq!(machine.intersect_classes(disjoint, high), None);
+        assert!(low.intersect(&machine, high).is_some());
+        assert_eq!(disjoint.intersect(&machine, high), None);
 
         (machine, low, high, disjoint)
     }
@@ -1039,7 +1037,7 @@ mod tests {
             unreachable!("these constraints have no `Reuse` to resolve")
         };
 
-        let both = machine.intersect_classes(low, high).unwrap();
+        let both = low.intersect(&machine, high).unwrap();
         assert_eq!(
             OperandConstraint::Reg(low).merge(
                 &OperandConstraint::Reg(high),

@@ -250,6 +250,34 @@ impl RegUnit {
 impl Reg {
     /// The maximum number of `Reg`s supported.
     pub const MAX: usize = 512;
+
+    /// The range of units that this register covers.
+    #[inline]
+    pub(crate) fn units(self, machine: &Machine) -> Range<RegUnit> {
+        machine.registers[self].units.clone()
+    }
+
+    /// This register's associated register bank.
+    #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
+    pub(crate) fn bank(self, machine: &Machine) -> RegBank {
+        machine.registers[self].bank
+    }
+
+    /// Does this register cover any units, and so may be allocated?
+    #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
+    pub(crate) fn is_allocatable(self, machine: &Machine) -> bool {
+        let units = &machine.registers[self].units;
+        units.start != units.end
+    }
+
+    /// Does this register cover no units, and so may never be allocated?
+    #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
+    pub(crate) fn is_non_allocatable(self, machine: &Machine) -> bool {
+        !self.is_allocatable(machine)
+    }
 }
 
 impl RegGroup {
@@ -258,6 +286,27 @@ impl RegGroup {
 
     /// The maximum number of `Reg`s in a single `RegGroup`.
     pub const MAX_SIZE: usize = 8;
+
+    /// The members of this group, in order.
+    #[inline]
+    pub(crate) fn members(self, machine: &Machine) -> &[Reg] {
+        &machine.groups[self].members
+    }
+
+    /// The same registers as `self.members(machine)`, as a set for fast
+    /// membership and interference testing rather than in order.
+    #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
+    pub(crate) fn member_set(self, machine: &Machine) -> &RegSet {
+        &machine.groups[self].member_set
+    }
+
+    /// This register group's associated register bank.
+    #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
+    pub(crate) fn bank(self, machine: &Machine) -> RegBank {
+        machine.groups[self].bank
+    }
 }
 
 impl RegClass {
@@ -267,11 +316,69 @@ impl RegClass {
     /// The maximum number of `RegClass`es supported, including the ones that
     /// `MachineBuilder::finish` derives.
     pub(crate) const MAX_INCLUDING_DERIVED: usize = 2 * Self::MAX;
+
+    /// The cost of spilling this register class.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn spill_cost(self, machine: &Machine) -> f32 {
+        machine.classes[self].spill_cost
+    }
+
+    /// The members of this register class.
+    #[inline]
+    pub(crate) fn members(self, machine: &Machine) -> &RegClassMembers {
+        &machine.classes[self].members
+    }
+
+    /// The same set of registers inside `self.members(machine)`, but as a
+    /// `RegSet` for fast interference testing, rather than in
+    /// allocation-preferrence order.
+    #[inline]
+    pub(crate) fn member_set(self, machine: &Machine) -> &RegSet {
+        &machine.classes[self].member_set
+    }
+
+    /// This register class's associated register bank.
+    #[inline]
+    #[expect(dead_code, reason = "will probably need it")]
+    pub(crate) fn bank(self, machine: &Machine) -> RegBank {
+        machine.classes[self].bank
+    }
+
+    /// The class whose members are the registers in both `self` and `other`, or
+    /// `None` when they have no members in common.
+    ///
+    /// This is what makes [`crate::input::OperandConstraint`]'s merge total: the
+    /// intersection of two classes is always either empty or itself a class.
+    #[inline]
+    pub(crate) fn intersect(self, machine: &Machine, other: RegClass) -> Option<RegClass> {
+        let n = machine.classes.len();
+        debug_assert!(self.index() < n);
+        debug_assert!(other.index() < n);
+        machine.class_intersections[self.index() * n + other.index()]
+    }
 }
 
 impl RegBank {
     /// The maximum number of `RegBank`s supported.
     pub const MAX: usize = 64;
+
+    /// The set of registers that belong to this register bank.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn registers(self, machine: &Machine) -> &RegSet {
+        &machine.banks[self].registers
+    }
+
+    /// The subset of `self.registers(machine)` that may be used as a temporary
+    /// for splitting stack-to-stack moves.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn stack_to_stack_move_regs(self, machine: &Machine) -> RegSet {
+        let bank = &machine.banks[self];
+        debug_assert!(bank.non_allocatable.is_subset_of(&bank.registers));
+        bank.registers.difference(&bank.non_allocatable)
+    }
 }
 
 /// A set of `Reg`s.
@@ -284,20 +391,6 @@ pub(crate) struct RegDef {
 
     /// This register's associated register bank.
     pub bank: RegBank,
-}
-
-impl RegDef {
-    #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
-    pub fn is_allocatable(&self) -> bool {
-        self.units.start != self.units.end
-    }
-
-    #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
-    pub fn is_non_allocatable(&self) -> bool {
-        !self.is_allocatable()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -353,15 +446,6 @@ pub(crate) struct RegBankDef {
     non_allocatable: RegSet,
 }
 
-impl RegBankDef {
-    /// The subset of `self.registers` that may be used as a temporary for
-    /// splitting stack-to-stack moves.
-    pub(crate) fn stack_to_stack_move_regs(&self) -> RegSet {
-        debug_assert!(self.non_allocatable.is_subset_of(&self.registers));
-        self.registers.difference(&self.non_allocatable)
-    }
-}
-
 /// Trait for checking interference (conflict) between two things.
 #[allow(dead_code, reason = "will probably need it")]
 pub(crate) trait Interfere<Rhs = Self> {
@@ -415,12 +499,11 @@ impl Interfere for Range<RegUnit> {
 /// Construct a `Machine` via a [`MachineBuilder`].
 #[derive(Clone, Debug)]
 pub struct Machine {
-    pub(crate) registers: PrimaryMap<Reg, RegDef>,
+    registers: PrimaryMap<Reg, RegDef>,
+    groups: PrimaryMap<RegGroup, RegGroupDef>,
+    classes: PrimaryMap<RegClass, RegClassDef>,
     #[allow(dead_code, reason = "will probably need it")]
-    pub(crate) groups: PrimaryMap<RegGroup, RegGroupDef>,
-    pub(crate) classes: PrimaryMap<RegClass, RegClassDef>,
-    #[allow(dead_code, reason = "will probably need it")]
-    pub(crate) banks: PrimaryMap<RegBank, RegBankDef>,
+    banks: PrimaryMap<RegBank, RegBankDef>,
 
     /// For each pair of register classes, the class whose members are the
     /// registers (or groups) in both of them, if there is one.
@@ -441,19 +524,6 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// The class whose members are the registers in both `a` and `b`, or `None`
-    /// when they have no members in common.
-    ///
-    /// This is what makes [`crate::input::OperandConstraint`]'s merge total: the
-    /// intersection of two classes is always either empty or itself a class.
-    #[inline]
-    pub(crate) fn intersect_classes(&self, a: RegClass, b: RegClass) -> Option<RegClass> {
-        let n = self.classes.len();
-        debug_assert!(a.index() < n);
-        debug_assert!(b.index() < n);
-        self.class_intersections[a.index() * n + b.index()]
-    }
-
     /// How many registers this machine has.
     #[inline]
     pub fn num_registers(&self) -> usize {
@@ -861,7 +931,8 @@ impl MachineBuilder {
             // Two spill slots can need a move between them -- a block parameter
             // in one and its incoming value in another -- and hardware cannot do
             // that directly, so every bank needs somewhere to stage it.
-            if def.stack_to_stack_move_regs().is_empty() {
+            debug_assert!(def.non_allocatable.is_subset_of(&def.registers));
+            if def.registers.difference(&def.non_allocatable).is_empty() {
                 return Err(Error::NoStackToStackRegs { bank });
             }
         }
@@ -1175,22 +1246,22 @@ mod tests {
         // Membership in a class is preference, not ownership: `r[3]` is in no
         // class, but the allocator still owns it, so it may stage a
         // stack-to-stack move.
-        assert!(machine.banks[gpr].registers.contains(r[3]));
-        assert!(!machine.classes[class].member_set.contains(r[3]));
-        assert!(machine.banks[gpr].stack_to_stack_move_regs().contains(r[3]));
-        assert!(machine.banks[gpr].stack_to_stack_move_regs().contains(r[0]));
+        assert!(gpr.registers(&machine).contains(r[3]));
+        assert!(!class.member_set(&machine).contains(r[3]));
+        assert!(gpr.stack_to_stack_move_regs(&machine).contains(r[3]));
+        assert!(gpr.stack_to_stack_move_regs(&machine).contains(r[0]));
 
         // A non-allocatable register belongs to its bank -- it still interferes
         // with what it overlaps -- but must not reach the scratch pool: staging a
         // move through the stack pointer would clobber it.
-        assert!(machine.banks[gpr].registers.contains(sp));
-        assert!(!machine.classes[class].member_set.contains(sp));
-        assert!(!machine.banks[gpr].stack_to_stack_move_regs().contains(sp));
+        assert!(gpr.registers(&machine).contains(sp));
+        assert!(!class.member_set(&machine).contains(sp));
+        assert!(!gpr.stack_to_stack_move_regs(&machine).contains(sp));
 
         // A group's order is part of its definition.
-        assert_eq!(&*machine.groups[group].members, &[v[0], v[1]]);
+        assert_eq!(group.members(&machine), &[v[0], v[1]]);
         assert!(matches!(
-            machine.classes[group_class].members,
+            *group_class.members(&machine),
             RegClassMembers::Groups(_)
         ));
 
@@ -1247,17 +1318,13 @@ mod tests {
 
         let machine = builder.finish().expect("this machine is well formed");
 
-        assert!(machine.classes[fixed].member_set.contains(flags));
-        assert!(machine.classes[group_class].member_set.contains(flags));
-        assert!(!machine.classes[general].member_set.contains(flags));
+        assert!(fixed.member_set(&machine).contains(flags));
+        assert!(group_class.member_set(&machine).contains(flags));
+        assert!(!general.member_set(&machine).contains(flags));
 
         // Being in a class does not put it back in the scratch pool.
-        assert!(
-            !machine.banks[bank]
-                .stack_to_stack_move_regs()
-                .contains(flags)
-        );
-        assert!(machine.banks[bank].stack_to_stack_move_regs().contains(r0));
+        assert!(!bank.stack_to_stack_move_regs(&machine).contains(flags));
+        assert!(bank.stack_to_stack_move_regs(&machine).contains(r0));
     }
 
     #[test]
@@ -1360,49 +1427,43 @@ mod tests {
         // `nested` and `high` intersect in `{r[1]}`, and `low` and `high` in
         // `{r[1], r[2]}`.
         assert_eq!(machine.classes.len(), num_user_classes + 2);
-        let singleton = machine.intersect_classes(nested, high).unwrap();
-        let crossing = machine.intersect_classes(low, high).unwrap();
+        let singleton = nested.intersect(&machine, high).unwrap();
+        let crossing = low.intersect(&machine, high).unwrap();
         assert_eq!(singleton.index(), num_user_classes);
         assert_eq!(crossing.index(), num_user_classes + 1);
 
         // And their own intersection is the smaller of them, which is the
         // closure holding transitively: a derived class intersected with another
         // derived class still lands on a class.
-        assert_eq!(
-            machine.intersect_classes(singleton, crossing),
-            Some(singleton)
-        );
+        assert_eq!(singleton.intersect(&machine, crossing), Some(singleton));
 
         // `low` is the lower-indexed of the pair, so its preference order is the
         // one that survives -- which is what makes the table symmetric, and so
         // `OperandConstraint::merge` commutative.
-        let RegClassMembers::Regs(members) = &machine.classes[crossing].members else {
+        let RegClassMembers::Regs(members) = crossing.members(&machine) else {
             panic!("intersecting two classes of registers gives a class of registers");
         };
         assert_eq!(&**members, &[r[2], r[1]]);
-        assert_eq!(machine.intersect_classes(high, low), Some(crossing));
+        assert_eq!(high.intersect(&machine, low), Some(crossing));
 
         // Spilling a subset is at least as expensive as spilling either class it
         // came from.
-        assert_eq!(
-            machine.classes[crossing].spill_cost,
-            machine.classes[high].spill_cost,
-        );
+        assert_eq!(crossing.spill_cost(&machine), high.spill_cost(&machine),);
 
         // A subset relationship derives nothing: the intersection is the subset.
-        assert_eq!(machine.intersect_classes(all, nested), Some(nested));
-        assert_eq!(machine.intersect_classes(nested, low), Some(nested));
+        assert_eq!(all.intersect(&machine, nested), Some(nested));
+        assert_eq!(nested.intersect(&machine, low), Some(nested));
 
         // Every class is its own intersection with itself, including the derived
         // one, and including classes that would otherwise dedup onto each other.
         for i in 0..machine.classes.len() {
             let class = RegClass::try_new(i).unwrap();
-            assert_eq!(machine.intersect_classes(class, class), Some(class));
+            assert_eq!(class.intersect(&machine, class), Some(class));
         }
 
         // Different banks, and registers against groups, have nothing in common.
-        assert_eq!(machine.intersect_classes(all, groups), None);
-        assert_eq!(machine.intersect_classes(groups, all), None);
+        assert_eq!(all.intersect(&machine, groups), None);
+        assert_eq!(groups.intersect(&machine, all), None);
 
         // The closure property, which is what `merge` totality rests on:
         // intersecting any two classes -- derived ones included -- either lands
@@ -1412,15 +1473,15 @@ mod tests {
             for b in 0..machine.classes.len() {
                 let b = RegClass::try_new(b).unwrap();
                 assert_eq!(
-                    machine.intersect_classes(a, b),
-                    machine.intersect_classes(b, a),
+                    a.intersect(&machine, b),
+                    b.intersect(&machine, a),
                     "the intersection table is symmetric",
                 );
-                if let Some(ab) = machine.intersect_classes(a, b) {
+                if let Some(ab) = a.intersect(&machine, b) {
                     // And it is a fixed point: intersecting the result with
                     // either parent gives the result back.
-                    assert_eq!(machine.intersect_classes(ab, a), Some(ab));
-                    assert_eq!(machine.intersect_classes(ab, b), Some(ab));
+                    assert_eq!(ab.intersect(&machine, a), Some(ab));
+                    assert_eq!(ab.intersect(&machine, b), Some(ab));
                 }
             }
         }

@@ -442,7 +442,7 @@ where
     E: EntityRepr,
 {
     for (block, _) in func.blocks() {
-        if !dominators.is_reachable(block) {
+        if !block.is_reachable(dominators) {
             return output.error(Error::UnreachableBlock { block });
         }
     }
@@ -508,7 +508,7 @@ fn check_block_reg_classes<'a>(
                 // The register class we are constraining a value to must be a
                 // subset of the value's register class.
                 OperandConstraint::Reg(class) => {
-                    if machine.intersect_classes(class, class_of(operand.val())) != Some(class) {
+                    if class.intersect(machine, class_of(operand.val())) != Some(class) {
                         return Err(Error::IncompatibleRegClass { inst, operand: i });
                     }
                 }
@@ -555,12 +555,12 @@ where
     E: EntityRepr,
 {
     for (block, _) in func.blocks() {
-        if func.block(block).immediate_dominator() != dominators.idom(block) {
+        if func.block(block).immediate_dominator() != block.idom(dominators) {
             return output.error(Error::InvalidImmediateDominator { block });
         }
 
         let check = |a: Block, b: Block| -> Result<()> {
-            if func.block(a).dominates(b) == dominators.block_dominates(a, b) {
+            if func.block(a).dominates(b) == a.dominates(dominators, b) {
                 Ok(())
             } else {
                 Err(Error::InvalidDominance { a, b })
@@ -568,7 +568,7 @@ where
         };
 
         let mut result = check(block, block);
-        if let Some(idom) = dominators.idom(block) {
+        if let Some(idom) = block.idom(dominators) {
             result = result.and_then(|()| check(idom, block));
             result = result.and_then(|()| check(block, idom));
         }
@@ -734,7 +734,7 @@ impl ProgramPoint {
         if self.block == other.block {
             self.position < other.position
         } else {
-            dominators.block_dominates(self.block, other.block)
+            self.block.dominates(dominators, other.block)
         }
     }
 }

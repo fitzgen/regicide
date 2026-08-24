@@ -718,7 +718,7 @@ impl TestFunction {
                     .count();
             }
 
-            stack.extend(self.dominators.children(block).map(ScopeFrame::Enter));
+            stack.extend(block.dom_children(&self.dominators).map(ScopeFrame::Enter));
         }
 
         if needs_param {
@@ -926,7 +926,7 @@ impl TestFunction {
             }
 
             // Every block is reachable, so this walk reaches every block.
-            stack.extend(dominators.children(block).map(ScopeFrame::Enter));
+            stack.extend(block.dom_children(dominators).map(ScopeFrame::Enter));
         }
     }
 }
@@ -1183,11 +1183,11 @@ impl<'a> InputBlock<'a> for TestBlock<'a> {
     }
 
     fn immediate_dominator(&self) -> Option<Block> {
-        self.func.dominators.idom(self.block)
+        self.block.idom(&self.func.dominators)
     }
 
     fn dominates(&self, other: Block) -> bool {
-        self.func.dominators.block_dominates(self.block, other)
+        self.block.dominates(&self.func.dominators, other)
     }
 
     fn len_successors(&self) -> usize {
@@ -1656,7 +1656,7 @@ impl TestInput {
                 let val_class =
                     RegClass::try_new(usize::from(self.func.values[operand.val()].reg_class))
                         .unwrap();
-                if machine.intersect_classes(class, val_class) == Some(class) {
+                if class.intersect(&machine, val_class) == Some(class) {
                     continue;
                 }
                 *operand = Operand::new(
@@ -2034,8 +2034,8 @@ mod tests {
                         let a = RegClass::try_new(a).unwrap();
                         let b = RegClass::try_new(b).unwrap();
                         assert_eq!(
-                            machine.intersect_classes(a, b),
-                            machine.intersect_classes(b, a),
+                            a.intersect(&machine, b),
+                            b.intersect(&machine, a),
                             "intersecting classes is symmetric",
                         );
                     }

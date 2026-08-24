@@ -168,12 +168,6 @@ impl Default for DominatorTree {
 
 /// Methods for querying the dominator tree.
 impl DominatorTree {
-    /// Is `block` reachable from the entry block?
-    pub fn is_reachable(&self, block: Block) -> bool {
-        debug_assert!(self.is_valid());
-        self.nodes[block].pre_number != NOT_VISITED
-    }
-
     /// Get the CFG postorder of blocks that was used to compute this dominator
     /// tree.
     #[allow(dead_code, reason = "will probably need it")]
@@ -181,49 +175,58 @@ impl DominatorTree {
         debug_assert!(self.is_valid());
         &self.postorder
     }
+}
 
-    /// Get the immediate dominator of `block`.
+/// Dominator tree queries about a block.
+impl Block {
+    /// Is this block reachable from the entry block?
+    pub(crate) fn is_reachable(self, dominators: &DominatorTree) -> bool {
+        debug_assert!(dominators.is_valid());
+        dominators.nodes[self].pre_number != NOT_VISITED
+    }
+
+    /// Get the immediate dominator of this block.
     ///
     /// `a` is said to *dominate* `b` if all control-flow paths from the
     /// function entry to `b` must go through `a`. The *immediate dominator* is
-    /// the dominator that is closest to `block`; all of `block`'s other
+    /// the dominator that is closest to this block; all of this block's other
     /// dominators also dominate its immediate dominator.
     ///
-    /// Returns `None` if `block` is the entry block, which has no dominator
-    /// other than itself, or if `block` is not reachable from the entry block.
-    pub fn idom(&self, block: Block) -> Option<Block> {
-        debug_assert!(self.is_valid());
-        self.nodes[block].idom
+    /// Returns `None` if this is the entry block, which has no dominator other
+    /// than itself, or if this block is not reachable from the entry block.
+    pub(crate) fn idom(self, dominators: &DominatorTree) -> Option<Block> {
+        debug_assert!(dominators.is_valid());
+        dominators.nodes[self].idom
     }
 
-    /// Does `a` dominate `b`?
+    /// Does this block dominate `other`?
     ///
-    /// That is, must every control-flow path from the function entry to `b` go
-    /// through `a`? A block is considered to dominate itself.
+    /// That is, must every control-flow path from the function entry to `other`
+    /// go through this block? A block is considered to dominate itself.
     ///
-    /// This is `O(1)`: it checks whether `a`'s dominator tree preorder interval
-    /// contains `b`'s.
+    /// This is `O(1)`: it checks whether this block's dominator tree preorder
+    /// interval contains `other`'s.
     ///
     /// Dominance is ill-defined for blocks that are not reachable from the
     /// entry block.
-    pub fn block_dominates(&self, a: Block, b: Block) -> bool {
-        debug_assert!(self.is_valid());
-        let a = &self.nodes[a];
-        let b = &self.nodes[b];
+    pub(crate) fn dominates(self, dominators: &DominatorTree, other: Block) -> bool {
+        debug_assert!(dominators.is_valid());
+        let a = &dominators.nodes[self];
+        let b = &dominators.nodes[other];
         a.dom_pre_number <= b.dom_pre_number && a.dom_pre_max >= b.dom_pre_max
     }
 
-    /// Get an iterator over the direct children of `block` in the dominator
+    /// Get an iterator over the direct children of this block in the dominator
     /// tree.
     ///
-    /// These are the blocks whose immediate dominator is `block`, ordered by
+    /// These are the blocks whose immediate dominator is this block, ordered by
     /// decreasing CFG postorder number.
     #[allow(dead_code, reason = "will probably need it")]
-    pub fn children(&self, block: Block) -> ChildIter<'_> {
-        debug_assert!(self.is_valid());
+    pub(crate) fn dom_children(self, dominators: &DominatorTree) -> ChildIter<'_> {
+        debug_assert!(dominators.is_valid());
         ChildIter {
-            dominators: self,
-            next: self.nodes[block].child,
+            dominators,
+            next: dominators.nodes[self].child,
         }
     }
 }
@@ -556,7 +559,7 @@ mod tests {
                 ));
             }
             for b in &blocks {
-                if !dominators.is_reachable(*b) {
+                if !b.is_reachable(dominators) {
                     return Err(format!("`is_reachable({b:?})` is false"));
                 }
             }
@@ -634,7 +637,7 @@ mod tests {
             // every block but the entry block is the child of exactly one block.
             let mut children = BTreeSet::new();
             for d in &blocks {
-                for c in dominators.children(*d) {
+                for c in d.dom_children(dominators) {
                     if !children.insert(c) {
                         return Err(format!(
                             "{c:?} is a dominator tree child of more than one block"

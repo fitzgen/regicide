@@ -203,7 +203,7 @@ where
         self.next_span[span] = None;
         self.set_head[span] = Some(span);
         self.set_tail[span] = Some(span);
-        self.set_constraint[span] = live_ranges.span_constraint(input, span);
+        self.set_constraint[span] = span.constraint(live_ranges, input);
     }
 
     /// Do the sets represented by `ra` and `rb` hold no two spans that are live
@@ -234,10 +234,10 @@ where
         // Fast path: the whole range of one set lies outside the whole range of
         // the other.
         if !LivePoint::spans_overlap(
-            live_ranges.span(head_a).start(),
-            live_ranges.span(tail_a).end(),
-            live_ranges.span(head_b).start(),
-            live_ranges.span(tail_b).end(),
+            head_a.start(live_ranges),
+            tail_a.end(live_ranges),
+            head_b.start(live_ranges),
+            tail_b.end(live_ranges),
         ) {
             return true;
         }
@@ -257,14 +257,13 @@ where
              next_span_x: &mut Option<LiveSpan<_>>,
              span_y: LiveSpan<_>,
              next_span_y: &mut Option<LiveSpan<_>>| {
-                let (dx, dy) = (live_ranges.span(span_x), live_ranges.span(span_y));
-                if dx.overlaps(dy) {
+                if span_x.overlaps(live_ranges, span_y) {
                     return true;
                 }
 
                 // Disjoint and sorted, so whichever span ends first cannot
                 // overlap with any span in the other set either.
-                if dx.end() <= dy.start() {
+                if span_x.end(live_ranges) <= span_y.start(live_ranges) {
                     *next_span_x = self.next_span[span_x];
                 } else {
                     *next_span_y = self.next_span[span_y];
@@ -332,10 +331,8 @@ where
         // sorted).
 
         // Get a sort comparison key for the given span.
-        let compare_key = |span: LiveSpan<E>| {
-            let data = live_ranges.span(span);
-            (data.start(), data.end(), span)
-        };
+        let compare_key =
+            |span: LiveSpan<E>| (span.start(live_ranges), span.end(live_ranges), span);
 
         // The head and tail of the resulting spliced list.
         let (mut head, mut tail) = (None, None);
@@ -423,7 +420,9 @@ where
     // Merge spans into sets within each region.
     coalescing.region_stack.push(region_tree.root());
     while let Some(region) = coalescing.region_stack.pop() {
-        coalescing.region_stack.extend(region_tree.children(region));
+        coalescing
+            .region_stack
+            .extend(region.children(&region_tree));
         coalescing.coalesce_region(region_tree, live_ranges, input, output, region)?;
     }
 
@@ -452,8 +451,8 @@ where
         region: Region<E>,
     ) -> IResult<()> {
         // Seed each span into its own set.
-        for block in region_tree.blocks(region) {
-            for span in live_ranges.block_spans(block) {
+        for block in region.blocks(&region_tree) {
+            for span in block.spans(live_ranges) {
                 self.seed(live_ranges, input, span);
             }
         }
@@ -499,23 +498,23 @@ where
         // Build a map from this block's live-out values to their final spans in
         // this block.
         debug_assert_eq!(self.val_exit_span.len(), 0);
-        for span in live_ranges.live_out_spans(block) {
-            debug_assert_eq!(live_ranges.span(span).end(), block_end);
-            self.val_exit_span[live_ranges.span(span).val()] = Some(span);
+        for span in block.live_out_spans(live_ranges) {
+            debug_assert_eq!(span.end(live_ranges), block_end);
+            self.val_exit_span[span.val(live_ranges)] = Some(span);
         }
 
         let block_data = input.func.block(block.with_repr32());
         for (i, succ) in block_data.successors().enumerate() {
             let succ_repr = output.with_repr(succ)?;
-            let is_same_region = region_tree.block_region(succ_repr) == region;
+            let is_same_region = succ_repr.region(&region_tree) == region;
 
             // Build a map from the successor's live-in values to their initial
             // spans in the successor.
             debug_assert_eq!(self.val_entry_span.len(), 0);
             let succ_start = block_start_point(input, output, succ_repr)?;
-            for span in live_ranges.live_in_spans(succ_repr) {
-                debug_assert_eq!(live_ranges.span(span).start(), succ_start);
-                let val = live_ranges.span(span).val();
+            for span in succ_repr.live_in_spans(live_ranges) {
+                debug_assert_eq!(span.start(live_ranges), succ_start);
+                let val = span.val(live_ranges);
                 // We might already have an entry in `val_entry_span` because a
                 // value can be associated with multiple spans: for example, when a
                 // value is used in multiple operands of the same instruction, but
@@ -534,8 +533,8 @@ where
 
             // Create affinities between the spans of a value that is both live-in
             // to the successor and live-out of this block.
-            for span in live_ranges.live_in_spans(succ_repr) {
-                let val = live_ranges.span(span).val();
+            for span in succ_repr.live_in_spans(live_ranges) {
+                let val = span.val(live_ranges);
                 if self.val_entry_span[val] != Some(span) {
                     // This span's value is not live-in to the successor; ignore it.
                     continue;
@@ -610,8 +609,8 @@ where
                 );
                 let inst = output.with_repr(inst)?;
                 let (Some(a), Some(b)) = (
-                    live_ranges.inst_operand_span(block, inst, j),
-                    live_ranges.inst_operand_span(block, inst, i),
+                    inst.operand_span(live_ranges, block, j),
+                    inst.operand_span(live_ranges, block, i),
                 ) else {
                     continue;
                 };
@@ -642,7 +641,7 @@ fn region_blocks_by_priority<E>(
     E: EntityRepr,
 {
     debug_assert!(region_blocks.is_empty());
-    region_blocks.extend(region_tree.blocks(region));
+    region_blocks.extend(region.blocks(&region_tree));
 
     // NB: use a stable sort for determinism.
     region_blocks.sort_by(|a, b| {
@@ -788,14 +787,16 @@ where
 {
     coalescing.region_stack.push(region_tree.root());
     while let Some(region) = coalescing.region_stack.pop() {
-        coalescing.region_stack.extend(region_tree.children(region));
+        coalescing
+            .region_stack
+            .extend(region.children(&region_tree));
 
         let start = live_ranges.next_bundle(output)?;
 
-        for block in region_tree.blocks(region) {
-            for span in live_ranges.block_spans(block) {
+        for block in region.blocks(&region_tree) {
+            for span in block.spans(live_ranges) {
                 let root = coalescing.span_sets.find(span);
-                if live_ranges.span_bundle(root).is_some() {
+                if root.bundle(live_ranges).is_some() {
                     continue;
                 }
 
@@ -812,7 +813,7 @@ where
         }
 
         let end = live_ranges.next_bundle(output)?;
-        live_ranges.set_region_bundles(region, EntityRange { start, end });
+        region.set_bundles(live_ranges, EntityRange { start, end });
     }
 
     counts.bundles += live_ranges.len_bundles();
@@ -841,19 +842,18 @@ fn hint_across_regions<E>(
 {
     for i in 0..coalescing.cross_region_affinities.len() {
         let (a, b) = coalescing.cross_region_affinities[i];
-        let (Some(bundle_a), Some(bundle_b)) =
-            (live_ranges.span_bundle(a), live_ranges.span_bundle(b))
+        let (Some(bundle_a), Some(bundle_b)) = (a.bundle(live_ranges), b.bundle(live_ranges))
         else {
             unreachable!("all spans are assigned a bundle by now")
         };
 
-        let region_a = live_ranges.bundle(bundle_a).region();
-        let region_b = live_ranges.bundle(bundle_b).region();
+        let region_a = bundle_a.region(live_ranges);
+        let region_b = bundle_b.region(live_ranges);
         debug_assert_ne!(region_a, region_b);
 
-        let (parent, child) = if region_tree.parent(region_b) == Some(region_a) {
+        let (parent, child) = if region_b.parent(&region_tree) == Some(region_a) {
             (bundle_a, bundle_b)
-        } else if region_tree.parent(region_a) == Some(region_b) {
+        } else if region_a.parent(&region_tree) == Some(region_b) {
             (bundle_b, bundle_a)
         } else {
             // With irreducible control flow we can get edges between sibling
@@ -861,8 +861,8 @@ fn hint_across_regions<E>(
             continue;
         };
 
-        let constraint = live_ranges.bundle(child).constraint();
-        live_ranges.hint_bundle(machine, parent, constraint);
+        let constraint = child.constraint(live_ranges);
+        parent.hint(live_ranges, machine, constraint);
     }
 }
 
@@ -952,10 +952,9 @@ mod tests {
     ) -> HashMap<Val, LiveSpan> {
         let (_, end) = block_points(func, block);
         let mut map = HashMap::new();
-        for span in live_ranges.block_spans(block) {
-            let data = live_ranges.span(span);
-            if data.end() == end {
-                map.insert(data.val(), span);
+        for span in block.spans(live_ranges) {
+            if span.end(live_ranges) == end {
+                map.insert(span.val(live_ranges), span);
             }
         }
         map
@@ -969,10 +968,9 @@ mod tests {
     ) -> HashMap<Val, LiveSpan> {
         let (start, _) = block_points(func, block);
         let mut map = HashMap::new();
-        for span in live_ranges.block_spans(block) {
-            let data = live_ranges.span(span);
-            if data.start() == start {
-                map.entry(data.val()).or_insert(span);
+        for span in block.spans(live_ranges) {
+            if span.start(live_ranges) == start {
+                map.entry(span.val(live_ranges)).or_insert(span);
             }
         }
         map
@@ -985,11 +983,10 @@ mod tests {
         inst: Inst,
         operand: usize,
     ) -> Option<LiveSpan> {
-        live_ranges.block_spans(block).into_iter().find(|&span| {
-            live_ranges
-                .uses(span)
-                .iter()
-                .any(|u| u.point().inst() == inst && u.operand() == operand)
+        block.spans(live_ranges).into_iter().find(|&span| {
+            span.uses(live_ranges)
+                .into_iter()
+                .any(|u| u.point(live_ranges).inst() == inst && u.operand(live_ranges) == operand)
         })
     }
 
@@ -1043,11 +1040,10 @@ mod tests {
 
     /// Do these two bundles hold spans that are live at the same time?
     fn bundles_overlap(live_ranges: &LiveRanges<u32>, a: LiveBundle, b: LiveBundle) -> bool {
-        live_ranges.bundle_spans(a).any(|x| {
-            let x = live_ranges.span(x);
-            live_ranges.bundle_spans(b).any(|y| {
-                let y = live_ranges.span(y);
-                x.start() < y.end() && y.start() < x.end()
+        a.spans(live_ranges).any(|x| {
+            b.spans(live_ranges).any(|y| {
+                x.start(live_ranges) < y.end(live_ranges)
+                    && y.start(live_ranges) < x.end(live_ranges)
             })
         })
     }
@@ -1066,19 +1062,19 @@ mod tests {
                 // 1. The bundles partition the spans: every span belongs to a
                 // bundle, and every bundle lists exactly the spans that point
                 // back at it.
-                for (span, _) in live_ranges.spans() {
-                    if live_ranges.span_bundle(span).is_none() {
+                for span in live_ranges.spans() {
+                    if span.bundle(live_ranges).is_none() {
                         return Err(format!("{span:?} was not put in any bundle"));
                     }
                 }
                 let mut total = 0;
-                for (bundle, _) in live_ranges.bundles() {
-                    for span in live_ranges.bundle_spans(bundle) {
+                for bundle in live_ranges.bundles() {
+                    for span in bundle.spans(live_ranges) {
                         total += 1;
-                        if live_ranges.span_bundle(span) != Some(bundle) {
+                        if span.bundle(live_ranges) != Some(bundle) {
                             return Err(format!(
                                 "{bundle:?} lists {span:?}, but {span:?} points at {:?}",
-                                live_ranges.span_bundle(span),
+                                span.bundle(live_ranges),
                             ));
                         }
                     }
@@ -1093,31 +1089,30 @@ mod tests {
                 // 2. A bundle's spans are in ascending program order and no two
                 // of them are live at the same time -- the whole point of a
                 // bundle being allocatable to one location.
-                for (bundle, _) in live_ranges.bundles() {
+                for bundle in live_ranges.bundles() {
                     let mut previous: Option<LivePoint<u32>> = None;
-                    for span in live_ranges.bundle_spans(bundle) {
-                        let data = live_ranges.span(span);
-                        if previous.is_some_and(|previous| previous > data.start()) {
+                    for span in bundle.spans(live_ranges) {
+                        let start = span.start(live_ranges);
+                        if previous.is_some_and(|previous| previous > start) {
                             return Err(format!(
-                                "{bundle:?} holds a span starting at {:?} after one ending at \
-                                 {previous:?}",
-                                data.start(),
+                                "{bundle:?} holds a span starting at {start:?} after one ending \
+                                 at {previous:?}",
                             ));
                         }
-                        previous = Some(data.end());
+                        previous = Some(span.end(live_ranges));
                     }
                 }
 
                 // 3. Every span in a bundle lies in the bundle's region.
-                for (bundle, data) in live_ranges.bundles() {
-                    for span in live_ranges.bundle_spans(bundle) {
-                        let block = inst_block[&live_ranges.span(span).start().inst()];
+                for bundle in live_ranges.bundles() {
+                    for span in bundle.spans(live_ranges) {
+                        let block = inst_block[&span.start(live_ranges).inst()];
                         let block = Block::try_new(block.index()).unwrap();
-                        let region = inner.region_tree.block_region(block);
-                        if region != data.region() {
+                        let region = block.region(&inner.region_tree);
+                        if region != bundle.region(live_ranges) {
                             return Err(format!(
                                 "{bundle:?} is in {:?}, but holds {span:?}, which is in {region:?}",
-                                data.region(),
+                                bundle.region(live_ranges),
                             ));
                         }
                     }
@@ -1126,23 +1121,23 @@ mod tests {
                 // 4. A bundle's constraint is the merge of its spans' resolved
                 // use constraints, and so is never a `Reuse`.
                 test_input.with_input(|input| -> Result<(), String> {
-                    for (bundle, data) in live_ranges.bundles() {
-                        if matches!(data.constraint(), OperandConstraint::Reuse(_)) {
+                    for bundle in live_ranges.bundles() {
+                        if matches!(bundle.constraint(live_ranges), OperandConstraint::Reuse(_)) {
                             return Err(format!("{bundle:?}'s constraint is unresolved"));
                         }
                         let mut expected = OperandConstraint::Any;
-                        for span in live_ranges.bundle_spans(bundle) {
-                            let span = live_ranges.span_constraint(input, span);
+                        for span in bundle.spans(live_ranges) {
+                            let span = span.constraint(live_ranges, input);
                             expected = expected
                                 .merge(&span, input.machine, |_| unreachable!(), |_| unreachable!())
                                 .ok_or_else(|| {
                                     format!("{bundle:?}'s spans have conflicting constraints")
                                 })?;
                         }
-                        if expected != data.constraint() {
+                        if expected != bundle.constraint(live_ranges) {
                             return Err(format!(
                                 "{bundle:?}'s constraint is {:?}, but its spans want {expected:?}",
-                                data.constraint(),
+                                bundle.constraint(live_ranges),
                             ));
                         }
                     }
@@ -1152,8 +1147,8 @@ mod tests {
                 // 5. The bundles' span lists tile their shared storage: no
                 // gaps, no overlap, nothing left over.
                 let mut next = 0;
-                for (bundle, data) in live_ranges.bundles() {
-                    let spans = data.spans();
+                for bundle in live_ranges.bundles() {
+                    let spans = bundle.spans_storage(live_ranges);
                     if spans.start.index() != next {
                         return Err(format!(
                             "{bundle:?}'s spans start at {}, but the bundle before it ended at \
@@ -1179,10 +1174,10 @@ mod tests {
                 let mut counted = 0;
                 let mut regions = Vec::from([inner.region_tree.root()]);
                 while let Some(region) = regions.pop() {
-                    regions.extend(inner.region_tree.children(region));
-                    for bundle in live_ranges.region_bundles(region) {
+                    regions.extend(region.children(&inner.region_tree));
+                    for bundle in region.bundles(live_ranges) {
                         counted += 1;
-                        let actual = live_ranges.bundle(bundle).region();
+                        let actual = bundle.region(live_ranges);
                         if actual != region {
                             return Err(format!(
                                 "{region:?} lists {bundle:?} among its bundles, but that \
@@ -1207,22 +1202,20 @@ mod tests {
                 // since bundles only ever grow.
                 test_input.with_input(|input| -> Result<(), String> {
                     for (a, b) in all_affinities(live_ranges, func) {
-                        let (Some(ba), Some(bb)) =
-                            (live_ranges.span_bundle(a), live_ranges.span_bundle(b))
+                        let (Some(ba), Some(bb)) = (a.bundle(live_ranges), b.bundle(live_ranges))
                         else {
                             return Err("an affinity's span has no bundle".to_string());
                         };
                         if ba == bb {
                             continue;
                         }
-                        let (da, db) = (live_ranges.bundle(ba), live_ranges.bundle(bb));
-                        if da.region() != db.region() {
+                        if ba.region(live_ranges) != bb.region(live_ranges) {
                             continue;
                         }
-                        if da
-                            .constraint()
+                        if ba
+                            .constraint(live_ranges)
                             .merge(
-                                &db.constraint(),
+                                &bb.constraint(live_ranges),
                                 input.machine,
                                 |_| unreachable!(),
                                 |_| unreachable!(),
@@ -1250,17 +1243,14 @@ mod tests {
                         .into_iter()
                         .filter_map(|(a, b)| {
                             let (ba, bb) = (
-                                live_ranges.span_bundle(a).unwrap(),
-                                live_ranges.span_bundle(b).unwrap(),
+                                a.bundle(live_ranges).unwrap(),
+                                b.bundle(live_ranges).unwrap(),
                             );
-                            let (ra, rb) = (
-                                live_ranges.bundle(ba).region(),
-                                live_ranges.bundle(bb).region(),
-                            );
+                            let (ra, rb) = (ba.region(live_ranges), bb.region(live_ranges));
                             let _ = input;
-                            if inner.region_tree.parent(rb) == Some(ra) {
+                            if rb.parent(&inner.region_tree) == Some(ra) {
                                 Some((ba, bb))
-                            } else if inner.region_tree.parent(ra) == Some(rb) {
+                            } else if ra.parent(&inner.region_tree) == Some(rb) {
                                 Some((bb, ba))
                             } else {
                                 None
@@ -1269,13 +1259,13 @@ mod tests {
                         .collect()
                 });
                 test_input.with_input(|input| -> Result<(), String> {
-                    for (bundle, data) in live_ranges.bundles() {
-                        if data.preference().is_empty() {
+                    for bundle in live_ranges.bundles() {
+                        if bundle.preference(live_ranges).is_empty() {
                             continue;
                         }
-                        if let OperandConstraint::Reg(class) = data.constraint() {
-                            let members = &input.machine.classes[class].member_set;
-                            if !data.preference().is_subset_of(members) {
+                        if let OperandConstraint::Reg(class) = bundle.constraint(live_ranges) {
+                            let members = class.member_set(input.machine);
+                            if !bundle.preference(live_ranges).is_subset_of(members) {
                                 return Err(format!(
                                     "{bundle:?} prefers registers outside its own class",
                                 ));
@@ -1283,11 +1273,11 @@ mod tests {
                         }
 
                         // Hints stay inside the class its values live in.
-                        for span in live_ranges.bundle_spans(bundle) {
-                            let val = live_ranges.span(span).val();
+                        for span in bundle.spans(live_ranges) {
+                            let val = span.val(live_ranges);
                             let class = input.func.value(val).reg_class();
-                            let members = &input.machine.classes[class].member_set;
-                            if !data.preference().is_subset_of(members) {
+                            let members = class.member_set(input.machine);
+                            if !bundle.preference(live_ranges).is_subset_of(members) {
                                 return Err(format!(
                                     "{bundle:?} prefers registers that {val:?}, one of its own \
                                      values, may not live in",
@@ -1310,15 +1300,14 @@ mod tests {
                 for (block, _) in func.blocks() {
                     let block_e = Block::try_new(block.index()).unwrap();
                     let (start, end) = block_points(func, block);
-                    for span in live_ranges.block_spans(block_e) {
+                    for span in block_e.spans(live_ranges) {
                         seen += 1;
-                        let data = live_ranges.span(span);
-                        if data.start() < start || data.end() > end {
+                        if span.start(live_ranges) < start || span.end(live_ranges) > end {
                             return Err(format!(
                                 "{span:?} is listed under {block:?}, but covers {:?}..{:?}, \
                                  outside {start:?}..{end:?}",
-                                data.start(),
-                                data.end(),
+                                span.start(live_ranges),
+                                span.end(live_ranges),
                             ));
                         }
                     }
@@ -1338,13 +1327,10 @@ mod tests {
                 }
                 for index in 0..live_ranges.len_bundles() {
                     let bundle = LiveBundle::try_new(index).unwrap();
-                    let (first, second) = (live_ranges.bundle(bundle), again.bundle(bundle));
-                    if first.region() != second.region()
-                        || first.constraint() != second.constraint()
-                        || first.preference() != second.preference()
-                        || live_ranges
-                            .bundle_spans(bundle)
-                            .ne(again.bundle_spans(bundle))
+                    if bundle.region(live_ranges) != bundle.region(again)
+                        || bundle.constraint(live_ranges) != bundle.constraint(again)
+                        || bundle.preference(live_ranges) != bundle.preference(again)
+                        || bundle.spans(live_ranges).ne(bundle.spans(again))
                     {
                         return Err(format!(
                             "coalescing twice gave {bundle:?} different contents"
@@ -1367,10 +1353,10 @@ mod tests {
     fn only_span(live_ranges: &LiveRanges<u32>, block: usize, val: usize) -> LiveSpan {
         let block = Block::try_new(block).unwrap();
         let val = Val::try_new(val).unwrap();
-        let mut found = live_ranges
-            .block_spans(block)
+        let mut found = block
+            .spans(live_ranges)
             .into_iter()
-            .filter(|&span| live_ranges.span(span).val() == val);
+            .filter(|&span| span.val(live_ranges) == val);
         let span = found.next().expect("the value has a span in the block");
         assert!(found.next().is_none(), "and only the one");
         span
@@ -1388,8 +1374,8 @@ mod tests {
         let arg = only_span(live_ranges, 0, 0);
         let param = only_span(live_ranges, 1, 1);
         assert_eq!(
-            live_ranges.span_bundle(arg),
-            live_ranges.span_bundle(param),
+            arg.bundle(live_ranges),
+            param.bundle(live_ranges),
             "the argument and the parameter should share a bundle",
         );
     }
@@ -1405,11 +1391,11 @@ mod tests {
 
         let arg = only_span(live_ranges, 0, 0);
         let param = only_span(live_ranges, 1, 1);
-        let arg_bundle = live_ranges.span_bundle(arg).unwrap();
-        assert_eq!(live_ranges.bundle(arg_bundle).constraint(), rc(0));
+        let arg_bundle = arg.bundle(live_ranges).unwrap();
+        assert_eq!(arg_bundle.constraint(live_ranges), rc(0));
         assert_ne!(
-            live_ranges.span_bundle(arg),
-            live_ranges.span_bundle(param),
+            arg.bundle(live_ranges),
+            param.bundle(live_ranges),
             "`rc0` and `rc1` are disjoint, so these may not share a location",
         );
     }

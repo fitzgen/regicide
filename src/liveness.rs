@@ -215,42 +215,6 @@ where
             && finished.is_empty()
     }
 
-    /// Get the values that are live on entry to `block`.
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn live_in(&self, block: Block<E>) -> impl Iterator<Item = Val<E>> + '_ {
-        self.live_in[block].iter(&self.arena).copied()
-    }
-
-    /// Get the values that are live at `block`'s exit.
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn live_out(&self, block: Block<E>) -> impl Iterator<Item = Val<E>> + '_ {
-        self.live_out[block].iter(&self.arena).copied()
-    }
-
-    /// Is `val` live on entry to `block`?
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn is_live_in(&self, block: Block<E>, val: Val<E>) -> bool {
-        self.live_in[block].contains(&self.arena, &val)
-    }
-
-    /// Is `val` live at `block`'s exit?
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn is_live_out(&self, block: Block<E>, val: Val<E>) -> bool {
-        self.live_out[block].contains(&self.arena, &val)
-    }
-
-    /// How many values are live on entry to `block`?
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn len_live_in(&self, block: Block<E>) -> usize {
-        self.live_in[block].len()
-    }
-
-    /// How many values are live at `block`'s exit?
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn len_live_out(&self, block: Block<E>) -> usize {
-        self.live_out[block].len()
-    }
-
     /// Construct this `Liveness` in place for the given function.
     pub fn construct(
         &mut self,
@@ -519,6 +483,48 @@ where
     index: usize,
 }
 
+/// Liveness queries about a block.
+impl<E> Block<E>
+where
+    E: EntityRepr,
+{
+    /// Get the values that are live on entry to this block.
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn live_in(self, liveness: &Liveness<E>) -> impl Iterator<Item = Val<E>> + '_ {
+        liveness.live_in[self].iter(&liveness.arena).copied()
+    }
+
+    /// Get the values that are live at this block's exit.
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn live_out(self, liveness: &Liveness<E>) -> impl Iterator<Item = Val<E>> + '_ {
+        liveness.live_out[self].iter(&liveness.arena).copied()
+    }
+
+    /// Is `val` live on entry to this block?
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn is_live_in(self, liveness: &Liveness<E>, val: Val<E>) -> bool {
+        liveness.live_in[self].contains(&liveness.arena, &val)
+    }
+
+    /// Is `val` live at this block's exit?
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn is_live_out(self, liveness: &Liveness<E>, val: Val<E>) -> bool {
+        liveness.live_out[self].contains(&liveness.arena, &val)
+    }
+
+    /// How many values are live on entry to this block?
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn len_live_in(self, liveness: &Liveness<E>) -> usize {
+        liveness.live_in[self].len()
+    }
+
+    /// How many values are live at this block's exit?
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn len_live_out(self, liveness: &Liveness<E>) -> usize {
+        liveness.live_out[self].len()
+    }
+}
+
 impl<E> Drop for BlockSpans<'_, E>
 where
     E: EntityRepr,
@@ -594,7 +600,7 @@ where
     // The chain was already in ascending program order.
     debug_assert!(
         uses.as_slice()[start.index()..end.index()]
-            .is_sorted_by(|a, b| (a.point(), a.operand()) < (b.point(), b.operand())),
+            .is_sorted_by(|a, b| a.order_key() < b.order_key()),
     );
 
     Ok(EntityRange { start, end })
@@ -978,8 +984,8 @@ mod tests {
                 let (expected_live_in, expected_live_out, needed) = liveness_oracle(func);
 
                 for (block, input_block) in func.blocks() {
-                    let actual_live_in: Vec<Val> = liveness.live_in(block).collect();
-                    let actual_live_out: Vec<Val> = liveness.live_out(block).collect();
+                    let actual_live_in: Vec<Val> = block.live_in(&liveness).collect();
+                    let actual_live_out: Vec<Val> = block.live_out(&liveness).collect();
 
                     // The sets match the oracle.
                     let expected: Vec<Val> = expected_live_in[&block].iter().copied().collect();
@@ -1008,26 +1014,26 @@ mod tests {
                             ));
                         }
                     }
-                    if liveness.len_live_in(block) != actual_live_in.len()
-                        || liveness.len_live_out(block) != actual_live_out.len()
+                    if block.len_live_in(&liveness) != actual_live_in.len()
+                        || block.len_live_out(&liveness) != actual_live_out.len()
                     {
                         return Err(format!(
                             "{block:?} reports {} live-in and {} live-out values, but its \
                              iterators yield {} and {}",
-                            liveness.len_live_in(block),
-                            liveness.len_live_out(block),
+                            block.len_live_in(&liveness),
+                            block.len_live_out(&liveness),
                             actual_live_in.len(),
                             actual_live_out.len(),
                         ));
                     }
                     for val_index in 0..num_values {
                         let val = Val::try_new(val_index).unwrap();
-                        if liveness.is_live_in(block, val) != actual_live_in.contains(&val) {
+                        if block.is_live_in(&liveness, val) != actual_live_in.contains(&val) {
                             return Err(format!(
                                 "`is_live_in({block:?}, {val:?})` disagrees with `live_in`",
                             ));
                         }
-                        if liveness.is_live_out(block, val) != actual_live_out.contains(&val) {
+                        if block.is_live_out(&liveness, val) != actual_live_out.contains(&val) {
                             return Err(format!(
                                 "`is_live_out({block:?}, {val:?})` disagrees with `live_out`",
                             ));
@@ -1054,7 +1060,7 @@ mod tests {
                             if params.contains(&val) {
                                 continue;
                             }
-                            if !liveness.is_live_out(pred, val) {
+                            if !pred.is_live_out(&liveness, val) {
                                 return Err(format!(
                                     "{val:?} is live-in at {block:?} but not live-out of its \
                                      predecessor {pred:?}",
@@ -1068,8 +1074,8 @@ mod tests {
                     for (i, successor) in input_block.successors().enumerate() {
                         let args = input_block.successor_block_args(i);
                         for (arg, param) in args.zip(func.block(successor).params()) {
-                            if liveness.is_live_in(successor, param)
-                                && !liveness.is_live_out(block, arg)
+                            if successor.is_live_in(&liveness, param)
+                                && !block.is_live_out(&liveness, arg)
                             {
                                 return Err(format!(
                                     "{block:?} passes {arg:?} to {successor:?}'s parameter \
@@ -1084,7 +1090,7 @@ mod tests {
                 // The only values live on entry to the function are the entry
                 // block's own parameters, which are the function's
                 // parameters. Anything else would be used before it is defined.
-                for val in liveness.live_in(entry) {
+                for val in entry.live_in(&liveness) {
                     if !func.block(entry).params().any(|param| param == val) {
                         return Err(format!(
                             "{val:?} is live on entry to the function, but is not one of \
@@ -1097,7 +1103,7 @@ mod tests {
                 // strictly dominates it.
                 let defs = defs(func);
                 for (block, input_block) in func.blocks() {
-                    for val in liveness.live_in(block) {
+                    for val in block.live_in(&liveness) {
                         let def_block = defs[&val];
                         if !func.block(def_block).dominates(block) {
                             return Err(format!(
@@ -1124,7 +1130,7 @@ mod tests {
                         continue;
                     }
                     for (block, _) in func.blocks() {
-                        if liveness.is_live_in(block, val) || liveness.is_live_out(block, val) {
+                        if block.is_live_in(&liveness, val) || block.is_live_out(&liveness, val) {
                             return Err(format!(
                                 "nothing reads {val:?}, but it is live at {block:?}",
                             ));
@@ -1135,16 +1141,16 @@ mod tests {
                 // Constructing twice gives the same answer.
                 let again = analyze(func)?;
                 for (block, _) in func.blocks() {
-                    let first: Vec<Val> = liveness.live_in(block).collect();
-                    let second: Vec<Val> = again.live_in(block).collect();
+                    let first: Vec<Val> = block.live_in(&liveness).collect();
+                    let second: Vec<Val> = block.live_in(&again).collect();
                     if first != second {
                         return Err(format!(
                             "constructing twice gave {block:?} the live-in sets {first:?} \
                              and {second:?}",
                         ));
                     }
-                    let first: Vec<Val> = liveness.live_out(block).collect();
-                    let second: Vec<Val> = again.live_out(block).collect();
+                    let first: Vec<Val> = block.live_out(&liveness).collect();
+                    let second: Vec<Val> = block.live_out(&again).collect();
                     if first != second {
                         return Err(format!(
                             "constructing twice gave {block:?} the live-out sets {first:?} \

@@ -10,7 +10,7 @@ use crate::{
     context::ContextInner,
     entity::{EntityRepr, Region},
     error::IResult,
-    live_ranges::{LiveBundle, LiveRanges},
+    live_ranges::{LiveBundle, LiveRanges, LiveSpan},
     machine::RegClassMembers,
     region_tree::RegionTree,
     timing::Timing,
@@ -140,7 +140,7 @@ where
         // Okay to call `region_bundles` because we haven't split any of this
         // region's bundles yet, because we haven't allocated registers within
         // this region yet.
-        for bundle in live_ranges.region_bundles(region) {
+        for bundle in region.bundles(live_ranges) {
             self.push_bundle(input, live_ranges, bundle, Phase::default());
         }
 
@@ -215,7 +215,7 @@ where
     ) -> bool {
         let machine = input.machine;
         let bundle = entry.bundle();
-        let pref = live_ranges.bundle(bundle).preference();
+        let pref = bundle.preference(live_ranges);
 
         if pref.is_empty() {
             return false;
@@ -224,16 +224,15 @@ where
         // If this bundle has a register preference, then that preference had
         // better match its constraints.
         if cfg!(debug_assertions) {
-            match live_ranges.bundle(bundle).constraint() {
+            match bundle.constraint(live_ranges) {
                 OperandConstraint::Any => {
-                    let class = &machine.classes[bundle_reg_class(input, live_ranges, bundle)];
-                    debug_assert!(pref.is_subset_of(&class.member_set));
-                    debug_assert!(matches!(class.members, RegClassMembers::Regs(_)));
+                    let class = bundle_reg_class(input, live_ranges, bundle);
+                    debug_assert!(pref.is_subset_of(class.member_set(machine)));
+                    debug_assert!(matches!(class.members(machine), RegClassMembers::Regs(_)));
                 }
                 OperandConstraint::Reg(rc) => {
-                    let class = &machine.classes[rc];
-                    debug_assert!(pref.is_subset_of(&class.member_set));
-                    debug_assert!(matches!(class.members, RegClassMembers::Regs(_)));
+                    debug_assert!(pref.is_subset_of(rc.member_set(machine)));
+                    debug_assert!(matches!(rc.members(machine), RegClassMembers::Regs(_)));
                 }
                 OperandConstraint::Stack => {
                     panic!("should not have reg preference with stack constraint")
@@ -245,11 +244,10 @@ where
         self.region_assignments.try_assign_to_reg(
             bundle,
             pref.iter(),
-            |r| machine.registers[r].units.clone(),
-            live_ranges.bundle_spans(bundle).map(|s| {
-                let span = live_ranges.span(s);
-                span.start()..span.end()
-            }),
+            |r| r.units(machine),
+            bundle
+                .spans(live_ranges)
+                .map(|s| s.start(live_ranges)..s.end(live_ranges)),
         )
     }
 
@@ -261,10 +259,9 @@ where
     ) -> bool {
         let bundle = entry.bundle();
 
-        let bundle_data = live_ranges.bundle(bundle);
-        let pref = bundle_data.preference();
+        let pref = bundle.preference(live_ranges);
 
-        let rc = match bundle_data.constraint() {
+        let rc = match bundle.constraint(live_ranges) {
             OperandConstraint::Any => {
                 // No use constrained this bundle any further than the default
                 // register class of its values, so use that default class.
@@ -278,16 +275,14 @@ where
             OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
         };
 
-        let class = &input.machine.classes[rc];
-        match &class.members {
+        match rc.members(input.machine) {
             RegClassMembers::Regs(regs) => self.region_assignments.try_assign_to_reg(
                 bundle,
                 regs.iter().copied().filter(|r| !pref.contains(*r)),
-                |r| input.machine.registers[r].units.clone(),
-                live_ranges.bundle_spans(bundle).map(|s| {
-                    let span = live_ranges.span(s);
-                    span.start()..span.end()
-                }),
+                |r| r.units(input.machine),
+                bundle
+                    .spans(live_ranges)
+                    .map(|s| s.start(live_ranges)..s.end(live_ranges)),
             ),
             RegClassMembers::Groups(groups) => {
                 debug_assert!(pref.is_empty());
@@ -295,15 +290,13 @@ where
                     bundle,
                     groups.iter().copied(),
                     |g| {
-                        input.machine.groups[g]
-                            .members
+                        g.members(input.machine)
                             .iter()
-                            .map(|r| input.machine.registers[*r].units.clone())
+                            .map(|r| r.units(input.machine))
                     },
-                    live_ranges.bundle_spans(bundle).map(|s| {
-                        let span = live_ranges.span(s);
-                        span.start()..span.end()
-                    }),
+                    bundle
+                        .spans(live_ranges)
+                        .map(|s| s.start(live_ranges)..s.end(live_ranges)),
                 )
             }
         }
@@ -362,12 +355,11 @@ fn compute_bundle_priority<E>(
 where
     E: EntityRepr,
 {
-    let data = live_ranges.bundle(bundle);
     Priority::new(
-        data.has_fixed_uses(),
-        data.is_minimal(),
+        bundle.has_fixed_uses(live_ranges),
+        bundle.is_minimal(live_ranges),
         bundle_group_size(input, live_ranges, bundle),
-        data.spans().indices().len(),
+        bundle.spans(live_ranges).len(),
     )
 }
 
@@ -384,15 +376,15 @@ where
     // An `Any` bundle is assignable within the class its values live in, which
     // may itself be a class of register groups, so it has to answer the same
     // question that a `Reg` bundle does.
-    let rc = match live_ranges.bundle(bundle).constraint() {
+    let rc = match bundle.constraint(live_ranges) {
         OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
         OperandConstraint::Reg(rc) => rc,
         OperandConstraint::Stack => return 0,
         OperandConstraint::Reuse(_) => unreachable!(),
     };
 
-    match &machine.classes[rc].members {
-        RegClassMembers::Groups(groups) => machine.groups[groups[0]].members.len(),
+    match rc.members(machine) {
+        RegClassMembers::Groups(groups) => groups[0].members(machine).len(),
         RegClassMembers::Regs(_) => 0,
     }
 }
@@ -406,12 +398,12 @@ fn bundle_reg_class<E>(
 where
     E: EntityRepr,
 {
-    let class_of = |span| {
-        let val = live_ranges.span(span).val().with_repr32();
+    let class_of = |span: LiveSpan<E>| {
+        let val = span.val(live_ranges).with_repr32();
         input.func.value(val).reg_class()
     };
 
-    let mut spans = live_ranges.bundle_spans(bundle);
+    let mut spans = bundle.spans(live_ranges);
     let first = spans
         .next()
         .expect("a bundle always holds at least one span");
@@ -595,7 +587,7 @@ impl Priority {
 
         let max_size = (1 << PRIORITY_SIZE_BITS) - 1;
         debug_assert!(size <= max_size);
-        let size = size as u32;
+        let size = u32::try_from(size).unwrap();
         let size = size << PRIORITY_SIZE_SHIFT;
         debug_assert_eq!(size & PRIORITY_SIZE_MASK, size);
 

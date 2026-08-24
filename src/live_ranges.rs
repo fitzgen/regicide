@@ -187,20 +187,14 @@ where
         }
     }
 
+    /// This use's position in program order: its program point, and then which
+    /// operand of that point's instruction it is.
+    ///
+    /// Span construction pushes uses in this order, so it is what checks that
+    /// the run it flushed is sorted.
     #[inline]
-    pub fn point(&self) -> LivePoint<E> {
-        self.point
-    }
-
-    #[inline]
-    pub fn operand(&self) -> usize {
-        usize::from(self.operand)
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn weight(&self) -> SpillWeight {
-        self.weight
+    pub(crate) fn order_key(&self) -> (LivePoint<E>, u16) {
+        (self.point, self.operand)
     }
 }
 
@@ -258,43 +252,6 @@ where
             val,
             flags: 0,
         }
-    }
-
-    /// This span's uses (and, possibly, def), in ascending program order.
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn uses(&self) -> EntityRange<Use<E>> {
-        self.uses
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn start(&self) -> LivePoint<E> {
-        self.start
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn end(&self) -> LivePoint<E> {
-        self.end
-    }
-
-    /// Do `self` and `other` overlap (intersect)?
-    #[inline]
-    pub fn overlaps(&self, other: &Self) -> bool {
-        LivePoint::<E>::spans_overlap(self.start(), self.end(), other.start(), other.end())
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn val(&self) -> Val<E> {
-        self.val
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn has_fixed_use(&self) -> bool {
-        self.flags & SPAN_HAS_FIXED_USE != 0
     }
 }
 
@@ -389,28 +346,6 @@ where
         }
     }
 
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn spans(&self) -> EntityRange<BundleSpansStorageIndex<E>> {
-        self.spans
-    }
-
-    #[inline]
-    pub fn region(&self) -> Region<E> {
-        self.region
-    }
-
-    #[inline]
-    pub fn constraint(&self) -> OperandConstraint {
-        self.constraint
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
-    pub fn preference(&self) -> &RegSet {
-        &self.preference
-    }
-
     /// Fold `hint` into this bundle's preference.
     fn add_hint(&mut self, hint: RegSet) {
         debug_assert!(!hint.is_empty());
@@ -431,33 +366,6 @@ where
         }
 
         self.preference = narrowed;
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn allocation(&self) -> Option<Allocation<E>> {
-        self.allocation
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn is_minimal(&self) -> bool {
-        self.weight_and_flags & BUNDLE_MINIMAL != 0
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn has_fixed_uses(&self) -> bool {
-        self.weight_and_flags & BUNDLE_HAS_FIXED_USES != 0
-    }
-
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn spill_weight(&self) -> f32 {
-        PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
-            self.weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
-        )
-        .as_f32()
     }
 }
 
@@ -595,86 +503,14 @@ where
 
     /// Iterate over every live span that has been constructed.
     #[allow(dead_code, reason = "will probably need it")]
-    pub fn spans(&self) -> impl Iterator<Item = (LiveSpan<E>, &LiveSpanData<E>)> + '_ {
-        self.spans.iter()
-    }
-
-    /// Get the data for one live span.
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn span(&self, span: LiveSpan<E>) -> &LiveSpanData<E> {
-        &self.spans[span]
+    pub fn spans(&self) -> impl Iterator<Item = LiveSpan<E>> + '_ {
+        self.spans.keys()
     }
 
     /// How many uses have been recorded?
     #[allow(dead_code, reason = "will probably need it")]
     pub fn len_uses(&self) -> usize {
         self.uses.len()
-    }
-
-    /// Get the data for one use.
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn use_data(&self, u: Use<E>) -> &UseData<E> {
-        &self.uses[u]
-    }
-
-    /// Get the uses for the given span, in ascending program order.
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn uses(&self, span: LiveSpan<E>) -> &[UseData<E>] {
-        let indices = self.span(span).uses.indices();
-        &self.uses.as_slice()[indices]
-    }
-
-    /// Get the spans within the given `block`.
-    ///
-    /// Only valid before any live span has been split (i.e. before region
-    /// allocation), as splitting invalidates this map.
-    pub fn block_spans(&self, block: Block<E>) -> EntityRange<LiveSpan<E>> {
-        self.block_spans[block]
-    }
-
-    /// Get the spans that are live-in to the given block.
-    ///
-    /// Only valid before any live span has been split (i.e. before region
-    /// allocation), as splitting invalidates this map.
-    pub fn live_in_spans(&self, block: Block<E>) -> EntityRange<LiveSpan<E>> {
-        self.live_in_spans[block]
-    }
-
-    /// Get the spans that are live-out of the given block.
-    ///
-    /// Only valid before any live span has been split (i.e. before region
-    /// allocation), as splitting invalidates this map.
-    pub fn live_out_spans(&self, block: Block<E>) -> EntityRange<LiveSpan<E>> {
-        self.live_out_spans[block]
-    }
-
-    /// Get the range of uses that construction recorded for the given `block`.
-    fn block_uses(&self, block: Block<E>) -> EntityRange<Use<E>> {
-        self.block_uses[block]
-    }
-
-    /// Get the span that contains the given use.
-    pub fn use_span(&self, u: Use<E>) -> LiveSpan<E> {
-        let span = self.use_span[u];
-        debug_assert_ne!(span, LiveSpan::MAX_REPRESENTABLE);
-        span
-    }
-
-    /// Find the span that records `inst`'s `operand`th operand as one of its
-    /// uses, where `inst` is in `block`.
-    pub(crate) fn inst_operand_span(
-        &self,
-        block: Block<E>,
-        inst: Inst<E>,
-        operand: usize,
-    ) -> Option<LiveSpan<E>> {
-        self.block_uses(block)
-            .into_iter()
-            .find(|&u| {
-                let data = self.use_data(u);
-                data.point().inst() == inst && data.operand() == operand
-            })
-            .map(|u| self.use_span(u))
     }
 
     /// How many bundles have been formed?
@@ -684,78 +520,13 @@ where
 
     /// Iterate over every bundle.
     #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
-    pub fn bundles(&self) -> impl Iterator<Item = (LiveBundle<E>, &LiveBundleData<E>)> + '_ {
-        self.bundles.iter()
-    }
-
-    /// Get the data for one bundle.
-    pub fn bundle(&self, bundle: LiveBundle<E>) -> &LiveBundleData<E> {
-        &self.bundles[bundle]
-    }
-
-    /// Get the spans within the given bundle, in ascending program order.
-    #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
-    pub fn bundle_spans(
-        &self,
-        bundle: LiveBundle<E>,
-    ) -> impl ExactSizeIterator<Item = LiveSpan<E>> + Clone + '_ {
-        self.bundles[bundle]
-            .spans
-            .into_iter()
-            .map(move |i| self.bundle_spans_storage[i])
-    }
-
-    /// Where `span` may be allocated: the merge of the resolved constraints of
-    /// every one of its uses.
-    pub(crate) fn span_constraint(
-        &self,
-        input: &Input<'_, impl InputFunction>,
-        span: LiveSpan<E>,
-    ) -> OperandConstraint {
-        let mut constraint = OperandConstraint::Any;
-        for use_data in self.uses(span) {
-            let input_inst = input.func.inst(use_data.point().inst().with_repr32());
-            let sibling = |j| input_inst.operand(j).constraint();
-            let use_constraint = input_inst
-                .operand(use_data.operand())
-                .constraint()
-                .resolved(sibling);
-            constraint = constraint
-                .merge(
-                    &use_constraint,
-                    input.machine,
-                    |_| unreachable!("the accumulated constraint is always resolved"),
-                    |_| unreachable!("the use's constraint is already resolved"),
-                )
-                .expect("uses within the same span never conflict");
-        }
-        constraint
-    }
-
-    /// Get the bundle that the given span is associated with, if any.
-    ///
-    /// Always returns `Some` after coalescing completes.
-    pub fn span_bundle(&self, span: LiveSpan<E>) -> Option<LiveBundle<E>> {
-        self.span_bundle[span]
-    }
-
-    /// Get the bundles that coalescing created for the given region.
-    ///
-    /// Only valid before any live span has been split (i.e. before region
-    /// allocation), as splitting adds bundles outside this range.
-    pub fn region_bundles(&self, region: Region<E>) -> EntityRange<LiveBundle<E>> {
-        self.region_bundles[region]
+    pub fn bundles(&self) -> impl Iterator<Item = LiveBundle<E>> + '_ {
+        self.bundles.keys()
     }
 
     /// Get the key that the next call to `push_bundle` will assign.
     pub fn next_bundle(&self, output: &mut OutputInner<E>) -> IResult<LiveBundle<E>> {
         self.bundles.next_key(output)
-    }
-
-    /// Record the bundles that were created for the given region.
-    pub fn set_region_bundles(&mut self, region: Region<E>, bundles: EntityRange<LiveBundle<E>>) {
-        debug_assert!(self.region_bundles[region].is_empty());
-        self.region_bundles[region] = bundles;
     }
 
     /// Form a new bundle out of `spans`, which must be non-empty and in
@@ -778,7 +549,7 @@ where
             debug_assert!(self.span_bundle[span].is_none());
             self.span_bundle[span] = Some(bundle);
 
-            has_fixed_uses |= self.spans[span].has_fixed_use();
+            has_fixed_uses |= self.spans[span].flags & SPAN_HAS_FIXED_USE != 0;
 
             self.bundle_spans_storage.push(output, span)?;
         }
@@ -798,50 +569,6 @@ where
         )?;
         debug_assert_eq!(pushed, bundle);
         Ok(bundle)
-    }
-
-    /// Bias `bundle` towards the registers that `constraint` names.
-    pub(crate) fn hint_bundle(
-        &mut self,
-        machine: &Machine,
-        bundle: LiveBundle<E>,
-        constraint: OperandConstraint,
-    ) {
-        match constraint {
-            // Fallthrough.
-            OperandConstraint::Reg(_) => {}
-
-            // If everything is acceptable there is nothing to hint.
-            OperandConstraint::Any => return,
-
-            // Things that belong on the stack have no register(s) to hint.
-            OperandConstraint::Stack => return,
-
-            OperandConstraint::Reuse(_) => unreachable!("constraints should already be resolved"),
-        }
-
-        let data = &mut self.bundles[bundle];
-
-        let already_resolved = |_| unreachable!("constraints should already be resolved");
-        let class =
-            match data
-                .constraint
-                .merge(&constraint, machine, &already_resolved, &already_resolved)
-            {
-                Some(OperandConstraint::Reg(intersection)) => &machine.classes[intersection],
-                Some(OperandConstraint::Any) | Some(OperandConstraint::Stack) | None => return,
-                Some(OperandConstraint::Reuse(_)) => {
-                    unreachable!("constraints should already be resolved")
-                }
-            };
-
-        // We only hint for registers (the common case) and not register groups.
-        let RegClassMembers::Regs(_) = class.members else {
-            return;
-        };
-
-        debug_assert!(!class.member_set.is_empty());
-        data.add_hint(class.member_set.clone());
     }
 
     /// Construct the live spans for `func`'s values.
@@ -898,7 +625,7 @@ where
             // See `live_in_spans` and `live_out_spans`.
             spans.as_mut_slice()[spans_start.index()..spans_end.index()].sort_unstable_by_key(
                 |data| {
-                    let bucket = match (data.start() == block_start, data.end() == block_end) {
+                    let bucket = match (data.start == block_start, data.end == block_end) {
                         // Live-in only.
                         (true, false) => 0u8,
                         // Live-in and live-out.
@@ -908,7 +635,7 @@ where
                         // Neither: born and dead within this block.
                         (false, false) => 3,
                     };
-                    (bucket, data.start(), data.end())
+                    (bucket, data.start, data.end)
                 },
             );
 
@@ -920,15 +647,15 @@ where
                 start: spans_start,
                 end: spans_end,
             }) {
-                for u in spans[span].uses() {
+                for u in spans[span].uses {
                     use_span[u] = span;
                 }
 
                 let next = LiveSpan::try_new(span.index() + 1).unwrap();
-                if spans[span].start() == block_start {
+                if spans[span].start == block_start {
                     live_in_end = next;
                 }
-                if spans[span].end() == block_end {
+                if spans[span].end == block_end {
                     live_out_start.get_or_insert(span);
                     live_out_end = next;
                 }
@@ -956,13 +683,13 @@ where
             debug_assert!(
                 live_in_spans[block]
                     .into_iter()
-                    .all(|s| spans[s].start() == block_start)
+                    .all(|s| spans[s].start == block_start)
             );
             debug_assert_eq!(
                 live_in_spans[block].into_iter().count(),
                 block_spans[block]
                     .into_iter()
-                    .filter(|&s| spans[s].start() == block_start)
+                    .filter(|&s| spans[s].start == block_start)
                     .count(),
             );
 
@@ -976,13 +703,13 @@ where
             debug_assert!(
                 live_out_spans[block]
                     .into_iter()
-                    .all(|s| spans[s].end() == block_end)
+                    .all(|s| spans[s].end == block_end)
             );
             debug_assert_eq!(
                 live_out_spans[block].into_iter().count(),
                 block_spans[block]
                     .into_iter()
-                    .filter(|&s| spans[s].end() == block_end)
+                    .filter(|&s| spans[s].end == block_end)
                     .count(),
             );
         }
@@ -990,6 +717,329 @@ where
         counts.live_spans += spans.len();
         counts.uses += uses.len();
         Ok(())
+    }
+}
+
+impl<E> Use<E>
+where
+    E: EntityRepr,
+{
+    /// The program point at which this use or def happens.
+    #[inline]
+    pub(crate) fn point(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
+        live_ranges.uses[self].point
+    }
+
+    /// Which operand of this use's instruction this is.
+    #[inline]
+    pub(crate) fn operand(self, live_ranges: &LiveRanges<E>) -> usize {
+        usize::from(live_ranges.uses[self].operand)
+    }
+
+    /// This use's spill weight.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn weight(self, live_ranges: &LiveRanges<E>) -> SpillWeight {
+        live_ranges.uses[self].weight
+    }
+
+    /// Get the span that contains this use.
+    pub(crate) fn span(self, live_ranges: &LiveRanges<E>) -> LiveSpan<E> {
+        let span = live_ranges.use_span[self];
+        debug_assert_ne!(span, LiveSpan::MAX_REPRESENTABLE);
+        span
+    }
+}
+
+impl<E> LiveSpan<E>
+where
+    E: EntityRepr,
+{
+    /// This span's uses (and, possibly, def), in ascending program order.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn uses(self, live_ranges: &LiveRanges<E>) -> EntityRange<Use<E>> {
+        live_ranges.spans[self].uses
+    }
+
+    /// The start of this span, inclusive.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn start(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
+        live_ranges.spans[self].start
+    }
+
+    /// The end of this span, exclusive.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn end(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
+        live_ranges.spans[self].end
+    }
+
+    /// Do this span and `other` overlap (intersect)?
+    #[inline]
+    pub(crate) fn overlaps(self, live_ranges: &LiveRanges<E>, other: LiveSpan<E>) -> bool {
+        LivePoint::<E>::spans_overlap(
+            self.start(live_ranges),
+            self.end(live_ranges),
+            other.start(live_ranges),
+            other.end(live_ranges),
+        )
+    }
+
+    /// The value that this span is associated with.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn val(self, live_ranges: &LiveRanges<E>) -> Val<E> {
+        live_ranges.spans[self].val
+    }
+
+    /// Does this span contain a use with a fixed register constraint?
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn has_fixed_use(self, live_ranges: &LiveRanges<E>) -> bool {
+        live_ranges.spans[self].flags & SPAN_HAS_FIXED_USE != 0
+    }
+
+    /// Get the bundle that this span is associated with, if any.
+    ///
+    /// Always returns `Some` after coalescing completes.
+    pub(crate) fn bundle(self, live_ranges: &LiveRanges<E>) -> Option<LiveBundle<E>> {
+        live_ranges.span_bundle[self]
+    }
+
+    /// Where this span may be allocated: the merge of the resolved constraints
+    /// of every one of its uses.
+    pub(crate) fn constraint(
+        self,
+        live_ranges: &LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+    ) -> OperandConstraint {
+        let mut constraint = OperandConstraint::Any;
+        for u in self.uses(live_ranges) {
+            let input_inst = input.func.inst(u.point(live_ranges).inst().with_repr32());
+            let sibling = |j| input_inst.operand(j).constraint();
+            let use_constraint = input_inst
+                .operand(u.operand(live_ranges))
+                .constraint()
+                .resolved(sibling);
+            constraint = constraint
+                .merge(
+                    &use_constraint,
+                    input.machine,
+                    |_| unreachable!("the accumulated constraint is always resolved"),
+                    |_| unreachable!("the use's constraint is already resolved"),
+                )
+                .expect("uses within the same span never conflict");
+        }
+        constraint
+    }
+}
+
+impl<E> LiveBundle<E>
+where
+    E: EntityRepr,
+{
+    /// Get the spans within this bundle, in ascending program order.
+    #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
+    pub(crate) fn spans(
+        self,
+        live_ranges: &LiveRanges<E>,
+    ) -> impl ExactSizeIterator<Item = LiveSpan<E>> + Clone + '_ {
+        live_ranges.bundles[self]
+            .spans
+            .into_iter()
+            .map(move |i| live_ranges.bundle_spans_storage[i])
+    }
+
+    /// Get the range of the shared span storage that holds this bundle's spans.
+    ///
+    /// This is an implementation detail of [`LiveBundle::spans`]; the tests use
+    /// it to check that the bundles' span lists tile that storage.
+    #[inline]
+    #[allow(dead_code, reason = "read by the tests")]
+    pub(crate) fn spans_storage(
+        self,
+        live_ranges: &LiveRanges<E>,
+    ) -> EntityRange<BundleSpansStorageIndex<E>> {
+        live_ranges.bundles[self].spans
+    }
+
+    /// The region that this bundle is within.
+    ///
+    /// Bundles never span across regions.
+    #[inline]
+    pub(crate) fn region(self, live_ranges: &LiveRanges<E>) -> Region<E> {
+        live_ranges.bundles[self].region
+    }
+
+    /// Where this bundle may be allocated: the merge of the resolved
+    /// constraints of every use of every span within it.
+    #[inline]
+    pub(crate) fn constraint(self, live_ranges: &LiveRanges<E>) -> OperandConstraint {
+        live_ranges.bundles[self].constraint
+    }
+
+    /// The subset of this bundle's constraint's registers that it would prefer
+    /// to be allocated within, if any.
+    ///
+    /// Empty means no preference.
+    #[inline]
+    #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
+    pub(crate) fn preference(self, live_ranges: &LiveRanges<E>) -> &RegSet {
+        &live_ranges.bundles[self].preference
+    }
+
+    /// Where this bundle is currently allocated.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn allocation(self, live_ranges: &LiveRanges<E>) -> Option<Allocation<E>> {
+        live_ranges.bundles[self].allocation
+    }
+
+    /// Is this bundle minimal, i.e. too small to be split any further?
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn is_minimal(self, live_ranges: &LiveRanges<E>) -> bool {
+        live_ranges.bundles[self].weight_and_flags & BUNDLE_MINIMAL != 0
+    }
+
+    /// Does this bundle contain a use with a fixed register constraint?
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn has_fixed_uses(self, live_ranges: &LiveRanges<E>) -> bool {
+        live_ranges.bundles[self].weight_and_flags & BUNDLE_HAS_FIXED_USES != 0
+    }
+
+    /// How expensive it would be to spill this bundle.
+    #[inline]
+    #[allow(dead_code, reason = "will probably need it")]
+    pub(crate) fn spill_weight(self, live_ranges: &LiveRanges<E>) -> f32 {
+        PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
+            live_ranges.bundles[self].weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
+        )
+        .as_f32()
+    }
+
+    /// Bias this bundle towards the registers that `constraint` names.
+    pub(crate) fn hint(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        machine: &Machine,
+        constraint: OperandConstraint,
+    ) {
+        match constraint {
+            // Fallthrough.
+            OperandConstraint::Reg(_) => {}
+
+            // If everything is acceptable there is nothing to hint.
+            OperandConstraint::Any => return,
+
+            // Things that belong on the stack have no register(s) to hint.
+            OperandConstraint::Stack => return,
+
+            OperandConstraint::Reuse(_) => unreachable!("constraints should already be resolved"),
+        }
+
+        let data = &mut live_ranges.bundles[self];
+
+        let already_resolved = |_| unreachable!("constraints should already be resolved");
+        let class =
+            match data
+                .constraint
+                .merge(&constraint, machine, &already_resolved, &already_resolved)
+            {
+                Some(OperandConstraint::Reg(intersection)) => intersection,
+                Some(OperandConstraint::Any) | Some(OperandConstraint::Stack) | None => return,
+                Some(OperandConstraint::Reuse(_)) => {
+                    unreachable!("constraints should already be resolved")
+                }
+            };
+
+        // We only hint for registers (the common case) and not register groups.
+        let RegClassMembers::Regs(_) = class.members(machine) else {
+            return;
+        };
+
+        debug_assert!(!class.member_set(machine).is_empty());
+        data.add_hint(class.member_set(machine).clone());
+    }
+}
+
+impl<E> Block<E>
+where
+    E: EntityRepr,
+{
+    /// Get the spans within this block.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    pub(crate) fn spans(self, live_ranges: &LiveRanges<E>) -> EntityRange<LiveSpan<E>> {
+        live_ranges.block_spans[self]
+    }
+
+    /// Get the spans that are live-in to this block.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    pub(crate) fn live_in_spans(self, live_ranges: &LiveRanges<E>) -> EntityRange<LiveSpan<E>> {
+        live_ranges.live_in_spans[self]
+    }
+
+    /// Get the spans that are live-out of this block.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting invalidates this map.
+    pub(crate) fn live_out_spans(self, live_ranges: &LiveRanges<E>) -> EntityRange<LiveSpan<E>> {
+        live_ranges.live_out_spans[self]
+    }
+
+    /// Get the range of uses that construction recorded for this block.
+    fn uses(self, live_ranges: &LiveRanges<E>) -> EntityRange<Use<E>> {
+        live_ranges.block_uses[self]
+    }
+}
+
+impl<E> Region<E>
+where
+    E: EntityRepr,
+{
+    /// Get the bundles that coalescing created for this region.
+    ///
+    /// Only valid before any live span has been split (i.e. before region
+    /// allocation), as splitting adds bundles outside this range.
+    pub(crate) fn bundles(self, live_ranges: &LiveRanges<E>) -> EntityRange<LiveBundle<E>> {
+        live_ranges.region_bundles[self]
+    }
+
+    /// Record the bundles that were created for this region.
+    pub(crate) fn set_bundles(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        bundles: EntityRange<LiveBundle<E>>,
+    ) {
+        debug_assert!(live_ranges.region_bundles[self].is_empty());
+        live_ranges.region_bundles[self] = bundles;
+    }
+}
+
+impl<E> Inst<E>
+where
+    E: EntityRepr,
+{
+    /// Find the span that records this instruction's `operand`th operand as one
+    /// of its uses, where this instruction is in `block`.
+    pub(crate) fn operand_span(
+        self,
+        live_ranges: &LiveRanges<E>,
+        block: Block<E>,
+        operand: usize,
+    ) -> Option<LiveSpan<E>> {
+        block
+            .uses(live_ranges)
+            .into_iter()
+            .find(|&u| u.point(live_ranges).inst() == self && u.operand(live_ranges) == operand)
+            .map(|u| u.span(live_ranges))
     }
 }
 
@@ -1016,11 +1066,13 @@ where
     let mut last_point = start;
     for use_ in span_uses {
         let use_data = &uses[use_];
-        let point = use_data.point();
+        let point = use_data.point;
 
         let input_inst = input.func.inst(point.inst().with_repr32());
         let sibling = |j| input_inst.operand(j).constraint();
-        let use_constraint = input_inst.operand(use_data.operand()).constraint();
+        let use_constraint = input_inst
+            .operand(usize::from(use_data.operand))
+            .constraint();
         match piece_constraint.merge(
             &use_constraint,
             input.machine,
@@ -1226,10 +1278,14 @@ mod tests {
         }
     }
 
+    fn has_fixed_use(span: &LiveSpanData<u32>) -> bool {
+        span.flags & SPAN_HAS_FIXED_USE != 0
+    }
+
     #[test]
     fn span_has_fixed_use_flag_round_trips() {
-        assert!(!span(0).has_fixed_use());
-        assert!(span(SPAN_HAS_FIXED_USE).has_fixed_use());
+        assert!(!has_fixed_use(&span(0)));
+        assert!(has_fixed_use(&span(SPAN_HAS_FIXED_USE)));
     }
 
     fn bundle(weight_and_flags: u32) -> LiveBundleData<u32> {
@@ -1243,19 +1299,34 @@ mod tests {
         }
     }
 
+    fn is_minimal(bundle: &LiveBundleData<u32>) -> bool {
+        bundle.weight_and_flags & BUNDLE_MINIMAL != 0
+    }
+
+    fn has_fixed_uses(bundle: &LiveBundleData<u32>) -> bool {
+        bundle.weight_and_flags & BUNDLE_HAS_FIXED_USES != 0
+    }
+
+    fn spill_weight(bundle: &LiveBundleData<u32>) -> f32 {
+        PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
+            bundle.weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
+        )
+        .as_f32()
+    }
+
     #[test]
     fn bundle_flags_do_not_disturb_the_weight() {
         let weight = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(3.25).bits();
 
         let plain = bundle(weight);
-        assert!(!plain.is_minimal());
-        assert!(!plain.has_fixed_uses());
-        assert_eq!(plain.spill_weight(), 3.25);
+        assert!(!is_minimal(&plain));
+        assert!(!has_fixed_uses(&plain));
+        assert_eq!(spill_weight(&plain), 3.25);
 
         let all = bundle(weight | BUNDLE_MINIMAL | BUNDLE_HAS_FIXED_USES);
-        assert!(all.is_minimal());
-        assert!(all.has_fixed_uses());
-        assert_eq!(all.spill_weight(), 3.25);
+        assert!(is_minimal(&all));
+        assert!(has_fixed_uses(&all));
+        assert_eq!(spill_weight(&all), 3.25);
     }
 
     /// The reason the flags sit above the weight: a minimal bundle outranks
@@ -1265,8 +1336,8 @@ mod tests {
     fn minimal_bundles_outrank_every_ordinary_weight() {
         let heaviest_ordinary = bundle(BUNDLE_SPILL_WEIGHT_MASK);
         let lightest_minimal = bundle(BUNDLE_MINIMAL);
-        assert!(!heaviest_ordinary.is_minimal());
-        assert!(lightest_minimal.is_minimal());
+        assert!(!is_minimal(&heaviest_ordinary));
+        assert!(is_minimal(&lightest_minimal));
         assert!(lightest_minimal.weight_and_flags > heaviest_ordinary.weight_and_flags);
     }
 
@@ -1297,10 +1368,10 @@ mod tests {
     #[test]
     fn the_first_hint_is_adopted_whole() {
         let mut bundle = bundle(0);
-        assert!(bundle.preference().is_empty());
+        assert!(bundle.preference.is_empty());
 
         bundle.add_hint(regs(&[0, 2]));
-        assert_eq!(*bundle.preference(), regs(&[0, 2]));
+        assert_eq!(bundle.preference, regs(&[0, 2]));
     }
 
     /// A second hint narrows the preference to the registers both hints want.
@@ -1310,12 +1381,12 @@ mod tests {
         bundle.add_hint(regs(&[0, 2]));
 
         bundle.add_hint(regs(&[2, 3]));
-        assert_eq!(*bundle.preference(), regs(&[2]));
+        assert_eq!(bundle.preference, regs(&[2]));
 
         // And narrowing again keeps narrowing, rather than starting over from
         // the newest hint.
         bundle.add_hint(regs(&[1, 2]));
-        assert_eq!(*bundle.preference(), regs(&[2]));
+        assert_eq!(bundle.preference, regs(&[2]));
     }
 
     /// ... but a hint that wants none of the registers the preference does is
@@ -1326,7 +1397,7 @@ mod tests {
         bundle.add_hint(regs(&[0, 2]));
 
         bundle.add_hint(regs(&[1, 3]));
-        assert_eq!(*bundle.preference(), regs(&[0, 2]));
+        assert_eq!(bundle.preference, regs(&[0, 2]));
     }
 
     /// Compute the liveness and live spans of `test_input`'s function.
@@ -1418,10 +1489,7 @@ mod tests {
         let test_input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
-        let spans: Vec<_> = live_ranges
-            .spans()
-            .map(|(span, data)| (span, *data))
-            .collect();
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
         assert_eq!(spans.len(), 2, "{spans:#?}");
 
         // The def, and then the two uses that cannot share a location.
@@ -1429,28 +1497,27 @@ mod tests {
         let first_use = LivePoint::new(inst(1), Position::Early);
         let second_use = LivePoint::new(inst(2), Position::Early);
 
-        let (first, second) = (spans[0].1, spans[1].1);
-        assert_eq!(first.val(), second.val());
-        assert_eq!(first.start(), def);
+        let (first, second) = (spans[0], spans[1]);
+        assert_eq!(first.val(&live_ranges), second.val(&live_ranges));
+        assert_eq!(first.start(&live_ranges), def);
         assert_eq!(
-            first.end(),
+            first.end(&live_ranges),
             second_use,
             "the cut is just before the conflict"
         );
-        assert_eq!(second.start(), second_use);
-        assert!(second.end() > second_use);
+        assert_eq!(second.start(&live_ranges), second_use);
+        assert!(second.end(&live_ranges) > second_use);
 
         // Each use is recorded by the piece that can satisfy it, and the def by
         // the piece it starts.
-        let points = |span| -> Vec<LivePoint<u32>> {
-            live_ranges
-                .uses(span)
-                .iter()
-                .map(|use_data| use_data.point())
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
                 .collect()
         };
-        assert_eq!(points(spans[0].0), vec![def, first_use]);
-        assert_eq!(points(spans[1].0), vec![second_use]);
+        assert_eq!(points(spans[0]), vec![def, first_use]);
+        assert_eq!(points(spans[1]), vec![second_use]);
 
         // The control: `rc2` holds both registers, so it can be satisfied
         // alongside `rc0` and there is nothing to split.
@@ -1484,37 +1551,41 @@ mod tests {
                     func.blocks().map(|(b, _)| (b, Vec::new())).collect();
 
                 // 1. Every span is well formed and stays inside a single block.
-                for (span, data) in live_ranges.spans() {
-                    if data.start() >= data.end() {
+                for span in live_ranges.spans() {
+                    if span.start(&live_ranges) >= span.end(&live_ranges) {
                         return Err(format!(
                             "{span:?} covers {:?}..{:?}, which is empty or backwards",
-                            data.start(),
-                            data.end(),
+                            span.start(&live_ranges),
+                            span.end(&live_ranges),
                         ));
                     }
-                    if data.val().index() >= num_values {
+                    if span.val(&live_ranges).index() >= num_values {
                         return Err(format!(
                             "{span:?} is for {:?}, but the function only defines {num_values} \
                              values",
-                            data.val(),
+                            span.val(&live_ranges),
                         ));
                     }
-                    let Some(&block) = inst_block.get(&data.start().inst()) else {
+                    let Some(&block) = inst_block.get(&span.start(&live_ranges).inst()) else {
                         return Err(format!(
                             "{span:?} starts at {:?}, which is in no block",
-                            data.start(),
+                            span.start(&live_ranges),
                         ));
                     };
                     let (block_start, block_end) = bounds[&block];
-                    if data.start() < block_start || data.end() > block_end {
+                    if span.start(&live_ranges) < block_start || span.end(&live_ranges) > block_end
+                    {
                         return Err(format!(
                             "{span:?} covers {:?}..{:?}, which escapes {block:?}'s bounds \
                              {block_start:?}..{block_end:?}",
-                            data.start(),
-                            data.end(),
+                            span.start(&live_ranges),
+                            span.end(&live_ranges),
                         ));
                     }
-                    spans_of.entry((data.val(), block)).or_default().push(span);
+                    spans_of
+                        .entry((span.val(&live_ranges), block))
+                        .or_default()
+                        .push(span);
                     spans_in.get_mut(&block).unwrap().push(span);
                 }
 
@@ -1524,25 +1595,24 @@ mod tests {
                 // the properties that talk about "the first" and "the last"
                 // piece.
                 for spans in spans_of.values_mut() {
-                    spans.sort_unstable_by_key(|&s| {
-                        let data = live_ranges.span(s);
-                        (data.start(), data.end())
-                    });
+                    spans.sort_unstable_by_key(|&s| (s.start(&live_ranges), s.end(&live_ranges)));
                 }
 
                 // 1b. Each span's uses are inside it, are strictly ascending in
                 // `(point, operand)`, and name real operands of that span's
                 // value.
-                for (span, data) in live_ranges.spans() {
+                for span in live_ranges.spans() {
                     let mut previous = None;
-                    for use_data in live_ranges.uses(span) {
-                        let key = (use_data.point(), use_data.operand());
-                        if use_data.point() < data.start() || use_data.point() >= data.end() {
+                    for use_data in span.uses(&live_ranges) {
+                        let key = (use_data.point(&live_ranges), use_data.operand(&live_ranges));
+                        if use_data.point(&live_ranges) < span.start(&live_ranges)
+                            || use_data.point(&live_ranges) >= span.end(&live_ranges)
+                        {
                             return Err(format!(
                                 "{span:?} covers {:?}..{:?} but has a use at {:?}",
-                                data.start(),
-                                data.end(),
-                                use_data.point(),
+                                span.start(&live_ranges),
+                                span.end(&live_ranges),
+                                use_data.point(&live_ranges),
                             ));
                         }
                         if previous.is_some_and(|previous| previous >= key) {
@@ -1553,17 +1623,17 @@ mod tests {
                         }
                         previous = Some(key);
                         let is_real = operands.iter().any(|&(_b, point, i, _kind, val)| {
-                            point == use_data.point()
-                                && i == use_data.operand()
-                                && val == data.val()
+                            point == use_data.point(&live_ranges)
+                                && i == use_data.operand(&live_ranges)
+                                && val == span.val(&live_ranges)
                         });
                         if !is_real {
                             return Err(format!(
                                 "{span:?} records a use of {:?} at {:?}, operand {}, but no such \
                                  operand exists",
-                                data.val(),
-                                use_data.point(),
-                                use_data.operand(),
+                                span.val(&live_ranges),
+                                use_data.point(&live_ranges),
+                                use_data.operand(&live_ranges),
                             ));
                         }
                     }
@@ -1573,7 +1643,7 @@ mod tests {
                 // recorded use belongs to exactly one span.
                 let mut ranges: Vec<(usize, usize)> = live_ranges
                     .spans()
-                    .map(|(_, data)| data.uses())
+                    .map(|span| span.uses(&live_ranges))
                     .filter(|range| !range.is_empty())
                     .map(|range| (range.start.index(), range.end.index()))
                     .collect();
@@ -1603,17 +1673,19 @@ mod tests {
                 // location that every use accepts. This is the property that
                 // eager splitting buys.
                 test_input.with_input(|input| -> Result<(), String> {
-                    for (span, _data) in live_ranges.spans() {
+                    for span in live_ranges.spans() {
                         let mut constraint = OperandConstraint::Any;
-                        for use_data in live_ranges.uses(span) {
+                        for use_data in span.uses(&live_ranges) {
                             // Fold the way construction folds, down to
                             // resolving each answer against the instruction it
                             // came from, so that this is a check on where the
                             // spans were cut and not on a second reading of the
                             // same operands.
-                            let input_inst = input.func.inst(use_data.point().inst());
+                            let input_inst = input.func.inst(use_data.point(&live_ranges).inst());
                             let sibling = |j| input_inst.operand(j).constraint();
-                            let this = input_inst.operand(use_data.operand()).constraint();
+                            let this = input_inst
+                                .operand(use_data.operand(&live_ranges))
+                                .constraint();
                             match constraint.merge(
                                 &this,
                                 input.machine,
@@ -1626,7 +1698,7 @@ mod tests {
                                         "{span:?} has a use at {:?} constrained to {this:?}, \
                                          which cannot be satisfied along with {constraint:?}, \
                                          the constraints of the uses before it",
-                                        use_data.point(),
+                                        use_data.point(&live_ranges),
                                     ));
                                 }
                             }
@@ -1649,26 +1721,32 @@ mod tests {
                 // between two instructions.
                 for ((val, block), spans) in &spans_of {
                     for pair in spans.windows(2) {
-                        let previous = live_ranges.span(pair[0]);
-                        let next = live_ranges.span(pair[1]);
-                        if next.start() < previous.start() || next.start() > previous.end() {
+                        let (previous, next) = (pair[0], pair[1]);
+                        if next.start(&live_ranges) < previous.start(&live_ranges)
+                            || next.start(&live_ranges) > previous.end(&live_ranges)
+                        {
                             return Err(format!(
                                 "{val:?}'s spans in {block:?} are out of order or leave a gap: \
                                  {:?}..{:?} is followed by {:?}..{:?}",
-                                previous.start(),
-                                previous.end(),
-                                next.start(),
-                                next.end(),
+                                previous.start(&live_ranges),
+                                previous.end(&live_ranges),
+                                next.start(&live_ranges),
+                                next.end(&live_ranges),
                             ));
                         }
                     }
                 }
-                for (span_a, a) in live_ranges.spans() {
-                    for (span_b, b) in live_ranges.spans() {
-                        if span_a >= span_b || a.val() != b.val() {
+                for span_a in live_ranges.spans() {
+                    for span_b in live_ranges.spans() {
+                        if span_a >= span_b || span_a.val(&live_ranges) != span_b.val(&live_ranges)
+                        {
                             continue;
                         }
-                        if a.start() >= b.end() || b.start() >= a.end() {
+                        let (a_start, a_end) =
+                            (span_a.start(&live_ranges), span_a.end(&live_ranges));
+                        let (b_start, b_end) =
+                            (span_b.start(&live_ranges), span_b.end(&live_ranges));
+                        if a_start >= b_end || b_start >= a_end {
                             continue;
                         }
 
@@ -1676,28 +1754,23 @@ mod tests {
                         // alone, so that two pieces that begin at the same point
                         // -- what a third conflicting use at that point leaves
                         // behind -- are still compared earlier-first.
-                        let (first, second) = if (a.start(), a.end()) <= (b.start(), b.end()) {
+                        let (first, second) = if (a_start, a_end) <= (b_start, b_end) {
                             (span_a, span_b)
                         } else {
                             (span_b, span_a)
                         };
-                        let point = live_ranges.span(second).start();
+                        let point = second.start(&live_ranges);
                         let both_use_it = [first, second].into_iter().all(|span| {
-                            live_ranges
-                                .uses(span)
-                                .iter()
-                                .any(|use_data| use_data.point() == point)
+                            span.uses(&live_ranges)
+                                .into_iter()
+                                .any(|u| u.point(&live_ranges) == point)
                         });
-                        if live_ranges.span(first).end() != point.next_point() || !both_use_it {
+                        if first.end(&live_ranges) != point.next_point() || !both_use_it {
                             return Err(format!(
-                                "{span_a:?} ({:?}..{:?}) and {span_b:?} ({:?}..{:?}) are both \
-                                 for {:?} and overlap by more than the one program point at \
-                                 which both of them record a use",
-                                a.start(),
-                                a.end(),
-                                b.start(),
-                                b.end(),
-                                a.val(),
+                                "{span_a:?} ({a_start:?}..{a_end:?}) and {span_b:?} \
+                                 ({b_start:?}..{b_end:?}) are both for {:?} and overlap by more \
+                                 than the one program point at which both of them record a use",
+                                span_a.val(&live_ranges),
                             ));
                         }
                     }
@@ -1712,11 +1785,10 @@ mod tests {
                     // program point in the block.
                     let starting_at_entry: Set<Val> = spans_in[&block]
                         .iter()
-                        .map(|&span| live_ranges.span(span))
-                        .filter(|data| data.start() == block_start)
-                        .map(|data| data.val())
+                        .filter(|&&span| span.start(&live_ranges) == block_start)
+                        .map(|&span| span.val(&live_ranges))
                         .collect();
-                    let mut expected: Set<Val> = liveness.live_in(block).collect();
+                    let mut expected: Set<Val> = block.live_in(&liveness).collect();
                     for &(b, point, _i, kind, val) in &operands {
                         if b == block && point == block_start && matches!(kind, DefUse::Def) {
                             expected.insert(val);
@@ -1748,11 +1820,10 @@ mod tests {
                     //   reaches that use ends just after it.
                     let ending_at_exit: Set<Val> = spans_in[&block]
                         .iter()
-                        .map(|&span| live_ranges.span(span))
-                        .filter(|data| data.end() == block_end)
-                        .map(|data| data.val())
+                        .filter(|&&span| span.end(&live_ranges) == block_end)
+                        .map(|&span| span.val(&live_ranges))
                         .collect();
-                    let mut expected: Set<Val> = liveness.live_out(block).collect();
+                    let mut expected: Set<Val> = block.live_out(&liveness).collect();
                     for &(b, point, _i, kind, val) in &operands {
                         if b != block || point.inst() != last_inst {
                             continue;
@@ -1774,19 +1845,18 @@ mod tests {
                     // which gives a dead parameter a trivial range.
                     for param in input_block.params() {
                         let spans = spans_of.get(&(param, block));
-                        if liveness.is_live_in(block, param) {
+                        if block.is_live_in(&liveness, param) {
                             match spans.map(|s| s.as_slice()) {
                                 // A parameter is live-in, so its range starts
                                 // at the entry however many pieces the range is
                                 // later split into.
                                 Some([first, ..]) => {
-                                    let data = live_ranges.span(*first);
-                                    if data.start() != block_start {
+                                    if first.start(&live_ranges) != block_start {
                                         return Err(format!(
                                             "{param:?} is live-in at {block:?}, but its first \
                                              span starts at {:?} rather than the block's entry \
                                              {block_start:?}",
-                                            data.start(),
+                                            first.start(&live_ranges),
                                         ));
                                     }
                                 }
@@ -1810,13 +1880,13 @@ mod tests {
                     // 6. A value with a span in a block is live at that block's
                     // entry or exit, or the block mentions it.
                     for &span in &spans_in[&block] {
-                        let val = live_ranges.span(span).val();
+                        let val = span.val(&live_ranges);
                         let mentioned = operands
                             .iter()
                             .any(|&(b, _p, _i, _k, v)| b == block && v == val);
                         if !mentioned
-                            && !liveness.is_live_in(block, val)
-                            && !liveness.is_live_out(block, val)
+                            && !block.is_live_in(&liveness, val)
+                            && !block.is_live_out(&liveness, val)
                         {
                             return Err(format!(
                                 "{span:?} gives {val:?} a span in {block:?}, which neither \
@@ -1829,7 +1899,7 @@ mod tests {
                     // that tiles the whole block, with no gap at either end.
                     for val_index in 0..num_values {
                         let val = Val::try_new(val_index).unwrap();
-                        if !liveness.is_live_in(block, val) || !liveness.is_live_out(block, val) {
+                        if !block.is_live_in(&liveness, val) || !block.is_live_out(&liveness, val) {
                             continue;
                         }
                         let Some(spans) = spans_of.get(&(val, block)).filter(|s| !s.is_empty())
@@ -1843,14 +1913,16 @@ mod tests {
                         // are ascending and leave no gap, so tiling the block is
                         // the first one starting at its entry and the last one
                         // ending at its exit.
-                        let first = live_ranges.span(*spans.first().unwrap());
-                        let last = live_ranges.span(*spans.last().unwrap());
-                        if first.start() != block_start || last.end() != block_end {
+                        let first = *spans.first().unwrap();
+                        let last = *spans.last().unwrap();
+                        if first.start(&live_ranges) != block_start
+                            || last.end(&live_ranges) != block_end
+                        {
                             return Err(format!(
                                 "{val:?} is live across all of {block:?}, but its spans cover \
                                  only {:?}..{:?} of {block_start:?}..{block_end:?}",
-                                first.start(),
-                                last.end(),
+                                first.start(&live_ranges),
+                                last.end(&live_ranges),
                             ));
                         }
                     }
@@ -1870,20 +1942,19 @@ mod tests {
                         // A def is where the value's range in the block begins,
                         // so it is the first piece that starts at its point.
                         DefUse::Def => {
-                            let data = live_ranges.span(*spans.first().unwrap());
-                            if data.start() != point {
+                            let first = *spans.first().unwrap();
+                            if first.start(&live_ranges) != point {
                                 return Err(format!(
                                     "{val:?} is defined at {point:?} in {block:?}, but its first \
                                      span there starts at {:?}",
-                                    data.start(),
+                                    first.start(&live_ranges),
                                 ));
                             }
                         }
                         // A use only has to fall inside one of the pieces.
                         DefUse::Use => {
                             let covered = spans.iter().any(|&span| {
-                                let data = live_ranges.span(span);
-                                point >= data.start() && point < data.end()
+                                point >= span.start(&live_ranges) && point < span.end(&live_ranges)
                             });
                             if !covered {
                                 return Err(format!(
@@ -1894,10 +1965,9 @@ mod tests {
                         }
                     }
                     let recorded = spans.iter().any(|&span| {
-                        live_ranges
-                            .uses(span)
-                            .iter()
-                            .any(|use_data| use_data.point() == point && use_data.operand() == i)
+                        span.uses(&live_ranges)
+                            .into_iter()
+                            .any(|u| u.point(&live_ranges) == point && u.operand(&live_ranges) == i)
                     });
                     if !recorded {
                         return Err(format!(
@@ -1909,8 +1979,8 @@ mod tests {
 
                 // 9. Constructing twice gives exactly the same spans and uses.
                 let (_, again) = analyze_spans(test_input)?;
-                let first: Vec<_> = live_ranges.spans().map(|(_, data)| *data).collect();
-                let second: Vec<_> = again.spans().map(|(_, data)| *data).collect();
+                let first: Vec<_> = live_ranges.spans.as_slice().to_vec();
+                let second: Vec<_> = again.spans.as_slice().to_vec();
                 if first != second {
                     return Err("constructing twice gave different spans".to_string());
                 }
@@ -1919,7 +1989,7 @@ mod tests {
                 }
                 for index in 0..live_ranges.len_uses() {
                     let u = Use::try_new(index).unwrap();
-                    if live_ranges.use_data(u) != again.use_data(u) {
+                    if live_ranges.uses[u] != again.uses[u] {
                         return Err(format!("constructing twice gave {u:?} different data"));
                     }
                 }

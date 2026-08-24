@@ -230,23 +230,35 @@ where
     pub fn keys(&self) -> PrimaryMapKeys<Scc<E>> {
         self.components.keys()
     }
+}
 
-    /// Get the blocks that make up the given strongly-connected component.
-    pub fn blocks(&self, scc: Scc<E>) -> impl ExactSizeIterator<Item = Block<E>> + '_ {
-        let Range { start, end } = self.components[scc].clone();
+impl<E> Scc<E>
+where
+    E: EntityRepr,
+{
+    /// Get the blocks that make up this strongly-connected component.
+    pub(crate) fn blocks(
+        self,
+        sccs: &StronglyConnectedComponents<E>,
+    ) -> impl ExactSizeIterator<Item = Block<E>> + '_ {
+        let Range { start, end } = sccs.components[self].clone();
         (start.index()..end.index()).map(|i| {
             let i = SccBlockIndex::try_new(i).unwrap();
-            self.component_blocks[i]
+            sccs.component_blocks[i]
         })
     }
+}
 
-    /// Get the strongly-connected component that the given block is a member
-    /// of.
+impl<E> Block<E>
+where
+    E: EntityRepr,
+{
+    /// Get the strongly-connected component that this block is a member of.
     ///
     /// Panics if the block is not reachable from the entry block, since such
     /// blocks are never assigned to a component.
-    pub fn scc(&self, block: Block<E>) -> Scc<E> {
-        self.block_sccs[block].expect("block is not reachable from the entry block")
+    pub(crate) fn scc(self, sccs: &StronglyConnectedComponents<E>) -> Scc<E> {
+        sccs.block_sccs[self].expect("block is not reachable from the entry block")
     }
 }
 
@@ -317,15 +329,15 @@ mod tests {
             ));
         }
 
-        let result: Vec<Vec<Block>> = sccs.keys().map(|scc| sccs.blocks(scc).collect()).collect();
+        let result: Vec<Vec<Block>> = sccs.keys().map(|scc| scc.blocks(&sccs).collect()).collect();
 
         // Every block's `scc` must name a component that actually contains it.
         for (block, _) in func.blocks() {
-            let scc = sccs.scc(block);
-            if !sccs.blocks(scc).any(|b| b == block) {
+            let scc = block.scc(&sccs);
+            if !scc.blocks(&sccs).any(|b| b == block) {
                 return Err(format!(
                     "`scc({block:?})` is {scc:?}, but that component's blocks are {:?}",
-                    sccs.blocks(scc).collect::<Vec<_>>(),
+                    scc.blocks(&sccs).collect::<Vec<_>>(),
                 ));
             }
         }
