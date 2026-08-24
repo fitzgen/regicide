@@ -6,7 +6,7 @@
 mod assignments;
 
 use crate::{
-    Entity, Input, InputFunction, Machine, OperandConstraint,
+    Entity, Input, InputFunction, InputValue, Machine, OperandConstraint, RegClass,
     context::ContextInner,
     entity::{EntityRepr, Region},
     error::IResult,
@@ -39,7 +39,7 @@ where
     find_region_pre_order(&mut region_pre_order, region_tree);
 
     for region in region_pre_order.iter().copied().rev() {
-        region_allocation.allocate_region(&input.machine, live_ranges, region);
+        region_allocation.allocate_region(input, live_ranges, region);
     }
 
     region_pre_order.clear();
@@ -129,7 +129,7 @@ where
 
     fn allocate_region(
         &mut self,
-        machine: &Machine,
+        input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         region: Region<E>,
     ) {
@@ -141,7 +141,7 @@ where
         // region's bundles yet, because we haven't allocated registers within
         // this region yet.
         for bundle in live_ranges.region_bundles(region) {
-            self.push_bundle(machine, live_ranges, bundle, Phase::default());
+            self.push_bundle(input, live_ranges, bundle, Phase::default());
         }
 
         // Keep processing bundles until they've all been assigned!
@@ -152,12 +152,12 @@ where
 
             let phase = entry.phase();
 
-            if self.assign_to_preferred(machine, live_ranges, entry) {
+            if self.assign_to_preferred(input.machine, live_ranges, entry) {
                 // TODO: increment `counts.preferred_assignments`
                 continue;
             }
 
-            if self.assign_to_non_preferred(machine, live_ranges, entry) {
+            if self.assign_to_non_preferred(input, live_ranges, entry) {
                 // TODO: increment `counts.non_preferred_assignments`
                 continue;
             }
@@ -187,12 +187,12 @@ where
 
     fn push_bundle(
         &mut self,
-        machine: &Machine,
+        input: &Input<'_, impl InputFunction>,
         live_ranges: &LiveRanges<E>,
         bundle: LiveBundle<E>,
         phase: Phase,
     ) {
-        let priority = compute_bundle_priority(machine, live_ranges, bundle);
+        let priority = compute_bundle_priority(input, live_ranges, bundle);
         self.set_bundle_priority(bundle, priority);
         self.queue.push(PqEntry::new(phase, priority, bundle));
     }
@@ -250,7 +250,7 @@ where
 
     fn assign_to_non_preferred(
         &mut self,
-        machine: &Machine,
+        input: &Input<'_, impl InputFunction>,
         live_ranges: &LiveRanges<E>,
         entry: PqEntry<E>,
     ) -> bool {
@@ -259,44 +259,48 @@ where
         let bundle_data = live_ranges.bundle(bundle);
         let pref = bundle_data.preference();
 
-        match bundle_data.constraint() {
-            OperandConstraint::Any => todo!(),
-            OperandConstraint::Reg(rc) => {
-                let class = &machine.classes[rc];
-                match &class.members {
-                    RegClassMembers::Regs(regs) => self.region_assignments.try_assign_to_reg(
-                        bundle,
-                        regs.iter().copied().filter(|r| !pref.contains(*r)),
-                        |r| machine.registers[r].units.clone(),
-                        live_ranges.bundle_spans(bundle).map(|s| {
-                            let span = live_ranges.span(s);
-                            span.start()..span.end()
-                        }),
-                    ),
-                    RegClassMembers::Groups(groups) => {
-                        debug_assert!(pref.is_empty());
-                        self.region_assignments.try_assign_to_reg_group(
-                            bundle,
-                            groups.iter().copied(),
-                            |g| {
-                                machine.groups[g]
-                                    .members
-                                    .iter()
-                                    .map(|r| machine.registers[*r].units.clone())
-                            },
-                            live_ranges.bundle_spans(bundle).map(|s| {
-                                let span = live_ranges.span(s);
-                                span.start()..span.end()
-                            }),
-                        )
-                    }
-                }
+        let rc = match bundle_data.constraint() {
+            OperandConstraint::Any => {
+                // No use constrained this bundle any further than the default
+                // register class of its values, so use that default class.
+                bundle_reg_class(input, live_ranges, bundle)
             }
+            OperandConstraint::Reg(rc) => rc,
             OperandConstraint::Stack => {
                 self.stack_bundles.push(bundle);
-                true
+                return true;
             }
             OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
+        };
+
+        let class = &input.machine.classes[rc];
+        match &class.members {
+            RegClassMembers::Regs(regs) => self.region_assignments.try_assign_to_reg(
+                bundle,
+                regs.iter().copied().filter(|r| !pref.contains(*r)),
+                |r| input.machine.registers[r].units.clone(),
+                live_ranges.bundle_spans(bundle).map(|s| {
+                    let span = live_ranges.span(s);
+                    span.start()..span.end()
+                }),
+            ),
+            RegClassMembers::Groups(groups) => {
+                debug_assert!(pref.is_empty());
+                self.region_assignments.try_assign_to_reg_group(
+                    bundle,
+                    groups.iter().copied(),
+                    |g| {
+                        input.machine.groups[g]
+                            .members
+                            .iter()
+                            .map(|r| input.machine.registers[*r].units.clone())
+                    },
+                    live_ranges.bundle_spans(bundle).map(|s| {
+                        let span = live_ranges.span(s);
+                        span.start()..span.end()
+                    }),
+                )
+            }
         }
     }
 
@@ -346,34 +350,74 @@ where
 }
 
 fn compute_bundle_priority<E>(
-    machine: &Machine,
+    input: &Input<'_, impl InputFunction>,
     live_ranges: &LiveRanges<E>,
     bundle: LiveBundle<E>,
 ) -> Priority
 where
     E: EntityRepr,
 {
-    let bundle = live_ranges.bundle(bundle);
+    let data = live_ranges.bundle(bundle);
     Priority::new(
-        bundle.has_fixed_uses(),
-        bundle.is_minimal(),
-        bundle_group_size(machine, bundle),
-        bundle.spans().indices().len(),
+        data.has_fixed_uses(),
+        data.is_minimal(),
+        bundle_group_size(input, live_ranges, bundle),
+        data.spans().indices().len(),
     )
 }
 
-fn bundle_group_size<E>(machine: &Machine, bundle: &crate::live_ranges::LiveBundleData<E>) -> usize
+fn bundle_group_size<E>(
+    input: &Input<'_, impl InputFunction>,
+    live_ranges: &LiveRanges<E>,
+    bundle: LiveBundle<E>,
+) -> usize
 where
     E: EntityRepr,
 {
-    match bundle.constraint() {
-        OperandConstraint::Reg(rc) => match &machine.classes[rc].members {
-            RegClassMembers::Groups(groups) => machine.groups[groups[0]].members.len(),
-            RegClassMembers::Regs(_) => 0,
-        },
-        OperandConstraint::Any | OperandConstraint::Stack => 0,
+    let machine = input.machine;
+
+    // An `Any` bundle is assignable within the class its values live in, which
+    // may itself be a class of register groups, so it has to answer the same
+    // question that a `Reg` bundle does.
+    let rc = match live_ranges.bundle(bundle).constraint() {
+        OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
+        OperandConstraint::Reg(rc) => rc,
+        OperandConstraint::Stack => return 0,
         OperandConstraint::Reuse(_) => unreachable!(),
+    };
+
+    match &machine.classes[rc].members {
+        RegClassMembers::Groups(groups) => machine.groups[groups[0]].members.len(),
+        RegClassMembers::Regs(_) => 0,
     }
+}
+
+/// The register class that `bundle`'s values naturally belong within.
+fn bundle_reg_class<E>(
+    input: &Input<'_, impl InputFunction>,
+    live_ranges: &LiveRanges<E>,
+    bundle: LiveBundle<E>,
+) -> RegClass
+where
+    E: EntityRepr,
+{
+    let class_of = |span| {
+        let val = live_ranges.span(span).val().with_repr32();
+        input.func.value(val).reg_class()
+    };
+
+    let mut spans = live_ranges.bundle_spans(bundle);
+    let first = spans
+        .next()
+        .expect("a bundle always holds at least one span");
+    let rc = class_of(first);
+
+    debug_assert!(
+        spans.all(|span| class_of(span) == rc),
+        "the values in one bundle always share a register class",
+    );
+
+    rc
 }
 
 /// What phase of allocation is the associated bundle in?

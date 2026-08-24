@@ -647,10 +647,8 @@ pub trait InputInst<'a> {
 /// registers or reloading it from a spill slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RematCost {
-    /// Always rematerialize this value on demand.
-    ///
-    /// Eagerly split its live range bundle to minimal ranges. It should never
-    /// be shuffled between registers or spilled.
+    /// Always rematerialize this value on demand; that is cheaper than keeping
+    /// it in a register.
     AlwaysRemat = 0,
 
     /// When its operands are already available, rematerializing this value is
