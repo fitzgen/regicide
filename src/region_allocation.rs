@@ -10,7 +10,7 @@ use crate::{
     context::ContextInner,
     entity::{EntityRepr, Region},
     error::IResult,
-    live_ranges::{LiveBundle, LiveRanges, LiveSpan},
+    live_ranges::{LiveBundle, LiveRanges, LiveSpan, SpillWeight},
     machine::RegClassMembers,
     region_tree::RegionTree,
     timing::Timing,
@@ -162,7 +162,7 @@ where
                 continue;
             }
 
-            if phase <= Phase::AssignEvict && self.assign_via_eviction(entry) {
+            if phase <= Phase::AssignEvict && self.assign_via_eviction(input, live_ranges, entry) {
                 // TODO: increment `counts.evictions`
                 continue;
             }
@@ -258,7 +258,6 @@ where
         entry: PqEntry<E>,
     ) -> bool {
         let bundle = entry.bundle();
-
         let pref = bundle.preference(live_ranges);
 
         let rc = match bundle.constraint(live_ranges) {
@@ -302,21 +301,98 @@ where
         }
     }
 
-    fn assign_via_eviction(&mut self, entry: PqEntry<E>) -> bool {
+    /// Try to assign `entry`'s bundle to a register by evicting a cheaper
+    /// bundle from a register, freeing that register up for this bundle.
+    ///
+    /// We only ever get here once plain assignment has failed for every
+    /// candidate. We take the cheapest-to-evict candidate, and only when that
+    /// victim is strictly cheaper than this bundle. Otherwise, two bundles
+    /// could evict each other forever.
+    ///
+    /// Eviction does not mean that the victim is split or spilled. Instead, it
+    /// is pushed back onto the queue to compete with the other unassigned
+    /// bundles. The re-enqueued victim will never evict this bundle because, as
+    /// explained above, it is cheaper than this bundle, guaranteeing forward
+    /// progress.
+    ///
+    /// Returns whether this bundle was assigned (and, therefore, whether
+    /// another bundle was evicted).
+    fn assign_via_eviction(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+        entry: PqEntry<E>,
+    ) -> bool {
+        let machine = input.machine;
         let bundle = entry.bundle();
-        let _ = bundle;
+        let pref = bundle.preference(live_ranges);
 
-        // TODO: otherwise, find the bundle with the least priority in any of
-        // this bundle's assignable registers where this bundle would be
-        // allocatable to the associated register if that other bundle were
-        // evicted. if there is no such bundle, or that bundle's priority is
-        // higher than this bundle's priority, then re-push this bundle with an
-        // `entry.priority().phase().inc()` phase. otherwise, if that bundle's
-        // priority is less than this bundle's priority, evict it, push it onto
-        // the queue with phase `AssignEvict`, and assign this bundle to that
-        // now-available register.
+        let rc = match bundle.constraint(live_ranges) {
+            OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
+            OperandConstraint::Reg(rc) => rc,
+            OperandConstraint::Stack => {
+                unreachable!("stack-constrained bundles are handled without a register")
+            }
+            OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
+        };
 
-        todo!()
+        // The most we are willing to pay for eviction. This bundle holds no
+        // register, so evicting it doesn't break any hints. We never break a
+        // hint to make room for a bundle that has none of its own.
+        let max_cost = EvictionCost::new(0, SpillWeight::new(bundle.spill_weight(live_ranges)));
+
+        let bundle_spans = |b: LiveBundle<E>| {
+            b.spans(live_ranges)
+                .map(|s| s.start(live_ranges)..s.end(live_ranges))
+        };
+
+        let evicted = match rc.members(machine) {
+            RegClassMembers::Regs(regs) => self.region_assignments.try_evict_reg_and_assign(
+                bundle,
+                pref.iter()
+                    .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                |r| r.units(machine),
+                max_cost,
+                |victim, reg| {
+                    let broken_hints = usize::from(victim.preference(live_ranges).contains(reg));
+                    EvictionCost::new(
+                        broken_hints,
+                        SpillWeight::new(victim.spill_weight(live_ranges)),
+                    )
+                },
+                bundle_spans,
+            ),
+            RegClassMembers::Groups(groups) => {
+                debug_assert!(pref.is_empty());
+                self.region_assignments.try_evict_reg_group_and_assign(
+                    bundle,
+                    groups.iter().copied(),
+                    |g| g.members(machine).iter().map(|r| r.units(machine)),
+                    max_cost,
+                    |victim, group| {
+                        let broken_hints = usize::from(
+                            !victim
+                                .preference(live_ranges)
+                                .intersection(group.member_set(machine))
+                                .is_empty(),
+                        );
+                        EvictionCost::new(
+                            broken_hints,
+                            SpillWeight::new(victim.spill_weight(live_ranges)),
+                        )
+                    },
+                    bundle_spans,
+                )
+            }
+        };
+
+        match evicted {
+            None => false,
+            Some(evicted) => {
+                self.push_bundle(input, live_ranges, evicted, Phase::AssignEvict);
+                true
+            }
+        }
     }
 
     fn split_once(&mut self, entry: PqEntry<E>) {
@@ -665,6 +741,73 @@ where
     }
 }
 
+/// What it would cost us to evict one or more bundles from a register.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EvictionCost {
+    ///  Bits:   31    ...    16   15      ...       0
+    ///        +-----------------+---------------------+
+    /// Field: | broken_hints:16 | max_spill_weight:16 |
+    ///        +-----------------+---------------------+
+    ///
+    /// Note: `broken_hints` comes first so we sort by that first and then
+    /// `max_spill_weight` second.
+    bits: u32,
+}
+
+const EVICTION_COST_MAX_SPILL_WEIGHT_BITS: u32 = 16;
+const EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT: u32 = 0;
+const EVICTION_COST_MAX_SPILL_WEIGHT_MASK: u32 =
+    ((1 << EVICTION_COST_MAX_SPILL_WEIGHT_BITS) - 1) << EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT;
+
+const EVICTION_COST_BROKEN_HINTS_BITS: u32 = 16;
+const EVICTION_COST_BROKEN_HINTS_SHIFT: u32 =
+    EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT + EVICTION_COST_MAX_SPILL_WEIGHT_BITS;
+const EVICTION_COST_BROKEN_HINTS_MASK: u32 =
+    ((1 << EVICTION_COST_BROKEN_HINTS_BITS) - 1) << EVICTION_COST_BROKEN_HINTS_SHIFT;
+const EVICTION_COST_BROKEN_HINTS_MAX: usize = (1 << EVICTION_COST_BROKEN_HINTS_BITS) - 1;
+
+impl fmt::Debug for EvictionCost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EvictionCost")
+            .field("broken_hints", &self.broken_hints())
+            .field("max_spill_weight", &self.max_spill_weight())
+            .finish()
+    }
+}
+
+impl EvictionCost {
+    fn new(broken_hints: usize, max_spill_weight: SpillWeight) -> Self {
+        let broken_hints = u32::try_from(broken_hints.min(EVICTION_COST_BROKEN_HINTS_MAX)).unwrap();
+        let broken_hints = broken_hints << EVICTION_COST_BROKEN_HINTS_SHIFT;
+        debug_assert_eq!(broken_hints & EVICTION_COST_BROKEN_HINTS_MASK, broken_hints);
+
+        let max_spill_weight = u32::from(max_spill_weight.bits());
+        let max_spill_weight = max_spill_weight << EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT;
+        debug_assert_eq!(
+            max_spill_weight & EVICTION_COST_MAX_SPILL_WEIGHT_MASK,
+            max_spill_weight
+        );
+
+        EvictionCost {
+            bits: broken_hints | max_spill_weight,
+        }
+    }
+
+    #[inline]
+    fn broken_hints(self) -> usize {
+        let broken_hints =
+            (self.bits & EVICTION_COST_BROKEN_HINTS_MASK) >> EVICTION_COST_BROKEN_HINTS_SHIFT;
+        usize::try_from(broken_hints).unwrap()
+    }
+
+    #[inline]
+    fn max_spill_weight(self) -> SpillWeight {
+        let max_spill_weight = (self.bits & EVICTION_COST_MAX_SPILL_WEIGHT_MASK)
+            >> EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT;
+        SpillWeight::from_bits(u16::try_from(max_spill_weight).unwrap())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +816,7 @@ mod tests {
 
     const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
     const MAX_GROUP_SIZE: usize = PRIORITY_GROUP_SIZE_MAX;
+    const MAX_BROKEN_HINTS: usize = EVICTION_COST_BROKEN_HINTS_MAX;
 
     /// Every phase, in ascending order.
     const PHASES: [Phase; 4] = [
@@ -773,5 +917,60 @@ mod tests {
         let mut queue: BinaryHeap<PqEntry<u32>> = ascending.iter().copied().collect();
         let popped: Vec<_> = core::iter::from_fn(|| queue.pop()).collect();
         assert!(ascending.iter().rev().eq(popped.iter()));
+    }
+
+    /// An eviction cost's fields survive the round trip through its packed
+    /// bits, up to the saturation of the one and the lossiness of the other.
+    #[test]
+    fn eviction_cost_round_trips_its_fields() {
+        for broken_hints in [
+            0,
+            1,
+            2,
+            1000,
+            MAX_BROKEN_HINTS - 1,
+            MAX_BROKEN_HINTS,
+            MAX_BROKEN_HINTS + 1,
+            usize::MAX,
+        ] {
+            for weight in [0.0, 1.0, 3.25, 1e20, f32::INFINITY] {
+                let weight = SpillWeight::new(weight);
+                let cost = EvictionCost::new(broken_hints, weight);
+                assert_eq!(
+                    cost.broken_hints(),
+                    broken_hints.min(MAX_BROKEN_HINTS),
+                    "{cost:?}",
+                );
+                // A `SpillWeight` is already packed, so it survives exactly.
+                assert_eq!(cost.max_spill_weight(), weight, "{cost:?}");
+            }
+        }
+    }
+
+    /// Eviction costs compare by broken hints first: any number of them
+    /// outweighs any spill weight at all.
+    #[test]
+    fn eviction_cost_compares_by_broken_hints_then_spill_weight() {
+        let ascending = [
+            EvictionCost::new(0, SpillWeight::new(0.0)),
+            EvictionCost::new(0, SpillWeight::new(1.0)),
+            EvictionCost::new(0, SpillWeight::new(1e20)),
+            EvictionCost::new(0, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(1, SpillWeight::new(0.0)),
+            EvictionCost::new(1, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(2, SpillWeight::new(0.0)),
+            EvictionCost::new(MAX_BROKEN_HINTS, SpillWeight::new(0.0)),
+            EvictionCost::new(MAX_BROKEN_HINTS, SpillWeight::new(f32::INFINITY)),
+        ];
+        for w in ascending.windows(2) {
+            assert!(w[0] < w[1], "{:?} should sort below {:?}", w[0], w[1]);
+        }
+
+        // And saturation makes the top of the range a plateau, rather than
+        // wrapping back around to the bottom of it.
+        assert_eq!(
+            EvictionCost::new(MAX_BROKEN_HINTS, SpillWeight::new(0.0)),
+            EvictionCost::new(usize::MAX, SpillWeight::new(0.0)),
+        );
     }
 }

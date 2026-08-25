@@ -112,7 +112,6 @@ where
     }
 
     /// Returns a mutable iterator over the key-value pairs in the map.
-    #[allow(dead_code, reason = "will probably need it")]
     pub fn iter_mut(&mut self) -> PrimaryMapIterMut<'_, K, V> {
         PrimaryMapIterMut {
             inner: self.elems.iter_mut().enumerate(),
@@ -359,6 +358,14 @@ where
 
     pub fn iter(&self) -> PrimaryMapIter<'_, K, V> {
         self.inner.iter()
+    }
+
+    /// Iterate over the entries that have been materialized in this map so far.
+    ///
+    /// Entries that are still implicitly the default value are not visited, as
+    /// there is nothing yet to mutate.
+    pub fn iter_mut(&mut self) -> PrimaryMapIterMut<'_, K, V> {
+        self.inner.iter_mut()
     }
 
     #[allow(dead_code, reason = "will probably need it")]

@@ -4,9 +4,10 @@ use crate::{
     Entity, Reg, RegGroup, RegUnit,
     entity::{EntityRepr, SecondaryMap},
     live_ranges::{LiveBundle, LivePoint},
+    region_allocation::EvictionCost,
 };
 use alloc::collections::BTreeMap;
-use core::ops::Range;
+use core::{iter, ops::ControlFlow, ops::Range};
 
 /// The key by which a register unit's assignments are ordered.
 ///
@@ -38,11 +39,9 @@ where
     /// The end of this assignment's span.
     ///
     /// The span's start is `AssignmentKey::start`.
-    #[allow(dead_code, reason = "will use it soon")]
     end: LivePoint<E>,
 
     /// The bundle that this assignment came from.
-    #[allow(dead_code, reason = "will use it soon")]
     bundle: LiveBundle<E>,
 }
 
@@ -89,12 +88,14 @@ where
         assignments.is_reset()
     }
 
-    /// Do the given spans conflict with any existing assignments in `reg_units`?
-    fn conflicts(
+    /// Call `f` on every existing assignment that overlaps one of the given
+    /// spans.
+    fn for_each_overlapping<T>(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
-    ) -> bool {
+        mut f: impl FnMut(&Assignment<E>) -> ControlFlow<T>,
+    ) -> Option<T> {
         for unit in iter_reg_units(reg_units) {
             for span in spans.clone() {
                 for (existing_key, existing) in self.assignments[unit]
@@ -108,12 +109,68 @@ where
                         existing_key.start,
                         existing.end,
                     ) {
-                        return true;
+                        if let ControlFlow::Break(result) = f(existing) {
+                            return Some(result);
+                        }
                     }
                 }
             }
         }
-        false
+        None
+    }
+
+    /// Do the given spans conflict with any existing assignments in `reg_units`?
+    fn conflicts(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    ) -> bool {
+        self.for_each_overlapping(reg_units, spans, |_| ControlFlow::Break(()))
+            .is_some()
+    }
+
+    /// The one and only bundle whose existing assignments in `reg_units`
+    /// conflict with the given spans, if there is exactly one such bundle.
+    ///
+    /// TODO: support evicting multiple bundles if that is still cheaper. will
+    /// require an `&mut Vec<LiveBundle>` out parameter to these methods for
+    /// writing the evicted bundles into.
+    fn sole_conflicting_bundle(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    ) -> Option<LiveBundle<E>> {
+        let mut sole = None;
+        let too_many = self.for_each_overlapping(reg_units, spans, |existing| match sole {
+            Some(bundle) if bundle == existing.bundle => ControlFlow::Continue(()),
+            Some(_) => ControlFlow::Break(()),
+            None => {
+                sole = Some(existing.bundle);
+                ControlFlow::Continue(())
+            }
+        });
+        if too_many.is_some() { None } else { sole }
+    }
+
+    /// Remove all of `bundle`'s assignments.
+    ///
+    /// `spans` must be exactly the spans that `bundle` was assigned with.
+    fn remove_assignment(
+        &mut self,
+        bundle: LiveBundle<E>,
+        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    ) {
+        for (_unit, unit_assignments) in self.assignments.iter_mut() {
+            for span in spans.clone() {
+                let key = AssignmentKey::new(span.start);
+                if unit_assignments
+                    .get(&key)
+                    .is_some_and(|existing| existing.bundle == bundle)
+                {
+                    unit_assignments.remove(&key);
+                }
+            }
+        }
     }
 
     /// Insert a new assignment.
@@ -157,7 +214,7 @@ where
         debug_assert!(spans.len() > 0);
 
         for reg in candidates {
-            let units = core::iter::once(reg_units(reg));
+            let units = iter::once(reg_units(reg));
             if !self.conflicts(units.clone(), spans.clone()) {
                 self.insert_assignment(bundle, units, spans);
                 return true;
@@ -196,12 +253,118 @@ where
 
         false
     }
+
+    fn try_evict_and_assign<C, Units, Spans>(
+        &mut self,
+        bundle: LiveBundle<E>,
+        candidates: impl IntoIterator<Item = C>,
+        candidate_units: impl Fn(C) -> Units,
+        max_cost: EvictionCost,
+        eviction_cost: impl Fn(LiveBundle<E>, C) -> EvictionCost,
+        bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
+    ) -> Option<LiveBundle<E>>
+    where
+        C: Copy,
+        Units: Iterator<Item = Range<RegUnit>> + Clone,
+        Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    {
+        let spans = bundle_spans(bundle);
+        debug_assert!(spans.len() > 0);
+
+        // A tuple of:
+        //
+        // 1. the bundle that would be evicted, and
+        // 2. the candidate that bundle is assigned to.
+        let mut best: Option<(LiveBundle<E>, C)> = None;
+
+        // The best (cheapest) eviction cost seen. Only ever taking a *strictly*
+        // cheaper candidate means we both refuse evictions that are not worth
+        // it and let the earliest of equally-cheap candidates win, so that the
+        // caller's ordering of `candidates` decides.
+        let mut best_cost = max_cost;
+
+        for candidate in candidates {
+            let units = candidate_units(candidate);
+            debug_assert!(self.conflicts(units.clone(), spans.clone()));
+
+            // Evicting a candidate bundle must make this bundle assignable (not
+            // conflict), or else the bundle is not a valid eviction candidate.
+            let Some(other_bundle) = self.sole_conflicting_bundle(units, spans.clone()) else {
+                continue;
+            };
+
+            let cost = eviction_cost(other_bundle, candidate);
+            if cost < best_cost {
+                best = Some((other_bundle, candidate));
+                best_cost = cost;
+            }
+        }
+
+        let Some((other_bundle, candidate)) = best else {
+            return None;
+        };
+
+        self.remove_assignment(other_bundle, bundle_spans(other_bundle));
+        self.insert_assignment(bundle, candidate_units(candidate), spans);
+        Some(other_bundle)
+    }
+
+    /// Try to insert an assignment for `bundle`, evicting another bundle if
+    /// necessary.
+    ///
+    /// If `bundle` was assigned, then returns the other `LiveBundle` that was
+    /// evicted. Otherwise, returns `None` and `self` is unmodified.
+    pub fn try_evict_reg_and_assign<Spans>(
+        &mut self,
+        bundle: LiveBundle<E>,
+        candidates: impl IntoIterator<Item = Reg>,
+        reg_units: impl Fn(Reg) -> Range<RegUnit>,
+        max_cost: EvictionCost,
+        eviction_cost: impl Fn(LiveBundle<E>, Reg) -> EvictionCost,
+        bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
+    ) -> Option<LiveBundle<E>>
+    where
+        Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    {
+        self.try_evict_and_assign(
+            bundle,
+            candidates,
+            |reg| iter::once(reg_units(reg)),
+            max_cost,
+            eviction_cost,
+            bundle_spans,
+        )
+    }
+
+    /// Like `try_evict_reg_and_assign` but for `RegGroup`s.
+    pub fn try_evict_reg_group_and_assign<GroupUnits, Spans>(
+        &mut self,
+        bundle: LiveBundle<E>,
+        candidates: impl IntoIterator<Item = RegGroup>,
+        group_units: impl Fn(RegGroup) -> GroupUnits,
+        max_cost: EvictionCost,
+        eviction_cost: impl Fn(LiveBundle<E>, RegGroup) -> EvictionCost,
+        bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
+    ) -> Option<LiveBundle<E>>
+    where
+        GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
+        Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+    {
+        self.try_evict_and_assign(
+            bundle,
+            candidates,
+            group_units,
+            max_cost,
+            eviction_cost,
+            bundle_spans,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Inst, Position};
+    use crate::{Inst, Position, live_ranges::SpillWeight};
     use mutatis::{
         Mutate,
         check::{Check, CheckResult},
@@ -395,6 +558,91 @@ mod tests {
         Some(index)
     }
 
+    /// The spans that each bundle is currently assigned with, as
+    /// `try_evict_*_and_assign` wants them, indexed by bundle.
+    ///
+    /// The incoming bundle is the one exception: it takes the spans it is being
+    /// assigned with now, rather than any it happens to already hold. In the
+    /// allocator proper this all comes straight off the bundle, whose spans do
+    /// not change while it is assigned.
+    fn spans_by_bundle(
+        oracle: &[OracleEntry],
+        incoming: LiveBundle<u32>,
+        incoming_spans: &[Range<LivePoint<u32>>],
+    ) -> Vec<Vec<Range<LivePoint<u32>>>> {
+        (0..usize::from(NUM_BUNDLES))
+            .map(|index| {
+                let b = bundle(index);
+                if b == incoming {
+                    return incoming_spans.to_vec();
+                }
+                let mut spans: Vec<_> = oracle
+                    .iter()
+                    .filter(|existing| existing.bundle == b)
+                    .map(|existing| existing.start..existing.end)
+                    .collect();
+                spans.sort_unstable_by_key(|span| (span.start, span.end));
+                spans.dedup();
+                spans
+            })
+            .collect()
+    }
+
+    /// Brute-force version of `Assignments::try_evict_reg_and_assign` and
+    /// `Assignments::try_evict_reg_group_and_assign`.
+    ///
+    /// `cost` is given the victim and the index of the candidate it would be
+    /// evicted from. Returns the bundle that was evicted and the index of the
+    /// candidate the incoming bundle took, if any.
+    fn oracle_try_evict_and_assign(
+        oracle: &mut Vec<OracleEntry>,
+        bundle: LiveBundle<u32>,
+        candidates: &[Vec<Range<RegUnit>>],
+        spans: &[Range<LivePoint<u32>>],
+        max_cost: EvictionCost,
+        cost: impl Fn(LiveBundle<u32>, usize) -> EvictionCost,
+    ) -> Option<(LiveBundle<u32>, usize)> {
+        let mut best = None;
+        let mut best_cost = max_cost;
+
+        for (index, units) in candidates.iter().enumerate() {
+            // The distinct bundles in the way, of which there must be exactly
+            // one for a single eviction to make room here.
+            let mut conflicting: Vec<LiveBundle<u32>> = oracle
+                .iter()
+                .filter(|existing| {
+                    units.iter().any(|units| units.contains(&existing.unit))
+                        && spans.iter().any(|span| {
+                            LivePoint::spans_overlap(
+                                span.start,
+                                span.end,
+                                existing.start,
+                                existing.end,
+                            )
+                        })
+                })
+                .map(|existing| existing.bundle)
+                .collect();
+            conflicting.sort_unstable();
+            conflicting.dedup();
+
+            let [victim] = conflicting[..] else {
+                continue;
+            };
+
+            let victim_cost = cost(victim, index);
+            if victim_cost < best_cost {
+                best = Some((victim, index));
+                best_cost = victim_cost;
+            }
+        }
+
+        let (victim, index) = best?;
+        oracle.retain(|existing| existing.bundle != victim);
+        oracle_insert(oracle, bundle, &candidates[index], spans);
+        Some((victim, index))
+    }
+
     /// Check that `assignments` records exactly what `oracle` does.
     fn check_agree(assignments: &Assignments<u32>, oracle: &[OracleEntry]) -> Result<(), String> {
         if assignments.is_reset() != oracle.is_empty() {
@@ -551,6 +799,43 @@ mod tests {
         Ok(())
     }
 
+    fn check_try_evict(
+        assignments: &Assignments<u32>,
+        what: &str,
+        candidates: &[Vec<Range<RegUnit>>],
+        spans: &[Range<LivePoint<u32>>],
+        actual: Option<LiveBundle<u32>>,
+        expected: Option<(LiveBundle<u32>, usize)>,
+    ) -> Result<(), String> {
+        if actual != expected.map(|(victim, _)| victim) {
+            return Err(match expected {
+                Some((victim, index)) => format!(
+                    "evicting to assign {what} for {spans:?} returned {actual:?}, but it should \
+                     have evicted {victim:?} from candidate {index}, which covers {:?}",
+                    candidates[index],
+                ),
+                None => format!(
+                    "evicting to assign {what} for {spans:?} returned {actual:?}, but no \
+                     eviction is both possible and worth it",
+                ),
+            });
+        }
+
+        if let Some((_, index)) = expected {
+            let units = &candidates[index];
+            let no_units = units.iter().all(|units| units.start == units.end);
+            let taken = assignments.conflicts(units.iter().cloned(), spans.iter().cloned());
+            if taken == no_units {
+                return Err(format!(
+                    "after evicting to assign {what} for {spans:?}, `conflicts` on candidate \
+                     {index}, which covers {units:?}, for those same spans is {taken}",
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     #[derive(Clone, Debug, Mutate)]
     enum Op {
         TryAssign {
@@ -562,6 +847,24 @@ mod tests {
             bundle: u8,
             candidates: Vec<u8>,
             spans: Vec<(u8, u8)>,
+        },
+        TryEvictAndAssign {
+            bundle: u8,
+            candidates: Vec<u8>,
+            spans: Vec<(u8, u8)>,
+            /// Each bundle's spill weight, indexed by bundle.
+            weights: Vec<u8>,
+            /// Each bundle's preferred candidate, indexed by bundle. Evicting a
+            /// bundle from the candidate it prefers costs one broken hint. The
+            /// one out-of-range value means "no preference".
+            hints: Vec<u8>,
+        },
+        TryEvictGroupAndAssign {
+            bundle: u8,
+            candidates: Vec<u8>,
+            spans: Vec<(u8, u8)>,
+            weights: Vec<u8>,
+            hints: Vec<u8>,
         },
         Reset,
     }
@@ -605,23 +908,60 @@ mod tests {
         }
     }
 
+    /// Ensure that the per-bundle cost tables are the right shape and in range.
+    ///
+    /// Missing weights default to zero, and missing hints to the one value that
+    /// is out of range for every candidate, and so names none of them.
+    fn fixup_costs(weights: &mut Vec<u8>, hints: &mut Vec<u8>, num_candidates: u8) {
+        let num_bundles = usize::from(NUM_BUNDLES);
+
+        weights.truncate(num_bundles);
+        weights.resize(num_bundles, 0);
+
+        hints.truncate(num_bundles);
+        hints.resize(num_bundles, num_candidates);
+        for hint in hints.iter_mut() {
+            *hint %= num_candidates + 1;
+        }
+    }
+
     /// Ensure that our test ops are valid.
     fn fixup_ops(ops: &mut Vec<Op>) {
         let num_regs = u8::try_from(NUM_REGS).unwrap();
         let num_groups = u8::try_from(NUM_GROUPS).unwrap();
         ops.truncate(MAX_OPS);
         for op in ops.iter_mut() {
-            let (bundle, candidates, spans, num_candidates) = match op {
+            let (bundle, candidates, spans, costs, num_candidates) = match op {
                 Op::TryAssign {
                     bundle,
                     candidates,
                     spans,
-                } => (bundle, candidates, spans, num_regs),
+                } => (bundle, candidates, spans, None, num_regs),
                 Op::TryAssignGroup {
                     bundle,
                     candidates,
                     spans,
-                } => (bundle, candidates, spans, num_groups),
+                } => (bundle, candidates, spans, None, num_groups),
+                Op::TryEvictAndAssign {
+                    bundle,
+                    candidates,
+                    spans,
+                    weights,
+                    hints,
+                } => (bundle, candidates, spans, Some((weights, hints)), num_regs),
+                Op::TryEvictGroupAndAssign {
+                    bundle,
+                    candidates,
+                    spans,
+                    weights,
+                    hints,
+                } => (
+                    bundle,
+                    candidates,
+                    spans,
+                    Some((weights, hints)),
+                    num_groups,
+                ),
                 Op::Reset => continue,
             };
             *bundle %= NUM_BUNDLES;
@@ -630,6 +970,9 @@ mod tests {
                 *candidate %= num_candidates;
             }
             fixup_spans(spans);
+            if let Some((weights, hints)) = costs {
+                fixup_costs(weights, hints, num_candidates);
+            }
         }
     }
 
@@ -646,6 +989,38 @@ mod tests {
             bundle,
             candidates: candidates.to_vec(),
             spans: spans.to_vec(),
+        }
+    }
+
+    fn try_evict(
+        bundle: u8,
+        candidates: &[u8],
+        spans: &[(u8, u8)],
+        weights: &[u8],
+        hints: &[u8],
+    ) -> Op {
+        Op::TryEvictAndAssign {
+            bundle,
+            candidates: candidates.to_vec(),
+            spans: spans.to_vec(),
+            weights: weights.to_vec(),
+            hints: hints.to_vec(),
+        }
+    }
+
+    fn try_evict_group(
+        bundle: u8,
+        candidates: &[u8],
+        spans: &[(u8, u8)],
+        weights: &[u8],
+        hints: &[u8],
+    ) -> Op {
+        Op::TryEvictGroupAndAssign {
+            bundle,
+            candidates: candidates.to_vec(),
+            spans: spans.to_vec(),
+            weights: weights.to_vec(),
+            hints: hints.to_vec(),
         }
     }
 
@@ -828,6 +1203,130 @@ mod tests {
                 Op::Reset,
                 try_assign_group(0, &[G4], &[(0, 6)]),
             ],
+            // The whole point: a bundle worth more than the one in its way
+            // takes the register, and one worth less does not.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+            ],
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[3, 2], &[]),
+            ],
+            // Two bundles are in the way, so evicting either one still leaves
+            // the other and this register is no candidate at all, no matter how
+            // cheap they both are.
+            vec![
+                try_assign(0, &[R0], &[(0, 2)]),
+                try_assign(1, &[R0], &[(2, 4)]),
+                try_evict(2, &[R0], &[(0, 4)], &[1, 1, 5], &[]),
+            ],
+            // Given a choice, we evict the cheaper of the two victims, even
+            // though the more expensive one is in the earlier candidate.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign(1, &[R1], &[(0, 6)]),
+                try_evict(2, &[R0, R1], &[(0, 6)], &[3, 1, 5], &[]),
+            ],
+            // Equally cheap victims go to the earlier candidate.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign(1, &[R1], &[(0, 6)]),
+                try_evict(2, &[R1, R0], &[(0, 6)], &[1, 1, 5], &[]),
+            ],
+            // Broken hints outweigh spill weight: the cheap victim sits in the
+            // register it prefers, so we take the expensive one instead.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign(1, &[R1], &[(0, 6)]),
+                try_evict(2, &[R0, R1], &[(0, 6)], &[1, 3, 5], &[R0]),
+            ],
+            // And when breaking a hint is the only option, we do not take it,
+            // however light the victim.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 5], &[R0]),
+            ],
+            // A hint only counts against the register it actually names, so
+            // evicting this bundle from a *different* register is free.
+            vec![
+                try_assign(0, &[R1], &[(0, 6)]),
+                try_evict(1, &[R1], &[(0, 6)], &[1, 2], &[R0]),
+            ],
+            // The victim holds a wide register, so evicting it has to free
+            // every one of its units, not just the one we wanted.
+            vec![
+                try_assign(0, &[R4], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                try_assign(2, &[R1], &[(0, 6)]),
+            ],
+            // Likewise, evicting a victim has to free every one of its spans,
+            // not just the one that was in the way.
+            vec![
+                try_assign(0, &[R0], &[(0, 2), (4, 6)]),
+                try_evict(1, &[R0], &[(1, 3)], &[1, 2], &[]),
+                try_assign(2, &[R0], &[(4, 6)]),
+            ],
+            // A bundle can never evict itself, however the weights fall.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_evict(0, &[R0], &[(0, 6)], &[1], &[]),
+            ],
+            // The bundle doing the evicting already holds a register of its
+            // own, and keeps it.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign(1, &[R1], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+            ],
+            // A victim can in turn be evicted by the next bundle along.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                try_evict(2, &[R0], &[(0, 6)], &[1, 2, 3], &[]),
+            ],
+            // Reset after an eviction: everything is free again.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                Op::Reset,
+                try_assign(0, &[R0], &[(0, 6)]),
+            ],
+            // A register in the way of a group, and the group's other member
+            // left free.
+            vec![
+                try_assign(0, &[R1], &[(0, 6)]),
+                try_evict_group(1, &[G0], &[(0, 6)], &[1, 2], &[]),
+                try_assign(2, &[R2], &[(0, 6)]),
+            ],
+            // A group victim spanning every unit, evicted for a group that
+            // needs only half of them.
+            vec![
+                try_assign_group(0, &[G4], &[(0, 6)]),
+                try_evict_group(1, &[G1], &[(0, 6)], &[1, 2], &[]),
+                try_assign(2, &[R0], &[(0, 6)]),
+            ],
+            // A group victim evicted by a plain register assignment.
+            vec![
+                try_assign_group(0, &[G0], &[(0, 6)]),
+                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                try_assign(2, &[R1], &[(0, 6)]),
+            ],
+            // Two different bundles in one group's way, so no single eviction
+            // frees it, but each of them alone frees a group of its own.
+            vec![
+                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign(1, &[R1], &[(0, 6)]),
+                try_evict_group(2, &[G0], &[(0, 6)], &[1, 1, 5], &[]),
+                try_evict_group(3, &[G2], &[(0, 6)], &[1, 1, 5, 5], &[]),
+            ],
+            // Broken hints for groups: the cheap victim prefers the first
+            // group, so the expensive one in the second group goes instead.
+            vec![
+                try_assign_group(0, &[G0], &[(0, 6)]),
+                try_assign_group(1, &[G1], &[(0, 6)]),
+                try_evict_group(2, &[G0, G1], &[(0, 6)], &[1, 3, 5], &[G0]),
+            ],
         ];
         for ops in seeds.iter_mut() {
             fixup_ops(ops);
@@ -910,6 +1409,139 @@ mod tests {
                                 spans.iter().cloned(),
                             );
                             check_try_assign(
+                                &assignments,
+                                &format!("{b:?} to one of {candidates:?}"),
+                                &units,
+                                &spans,
+                                actual,
+                                expected,
+                            )?;
+                        }
+
+                        Op::TryEvictAndAssign {
+                            bundle: b,
+                            candidates,
+                            spans,
+                            weights,
+                            hints,
+                        } => {
+                            let b = bundle(usize::from(*b));
+                            let spans: Vec<Range<LivePoint<u32>>> =
+                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+
+                            // Every candidate must already be in conflict, so
+                            // filter out the ones that are not: this method is
+                            // only ever reached once plain assignment has
+                            // failed everywhere.
+                            let candidates: Vec<Reg> = candidates
+                                .iter()
+                                .map(|&index| reg(index))
+                                .filter(|&r| oracle_conflicts(&oracle, &[reg_units(r)], &spans))
+                                .collect();
+                            let units: Vec<Vec<Range<RegUnit>>> =
+                                candidates.iter().map(|&r| vec![reg_units(r)]).collect();
+
+                            let spans_of = spans_by_bundle(&oracle, b, &spans);
+                            let bundle_spans =
+                                |bb: LiveBundle<u32>| spans_of[bb.index()].iter().cloned();
+
+                            let cost = |victim: LiveBundle<u32>, r: Reg| {
+                                let broken_hints =
+                                    usize::from(usize::from(hints[victim.index()]) == r.index());
+                                EvictionCost::new(
+                                    broken_hints,
+                                    SpillWeight::new(f32::from(weights[victim.index()])),
+                                )
+                            };
+                            let max_cost = EvictionCost::new(
+                                0,
+                                SpillWeight::new(f32::from(weights[b.index()])),
+                            );
+
+                            let expected = oracle_try_evict_and_assign(
+                                &mut oracle,
+                                b,
+                                &units,
+                                &spans,
+                                max_cost,
+                                |victim, index| cost(victim, candidates[index]),
+                            );
+                            let actual = assignments.try_evict_reg_and_assign(
+                                b,
+                                candidates.iter().copied(),
+                                reg_units,
+                                max_cost,
+                                cost,
+                                bundle_spans,
+                            );
+                            check_try_evict(
+                                &assignments,
+                                &format!("{b:?} to one of {candidates:?}"),
+                                &units,
+                                &spans,
+                                actual,
+                                expected,
+                            )?;
+                        }
+
+                        Op::TryEvictGroupAndAssign {
+                            bundle: b,
+                            candidates,
+                            spans,
+                            weights,
+                            hints,
+                        } => {
+                            let b = bundle(usize::from(*b));
+                            let spans: Vec<Range<LivePoint<u32>>> =
+                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+
+                            let candidates: Vec<RegGroup> = candidates
+                                .iter()
+                                .map(|&index| group(index))
+                                .filter(|&g| {
+                                    let units: Vec<_> = group_units(g).collect();
+                                    oracle_conflicts(&oracle, &units, &spans)
+                                })
+                                .collect();
+                            let units: Vec<Vec<Range<RegUnit>>> = candidates
+                                .iter()
+                                .map(|&g| group_units(g).collect())
+                                .collect();
+
+                            let spans_of = spans_by_bundle(&oracle, b, &spans);
+                            let bundle_spans =
+                                |bb: LiveBundle<u32>| spans_of[bb.index()].iter().cloned();
+
+                            let cost = |victim: LiveBundle<u32>, g: RegGroup| {
+                                let broken_hints =
+                                    usize::from(usize::from(hints[victim.index()]) == g.index());
+                                EvictionCost::new(
+                                    broken_hints,
+                                    SpillWeight::new(f32::from(weights[victim.index()])),
+                                )
+                            };
+                            let max_cost = EvictionCost::new(
+                                0,
+                                SpillWeight::new(f32::from(weights[b.index()])),
+                            );
+
+                            let expected = oracle_try_evict_and_assign(
+                                &mut oracle,
+                                b,
+                                &units,
+                                &spans,
+                                max_cost,
+                                |victim, index| cost(victim, candidates[index]),
+                            );
+                            let actual = assignments.try_evict_reg_group_and_assign(
+                                b,
+                                candidates.iter().copied(),
+                                group_units,
+                                max_cost,
+                                cost,
+                                bundle_spans,
+                            );
+                            check_try_evict(
                                 &assignments,
                                 &format!("{b:?} to one of {candidates:?}"),
                                 &units,

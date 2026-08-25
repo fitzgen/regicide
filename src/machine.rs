@@ -296,7 +296,6 @@ impl RegGroup {
     /// The same registers as `self.members(machine)`, as a set for fast
     /// membership and interference testing rather than in order.
     #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
     pub(crate) fn member_set(self, machine: &Machine) -> &RegSet {
         &machine.groups[self].member_set
     }
@@ -413,7 +412,6 @@ pub(crate) struct RegGroupDef {
 
     /// The same registers as `self.members`, as a set for fast membership and
     /// interference testing rather than in order.
-    #[expect(dead_code, reason = "will probably need it")]
     pub member_set: RegSet,
 
     /// This register group's associated register bank.

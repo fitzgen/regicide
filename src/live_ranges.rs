@@ -157,6 +157,16 @@ impl SpillWeight {
     pub const fn as_f32(self) -> f32 {
         self.0.as_f32()
     }
+
+    #[inline]
+    pub(crate) const fn bits(self) -> u16 {
+        self.0.bits()
+    }
+
+    #[inline]
+    pub(crate) const fn from_bits(bits: u16) -> Self {
+        SpillWeight(PackedSpillWeight::from_bits(bits))
+    }
 }
 
 /// The cost of a register-to-register move, relative to a spill or a reload.
@@ -1083,7 +1093,6 @@ where
 
     /// How expensive it would be to spill this bundle.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn spill_weight(self, live_ranges: &LiveRanges<E>) -> f32 {
         PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
             live_ranges.bundles[self].weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
