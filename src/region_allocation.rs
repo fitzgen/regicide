@@ -8,7 +8,7 @@ mod assignments;
 use crate::{
     Entity, Input, InputFunction, InputValue, OperandConstraint, RegClass,
     context::ContextInner,
-    entity::{EntityRepr, Region},
+    entity::{EntityRepr, Region, SecondaryMap},
     error::IResult,
     live_ranges::{LiveBundle, LiveRanges, LiveSpan, SpillWeight},
     machine::RegClassMembers,
@@ -73,6 +73,9 @@ where
     /// The main work queue of bundles that still need assignment.
     queue: BinaryHeap<PqEntry<E>>,
 
+    /// Each bundle's current allocation priority.
+    bundle_priority: SecondaryMap<LiveBundle<E>, Priority>,
+
     /// Scratch space to hold a pre-order traversal of the region tree.
     region_pre_order: Vec<Region<E>>,
 
@@ -92,6 +95,7 @@ where
             assignments: Assignments::new(),
             region_assignments: Assignments::new(),
             queue: BinaryHeap::new(),
+            bundle_priority: SecondaryMap::new(Priority::ZERO),
             region_pre_order: Vec::new(),
             stack_bundles: Vec::new(),
         }
@@ -102,12 +106,14 @@ where
             assignments,
             region_assignments,
             queue,
+            bundle_priority,
             region_pre_order,
             stack_bundles,
         } = self;
         assignments.reset();
         region_assignments.reset();
         queue.clear();
+        bundle_priority.reset();
         region_pre_order.clear();
         stack_bundles.clear();
     }
@@ -117,12 +123,14 @@ where
             assignments,
             region_assignments,
             queue,
+            bundle_priority,
             region_pre_order,
             stack_bundles,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
             && queue.is_empty()
+            && bundle_priority.is_reset()
             && region_pre_order.is_empty()
             && stack_bundles.is_empty()
     }
@@ -198,13 +206,11 @@ where
     }
 
     fn set_bundle_priority(&mut self, bundle: LiveBundle<E>, priority: Priority) {
-        let _ = (bundle, priority);
-        todo!("SecondaryMap<LiveBundle<E>, Priority> on self")
+        self.bundle_priority[bundle] = priority;
     }
 
     fn get_bundle_priority(&self, bundle: LiveBundle<E>) -> Priority {
-        let _ = bundle;
-        todo!("SecondaryMap<LiveBundle<E>, Priority> on self")
+        self.bundle_priority[bundle]
     }
 
     fn assign_to_preferred(
@@ -650,6 +656,9 @@ where
 }
 
 impl Priority {
+    /// The lowest possible priority.
+    const ZERO: Priority = Priority { bits: 0 };
+
     fn new(has_fixed_use: bool, is_minimal: bool, group_size: usize, size: usize) -> Self {
         let has_fixed_use = u32::from(has_fixed_use) << PRIORITY_HAS_FIXED_USE_SHIFT;
         debug_assert_eq!(has_fixed_use & PRIORITY_HAS_FIXED_USE_MASK, has_fixed_use);
