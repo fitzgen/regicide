@@ -8,6 +8,7 @@ mod assignments;
 use crate::{
     Entity, Input, InputFunction, InputValue, OperandConstraint, RegClass,
     context::ContextInner,
+    counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
     error::IResult,
     live_ranges::{LiveBundle, LiveRanges, LiveSpan, SpillWeight},
@@ -29,6 +30,7 @@ where
     let _timing = Timing::new("region allocate");
 
     let ContextInner {
+        counts,
         region_tree,
         live_ranges,
         region_allocation,
@@ -39,14 +41,15 @@ where
     find_region_pre_order(&mut region_pre_order, region_tree);
 
     for region in region_pre_order.iter().copied().rev() {
-        region_allocation.allocate_region(input, live_ranges, region);
+        region_allocation.allocate_region(input, live_ranges, counts, region);
     }
 
     region_pre_order.clear();
     debug_assert!(region_allocation.region_pre_order.is_empty());
     region_allocation.region_pre_order = region_pre_order;
 
-    // TODO: add final counts of spans and bundles
+    counts.final_live_spans += live_ranges.len_spans();
+    counts.final_bundles += live_ranges.len_bundles();
 
     Ok(())
 }
@@ -139,6 +142,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
+        counts: &mut Counts,
         region: Region<E>,
     ) {
         debug_assert!(self.queue.is_empty());
@@ -156,40 +160,40 @@ where
         while let Some(entry) = self.queue.pop() {
             debug_assert_eq!(entry.priority(), self.get_bundle_priority(entry.bundle()));
 
-            // TODO: increment `counts.queue_pops`
+            counts.queue_pops += 1u64;
 
             let phase = entry.phase();
 
             if self.assign_to_preferred(input, live_ranges, entry) {
-                // TODO: increment `counts.preferred_assignments`
+                counts.preferred_assignments += 1u64;
                 continue;
             }
 
             if self.assign_to_non_preferred(input, live_ranges, entry) {
-                // TODO: increment `counts.non_preferred_assignments`
+                counts.non_preferred_assignments += 1u64;
                 continue;
             }
 
             if phase <= Phase::AssignEvict && self.assign_via_eviction(input, live_ranges, entry) {
-                // TODO: increment `counts.evictions`
+                counts.evictions += 1u64;
                 continue;
             }
 
             if phase <= Phase::SplitOnce {
                 self.split_once(entry);
-                // TODO: increment `counts.split_once`
+                counts.split_once += 1u64;
                 continue;
             }
 
             if phase <= Phase::SplitAtBlocks {
                 self.split_at_blocks(entry);
-                // TODO: increment `counts.split_at_blocks`
+                counts.split_at_blocks += 1u64;
                 continue;
             }
 
             debug_assert_eq!(phase, Phase::SplitIntoMinimalOrSpill);
             self.split_into_minimal_or_spill(entry);
-            // TODO: increment `counts.split_into_minimal_or_spill`
+            counts.split_into_minimal_or_spill += 1u64;
         }
     }
 

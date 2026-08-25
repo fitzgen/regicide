@@ -64,6 +64,15 @@ pub struct Counts {
     pub uses: Count,
     pub eager_splits: Count,
     pub bundles: Count,
+    pub queue_pops: Count,
+    pub preferred_assignments: Count,
+    pub non_preferred_assignments: Count,
+    pub evictions: Count,
+    pub split_once: Count,
+    pub split_at_blocks: Count,
+    pub split_into_minimal_or_spill: Count,
+    pub final_live_spans: Count,
+    pub final_bundles: Count,
 }
 
 impl Counts {
@@ -76,6 +85,15 @@ impl Counts {
             uses: Count::new(),
             eager_splits: Count::new(),
             bundles: Count::new(),
+            queue_pops: Count::new(),
+            preferred_assignments: Count::new(),
+            non_preferred_assignments: Count::new(),
+            evictions: Count::new(),
+            split_once: Count::new(),
+            split_at_blocks: Count::new(),
+            split_into_minimal_or_spill: Count::new(),
+            final_live_spans: Count::new(),
+            final_bundles: Count::new(),
         }
     }
 
@@ -92,6 +110,15 @@ impl Counts {
             uses,
             eager_splits,
             bundles,
+            queue_pops,
+            preferred_assignments,
+            non_preferred_assignments,
+            evictions,
+            split_once,
+            split_at_blocks,
+            split_into_minimal_or_spill,
+            final_live_spans,
+            final_bundles,
         } = self;
         sccs.is_reset()
             && regions.is_reset()
@@ -100,5 +127,14 @@ impl Counts {
             && uses.is_reset()
             && eager_splits.is_reset()
             && bundles.is_reset()
+            && queue_pops.is_reset()
+            && preferred_assignments.is_reset()
+            && non_preferred_assignments.is_reset()
+            && evictions.is_reset()
+            && split_once.is_reset()
+            && split_at_blocks.is_reset()
+            && split_into_minimal_or_spill.is_reset()
+            && final_live_spans.is_reset()
+            && final_bundles.is_reset()
     }
 }
