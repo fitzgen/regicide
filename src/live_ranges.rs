@@ -1289,7 +1289,7 @@ where
                         piece_has_fixed_use,
                     ),
                 )?;
-                counts.eager_splits += 1u64;
+                counts.eager_splits.inc();
 
                 piece_start = point;
                 piece_uses_start = use_;

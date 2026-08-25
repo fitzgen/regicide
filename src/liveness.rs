@@ -305,7 +305,7 @@ where
 
         while let Some(block) = worklist.pop() {
             on_worklist.remove(block);
-            counts.liveness_iterations += 1u64;
+            counts.liveness_iterations.inc();
 
             // Recompute this block's live-out set from its successors.
             live_out[block].clear(arena);

@@ -160,40 +160,40 @@ where
         while let Some(entry) = self.queue.pop() {
             debug_assert_eq!(entry.priority(), self.get_bundle_priority(entry.bundle()));
 
-            counts.queue_pops += 1u64;
+            counts.queue_pops.inc();
 
             let phase = entry.phase();
 
             if self.assign_to_preferred(input, live_ranges, entry) {
-                counts.preferred_assignments += 1u64;
+                counts.preferred_assignments.inc();
                 continue;
             }
 
             if self.assign_to_non_preferred(input, live_ranges, entry) {
-                counts.non_preferred_assignments += 1u64;
+                counts.non_preferred_assignments.inc();
                 continue;
             }
 
             if phase <= Phase::AssignEvict && self.assign_via_eviction(input, live_ranges, entry) {
-                counts.evictions += 1u64;
+                counts.evictions.inc();
                 continue;
             }
 
             if phase <= Phase::SplitOnce {
                 self.split_once(entry);
-                counts.split_once += 1u64;
+                counts.split_once.inc();
                 continue;
             }
 
             if phase <= Phase::SplitAtBlocks {
                 self.split_at_blocks(entry);
-                counts.split_at_blocks += 1u64;
+                counts.split_at_blocks.inc();
                 continue;
             }
 
             debug_assert_eq!(phase, Phase::SplitIntoMinimalOrSpill);
             self.split_into_minimal_or_spill(entry);
-            counts.split_into_minimal_or_spill += 1u64;
+            counts.split_into_minimal_or_spill.inc();
         }
     }
 

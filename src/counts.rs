@@ -44,6 +44,10 @@ impl Count {
         }
     }
 
+    pub fn inc(&mut self) {
+        *self += 1u64;
+    }
+
     pub fn is_reset(&self) -> bool {
         #[cfg(not(feature = "trace-log"))]
         return true;
