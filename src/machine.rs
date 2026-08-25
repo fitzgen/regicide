@@ -319,7 +319,6 @@ impl RegClass {
 
     /// The cost of spilling this register class.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn spill_cost(self, machine: &Machine) -> f32 {
         machine.classes[self].spill_cost
     }
@@ -328,6 +327,15 @@ impl RegClass {
     #[inline]
     pub(crate) fn members(self, machine: &Machine) -> &RegClassMembers {
         &machine.classes[self].members
+    }
+
+    /// Does this class contain exactly one register (or one register group)?
+    #[inline]
+    pub(crate) fn is_singleton(self, machine: &Machine) -> bool {
+        match self.members(machine) {
+            RegClassMembers::Regs(regs) => regs.len() == 1,
+            RegClassMembers::Groups(groups) => groups.len() == 1,
+        }
     }
 
     /// The same set of registers inside `self.members(machine)`, but as a
@@ -828,6 +836,8 @@ impl MachineBuilder {
         spill_cost: f32,
         registers: impl IntoIterator<Item = Reg>,
     ) -> Result<RegClass> {
+        assert!(spill_cost.is_sign_positive());
+
         let class = self.begin_class(bank)?;
         let members: Box<[Reg]> = registers.into_iter().collect();
         if members.is_empty() {
@@ -864,6 +874,8 @@ impl MachineBuilder {
         spill_cost: f32,
         groups: impl IntoIterator<Item = RegGroup>,
     ) -> Result<RegClass> {
+        assert!(spill_cost.is_sign_positive());
+
         let class = self.begin_class(bank)?;
         let members: Box<[RegGroup]> = groups.into_iter().collect();
         if members.is_empty() {

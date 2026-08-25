@@ -6,7 +6,9 @@ use crate::entity::{
     Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, Region, SecondaryMap, Val, WideInt,
 };
 use crate::error::IResult;
-use crate::input::{Input, InputFunction, InputInst, OperandConstraint, Position};
+use crate::input::{
+    Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position, RematCost,
+};
 use crate::liveness::{Liveness, block_first_inst, block_last_inst};
 use crate::machine::{Machine, RegClassMembers};
 use crate::output::{Allocation, OutputInner};
@@ -116,9 +118,27 @@ where
             bits: E::Wide::from_usize(bits),
         }
     }
+
+    /// The program point immediately preceding this one; the inverse of
+    /// `Self::next_point`.
+    #[inline]
+    pub fn prev_point(self) -> Self {
+        let bits = self.bits.to_usize();
+        debug_assert!(bits > 0, "the first program point has no predecessor");
+        LivePoint {
+            bits: E::Wide::from_usize(bits - 1),
+        }
+    }
 }
 
 /// How much it would cost to spill a value, rather than keep it in a register.
+///
+/// Larger values mean a spill would be more expensive; smaller values mean a
+/// spill would be less expensive.
+///
+/// A `SpillWeight` is not a cycle estimate, it has not unit and is only used to
+/// weigh decisions, and is therefore only meaningful in comparison to other
+/// `SpillWeight`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SpillWeight(PackedSpillWeight);
 
@@ -134,10 +154,154 @@ impl SpillWeight {
 
     /// This weight's value.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub const fn as_f32(self) -> f32 {
         self.0.as_f32()
     }
+}
+
+/// The cost of a register-to-register move, relative to a spill or a reload.
+const MOVE_COST: f32 = 0.5;
+
+/// What fraction of its value's register class's spill cost an unconstrained
+/// use pays.
+///
+/// An `Any` operand constraint accepts an operand in a stack slot, so spilling
+/// its value does not make the program illegal, but a stack slot is still
+/// slower than a register.
+const STACK_ACCESS_SCALE: f32 = 0.5;
+
+/// The `K` in `weight = total_cost / (num_insts + K)`.
+///
+/// For a bundle much shorter than `K`, the denominator barely moves, so the
+/// weight is effectively a use *count*; for one much longer than `K`, the `K`
+/// washes out and the weight becomes a use *density*.
+///
+/// For what it's worth: for their equivalent constants, LLVM uses `25` and
+/// regalloc3 uses `200`.
+const SPILL_WEIGHT_ADJUST: usize = 25;
+
+/// Cost scale for a value that is always cheaper to rematerialize than to keep
+/// in a register: spilling it costs nothing at all.
+const REMAT_ALWAYS_SCALE: f32 = 0.0;
+
+/// Cost scale for a value that is cheaper to rematerialize than to move.
+const REMAT_CHEAPER_THAN_MOVE_SCALE: f32 = 0.1;
+
+/// Cost scale for a value that is cheaper to rematerialize than to reload from
+/// a spill slot.
+const REMAT_CHEAPER_THAN_RELOAD_SCALE: f32 = 0.25;
+
+/// How much worse off `val` would be if this use had to read it from a spill
+/// slot instead of a register.
+///
+/// `unresolved` is the operand's constraint as written, and `resolved` is that
+/// same constraint after a `Reuse` has been chased to the operand it is tied
+/// to.
+fn use_spill_cost<E>(
+    input: &Input<'_, impl InputFunction>,
+    val: Val<E>,
+    unresolved: OperandConstraint,
+    resolved: OperandConstraint,
+) -> f32
+where
+    E: EntityRepr,
+{
+    let cost = match resolved {
+        // The value has to be on the stack anyways, so spilling it costs
+        // nothing.
+        OperandConstraint::Stack => 0.0,
+
+        // The value must be in a register here; pay the class's full price.
+        OperandConstraint::Reg(class) => class.spill_cost(input.machine),
+
+        // A spill slot is legal here, but still slower than a register.
+        OperandConstraint::Any => {
+            let class = input.func.value(val.with_repr32()).reg_class();
+            STACK_ACCESS_SCALE * class.spill_cost(input.machine)
+        }
+
+        OperandConstraint::Reuse(_) => unreachable!("`resolved` is resolved"),
+    };
+
+    if matches!(unresolved, OperandConstraint::Reuse(_)) {
+        // A reuse-tied operand needs a register-to-register move whether or not
+        // its value is spilled, so subtract the move cost.
+        (cost - MOVE_COST).max(0.0)
+    } else {
+        cost
+    }
+}
+
+/// How much cheaper rematerializing a value makes spilling it.
+fn remat_scale(remat_cost: Option<RematCost>) -> f32 {
+    match remat_cost {
+        None => 1.0,
+        Some(RematCost::AlwaysRemat) => REMAT_ALWAYS_SCALE,
+        Some(RematCost::CheaperThanMove) => REMAT_CHEAPER_THAN_MOVE_SCALE,
+        Some(RematCost::CheaperThanReload) => REMAT_CHEAPER_THAN_RELOAD_SCALE,
+    }
+}
+
+/// Like `use_spill_cost`, but scaled by rematerializability and block
+/// frequency.
+fn use_spill_weight<E>(
+    input: &Input<'_, impl InputFunction>,
+    uses: &PrimaryMap<Use<E>, UseData<E>>,
+    frequency: f32,
+    val: Val<E>,
+    u: Use<E>,
+) -> SpillWeight
+where
+    E: EntityRepr,
+{
+    let remat_scale = remat_scale(input.func.value(val.with_repr32()).remat_cost());
+    let point = uses[u].point;
+    let operand = usize::from(uses[u].operand);
+    let input_inst = input.func.inst(point.inst().with_repr32());
+    let constraint = input_inst.operand(operand).constraint();
+
+    let cost = use_spill_cost(
+        input,
+        val,
+        constraint,
+        constraint.resolved(|j| input_inst.operand(j).constraint()),
+    );
+    debug_assert!(cost.is_sign_positive());
+
+    let weight = cost * remat_scale * frequency;
+    debug_assert!(weight.is_sign_positive());
+
+    SpillWeight::new(weight)
+}
+
+/// Divide a bundle's total use cost by its length, blending a use count with a
+/// use density.
+pub(crate) fn normalize_spill_weight(total_use_cost: f32, sum_len_insts: usize) -> f32 {
+    debug_assert!(total_use_cost >= 0.0);
+    let denominator = (sum_len_insts + SPILL_WEIGHT_ADJUST) as f32;
+    (total_use_cost / denominator).min(f32::MAX)
+}
+
+/// Is a bundle covering `sum_len_insts` instructions minimal?
+///
+/// Minimal bundles cannot be split any further.
+///
+/// One instruction is the floor because moves go at instruction boundaries, and
+/// a one-instruction bundle has no interior boundary to put one at. On the
+/// other hand, a bundle holding two one-instruction spans can still be split
+/// into two bundles of one span each.
+pub(crate) fn is_minimal_bundle(sum_len_insts: usize) -> bool {
+    debug_assert!(
+        sum_len_insts >= 1,
+        "a bundle always covers at least one instruction",
+    );
+    sum_len_insts <= 1
+}
+
+/// Round `weight` to the precision a bundle stores it at.
+#[cfg(test)]
+pub(crate) fn round_bundle_spill_weight(weight: f32) -> f32 {
+    PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(weight).as_f32()
 }
 
 pub const MAX_INST_INDEX: usize = LivePoint::<u32>::MAX_INST_INDEX;
@@ -159,7 +323,7 @@ where
     /// Which operand of `self.pos`'s instruction this is.
     operand: u16,
 
-    /// Whether this is a use or a def of `self.val`.
+    /// How much worse off this use would be if its value were spilled.
     weight: SpillWeight,
 }
 
@@ -169,21 +333,14 @@ where
 {
     /// Create a `UseData` for the `operand`th operand of `point`'s instruction.
     ///
-    /// TODO: the weight is a placeholder. Computing a real spill weight (and
-    /// setting [`SPAN_HAS_FIXED_USE`] on the containing span) needs the
-    /// operand's register constraint, and `Operand` does not carry one yet.
-    ///
-    /// `Operand` does carry a constraint now, and live span construction reads
-    /// it to split spans whose uses conflict. What is still missing is a way to
-    /// ask a `Machine` whether a class holds a single register, which is what
-    /// both the weight and `SPAN_HAS_FIXED_USE` need.
+    /// The weight is initially zero and is filled in later.
     #[inline]
-    pub(crate) fn new(point: LivePoint<E>, operand: usize, weight: SpillWeight) -> Self {
+    pub(crate) fn new(point: LivePoint<E>, operand: usize) -> Self {
         debug_assert!(operand < MAX_OPERANDS_PER_INST);
         UseData {
             point,
             operand: u16::try_from(operand).unwrap(),
-            weight,
+            weight: SpillWeight::new(0.0),
         }
     }
 
@@ -232,17 +389,16 @@ where
 {
     /// Create a span covering `[start, end)` for `val`, with the given uses.
     ///
-    /// The flags all start clear: `has_fixed_use` needs register constraints
-    /// that `Operand` does not carry yet.
-    ///
-    /// The constraints are reachable now; see [`UseData::new`] for what is still
-    /// missing before `has_fixed_use` can be set here.
+    /// `has_fixed_use` is whether any of `uses` demands one particular register,
+    /// i.e. resolves to a singleton class. The caller computes it because it is
+    /// already resolving each use's constraint to decide where to split.
     #[inline]
     pub(crate) fn new(
         start: LivePoint<E>,
         end: LivePoint<E>,
         val: Val<E>,
         uses: EntityRange<Use<E>>,
+        has_fixed_use: bool,
     ) -> Self {
         debug_assert!(start < end);
         LiveSpanData {
@@ -250,7 +406,7 @@ where
             end,
             uses,
             val,
-            flags: 0,
+            flags: if has_fixed_use { SPAN_HAS_FIXED_USE } else { 0 },
         }
     }
 }
@@ -376,19 +532,22 @@ where
     /// Arena of all uses in the input function.
     uses: PrimaryMap<Use<E>, UseData<E>>,
 
+    /// Map from a use to the span that contains it.
+    use_span: SecondaryMap<Use<E>, LiveSpan<E>>,
+
     /// The live spans for the input function's values.
     spans: PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
+
+    /// Each span's bundle.
+    ///
+    /// `None` until after coalescing has run.
+    span_bundle: SecondaryMap<LiveSpan<E>, Option<LiveBundle<E>>>,
 
     /// The live bundles.
     bundles: PrimaryMap<LiveBundle<E>, LiveBundleData<E>>,
 
     /// Contiguous storage for the member spans of every bundle.
     bundle_spans_storage: PrimaryMap<BundleSpansStorageIndex<E>, LiveSpan<E>>,
-
-    /// Each span's bundle.
-    ///
-    /// `None` until after coalescing has run.
-    span_bundle: SecondaryMap<LiveSpan<E>, Option<LiveBundle<E>>>,
 
     /// Map from a block to the spans within it.
     ///
@@ -416,9 +575,6 @@ where
     /// Does not include bundles created after coalescing, e.g. by splitting
     /// during region allocation.
     region_bundles: SecondaryMap<Region<E>, EntityRange<LiveBundle<E>>>,
-
-    /// Map from a use to the span that contains it.
-    use_span: SecondaryMap<Use<E>, LiveSpan<E>>,
 }
 
 impl<E> LiveRanges<E>
@@ -536,20 +692,27 @@ where
         output: &mut OutputInner<E>,
         region: Region<E>,
         constraint: OperandConstraint,
-        is_minimal: bool,
-        spill_weight: f32,
         spans: impl Iterator<Item = LiveSpan<E>>,
     ) -> IResult<LiveBundle<E>> {
         let bundle = self.bundles.next_key(output)?;
 
         let mut has_fixed_uses = false;
+        let mut total_use_cost = 0.0;
+        let mut sum_len_insts = 0;
 
         let start = self.bundle_spans_storage.next_key(output)?;
         for span in spans {
             debug_assert!(self.span_bundle[span].is_none());
             self.span_bundle[span] = Some(bundle);
 
-            has_fixed_uses |= self.spans[span].flags & SPAN_HAS_FIXED_USE != 0;
+            has_fixed_uses |= span.has_fixed_use(self);
+
+            total_use_cost += span
+                .uses(self)
+                .into_iter()
+                .map(|u| u.weight(self).as_f32())
+                .sum::<f32>();
+            sum_len_insts += span.len_insts(self);
 
             self.bundle_spans_storage.push(output, span)?;
         }
@@ -562,9 +725,9 @@ where
                 EntityRange { start, end },
                 region,
                 constraint,
-                is_minimal,
+                is_minimal_bundle(sum_len_insts),
                 has_fixed_uses,
-                spill_weight,
+                normalize_spill_weight(total_use_cost, sum_len_insts),
             ),
         )?;
         debug_assert_eq!(pushed, bundle);
@@ -642,13 +805,17 @@ where
             let mut live_in_end = spans_start;
             let mut live_out_start = None;
             let mut live_out_end = spans_start;
+            let frequency = input_block.frequency().as_f32();
 
+            // Attach each use to its span and calculate the use's spill weight.
             for span in (EntityRange {
                 start: spans_start,
                 end: spans_end,
             }) {
+                let val = spans[span].val;
                 for u in spans[span].uses {
                     use_span[u] = span;
+                    uses[u].weight = use_spill_weight(input, uses, frequency, val, u);
                 }
 
                 let next = LiveSpan::try_new(span.index() + 1).unwrap();
@@ -738,7 +905,6 @@ where
 
     /// This use's spill weight.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn weight(self, live_ranges: &LiveRanges<E>) -> SpillWeight {
         live_ranges.uses[self].weight
     }
@@ -757,23 +923,29 @@ where
 {
     /// This span's uses (and, possibly, def), in ascending program order.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn uses(self, live_ranges: &LiveRanges<E>) -> EntityRange<Use<E>> {
         live_ranges.spans[self].uses
     }
 
     /// The start of this span, inclusive.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn start(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
         live_ranges.spans[self].start
     }
 
     /// The end of this span, exclusive.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn end(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
         live_ranges.spans[self].end
+    }
+
+    /// How many instructions this span covers.
+    #[inline]
+    pub(crate) fn len_insts(self, live_ranges: &LiveRanges<E>) -> usize {
+        let first = self.start(live_ranges).inst().index();
+        let last = self.end(live_ranges).prev_point().inst().index();
+        debug_assert!(first <= last);
+        last - first + 1
     }
 
     /// Do this span and `other` overlap (intersect)?
@@ -789,14 +961,12 @@ where
 
     /// The value that this span is associated with.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn val(self, live_ranges: &LiveRanges<E>) -> Val<E> {
         live_ranges.spans[self].val
     }
 
     /// Does this span contain a use with a fixed register constraint?
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn has_fixed_use(self, live_ranges: &LiveRanges<E>) -> bool {
         live_ranges.spans[self].flags & SPAN_HAS_FIXED_USE != 0
     }
@@ -1057,11 +1227,13 @@ fn push_span_and_split_conflicts<E>(
 where
     E: EntityRepr,
 {
-    // The piece we are accumulating: where it starts, where its uses start, and
-    // the merged constraint of everything folded into it so far.
+    // The piece we are accumulating: where it starts, where its uses start, the
+    // merged constraint of everything folded into it so far, and whether any of
+    // that demands one particular register.
     let mut piece_start = start;
     let mut piece_uses_start = span_uses.start;
     let mut piece_constraint = OperandConstraint::Any;
+    let mut piece_has_fixed_use = false;
 
     let mut last_point = start;
     for use_ in span_uses {
@@ -1073,6 +1245,13 @@ where
         let use_constraint = input_inst
             .operand(usize::from(use_data.operand))
             .constraint();
+
+        let resolved = use_constraint.resolved(&sibling);
+        let is_fixed = match resolved {
+            OperandConstraint::Reg(class) => class.is_singleton(input.machine),
+            _ => false,
+        };
+
         match piece_constraint.merge(
             &use_constraint,
             input.machine,
@@ -1082,6 +1261,7 @@ where
             // No conflict: we can fold `use_` into this piece.
             Some(merged) => {
                 piece_constraint = merged.resolved(&sibling);
+                piece_has_fixed_use |= is_fixed;
                 last_point = point;
             }
 
@@ -1097,13 +1277,15 @@ where
                             start: piece_uses_start,
                             end: use_,
                         },
+                        piece_has_fixed_use,
                     ),
                 )?;
                 counts.eager_splits += 1u64;
 
                 piece_start = point;
                 piece_uses_start = use_;
-                piece_constraint = use_constraint.resolved(&sibling);
+                piece_constraint = resolved;
+                piece_has_fixed_use = is_fixed;
                 last_point = point;
             }
         }
@@ -1124,6 +1306,7 @@ where
                 start: piece_uses_start,
                 end: span_uses.end,
             },
+            piece_has_fixed_use,
         ),
     )?;
 
@@ -1138,7 +1321,7 @@ mod tests {
     use crate::RegClass;
     use crate::dfs::Dfs;
     use crate::entity::Block;
-    use crate::input::InputBlock as _;
+    use crate::input::BlockFrequency;
     use crate::region_tree::RegionTree;
     use crate::test::{TestFunction, TestInput};
     use mutatis::check::{Check, CheckResult};
@@ -1524,6 +1707,266 @@ mod tests {
         let test_input = TestInput::with_use_constraints(&[rc(0), rc(2)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         assert_eq!(live_ranges.spans().count(), 1);
+    }
+
+    /// Every use in `test_input`, in program order, as `(point, operand,
+    /// weight)`.
+    fn use_weights(test_input: &TestInput) -> Vec<(LivePoint<u32>, usize, f32)> {
+        let (_liveness, live_ranges) = analyze_spans(test_input).unwrap();
+        let mut weights: Vec<_> = live_ranges
+            .spans()
+            .flat_map(|span| span.uses(&live_ranges).into_iter())
+            .map(|u| {
+                (
+                    u.point(&live_ranges),
+                    u.operand(&live_ranges),
+                    u.weight(&live_ranges).as_f32(),
+                )
+            })
+            .collect();
+        weights.sort_by_key(|&(point, operand, _)| (point, operand));
+        weights
+    }
+
+    /// `weight` as it survives being packed into a [`SpillWeight`].
+    ///
+    /// A weight keeps only the top bits of its mantissa, so an expectation
+    /// computed in full `f32` precision has to be put through the same rounding
+    /// before it can be compared for equality.
+    fn packed(weight: f32) -> f32 {
+        SpillWeight::new(weight).as_f32()
+    }
+
+    /// Every class of [`TestMachine::two_registers`] costs this much to spill,
+    /// and all of its values belong to `rc2`, so every weight the tests below
+    /// expect is a multiple of this one number.
+    const CLASS_COST: f32 = 1.0;
+
+    /// What a use is worth in a register comes from its own constraint: nothing
+    /// when it has to be on the stack anyway, a fraction when the stack is
+    /// merely allowed, and full price when only a register will do.
+    #[test]
+    fn a_use_weighs_what_a_register_saves_it() {
+        let rc2 = OperandConstraint::Reg(RegClass::try_new(2).unwrap());
+
+        // Index 1 is the use; index 0 is the `Any` def that `with_use_constraints`
+        // puts in front of it.
+        let weight_of =
+            |constraint| use_weights(&TestInput::with_use_constraints(&[constraint]))[1].2;
+
+        assert_eq!(weight_of(rc2), packed(CLASS_COST));
+        assert_eq!(
+            weight_of(OperandConstraint::Any),
+            packed(STACK_ACCESS_SCALE * CLASS_COST),
+        );
+        assert_eq!(
+            weight_of(OperandConstraint::Stack),
+            0.0,
+            "a use that demands the stack loses nothing by being spilled there",
+        );
+
+        // The `Any` def in front of every one of those is itself weighed the
+        // same way, so a def is not a special case.
+        assert_eq!(
+            use_weights(&TestInput::with_use_constraints(&[rc2]))[0].2,
+            packed(STACK_ACCESS_SCALE * CLASS_COST),
+        );
+    }
+
+    /// A tied operand needs a move whether or not its value is spilled, so a
+    /// register only saves it the difference.
+    #[test]
+    fn a_tied_operand_only_saves_the_difference() {
+        let rc2 = OperandConstraint::Reg(RegClass::try_new(2).unwrap());
+
+        let weight_of = |test_input: &TestInput, operand: usize| {
+            use_weights(test_input)
+                .into_iter()
+                .find(|&(point, j, _)| point.inst() == inst(1) && j == operand)
+                .expect("the tied instruction's operands are both recorded")
+                .2
+        };
+
+        // Operand 1 is the def tied to operand 0, so it resolves to operand 0's
+        // constraint -- but pays a move's worth less for it.
+        let tied = TestInput::with_reuse_def(rc2);
+        assert_eq!(weight_of(&tied, 1), packed(CLASS_COST - MOVE_COST));
+        assert_eq!(
+            weight_of(&tied, 0),
+            packed(CLASS_COST),
+            "the untied operand it is tied *to* still pays full price",
+        );
+
+        // When a register would not have saved more than a move costs, the
+        // difference floors at zero rather than going negative.
+        let tied = TestInput::with_reuse_def(OperandConstraint::Any);
+        assert!(STACK_ACCESS_SCALE * CLASS_COST <= MOVE_COST);
+        assert_eq!(weight_of(&tied, 1), 0.0);
+    }
+
+    /// The same use is worth more in a block that runs more often.
+    #[test]
+    fn block_frequency_scales_every_weight() {
+        let rc2 = OperandConstraint::Reg(RegClass::try_new(2).unwrap());
+
+        let weight_at = |frequency| {
+            let mut test_input = TestInput::with_use_constraints(&[rc2]);
+            test_input.set_block_frequencies(frequency);
+            use_weights(&test_input)[1].2
+        };
+
+        assert_eq!(weight_at(BlockFrequency::NORMAL), packed(CLASS_COST),);
+        assert_eq!(
+            weight_at(BlockFrequency::HOT),
+            packed(BlockFrequency::HOT.as_f32() * CLASS_COST),
+        );
+
+        // A cold block does not zero a use out -- `COLD` is the smallest
+        // positive frequency, not no frequency -- it just puts it below
+        // everything that runs at all.
+        let cold = weight_at(BlockFrequency::COLD);
+        assert!(cold > 0.0, "{cold}");
+        assert!(cold < weight_at(BlockFrequency::NORMAL));
+    }
+
+    /// A value that can be recomputed on demand is worth less in a register,
+    /// and the cheaper it is to recompute the less it is worth.
+    #[test]
+    fn rematerializable_values_are_cheaper_to_spill() {
+        let rc2 = OperandConstraint::Reg(RegClass::try_new(2).unwrap());
+
+        let weight_with = |remat| {
+            let mut test_input = TestInput::with_use_constraints(&[rc2]);
+            test_input.set_remat_costs(remat);
+            use_weights(&test_input)[1].2
+        };
+
+        assert_eq!(weight_with(None), packed(CLASS_COST));
+        assert_eq!(
+            weight_with(Some(RematCost::CheaperThanReload)),
+            packed(REMAT_CHEAPER_THAN_RELOAD_SCALE * CLASS_COST),
+        );
+        assert_eq!(
+            weight_with(Some(RematCost::CheaperThanMove)),
+            packed(REMAT_CHEAPER_THAN_MOVE_SCALE * CLASS_COST),
+        );
+        assert_eq!(
+            weight_with(Some(RematCost::AlwaysRemat)),
+            0.0,
+            "a value that is always cheaper to recompute is free to spill",
+        );
+
+        assert!(
+            weight_with(Some(RematCost::AlwaysRemat))
+                < weight_with(Some(RematCost::CheaperThanMove))
+        );
+        assert!(
+            weight_with(Some(RematCost::CheaperThanMove))
+                < weight_with(Some(RematCost::CheaperThanReload))
+        );
+        assert!(weight_with(Some(RematCost::CheaperThanReload)) < weight_with(None));
+    }
+
+    /// A use that names a class holding one register has no allocation choice
+    /// left, and the span that covers it says so.
+    #[test]
+    fn a_use_that_names_one_register_is_a_fixed_use() {
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+
+        let flags = |test_input: &TestInput| -> Vec<bool> {
+            let (_liveness, live_ranges) = analyze_spans(test_input).unwrap();
+            live_ranges
+                .spans()
+                .map(|s| s.has_fixed_use(&live_ranges))
+                .collect()
+        };
+
+        // `rc0` holds exactly one of `two_registers`' two registers...
+        assert_eq!(
+            flags(&TestInput::with_use_constraints(&[rc(0)])),
+            vec![true]
+        );
+
+        // ...while `rc2` holds both, so a use of it still has a choice.
+        assert_eq!(
+            flags(&TestInput::with_use_constraints(&[rc(2)])),
+            vec![false]
+        );
+
+        // The flag is per span, not per value: a value whose stack use and
+        // fixed register use force a split only flags the piece that actually
+        // has the fixed one.
+        assert_eq!(
+            flags(&TestInput::with_use_constraints(&[
+                OperandConstraint::Stack,
+                rc(0),
+            ])),
+            vec![false, true],
+        );
+    }
+
+    /// A span's length is what its weight gets divided by, so it counts
+    /// instructions -- inclusively, and never fewer than one.
+    #[test]
+    fn a_spans_length_counts_its_instructions_inclusively() {
+        let rc2 = OperandConstraint::Reg(RegClass::try_new(2).unwrap());
+
+        // A def at instruction 0 and uses at 1 and 2 span three instructions,
+        // even though the span ends part-way through the third.
+        let test_input = TestInput::with_use_constraints(&[rc2, rc2]);
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 1, "{spans:#?}");
+        assert_eq!(
+            spans[0].start(&live_ranges),
+            LivePoint::new(inst(0), Position::Late)
+        );
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            LivePoint::new(inst(2), Position::Late)
+        );
+        assert_eq!(spans[0].len_insts(&live_ranges), 3);
+
+        // A def whose value dies within its own instruction still covers that
+        // one instruction, so no bundle can ever have a zero-length span to
+        // divide by.
+        for span in live_ranges.spans() {
+            assert!(span.len_insts(&live_ranges) >= 1);
+        }
+    }
+
+    /// The constant added to a bundle's length is what makes the weight a use
+    /// *count* for short bundles and a use *density* for long ones.
+    #[test]
+    fn the_normalizer_blends_a_use_count_with_a_use_density() {
+        // Same total cost, different lengths: the shorter bundle wins, because
+        // it packs the same work into fewer instructions.
+        assert!(normalize_spill_weight(4.0, 1) > normalize_spill_weight(4.0, 100));
+
+        // Well below `SPILL_WEIGHT_ADJUST` the denominator barely moves, so
+        // doubling a bundle's length costs it only a few percent...
+        let short = normalize_spill_weight(1.0, 1);
+        let twice = normalize_spill_weight(1.0, 2);
+        assert!(twice > 0.9 * short, "{twice} vs {short}");
+
+        // ...while well above it the constant washes out and doubling the
+        // length nearly halves the weight.
+        let long = normalize_spill_weight(1.0, 1_000);
+        let twice = normalize_spill_weight(1.0, 2_000);
+        assert!(twice < 0.6 * long, "{twice} vs {long}");
+
+        // A bundle whose uses are all free to spill weighs nothing, however
+        // long it is.
+        assert_eq!(normalize_spill_weight(0.0, 1_000), 0.0);
+    }
+
+    /// The floor is one instruction, and it is a floor rather than a step: a
+    /// bundle that somehow came out smaller is still minimal.
+    #[test]
+    fn the_minimal_floor_is_one_instruction() {
+        assert!(is_minimal_bundle(1));
+        assert!(!is_minimal_bundle(2));
+        assert!(!is_minimal_bundle(usize::MAX));
     }
 
     #[test]
@@ -1977,7 +2420,66 @@ mod tests {
                     }
                 }
 
-                // 9. Constructing twice gives exactly the same spans and uses.
+                // 9. Each use's weight is the cost model applied to that
+                // use's own operand, in that use's own block, and a span flags
+                // a fixed use exactly when one of its uses names a class that
+                // holds a single register.
+                test_input.with_input(|input| -> Result<(), String> {
+                    for span in live_ranges.spans() {
+                        let val = span.val(&live_ranges);
+                        let remat = remat_scale(input.func.value(val).remat_cost());
+                        let mut any_fixed = false;
+
+                        for u in span.uses(&live_ranges) {
+                            let point = u.point(&live_ranges);
+                            let operand = u.operand(&live_ranges);
+                            let block = inst_block[&point.inst()];
+                            let frequency = func.block(block).frequency().as_f32();
+
+                            let input_inst = input.func.inst(point.inst());
+                            let sibling = |j| input_inst.operand(j).constraint();
+                            let raw = input_inst.operand(operand).constraint();
+                            let resolved = raw.resolved(&sibling);
+
+                            let expected = SpillWeight::new(
+                                (use_spill_cost(input, val, raw, resolved) * remat * frequency)
+                                    .max(0.0),
+                            );
+                            let actual = u.weight(&live_ranges);
+                            if actual != expected {
+                                return Err(format!(
+                                    "{u:?} (operand {operand} of {point:?}, in {block:?}) weighs \
+                                     {}, but the cost model says {}",
+                                    actual.as_f32(),
+                                    expected.as_f32(),
+                                ));
+                            }
+                            if !actual.as_f32().is_finite() || actual.as_f32() < 0.0 {
+                                return Err(format!(
+                                    "{u:?} weighs {}, which is not a weight",
+                                    actual.as_f32(),
+                                ));
+                            }
+
+                            any_fixed |= match resolved {
+                                OperandConstraint::Reg(class) => class.is_singleton(input.machine),
+                                _ => false,
+                            };
+                        }
+
+                        if span.has_fixed_use(&live_ranges) != any_fixed {
+                            return Err(format!(
+                                "{span:?} reports has_fixed_use = {}, but {} of its uses names a \
+                                 class holding a single register",
+                                span.has_fixed_use(&live_ranges),
+                                if any_fixed { "one" } else { "none" },
+                            ));
+                        }
+                    }
+                    Ok(())
+                })?;
+
+                // 10. Constructing twice gives exactly the same spans and uses.
                 let (_, again) = analyze_spans(test_input)?;
                 let first: Vec<_> = live_ranges.spans.as_slice().to_vec();
                 let second: Vec<_> = again.spans.as_slice().to_vec();
@@ -1994,7 +2496,7 @@ mod tests {
                     }
                 }
 
-                // 10. Both halves reset cleanly, including the scratch that
+                // 11. Both halves reset cleanly, including the scratch that
                 // span construction borrows from `Liveness`.
                 let mut live_ranges = live_ranges;
                 live_ranges.reset();

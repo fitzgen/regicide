@@ -10,7 +10,7 @@ use crate::{
     entity::{
         Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SccBlockIndex, SecondaryMap, SpillSlot,
     },
-    input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position},
+    input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position, RematCost},
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
     union_find::UnionFind,
@@ -281,7 +281,22 @@ pub struct ValData {
     /// machine really defines by `TestInput::fixup`.
     reg_class: u8,
     def: ValDef,
+
+    /// An index into [`REMAT_COSTS`].
+    remat: u8,
 }
+
+/// The rematerialization costs that a `TestFunction`'s values may take, indexed
+/// by `ValData::remat`.
+///
+/// `None` comes first so that a default, unmutated value is not
+/// rematerializable, which is the common case in a real function.
+const REMAT_COSTS: [Option<RematCost>; 4] = [
+    None,
+    Some(RematCost::AlwaysRemat),
+    Some(RematCost::CheaperThanMove),
+    Some(RematCost::CheaperThanReload),
+];
 
 /// Where a value is defined.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Mutate)]
@@ -498,6 +513,7 @@ impl TestFunction {
                             inst: Inst::try_new(0).unwrap(),
                             i: 0,
                         },
+                        remat: 0,
                     },
                 )
                 .unwrap();
@@ -747,7 +763,17 @@ impl TestFunction {
         let mut fresh_val = |values: &mut PrimaryMap<Val, ValData>, old: Val, def: ValDef| -> Val {
             let old = Val::try_new(old.index() % num_old_values).unwrap();
             let reg_class = old_values[old].reg_class;
-            values.push(output, ValData { reg_class, def }).unwrap()
+            let remat = old_values[old].remat;
+            values
+                .push(
+                    output,
+                    ValData {
+                        reg_class,
+                        def,
+                        remat,
+                    },
+                )
+                .unwrap()
         };
 
         let Self {
@@ -995,8 +1021,9 @@ impl<'a> InputValue<'a> for TestValue<'a> {
         self.val
     }
 
-    fn remat_cost(&self) -> Option<crate::RematCost> {
-        None
+    fn remat_cost(&self) -> Option<RematCost> {
+        let index = self.func.values[self.val].remat;
+        REMAT_COSTS[usize::from(index) % REMAT_COSTS.len()]
     }
 
     fn reg_class(&self) -> RegClass {
@@ -1690,6 +1717,7 @@ impl TestInput {
                 ValData {
                     reg_class: TestMachine::BOTH_REGS_CLASS,
                     def: ValDef::InstResult { inst: def, i: 0 },
+                    remat: 0,
                 },
             )
             .unwrap();
@@ -1754,6 +1782,117 @@ impl TestInput {
         input
     }
 
+    /// A single-block input with one instruction that ties a def to a use: the
+    /// def carries a `Reuse` naming the use operand, whose own constraint is
+    /// `use_constraint`.
+    ///
+    /// This is the smallest function with a tied operand, which is the case
+    /// that the spill weight model prices differently from every other use.
+    pub fn with_reuse_def(use_constraint: OperandConstraint) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let tied = Val::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in 0..2 {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    Operand::new(Position::Early, DefUse::Use, use_constraint, defined),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        tied,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // `ensure_terminators` rewrites a block's last instruction, so give
+            // it one of its own rather than letting it take the tied one.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// Report `frequency` for every block in this function.
+    ///
+    /// `frequency` must be one of [`BLOCK_FREQUENCIES`], which is every value a
+    /// `TestFunction` can report.
+    pub fn set_block_frequencies(&mut self, frequency: BlockFrequency) {
+        let index = BLOCK_FREQUENCIES
+            .iter()
+            .position(|f| *f == frequency)
+            .expect("not a frequency a `TestFunction` can report");
+        let index = u8::try_from(index).unwrap();
+        for (_block, block_data) in self.func.blocks.iter_mut() {
+            block_data.frequency = index;
+        }
+    }
+
+    /// Report `remat` for every value in this function.
+    pub fn set_remat_costs(&mut self, remat: Option<RematCost>) {
+        let index = REMAT_COSTS
+            .iter()
+            .position(|r| *r == remat)
+            .expect("not a remat cost a `TestFunction` can report");
+        let index = u8::try_from(index).unwrap();
+        for (_val, val_data) in self.func.values.iter_mut() {
+            val_data.remat = index;
+        }
+    }
+
     /// A two-block input that passes one value along an edge as a block
     /// argument, with a use of the argument constrained by `arg` and a use of
     /// the parameter it feeds constrained by `param`.
@@ -1786,6 +1925,7 @@ impl TestInput {
                     ValData {
                         reg_class: TestMachine::BOTH_REGS_CLASS,
                         def,
+                        remat: 0,
                     },
                 )
                 .unwrap();
@@ -2410,6 +2550,7 @@ mod tests {
                             inst: inst(i),
                             i: 0,
                         },
+                        remat: 0,
                     },
                 )
                 .unwrap();

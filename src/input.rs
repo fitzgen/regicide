@@ -463,7 +463,7 @@ impl BlockFrequency {
         Self(PackedBlockFrequency::new(frequency))
     }
 
-    #[allow(dead_code, reason = "will probably need it")]
+    /// This frequency's value.
     pub(crate) const fn as_f32(self) -> f32 {
         self.0.as_f32()
     }

@@ -806,9 +806,7 @@ where
                 let next_span = &coalescing.next_span;
                 let members = core::iter::successors(head, |&s| next_span[s]);
 
-                // Minimality and spill weights are computed later, once
-                // bundles are being allocated and split.
-                live_ranges.push_bundle(output, region, constraint, false, 0.0, members)?;
+                live_ranges.push_bundle(output, region, constraint, members)?;
             }
         }
 
@@ -872,7 +870,9 @@ mod tests {
     use crate::RegClass;
     use crate::context::Context;
     use crate::entity::Inst;
-    use crate::live_ranges::LiveBundle;
+    use crate::live_ranges::{
+        LiveBundle, is_minimal_bundle, normalize_spill_weight, round_bundle_spill_weight,
+    };
     use crate::test::{TestFunction, TestInput};
     use mutatis::check::{Check, CheckResult};
     use std::{
@@ -1338,7 +1338,68 @@ mod tests {
                     }
                 }
 
-                // 11. Everything the pass touched resets cleanly.
+                // 11. A bundle's weight, its fixed-use flag, and its
+                // minimality are exactly what its spans say they are: the flag
+                // is the OR of theirs, the weight is their uses' weights over
+                // their length, normalized, and the minimality is the floor
+                // applied to their summed length. Recomputing the weight from
+                // the *packed* per-use weights and rounding the result the way
+                // the bundle does makes that one an equality rather than an
+                // approximation.
+                for bundle in live_ranges.bundles() {
+                    let mut expected_fixed = false;
+                    let mut total_cost = 0.0;
+                    let mut num_insts = 0;
+                    for span in bundle.spans(live_ranges) {
+                        expected_fixed |= span.has_fixed_use(live_ranges);
+                        total_cost += span
+                            .uses(live_ranges)
+                            .into_iter()
+                            .map(|u| u.weight(live_ranges).as_f32())
+                            .sum::<f32>();
+                        num_insts += span.len_insts(live_ranges);
+                    }
+
+                    if bundle.has_fixed_uses(live_ranges) != expected_fixed {
+                        return Err(format!(
+                            "{bundle:?} reports has_fixed_uses = {}, but {} of its spans has a \
+                             fixed use",
+                            bundle.has_fixed_uses(live_ranges),
+                            if expected_fixed { "one" } else { "none" },
+                        ));
+                    }
+
+                    let expected =
+                        round_bundle_spill_weight(normalize_spill_weight(total_cost, num_insts));
+                    let actual = bundle.spill_weight(live_ranges);
+                    if actual != expected {
+                        return Err(format!(
+                            "{bundle:?} weighs {actual}, but its {num_insts} instructions and \
+                             {total_cost} of use cost come to {expected}",
+                        ));
+                    }
+                    if !actual.is_finite() || actual < 0.0 {
+                        return Err(format!("{bundle:?} weighs {actual}, which is not a weight"));
+                    }
+
+                    let expected_minimal = is_minimal_bundle(num_insts);
+                    if bundle.is_minimal(live_ranges) != expected_minimal {
+                        return Err(format!(
+                            "{bundle:?} reports is_minimal = {}, but it covers {num_insts} \
+                             instructions",
+                            bundle.is_minimal(live_ranges),
+                        ));
+                    }
+                    if expected_minimal && bundle.spans(live_ranges).len() != 1 {
+                        return Err(format!(
+                            "{bundle:?} is minimal but holds {} spans, which could be split \
+                             into one bundle each",
+                            bundle.spans(live_ranges).len(),
+                        ));
+                    }
+                }
+
+                // 12. Everything the pass touched resets cleanly.
                 context.reset();
                 if !context.is_reset() {
                     return Err("`Context::is_reset` is false after `reset`".to_string());
@@ -1397,6 +1458,89 @@ mod tests {
             arg.bundle(live_ranges),
             param.bundle(live_ranges),
             "`rc0` and `rc1` are disjoint, so these may not share a location",
+        );
+    }
+
+    /// The bundle for `val` in `block`, which these hand-built functions always
+    /// have.
+    fn only_bundle(live_ranges: &LiveRanges<u32>, block: usize, val: usize) -> LiveBundle<u32> {
+        only_span(live_ranges, block, val)
+            .bundle(live_ranges)
+            .expect("the span is in a bundle")
+    }
+
+    /// A value defined by one instruction and used by the next reaches across
+    /// the boundary between them, and a move can go there, so its bundle is not
+    /// minimal: the splitter still has work it can do.
+    #[test]
+    fn a_bundle_reaching_between_two_instructions_is_not_minimal() {
+        let input = TestInput::with_use_constraints(&[OperandConstraint::Any]);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let span = only_span(live_ranges, 0, 0);
+        assert_eq!(
+            span.len_insts(live_ranges),
+            2,
+            "the def and the use are on different instructions",
+        );
+        assert!(!only_bundle(live_ranges, 0, 0).is_minimal(live_ranges));
+    }
+
+    /// A bundle of several spans covers all of them.
+    #[test]
+    fn a_bundle_of_several_spans_is_not_minimal() {
+        let input =
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Any);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let arg = only_span(live_ranges, 0, 0);
+        let param = only_span(live_ranges, 1, 1);
+        let bundle = arg.bundle(live_ranges).expect("the span is in a bundle");
+        assert_eq!(
+            param.bundle(live_ranges),
+            Some(bundle),
+            "coalescing puts the argument and the parameter in one bundle",
+        );
+        assert_eq!(
+            param.len_insts(live_ranges),
+            1,
+            "the parameter's span sits inside the one instruction that defines it",
+        );
+        assert!(
+            !bundle.is_minimal(live_ranges),
+            "a bundle holding more than one span always has a bundle-per-span split left",
+        );
+    }
+
+    /// Splitting a span whose uses conflict leaves pieces of different sizes,
+    /// and each is judged on its own.
+    #[test]
+    fn a_conflict_split_leaves_one_minimal_piece_and_one_that_is_not() {
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+        let (first, second) = (spans[0], spans[1]);
+
+        // The def through the second use, cut just before the conflict: two
+        // instructions, and a boundary between them to cut at.
+        assert_eq!(first.len_insts(live_ranges), 2);
+        let first_bundle = first.bundle(live_ranges).expect("the span is in a bundle");
+        assert!(!first_bundle.is_minimal(live_ranges));
+
+        // The tail, holding only the conflicting use.
+        assert_eq!(second.len_insts(live_ranges), 1);
+        let second_bundle = second.bundle(live_ranges).expect("the span is in a bundle");
+        assert!(second_bundle.is_minimal(live_ranges));
+
+        assert_ne!(
+            first_bundle, second_bundle,
+            "`rc0` and `rc1` are disjoint, so the pieces cannot share a bundle",
         );
     }
 }

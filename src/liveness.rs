@@ -66,7 +66,7 @@ use crate::{
     },
     error::IResult,
     input::{DefUse, InputBlock, InputFunction, InputInst as _, Position},
-    live_ranges::{LivePoint, SpillWeight, Use, UseData},
+    live_ranges::{LivePoint, Use, UseData},
     output::OutputInner,
     timing::Timing,
 };
@@ -397,7 +397,7 @@ where
             &func.block(block.with_repr32()),
             output,
             |output, point, i, kind, val| {
-                let use_data = UseData::new(point, i, SpillWeight::new(0.0));
+                let use_data = UseData::new(point, i);
                 match kind {
                     DefUse::Def if live.remove(arena, &val) => {
                         // The value is live after this instruction, so its span
