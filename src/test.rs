@@ -1868,7 +1868,7 @@ impl TestInput {
 
     /// Report `frequency` for every block in this function.
     ///
-    /// `frequency` must be one of [`BLOCK_FREQUENCIES`], which is every value a
+    /// `frequency` must be one of `BLOCK_FREQUENCIES`, which is every value a
     /// `TestFunction` can report.
     pub fn set_block_frequencies(&mut self, frequency: BlockFrequency) {
         let index = BLOCK_FREQUENCIES
@@ -1879,6 +1879,17 @@ impl TestInput {
         for (_block, block_data) in self.func.blocks.iter_mut() {
             block_data.frequency = index;
         }
+    }
+
+    /// Report `frequency` for `block`, leaving every other block alone.
+    ///
+    /// `frequency` must be one of `BLOCK_FREQUENCIES`.
+    pub fn set_block_frequency(&mut self, block: Block, frequency: BlockFrequency) {
+        let index = BLOCK_FREQUENCIES
+            .iter()
+            .position(|f| *f == frequency)
+            .expect("not a frequency a `TestFunction` can report");
+        self.func.blocks[block].frequency = u8::try_from(index).unwrap();
     }
 
     /// Report `remat` for every value in this function.

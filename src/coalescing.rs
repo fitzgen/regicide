@@ -16,14 +16,21 @@
 //! and no consideration as to whether the merge increases the bundle's degree
 //! in the (logical, never materialized) interference graph.
 //!
-//! Three things prevent merging:
+//! Four things prevent merging:
 //!
 //! 1. Two spans in different regions may never share a bundle, because a bundle
 //!    is allocated within one region.
+//!
 //! 2. Two spans whose uses want disjoint locations never merge, because a
 //!    bundle has one location.
-//! 3. And two spans that overlap may not merge, because one location cannot
-//!    hold two different values at the same time.
+//!
+//! 3. Two spans that overlap may not merge, because one location cannot hold
+//!    two different values at the same time.
+//!
+//! 4. And two spans joined by an affinity across a control-flow edge with a
+//!    cold block on either end never merge, because the move merging would
+//!    remove hardly ever executes, while the merged bundle would be bigger and
+//!    more constrained everywhere else, including on hot paths.
 //!
 //! Being aggressive makes the result order-dependent (i.e. non-associative):
 //! performing one merge can be what makes a later one illegal. For example,
@@ -32,7 +39,10 @@
 //! bundles `ab` and `c` or bundles `a` and `bc` depending on our merge
 //! order. Therefore, we sort blocks such that hot blocks are visited first, so
 //! that when two merges conflict we take the one that will execute most often
-//! (placing the conflict's implied move into the block that is colder).
+//! (placing the conflict's implied move into the block that is colder). Rule 4
+//! above is the same instinct taken to its conclusion: where that ordering
+//! picks which of two moves to keep, rule 4 declines to spend anything at all
+//! on a move that nobody pays for.
 //!
 //! Bundles don't cross regions because we want to get the best allocation we
 //! can within a region (i.e. within a loop) and we don't want interference from
@@ -504,9 +514,12 @@ where
         }
 
         let block_data = input.func.block(block.with_repr32());
+        let block_is_cold = block_data.frequency().is_cold();
         for (i, succ) in block_data.successors().enumerate() {
             let succ_repr = output.with_repr(succ)?;
             let is_same_region = succ_repr.region(&region_tree) == region;
+            let succ_data = input.func.block(succ);
+            let edge_is_cold = block_is_cold || succ_data.frequency().is_cold();
 
             // Build a map from the successor's live-in values to their initial
             // spans in the successor.
@@ -543,12 +556,11 @@ where
                     // This span's value is not live-out of this block; ignore it.
                     continue;
                 };
-                self.coalesce_affinity(live_ranges, input, is_same_region, out, span);
+                self.coalesce_affinity(live_ranges, input, is_same_region, edge_is_cold, out, span);
             }
 
             // Create affinities between block-call arguments in this block and
             // their associated block parameters in the successor block.
-            let succ_data = input.func.block(succ);
             for (arg, param) in block_data.successor_block_args(i).zip(succ_data.params()) {
                 debug_assert_eq!(
                     input.func.value(arg).reg_class(),
@@ -561,7 +573,14 @@ where
                 else {
                     continue;
                 };
-                self.coalesce_affinity(live_ranges, input, is_same_region, arg_span, param_span);
+                self.coalesce_affinity(
+                    live_ranges,
+                    input,
+                    is_same_region,
+                    edge_is_cold,
+                    arg_span,
+                    param_span,
+                );
             }
 
             self.val_entry_span.reset();
@@ -571,21 +590,22 @@ where
         Ok(())
     }
 
-    /// Given that `a` and `b` share an affinity: try merging them if they are in
-    /// the same region, or otherwise remember the cross-region affinity for
-    /// hinting.
+    /// Given that `a` and `b` share an affinity across a control-flow edge: try
+    /// merging them if they are in the same region and the edge is not cold, or
+    /// otherwise remember the cross-region affinity for hinting.
     fn coalesce_affinity(
         &mut self,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
         is_same_region: bool,
+        edge_is_cold: bool,
         a: LiveSpan<E>,
         b: LiveSpan<E>,
     ) {
-        if is_same_region {
-            self.try_merge(input.machine, live_ranges, a, b);
-        } else {
+        if !is_same_region {
             self.cross_region_affinities.push((a, b));
+        } else if !edge_is_cold {
+            self.try_merge(input.machine, live_ranges, a, b);
         }
     }
 
@@ -870,6 +890,7 @@ mod tests {
     use crate::RegClass;
     use crate::context::Context;
     use crate::entity::Inst;
+    use crate::input::BlockFrequency;
     use crate::live_ranges::{
         LiveBundle, is_minimal_bundle, normalize_spill_weight, round_bundle_spill_weight,
     };
@@ -991,15 +1012,17 @@ mod tests {
     }
 
     /// Every pair of spans that coalescing should have tried to merge, derived
-    /// from the function rather than from anything the pass recorded.
+    /// from the function rather than from anything the pass recorded, as well
+    /// as whether coalescing was allowed to take the affinity.
     fn all_affinities(
         live_ranges: &LiveRanges<u32>,
         func: &TestFunction,
-    ) -> Vec<(LiveSpan, LiveSpan)> {
+    ) -> Vec<(LiveSpan, LiveSpan, bool)> {
         let mut affinities = Vec::new();
 
         for (block, input_block) in func.blocks() {
-            // A def that must reuse one of its own operands' registers.
+            // A def that must reuse one of its own operands' registers. Within
+            // one instruction, so no edge and no frequency to consider.
             for (inst, input_inst) in input_block.insts() {
                 for j in 0..input_inst.operands_len() {
                     let OperandConstraint::Reuse(i) = input_inst.operand(j).constraint() else {
@@ -1009,27 +1032,29 @@ mod tests {
                         operand_span(live_ranges, block, inst, j),
                         operand_span(live_ranges, block, inst, i),
                     ) {
-                        affinities.push((a, b));
+                        affinities.push((a, b, true));
                     }
                 }
             }
 
+            let block_is_cold = input_block.frequency().is_cold();
             let out = exit_spans(live_ranges, func, block);
             for (i, succ) in input_block.successors().enumerate() {
                 let in_ = entry_spans(live_ranges, func, succ);
+                let succ_block = func.block(succ);
+                let mergeable = !(block_is_cold || succ_block.frequency().is_cold());
 
                 // The same value live on both sides of the edge.
                 for (val, &entry) in in_.iter() {
                     if let Some(&exit) = out.get(val) {
-                        affinities.push((exit, entry));
+                        affinities.push((exit, entry, mergeable));
                     }
                 }
 
                 // A block argument and the parameter it feeds.
-                let succ_block = func.block(succ);
                 for (arg, param) in input_block.successor_block_args(i).zip(succ_block.params()) {
                     if let (Some(&exit), Some(&entry)) = (out.get(&arg), in_.get(&param)) {
-                        affinities.push((exit, entry));
+                        affinities.push((exit, entry, mergeable));
                     }
                 }
             }
@@ -1194,19 +1219,22 @@ mod tests {
                     ));
                 }
 
-                // 7. Coalescing did its job: for every affinity, either the
-                // two spans share a bundle or there is a reason they cannot.
-                // Aggressive coalescing is order-dependent, so "an earlier
-                // merge made this one illegal" is one of those reasons -- but it
-                // is only legitimate if it still shows up as a conflict now,
-                // since bundles only ever grow.
+                // 7. Coalescing did its job: for every affinity it was allowed
+                // to take, either the two spans share a bundle or there is a
+                // reason they cannot. Aggressive coalescing is order-dependent,
+                // so "an earlier merge made this one illegal" is one of those
+                // reasons -- but it is only legitimate if it still shows up as a
+                // conflict now, since bundles only ever grow.
                 test_input.with_input(|input| -> Result<(), String> {
-                    for (a, b) in all_affinities(live_ranges, func) {
+                    for (a, b, mergeable) in all_affinities(live_ranges, func) {
                         let (Some(ba), Some(bb)) = (a.bundle(live_ranges), b.bundle(live_ranges))
                         else {
                             return Err("an affinity's span has no bundle".to_string());
                         };
                         if ba == bb {
+                            continue;
+                        }
+                        if !mergeable {
                             continue;
                         }
                         if ba.region(live_ranges) != bb.region(live_ranges) {
@@ -1241,7 +1269,7 @@ mod tests {
                 let cross_region: Vec<(LiveBundle, LiveBundle)> = test_input.with_input(|input| {
                     all_affinities(live_ranges, func)
                         .into_iter()
-                        .filter_map(|(a, b)| {
+                        .filter_map(|(a, b, _)| {
                             let (ba, bb) = (
                                 a.bundle(live_ranges).unwrap(),
                                 b.bundle(live_ranges).unwrap(),
@@ -1458,6 +1486,67 @@ mod tests {
             arg.bundle(live_ranges),
             param.bundle(live_ranges),
             "`rc0` and `rc1` are disjoint, so these may not share a location",
+        );
+    }
+
+    /// ... and not when the edge the argument travels along is cold, however
+    /// happily the two ends would otherwise share a location: the move we would
+    /// be removing hardly ever runs.
+    #[test]
+    fn a_block_argument_is_not_coalesced_across_a_cold_edge() {
+        let mut input =
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Any);
+        input.set_block_frequencies(BlockFrequency::COLD);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let arg = only_span(live_ranges, 0, 0);
+        let param = only_span(live_ranges, 1, 1);
+        assert_ne!(
+            arg.bundle(live_ranges),
+            param.bundle(live_ranges),
+            "the edge is cold, so the argument and the parameter should not share a bundle",
+        );
+    }
+
+    /// One cold end is enough, whichever end it is.
+    #[test]
+    fn a_block_argument_is_not_coalesced_when_only_one_end_of_the_edge_is_cold() {
+        for cold in [0, 1] {
+            let mut input = TestInput::with_block_arg_constraints(
+                OperandConstraint::Any,
+                OperandConstraint::Any,
+            );
+            input.set_block_frequency(Block::try_new(cold).unwrap(), BlockFrequency::COLD);
+            let context = coalesce_input(&input).unwrap();
+            let live_ranges = &context.context32.live_ranges;
+
+            let arg = only_span(live_ranges, 0, 0);
+            let param = only_span(live_ranges, 1, 1);
+            assert_ne!(
+                arg.bundle(live_ranges),
+                param.bundle(live_ranges),
+                "block {cold} is cold, which makes the edge between them cold",
+            );
+        }
+    }
+
+    /// The cold rule is about edges, so it leaves a reuse affinity alone: that
+    /// one ties two operands of a single instruction, and a move between them
+    /// would run exactly as often as the instruction itself.
+    #[test]
+    fn a_reuse_operand_is_still_coalesced_inside_a_cold_block() {
+        let mut input = TestInput::with_reuse_def(OperandConstraint::Any);
+        input.set_block_frequencies(BlockFrequency::COLD);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+        assert_eq!(
+            spans[0].bundle(live_ranges),
+            spans[1].bundle(live_ranges),
+            "the tied def and the operand it reuses should still share a bundle",
         );
     }
 

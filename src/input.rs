@@ -476,6 +476,13 @@ impl BlockFrequency {
 
     /// The canonical "hot" block frequency.
     pub const HOT: Self = BlockFrequency::new(100.0);
+
+    /// Is this frequency at or below the canonical [`BlockFrequency::COLD`]?
+    pub const fn is_cold(self) -> bool {
+        // The packed bits compare in the same order as the values they encode,
+        // and trait comparison is not available in a `const fn`.
+        self.0.bits() <= Self::COLD.0.bits()
+    }
 }
 
 /// A block in an [`InputFunction`].
@@ -903,6 +910,20 @@ mod tests {
         assert_eq!(BlockFrequency::HOT.as_f32(), 100.0);
 
         assert_eq!(BlockFrequency::default(), BlockFrequency::NORMAL);
+    }
+
+    #[test]
+    fn cold_is_every_frequency_at_or_below_cold() {
+        assert!(BlockFrequency::COLD.is_cold());
+
+        // An embedder is free to report a frequency below `COLD`, and it means
+        // the same thing.
+        assert!(BlockFrequency::new(0.0).is_cold());
+        assert!(BlockFrequency::new(f32::EPSILON / 2.0).is_cold());
+
+        assert!(!BlockFrequency::NORMAL.is_cold());
+        assert!(!BlockFrequency::HOT.is_cold());
+        assert!(!BlockFrequency::default().is_cold());
     }
 
     fn every_operand<E>() -> impl Iterator<Item = Operand<E>>
