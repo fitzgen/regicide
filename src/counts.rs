@@ -72,7 +72,8 @@ pub struct Counts {
     pub preferred_assignments: Count,
     pub non_preferred_assignments: Count,
     pub evictions: Count,
-    pub split_once: Count,
+    pub split_between_spans: Count,
+    pub split_between_spans_failed: Count,
     pub split_at_blocks: Count,
     pub split_into_minimal_or_spill: Count,
     pub final_live_spans: Count,
@@ -93,7 +94,8 @@ impl Counts {
             preferred_assignments: Count::new(),
             non_preferred_assignments: Count::new(),
             evictions: Count::new(),
-            split_once: Count::new(),
+            split_between_spans: Count::new(),
+            split_between_spans_failed: Count::new(),
             split_at_blocks: Count::new(),
             split_into_minimal_or_spill: Count::new(),
             final_live_spans: Count::new(),
@@ -118,7 +120,8 @@ impl Counts {
             preferred_assignments,
             non_preferred_assignments,
             evictions,
-            split_once,
+            split_between_spans,
+            split_between_spans_failed,
             split_at_blocks,
             split_into_minimal_or_spill,
             final_live_spans,
@@ -135,7 +138,8 @@ impl Counts {
             && preferred_assignments.is_reset()
             && non_preferred_assignments.is_reset()
             && evictions.is_reset()
-            && split_once.is_reset()
+            && split_between_spans.is_reset()
+            && split_between_spans_failed.is_reset()
             && split_at_blocks.is_reset()
             && split_into_minimal_or_spill.is_reset()
             && final_live_spans.is_reset()

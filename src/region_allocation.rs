@@ -4,25 +4,29 @@
 //! region.
 
 mod assignments;
+mod splitting;
 
 use crate::{
-    Entity, Input, InputFunction, InputValue, OperandConstraint, RegClass,
+    Entity, Input, InputFunction, InputValue, OperandConstraint, RegClass, RegSet,
     context::ContextInner,
     counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
     error::IResult,
-    live_ranges::{LiveBundle, LiveRanges, LiveSpan, SpillWeight},
+    live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
     machine::RegClassMembers,
+    output::OutputInner,
     region_tree::RegionTree,
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
 use assignments::Assignments;
-use core::{fmt, marker::PhantomData};
+use core::{fmt, marker::PhantomData, ops::Range};
+use splitting::SplitUse;
 
 pub fn region_allocate<E>(
     context: &mut ContextInner<E>,
     input: &Input<'_, impl InputFunction>,
+    output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -40,13 +44,18 @@ where
     let mut region_pre_order = core::mem::take(&mut region_allocation.region_pre_order);
     find_region_pre_order(&mut region_pre_order, region_tree);
 
-    for region in region_pre_order.iter().copied().rev() {
-        region_allocation.allocate_region(input, live_ranges, counts, region);
-    }
+    let result = (|| {
+        for region in region_pre_order.iter().copied().rev() {
+            region_allocation.allocate_region(input, live_ranges, counts, output, region)?;
+        }
+        Ok(())
+    })();
 
     region_pre_order.clear();
     debug_assert!(region_allocation.region_pre_order.is_empty());
     region_allocation.region_pre_order = region_pre_order;
+
+    result?;
 
     counts.final_live_spans += live_ranges.len_spans();
     counts.final_bundles += live_ranges.len_bundles();
@@ -87,6 +96,18 @@ where
     /// We just remember the set for now, and actually allocate the stack slots
     /// in later passes.
     stack_bundles: Vec<LiveBundle<E>>,
+
+    /// Scratch space holding the spans of the bundle being split, flattened for
+    /// [`splitting::best_split_point`], which knows nothing about `LiveRanges`.
+    split_spans: Vec<Range<LivePoint<E>>>,
+
+    /// Scratch space holding the uses of the bundle being split, likewise.
+    split_uses: Vec<SplitUse<E>>,
+
+    /// Scratch space for deduplicating the bundles in the way of a half, which
+    /// [`Assignments::interference_weight`] borrows for the duration of a call
+    /// and hands back empty.
+    interference_scratch: Vec<LiveBundle<E>>,
 }
 
 impl<E> RegionAllocation<E>
@@ -101,6 +122,9 @@ where
             bundle_priority: SecondaryMap::new(Priority::ZERO),
             region_pre_order: Vec::new(),
             stack_bundles: Vec::new(),
+            split_spans: Vec::new(),
+            split_uses: Vec::new(),
+            interference_scratch: Vec::new(),
         }
     }
 
@@ -112,6 +136,9 @@ where
             bundle_priority,
             region_pre_order,
             stack_bundles,
+            split_spans,
+            split_uses,
+            interference_scratch,
         } = self;
         assignments.reset();
         region_assignments.reset();
@@ -119,6 +146,9 @@ where
         bundle_priority.reset();
         region_pre_order.clear();
         stack_bundles.clear();
+        split_spans.clear();
+        split_uses.clear();
+        interference_scratch.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -129,6 +159,9 @@ where
             bundle_priority,
             region_pre_order,
             stack_bundles,
+            split_spans,
+            split_uses,
+            interference_scratch,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
@@ -136,6 +169,9 @@ where
             && bundle_priority.is_reset()
             && region_pre_order.is_empty()
             && stack_bundles.is_empty()
+            && split_spans.is_empty()
+            && split_uses.is_empty()
+            && interference_scratch.is_empty()
     }
 
     fn allocate_region(
@@ -143,8 +179,9 @@ where
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
+        output: &mut OutputInner<E>,
         region: Region<E>,
-    ) {
+    ) -> IResult<()> {
         debug_assert!(self.queue.is_empty());
 
         // Insert each bundle in this region into the queue.
@@ -179,22 +216,25 @@ where
                 continue;
             }
 
-            if phase <= Phase::SplitOnce {
-                self.split_once(entry);
-                counts.split_once.inc();
+            if phase <= Phase::SplitBetweenSpans
+                && self.split_between_spans(input, live_ranges, counts, output, entry)?
+            {
+                counts.split_between_spans.inc();
                 continue;
             }
 
             if phase <= Phase::SplitAtBlocks {
-                self.split_at_blocks(entry);
+                self.split_at_blocks(input, live_ranges, counts, output, entry)?;
                 counts.split_at_blocks.inc();
                 continue;
             }
 
             debug_assert_eq!(phase, Phase::SplitIntoMinimalOrSpill);
-            self.split_into_minimal_or_spill(entry);
+            self.split_into_minimal_or_spill(input, live_ranges, counts, output, entry)?;
             counts.split_into_minimal_or_spill.inc();
         }
+
+        Ok(())
     }
 
     fn push_bundle(
@@ -405,21 +445,153 @@ where
         }
     }
 
-    fn split_once(&mut self, entry: PqEntry<E>) {
+    /// Split `entry`'s bundle in two, between spans.
+    ///
+    /// Returns whether the bundle was successfully cut: returns `false` when
+    /// the bundle was not cut and the entry is left unqueued (so it can
+    /// fallthrough to the next phase); returns `true` when the bundle was cut
+    /// and its halves requeued for processing.
+    fn split_between_spans(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &mut LiveRanges<E>,
+        counts: &mut Counts,
+        output: &mut OutputInner<E>,
+        entry: PqEntry<E>,
+    ) -> IResult<bool> {
         let bundle = entry.bundle();
-        let _ = bundle;
+
+        debug_assert!(self.split_spans.is_empty());
+        debug_assert!(self.split_uses.is_empty());
+
+        // Can't split between fewer than two spans.
+        if bundle.spans(live_ranges).len() < 2 {
+            counts.split_between_spans_failed.inc();
+            return Ok(false);
+        }
+
+        self.split_spans.extend(
+            bundle
+                .spans(live_ranges)
+                .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+        );
+
+        self.split_uses
+            .extend(bundle.spans(live_ranges).flat_map(|span| {
+                span.uses(live_ranges).into_iter().map(|u| SplitUse {
+                    point: u.point(live_ranges),
+                    weight: u.weight(live_ranges).as_f32(),
+                })
+            }));
+
+        let pref = bundle.preference(live_ranges).clone();
+
+        let rc = match bundle.constraint(live_ranges) {
+            OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
+            OperandConstraint::Reg(rc) => rc,
+            OperandConstraint::Stack => unreachable!("already handled"),
+            OperandConstraint::Reuse(_) => unreachable!("already resolved"),
+        };
+
+        let choice = {
+            let RegionAllocation {
+                region_assignments,
+                split_spans,
+                split_uses,
+                interference_scratch,
+                ..
+            } = self;
+
+            match rc.members(input.machine) {
+                RegClassMembers::Regs(regs) => splitting::best_split_point(
+                    split_spans,
+                    split_uses,
+                    pref.iter()
+                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                    |reg, half| {
+                        region_assignments.interference_weight(
+                            core::iter::once(reg.units(input.machine)),
+                            half.iter().cloned(),
+                            interference_scratch,
+                            |victim| victim.spill_weight(live_ranges),
+                        )
+                    },
+                )
+                .map(|choice| (choice.index, Some(choice.candidate))),
+
+                RegClassMembers::Groups(groups) => {
+                    debug_assert!(pref.is_empty());
+                    splitting::best_split_point(
+                        split_spans,
+                        split_uses,
+                        groups.iter().copied(),
+                        |group, half| {
+                            region_assignments.interference_weight(
+                                group
+                                    .members(input.machine)
+                                    .iter()
+                                    .map(|r| r.units(input.machine)),
+                                half.iter().cloned(),
+                                interference_scratch,
+                                |victim| victim.spill_weight(live_ranges),
+                            )
+                        },
+                    )
+                    .map(|choice| (choice.index, None))
+                }
+            }
+        };
+
+        self.split_spans.clear();
+        self.split_uses.clear();
+
+        let (index, winner) = match choice {
+            Some(choice) => choice,
+            None => {
+                counts.split_between_spans_failed.inc();
+                return Ok(false);
+            }
+        };
+
+        let suffix = bundle.split_at_span(live_ranges, input, output, index)?;
+
+        if let Some(reg) = winner {
+            let mut winning_reg = RegSet::new();
+            winning_reg.insert(reg);
+
+            suffix.add_hint(live_ranges, &winning_reg);
+            suffix.add_hint(live_ranges, &pref);
+
+            bundle.add_hint(live_ranges, &winning_reg);
+            // Note: `bundle` already has a hint of `pref`.
+        }
+
+        self.push_bundle(input, live_ranges, bundle, Phase::default());
+        self.push_bundle(input, live_ranges, suffix, Phase::default());
+        Ok(true)
+    }
+
+    fn split_at_blocks(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &mut LiveRanges<E>,
+        counts: &mut Counts,
+        output: &mut OutputInner<E>,
+        entry: PqEntry<E>,
+    ) -> IResult<()> {
+        let _ = (input, live_ranges, counts, output, entry.bundle());
         todo!()
     }
 
-    fn split_at_blocks(&mut self, entry: PqEntry<E>) {
-        let bundle = entry.bundle();
-        let _ = bundle;
-        todo!()
-    }
-
-    fn split_into_minimal_or_spill(&mut self, entry: PqEntry<E>) {
-        let bundle = entry.bundle();
-        let _ = bundle;
+    fn split_into_minimal_or_spill(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &mut LiveRanges<E>,
+        counts: &mut Counts,
+        output: &mut OutputInner<E>,
+        entry: PqEntry<E>,
+    ) -> IResult<()> {
+        let _ = (input, live_ranges, counts, output, entry.bundle());
         todo!()
     }
 }
@@ -516,10 +688,12 @@ pub enum Phase {
 
     /// The first split attempt.
     ///
-    /// Split the bundle to resolve a conflict and then try allocating each half
-    /// again. This optimistically keeps bundles as large as possible, while
-    /// resolving the conflict.
-    SplitOnce = 1,
+    /// Split a bundle in two at a span boundary, and then try allocating each
+    /// half again. This optimistically keeps bundles fairly large.
+    ///
+    /// A bundle with no spans to cut between falls through to the next phase
+    /// immediately.
+    SplitBetweenSpans = 1,
 
     /// The second split attempt.
     ///
@@ -542,7 +716,6 @@ pub enum Phase {
 
 impl Phase {
     /// Get the next phase after this one.
-    #[allow(dead_code, reason = "will use it soon")]
     fn next(self) -> Self {
         Self::from_raw((self as u8) + 1).unwrap()
     }
@@ -551,7 +724,7 @@ impl Phase {
     fn from_raw(raw: u8) -> Option<Self> {
         match raw {
             0 => Some(Self::AssignEvict),
-            1 => Some(Self::SplitOnce),
+            1 => Some(Self::SplitBetweenSpans),
             2 => Some(Self::SplitAtBlocks),
             3 => Some(Self::SplitIntoMinimalOrSpill),
             _ => None,
@@ -834,7 +1007,7 @@ mod tests {
     /// Every phase, in ascending order.
     const PHASES: [Phase; 4] = [
         Phase::AssignEvict,
-        Phase::SplitOnce,
+        Phase::SplitBetweenSpans,
         Phase::SplitAtBlocks,
         Phase::SplitIntoMinimalOrSpill,
     ];

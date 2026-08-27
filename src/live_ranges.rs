@@ -472,46 +472,6 @@ impl<E> LiveBundleData<E>
 where
     E: EntityRepr,
 {
-    /// Create a bundle of `spans`.
-    ///
-    /// `spans` must be non-empty and in ascending program order.
-    ///
-    /// `constraint` must already be resolved (i.e. not `Reuse`).
-    #[inline]
-    pub(crate) fn new(
-        spans: EntityRange<BundleSpansStorageIndex<E>>,
-        region: Region<E>,
-        constraint: OperandConstraint,
-        is_minimal: bool,
-        has_fixed_uses: bool,
-        spill_weight: f32,
-    ) -> Self {
-        debug_assert!(!spans.is_empty());
-        debug_assert!(
-            !matches!(constraint, OperandConstraint::Reuse(_)),
-            "a bundle's constraint must be resolved",
-        );
-
-        let mut weight_and_flags =
-            PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(spill_weight).bits();
-        debug_assert_eq!(weight_and_flags & !BUNDLE_SPILL_WEIGHT_MASK, 0);
-        if is_minimal {
-            weight_and_flags |= BUNDLE_MINIMAL;
-        }
-        if has_fixed_uses {
-            weight_and_flags |= BUNDLE_HAS_FIXED_USES;
-        }
-
-        LiveBundleData {
-            spans,
-            region,
-            constraint,
-            preference: RegSet::new(),
-            allocation: None,
-            weight_and_flags,
-        }
-    }
-
     /// Fold `hint` into this bundle's preference.
     fn add_hint(&mut self, hint: RegSet) {
         debug_assert!(!hint.is_empty());
@@ -704,44 +664,13 @@ where
         constraint: OperandConstraint,
         spans: impl Iterator<Item = LiveSpan<E>>,
     ) -> IResult<LiveBundle<E>> {
-        let bundle = self.bundles.next_key(output)?;
-
-        let mut has_fixed_uses = false;
-        let mut total_use_cost = 0.0;
-        let mut sum_len_insts = 0;
-
         let start = self.bundle_spans_storage.next_key(output)?;
         for span in spans {
-            debug_assert!(self.span_bundle[span].is_none());
-            self.span_bundle[span] = Some(bundle);
-
-            has_fixed_uses |= span.has_fixed_use(self);
-
-            total_use_cost += span
-                .uses(self)
-                .into_iter()
-                .map(|u| u.weight(self).as_f32())
-                .sum::<f32>();
-            sum_len_insts += span.len_insts(self);
-
             self.bundle_spans_storage.push(output, span)?;
         }
         let end = self.bundle_spans_storage.next_key(output)?;
-        debug_assert_ne!(start, end);
 
-        let pushed = self.bundles.push(
-            output,
-            LiveBundleData::new(
-                EntityRange { start, end },
-                region,
-                constraint,
-                is_minimal_bundle(sum_len_insts),
-                has_fixed_uses,
-                normalize_spill_weight(total_use_cost, sum_len_insts),
-            ),
-        )?;
-        debug_assert_eq!(pushed, bundle);
-        Ok(bundle)
+        LiveBundle::new(self, output, region, constraint, EntityRange { start, end })
     }
 
     /// Construct the live spans for `func`'s values.
@@ -1020,8 +949,80 @@ impl<E> LiveBundle<E>
 where
     E: EntityRepr,
 {
+    /// Create a new bundle.
+    ///
+    /// The spans must be non-empty, in ascending program order, and not already
+    /// associated with another bundle.
+    ///
+    /// `constraint` must already be resolved (i.e. not `Reuse`).
+    fn new(
+        live_ranges: &mut LiveRanges<E>,
+        output: &mut OutputInner<E>,
+        region: Region<E>,
+        constraint: OperandConstraint,
+        spans: EntityRange<BundleSpansStorageIndex<E>>,
+    ) -> IResult<Self> {
+        debug_assert!(!spans.is_empty());
+        debug_assert!(!matches!(constraint, OperandConstraint::Reuse(_)));
+
+        let bundle = live_ranges.bundles.next_key(output)?;
+
+        for index in spans {
+            let span = live_ranges.bundle_spans_storage[index];
+            debug_assert!(live_ranges.span_bundle[span].is_none());
+            live_ranges.span_bundle[span] = Some(bundle);
+        }
+
+        let pushed = live_ranges.bundles.push(
+            output,
+            LiveBundleData {
+                spans,
+                region,
+                constraint,
+                preference: RegSet::new(),
+                allocation: None,
+                weight_and_flags: 0,
+            },
+        )?;
+        debug_assert_eq!(pushed, bundle);
+
+        bundle.recompute_weight_and_flags(live_ranges);
+        Ok(bundle)
+    }
+
+    /// Recompute the cached `has_fixed_uses`, `is_minimal` and spill weight
+    /// from the spans this bundle currently holds.
+    fn recompute_weight_and_flags(self, live_ranges: &mut LiveRanges<E>) {
+        let mut has_fixed_uses = false;
+        let mut total_use_cost = 0.0;
+        let mut sum_len_insts = 0;
+
+        for span in self.spans(live_ranges) {
+            has_fixed_uses |= span.has_fixed_use(live_ranges);
+            total_use_cost += span
+                .uses(live_ranges)
+                .into_iter()
+                .map(|u| u.weight(live_ranges).as_f32())
+                .sum::<f32>();
+            sum_len_insts += span.len_insts(live_ranges);
+        }
+
+        let mut weight_and_flags = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(
+            normalize_spill_weight(total_use_cost, sum_len_insts),
+        )
+        .bits();
+        debug_assert_eq!(weight_and_flags & !BUNDLE_SPILL_WEIGHT_MASK, 0);
+        if is_minimal_bundle(sum_len_insts) {
+            weight_and_flags |= BUNDLE_MINIMAL;
+        }
+        if has_fixed_uses {
+            weight_and_flags |= BUNDLE_HAS_FIXED_USES;
+        }
+
+        live_ranges.bundles[self].weight_and_flags = weight_and_flags;
+    }
+
     /// Get the spans within this bundle, in ascending program order.
-    #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
     pub(crate) fn spans(
         self,
         live_ranges: &LiveRanges<E>,
@@ -1032,17 +1033,82 @@ where
             .map(move |i| live_ranges.bundle_spans_storage[i])
     }
 
-    /// Get the range of the shared span storage that holds this bundle's spans.
-    ///
-    /// This is an implementation detail of [`LiveBundle::spans`]; the tests use
-    /// it to check that the bundles' span lists tile that storage.
     #[inline]
-    #[allow(dead_code, reason = "read by the tests")]
+    #[cfg(test)]
     pub(crate) fn spans_storage(
         self,
         live_ranges: &LiveRanges<E>,
     ) -> EntityRange<BundleSpansStorageIndex<E>> {
         live_ranges.bundles[self].spans
+    }
+
+    /// Split this bundle in two between spans.
+    ///
+    /// This `LiveBundle` will retain `spans[..i]` and the return value is a new
+    /// `LiveBundle` that contains `spans[i..]`.
+    ///
+    /// ```text
+    ///                  bundle1
+    /// +----------------------------------------+
+    /// | span1      span2        span3          |
+    /// | [==========)            [============) |
+    /// |            [======)                    |
+    /// +----------------------------------------+
+    ///
+    ///                      |
+    ///                      |
+    ///                      |
+    ///                split_at_span(3)
+    ///                      |
+    ///                      |
+    ///                      V
+    ///
+    ///         bundle1                 bundle2
+    /// +---------------------+    +----------------+
+    /// | span1      span2    |    | span3          |
+    /// | [==========)        |    | [============) |
+    /// |            [======) |    |                |
+    /// +---------------------+    +----------------+
+    /// ```
+    ///
+    /// It must be the case that `1 <= i < spans.len()`, so that neither half is
+    /// left without any span.
+    pub(crate) fn split_at_span(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+        output: &mut OutputInner<E>,
+        i: usize,
+    ) -> IResult<LiveBundle<E>> {
+        let data = &live_ranges.bundles[self];
+        let (region, spans) = (data.region, data.spans);
+        debug_assert!(data.allocation.is_none());
+
+        let indices = spans.indices();
+        debug_assert!(1 <= i && i < indices.len());
+        let mid = BundleSpansStorageIndex::try_new(indices.start + i).unwrap();
+
+        let prefix = EntityRange {
+            start: spans.start,
+            end: mid,
+        };
+        let suffix = EntityRange {
+            start: mid,
+            end: spans.end,
+        };
+
+        live_ranges.bundles[self].spans = prefix;
+        self.recompute_weight_and_flags(live_ranges);
+        self.recompute_constraint(live_ranges, input);
+
+        for index in suffix {
+            let span = live_ranges.bundle_spans_storage[index];
+            debug_assert_eq!(live_ranges.span_bundle[span], Some(self));
+            live_ranges.span_bundle[span] = None;
+        }
+        let new = LiveBundle::new(live_ranges, output, region, OperandConstraint::Any, suffix)?;
+        new.recompute_constraint(live_ranges, input);
+        Ok(new)
     }
 
     /// The region that this bundle is within.
@@ -1065,7 +1131,6 @@ where
     ///
     /// Empty means no preference.
     #[inline]
-    #[allow(dead_code, reason = "read by the tests, and by allocation soon")]
     pub(crate) fn preference(self, live_ranges: &LiveRanges<E>) -> &RegSet {
         &live_ranges.bundles[self].preference
     }
@@ -1142,6 +1207,35 @@ where
 
         debug_assert!(!class.member_set(machine).is_empty());
         data.add_hint(class.member_set(machine).clone());
+    }
+
+    /// Bias this bundle towards `regs`.
+    pub(crate) fn add_hint(self, live_ranges: &mut LiveRanges<E>, regs: &RegSet) {
+        if regs.is_empty() {
+            return;
+        }
+        live_ranges.bundles[self].add_hint(regs.clone());
+    }
+
+    /// Recompute this bundle's constraint from the spans it currently holds.
+    fn recompute_constraint(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+    ) {
+        let mut constraint = OperandConstraint::Any;
+        for span in self.spans(live_ranges) {
+            let span_constraint = span.constraint(live_ranges, input);
+            constraint = constraint
+                .merge(
+                    &span_constraint,
+                    input.machine,
+                    |_| unreachable!("the accumulated constraint is always resolved"),
+                    |_| unreachable!("a span's constraint is already resolved"),
+                )
+                .expect("the spans of a bundle never conflict, so neither do any subset of them");
+        }
+        live_ranges.bundles[self].constraint = constraint;
     }
 }
 
@@ -1716,6 +1810,199 @@ mod tests {
         let test_input = TestInput::with_use_constraints(&[rc(0), rc(2)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         assert_eq!(live_ranges.spans().count(), 1);
+    }
+
+    /// Splitting a bundle rearranges who owns which slots of the shared span
+    /// storage without disturbing the tiling of it.
+    ///
+    /// Nothing else covers the arena side of splitting: the `splitting.rs`
+    /// kernel never sees a `LiveRanges`, and `coalescing_properties` stops
+    /// before region allocation ever runs. So this walks every admissible cut
+    /// of one multi-span bundle and checks that the halves partition the
+    /// parent exactly — no gap, no overlap, no orphaned slot — that both come
+    /// out with the summaries `push_bundle` would have given them, and that
+    /// both have had their constraints recomputed from the spans they kept.
+    #[test]
+    fn split_bundle_keeps_storage_tiled() {
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+
+        // Alternating conflicting classes, so that span construction cuts the
+        // one value into a span per use and there are several cuts to try.
+        let test_input = TestInput::with_use_constraints(&[rc(0), rc(1), rc(0), rc(1), rc(0)]);
+        let region = Region::try_new(0).unwrap();
+
+        let build = || -> (LiveRanges<u32>, Vec<LiveSpan>) {
+            let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+            let spans = live_ranges.spans().collect::<Vec<_>>();
+            (live_ranges, spans)
+        };
+
+        // A bundle's spans must never conflict with one another, and here every
+        // span conflicts with its neighbours, so the bundle we split takes every
+        // *other* span: one class throughout, with a hole between each pair.
+        // That is the shape `split_between_spans` is handed in practice anyway.
+        // The rest go into a second bundle, both so that every slot of the
+        // storage is owned and so that the tiling comes out *unsorted* after the
+        // split: the suffix half is the newest bundle in the arena, but its run
+        // sits before that second bundle's.
+        let evens = |spans: &[LiveSpan]| spans.iter().copied().step_by(2).collect::<Vec<_>>();
+        let odds =
+            |spans: &[LiveSpan]| spans.iter().copied().skip(1).step_by(2).collect::<Vec<_>>();
+
+        let (_, all_spans) = build();
+        let num_cut_spans = evens(&all_spans).len();
+        assert!(
+            num_cut_spans >= 3 && !odds(&all_spans).is_empty(),
+            "want several cuts to try and a bundle after them, got {num_cut_spans} of \
+             {} spans",
+            all_spans.len(),
+        );
+
+        for prefix_end in 1..num_cut_spans {
+            let (mut live_ranges, spans) = build();
+            let mut output = OutputInner::<u32>::new();
+            let (cut, rest) = (evens(&spans), odds(&spans));
+
+            let prefix = live_ranges
+                .push_bundle(
+                    &mut output,
+                    region,
+                    OperandConstraint::Any,
+                    cut.iter().copied(),
+                )
+                .unwrap();
+            let tail = live_ranges
+                .push_bundle(
+                    &mut output,
+                    region,
+                    OperandConstraint::Any,
+                    rest.iter().copied(),
+                )
+                .unwrap();
+            let parent_run = prefix.spans_storage(&live_ranges);
+
+            let suffix = test_input
+                .with_input(|input| {
+                    prefix.split_at_span(&mut live_ranges, input, &mut output, prefix_end)
+                })
+                .unwrap();
+
+            // The two runs are adjacent, and together they are exactly what the
+            // parent held.
+            let prefix_run = prefix.spans_storage(&live_ranges);
+            let suffix_run = suffix.spans_storage(&live_ranges);
+            assert_eq!(prefix_run.start, parent_run.start);
+            assert_eq!(prefix_run.end, suffix_run.start, "no gap and no overlap");
+            assert_eq!(suffix_run.end, parent_run.end);
+            assert_eq!(prefix_run.indices().len(), prefix_end);
+            assert_eq!(suffix_run.indices().len(), num_cut_spans - prefix_end);
+
+            // Each half holds the spans it should, in order, and each span
+            // names the half that holds it.
+            assert_eq!(
+                prefix.spans(&live_ranges).collect::<Vec<_>>(),
+                cut[..prefix_end]
+            );
+            assert_eq!(
+                suffix.spans(&live_ranges).collect::<Vec<_>>(),
+                cut[prefix_end..]
+            );
+            for (i, &span) in cut.iter().enumerate() {
+                let expected = if i < prefix_end { prefix } else { suffix };
+                assert_eq!(span.bundle(&live_ranges), Some(expected), "cut span {i}");
+            }
+            for (i, &span) in rest.iter().enumerate() {
+                assert_eq!(span.bundle(&live_ranges), Some(tail), "tail span {i}");
+            }
+
+            // Both halves' cached summaries are what `push_bundle` would have
+            // computed for the same span lists, and their constraints are what a
+            // from-scratch recompute over those same spans gives — both built
+            // from scratch elsewhere.
+            let (mut reference, ref_spans) = build();
+            let mut ref_output = OutputInner::<u32>::new();
+            let ref_cut = evens(&ref_spans);
+            let want_prefix = reference
+                .push_bundle(
+                    &mut ref_output,
+                    region,
+                    OperandConstraint::Any,
+                    ref_cut[..prefix_end].iter().copied(),
+                )
+                .unwrap();
+            let want_suffix = reference
+                .push_bundle(
+                    &mut ref_output,
+                    region,
+                    OperandConstraint::Any,
+                    ref_cut[prefix_end..].iter().copied(),
+                )
+                .unwrap();
+            test_input.with_input(|input| {
+                want_prefix.recompute_constraint(&mut reference, input);
+                want_suffix.recompute_constraint(&mut reference, input);
+            });
+
+            for (half, want) in [(prefix, want_prefix), (suffix, want_suffix)] {
+                assert_eq!(
+                    half.constraint(&live_ranges),
+                    want.constraint(&reference),
+                    "constraint of {half:?} after splitting at {prefix_end}",
+                );
+                assert_eq!(
+                    half.has_fixed_uses(&live_ranges),
+                    want.has_fixed_uses(&reference),
+                    "has_fixed_uses of {half:?} after splitting at {prefix_end}",
+                );
+                assert_eq!(
+                    half.spill_weight(&live_ranges),
+                    want.spill_weight(&reference),
+                    "spill_weight of {half:?} after splitting at {prefix_end}",
+                );
+                assert_eq!(
+                    half.is_minimal(&live_ranges),
+                    want.is_minimal(&reference),
+                    "is_minimal of {half:?} after splitting at {prefix_end}",
+                );
+            }
+
+            // And `coalescing.rs`'s invariant 5 still holds over the arena as a
+            // whole: the runs tile it, though no longer in bundle-index order,
+            // since the suffix is the newest bundle but sits in the middle.
+            check_bundle_runs_tile_storage(&live_ranges);
+            assert!(
+                suffix > tail && suffix_run.start < tail.spans_storage(&live_ranges).start,
+                "the suffix is the newest bundle but sits before the tail in storage, which is \
+                 the case the sorted walk exists for",
+            );
+        }
+    }
+
+    /// The bundles' span lists tile their shared storage, in storage order.
+    ///
+    /// This is `coalescing.rs`'s invariant 5, repeated here because the test
+    /// above is the only thing that runs it against a *split* arena.
+    fn check_bundle_runs_tile_storage(live_ranges: &LiveRanges<u32>) {
+        let mut runs = live_ranges
+            .bundles()
+            .map(|bundle| {
+                let spans = bundle.spans_storage(live_ranges);
+                assert!(!spans.is_empty(), "{bundle:?} holds no spans");
+                (spans.start.index(), spans.end.index(), bundle)
+            })
+            .collect::<Vec<_>>();
+        runs.sort_unstable();
+
+        let mut next = 0;
+        for (start, end, bundle) in runs {
+            assert_eq!(start, next, "{bundle:?}'s run leaves a gap or overlaps");
+            next = end;
+        }
+        assert_eq!(
+            next,
+            live_ranges.len_spans(),
+            "some span belongs to nothing"
+        );
     }
 
     /// Every use in `test_input`, in program order, as `(point, operand,

@@ -6,7 +6,7 @@ use crate::{
     live_ranges::{LiveBundle, LivePoint},
     region_allocation::EvictionCost,
 };
-use alloc::collections::BTreeMap;
+use alloc::{collections::BTreeMap, vec::Vec};
 use core::{iter, ops::ControlFlow, ops::Range};
 
 /// The key by which a register unit's assignments are ordered.
@@ -117,6 +117,32 @@ where
             }
         }
         None
+    }
+
+    /// The total weight of the distinct bundles already assigned in `reg_units`
+    /// that overlap `spans`.
+    ///
+    /// This is what it would cost to make room for `spans` in `reg_units`.
+    pub fn interference_weight(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        scratch: &mut Vec<LiveBundle<E>>,
+        weight_of: impl Fn(LiveBundle<E>) -> f32,
+    ) -> f32 {
+        debug_assert!(scratch.is_empty());
+
+        self.for_each_overlapping::<()>(reg_units, spans, |existing| {
+            scratch.push(existing.bundle);
+            ControlFlow::Continue(())
+        });
+
+        scratch.sort_unstable();
+        scratch.dedup();
+
+        let weight = scratch.iter().copied().map(weight_of).sum();
+        scratch.clear();
+        weight
     }
 
     /// Do the given spans conflict with any existing assignments in `reg_units`?
@@ -759,6 +785,119 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A distinct weight per bundle, so that every subset of the bundles has a
+    /// distinct, exactly-representable sum and a double-count or an omission
+    /// names its own culprit.
+    const WEIGHTS: [f32; NUM_BUNDLES as usize] = [1.0, 2.0, 4.0, 8.0];
+
+    /// Brute-force version of `Assignments::interference_weight`.
+    fn oracle_interference_weight(
+        oracle: &[OracleEntry],
+        reg_units: &[Range<RegUnit>],
+        spans: &[Range<LivePoint<u32>>],
+        weight_of: impl Fn(LiveBundle<u32>) -> f32,
+    ) -> f32 {
+        let mut conflicting: Vec<LiveBundle<u32>> = oracle
+            .iter()
+            .filter(|existing| {
+                reg_units.iter().any(|units| units.contains(&existing.unit))
+                    && spans.iter().any(|span| {
+                        LivePoint::spans_overlap(span.start, span.end, existing.start, existing.end)
+                    })
+            })
+            .map(|existing| existing.bundle)
+            .collect();
+        conflicting.sort_unstable();
+        conflicting.dedup();
+        conflicting.into_iter().map(weight_of).sum()
+    }
+
+    /// The span sets that `interference_weight` is probed with.
+    fn probe_span_sets() -> Vec<Vec<Range<LivePoint<u32>>>> {
+        vec![
+            vec![span(0, 8)],
+            vec![span(3, 5)],
+            vec![span(2, 3)],
+            vec![span(0, 1), span(2, 3)],
+            vec![span(0, 1), span(3, 4)],
+            vec![span(0, 2), span(4, 6)],
+            vec![span(0, 1), span(7, 8)],
+            vec![span(1, 2), span(3, 5), span(6, 8)],
+            vec![span(0, 4), span(4, 8)],
+        ]
+    }
+
+    fn check_interference_weight_agrees(
+        assignments: &Assignments<u32>,
+        oracle: &[OracleEntry],
+    ) -> Result<(), String> {
+        let scratch = &mut Vec::new();
+        let weight_of = |b: LiveBundle<u32>| WEIGHTS[b.index()];
+        let span_sets = probe_span_sets();
+
+        for (index, units) in probe_unit_sets().iter().enumerate() {
+            let weigh = |spans: &[Range<LivePoint<u32>>],
+                         scratch: &mut Vec<LiveBundle<u32>>,
+                         weight_of: &dyn Fn(LiveBundle<u32>) -> f32| {
+                assignments.interference_weight(
+                    units.iter().cloned(),
+                    spans.iter().cloned(),
+                    scratch,
+                    weight_of,
+                )
+            };
+
+            for spans in &span_sets {
+                let actual = weigh(spans, scratch, &weight_of);
+                let expected = oracle_interference_weight(oracle, units, spans, weight_of);
+                if actual != expected {
+                    return Err(format!(
+                        "`interference_weight({}, {spans:?})` is {actual} but should be {expected}",
+                        probe_name(index),
+                    ));
+                }
+                if !scratch.is_empty() {
+                    return Err(format!(
+                        "`interference_weight({}, {spans:?})` left {} bundles in the scratch \
+                         buffer",
+                        probe_name(index),
+                        scratch.len(),
+                    ));
+                }
+
+                // Weighing every bundle 1 counts the distinct bundles in the way,
+                // which is zero exactly when nothing is in the way at all. This
+                // ties the new method to `conflicts`, which is already under test
+                // against an oracle of its own, so the two would have to be wrong
+                // together to agree here.
+                let count = weigh(spans, scratch, &|_| 1.0);
+                let conflicts = assignments.conflicts(units.iter().cloned(), spans.iter().cloned());
+                if (count != 0.0) != conflicts {
+                    return Err(format!(
+                        "`interference_weight({}, {spans:?})` counts {count} bundles in the way, \
+                         but `conflicts` is {conflicts}",
+                        probe_name(index),
+                    ));
+                }
+            }
+
+            // Two adjacent ranges cover exactly what the single range they tile
+            // does, so they must cost exactly what it does: no bundle in the way
+            // of both may be charged twice for straddling the seam.
+            let split = weigh(&[span(0, 4), span(4, 8)], scratch, &weight_of);
+            let whole = weigh(&[span(0, 8)], scratch, &weight_of);
+            if split != whole {
+                return Err(format!(
+                    "`interference_weight({}, ..)` is {split} for two adjacent halves but \
+                     {whole} for the single range they tile",
+                    probe_name(index),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1565,6 +1704,7 @@ mod tests {
                     check_agree(&assignments, &oracle)?;
                     check_no_overlaps(&assignments)?;
                     check_conflicts_agree(&assignments, &oracle)?;
+                    check_interference_weight_agrees(&assignments, &oracle)?;
                 }
 
                 Ok(())

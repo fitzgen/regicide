@@ -238,6 +238,18 @@ pub struct Iter<'a, K> {
     _phantom: PhantomData<fn() -> K>,
 }
 
+// Manual impl so that we don't require `K: Clone`.
+impl<K> Clone for Iter<'_, K> {
+    fn clone(&self) -> Self {
+        Iter {
+            words: self.words.clone(),
+            word: self.word,
+            base: self.base,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<K> Iterator for Iter<'_, K>
 where
     K: Entity,

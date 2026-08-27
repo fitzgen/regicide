@@ -162,7 +162,7 @@ where
         .construct(input, &mut context.counts, &mut context.liveness, output)?;
 
     coalescing::coalesce(context, input, output)?;
-    region_allocation::region_allocate(context, input)?;
+    region_allocation::region_allocate(context, input, output)?;
     spill_slots::allocate_spill_slots(context, input.func)?;
     move_elimination::eliminate_moves(context, input.func)?;
 
