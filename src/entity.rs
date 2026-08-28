@@ -409,6 +409,10 @@ where
             self.start.index()..self.end.index()
         }
     }
+
+    pub fn len(&self) -> usize {
+        self.indices().len()
+    }
 }
 
 impl<K> IntoIterator for EntityRange<K>

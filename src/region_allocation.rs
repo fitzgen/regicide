@@ -7,12 +7,12 @@ mod assignments;
 mod splitting;
 
 use crate::{
-    Entity, Input, InputFunction, InputValue, OperandConstraint, RegClass, RegSet,
+    Entity, Input, InputFunction, OperandConstraint, RegSet,
     context::ContextInner,
     counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
     error::IResult,
-    live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
+    live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
     machine::RegClassMembers,
     output::OutputInner,
     region_tree::RegionTree,
@@ -97,8 +97,7 @@ where
     /// in later passes.
     stack_bundles: Vec<LiveBundle<E>>,
 
-    /// Scratch space holding the spans of the bundle being split, flattened for
-    /// [`splitting::best_split_point`], which knows nothing about `LiveRanges`.
+    /// Scratch space holding the spans of the bundle being split.
     split_spans: Vec<Range<LivePoint<E>>>,
 
     /// Scratch space holding the uses of the bundle being split, likewise.
@@ -223,9 +222,10 @@ where
                 continue;
             }
 
-            if phase <= Phase::SplitAtBlocks {
-                self.split_at_blocks(input, live_ranges, counts, output, entry)?;
-                counts.split_at_blocks.inc();
+            if phase <= Phase::SplitWithinSpan
+                && self.split_within_span(input, live_ranges, counts, output, entry)?
+            {
+                counts.split_within_span.inc();
                 continue;
             }
 
@@ -233,6 +233,9 @@ where
             self.split_into_minimal_or_spill(input, live_ranges, counts, output, entry)?;
             counts.split_into_minimal_or_spill.inc();
         }
+
+        // TODO: merge `self.region_assignments` into `self.assignments` and
+        // clear `self.region_assignments`.
 
         Ok(())
     }
@@ -263,10 +266,9 @@ where
         live_ranges: &LiveRanges<E>,
         entry: PqEntry<E>,
     ) -> bool {
-        let machine = input.machine;
         let bundle = entry.bundle();
-        let pref = bundle.preference(live_ranges);
 
+        let pref = bundle.preference(live_ranges);
         if pref.is_empty() {
             return false;
         }
@@ -276,13 +278,19 @@ where
         if cfg!(debug_assertions) {
             match bundle.constraint(live_ranges) {
                 OperandConstraint::Any => {
-                    let class = bundle_reg_class(input, live_ranges, bundle);
-                    debug_assert!(pref.is_subset_of(class.member_set(machine)));
-                    debug_assert!(matches!(class.members(machine), RegClassMembers::Regs(_)));
+                    let class = bundle.value_reg_class(live_ranges, input);
+                    debug_assert!(pref.is_subset_of(class.member_set(input.machine)));
+                    debug_assert!(matches!(
+                        class.members(input.machine),
+                        RegClassMembers::Regs(_)
+                    ));
                 }
                 OperandConstraint::Reg(rc) => {
-                    debug_assert!(pref.is_subset_of(rc.member_set(machine)));
-                    debug_assert!(matches!(rc.members(machine), RegClassMembers::Regs(_)));
+                    debug_assert!(pref.is_subset_of(rc.member_set(input.machine)));
+                    debug_assert!(matches!(
+                        rc.members(input.machine),
+                        RegClassMembers::Regs(_)
+                    ));
                 }
                 OperandConstraint::Stack => {
                     panic!("should not have reg preference with stack constraint")
@@ -294,7 +302,7 @@ where
         self.region_assignments.try_assign_to_reg(
             bundle,
             pref.iter(),
-            |r| r.units(machine),
+            |r| r.units(input.machine),
             bundle
                 .spans(live_ranges)
                 .map(|s| s.start(live_ranges)..s.end(live_ranges)),
@@ -314,7 +322,7 @@ where
             OperandConstraint::Any => {
                 // No use constrained this bundle any further than the default
                 // register class of its values, so use that default class.
-                bundle_reg_class(input, live_ranges, bundle)
+                bundle.value_reg_class(live_ranges, input)
             }
             OperandConstraint::Reg(rc) => rc,
             OperandConstraint::Stack => {
@@ -378,7 +386,7 @@ where
         let pref = bundle.preference(live_ranges);
 
         let rc = match bundle.constraint(live_ranges) {
-            OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
+            OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
             OperandConstraint::Reg(rc) => rc,
             OperandConstraint::Stack => {
                 unreachable!("stack-constrained bundles are handled without a register")
@@ -445,6 +453,25 @@ where
         }
     }
 
+    fn fill_split_scratch(&mut self, live_ranges: &LiveRanges<E>, bundle: LiveBundle<E>) {
+        debug_assert!(self.split_spans.is_empty());
+        debug_assert!(self.split_uses.is_empty());
+
+        self.split_spans.extend(
+            bundle
+                .spans(live_ranges)
+                .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+        );
+
+        self.split_uses
+            .extend(bundle.spans(live_ranges).flat_map(|span| {
+                span.uses(live_ranges).into_iter().map(|u| SplitUse {
+                    point: u.point(live_ranges),
+                    weight: u.weight(live_ranges).as_f32(),
+                })
+            }));
+    }
+
     /// Split `entry`'s bundle in two, between spans.
     ///
     /// Returns whether the bundle was successfully cut: returns `false` when
@@ -461,39 +488,24 @@ where
     ) -> IResult<bool> {
         let bundle = entry.bundle();
 
-        debug_assert!(self.split_spans.is_empty());
-        debug_assert!(self.split_uses.is_empty());
-
         // Can't split between fewer than two spans.
         if bundle.spans(live_ranges).len() < 2 {
             counts.split_between_spans_failed.inc();
             return Ok(false);
         }
 
-        self.split_spans.extend(
-            bundle
-                .spans(live_ranges)
-                .map(|s| s.start(live_ranges)..s.end(live_ranges)),
-        );
-
-        self.split_uses
-            .extend(bundle.spans(live_ranges).flat_map(|span| {
-                span.uses(live_ranges).into_iter().map(|u| SplitUse {
-                    point: u.point(live_ranges),
-                    weight: u.weight(live_ranges).as_f32(),
-                })
-            }));
+        self.fill_split_scratch(live_ranges, bundle);
 
         let pref = bundle.preference(live_ranges).clone();
 
         let rc = match bundle.constraint(live_ranges) {
-            OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
+            OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
             OperandConstraint::Reg(rc) => rc,
             OperandConstraint::Stack => unreachable!("already handled"),
             OperandConstraint::Reuse(_) => unreachable!("already resolved"),
         };
 
-        let choice = {
+        let (index, winner) = {
             let RegionAllocation {
                 region_assignments,
                 split_spans,
@@ -503,25 +515,28 @@ where
             } = self;
 
             match rc.members(input.machine) {
-                RegClassMembers::Regs(regs) => splitting::best_split_point(
-                    split_spans,
-                    split_uses,
-                    pref.iter()
-                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                    |reg, half| {
-                        region_assignments.interference_weight(
-                            core::iter::once(reg.units(input.machine)),
-                            half.iter().cloned(),
-                            interference_scratch,
-                            |victim| victim.spill_weight(live_ranges),
-                        )
-                    },
-                )
-                .map(|choice| (choice.index, Some(choice.candidate))),
+                RegClassMembers::Regs(regs) => {
+                    let best = splitting::best_split_between_spans(
+                        split_spans,
+                        split_uses,
+                        pref.iter()
+                            .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                        |reg, half| {
+                            region_assignments.interference_weight(
+                                core::iter::once(reg.units(input.machine)),
+                                half.iter().cloned(),
+                                interference_scratch,
+                                |victim| victim.spill_weight(live_ranges),
+                            )
+                        },
+                    )
+                    .expect("already filtered out bundles without spans we could split");
+                    (best.cut, Some(best.candidate))
+                }
 
                 RegClassMembers::Groups(groups) => {
                     debug_assert!(pref.is_empty());
-                    splitting::best_split_point(
+                    let best = splitting::best_split_between_spans(
                         split_spans,
                         split_uses,
                         groups.iter().copied(),
@@ -537,7 +552,8 @@ where
                             )
                         },
                     )
-                    .map(|choice| (choice.index, None))
+                    .expect("already filtered out bundles without spans we could split");
+                    (best.cut, None)
                 }
             }
         };
@@ -545,15 +561,126 @@ where
         self.split_spans.clear();
         self.split_uses.clear();
 
-        let (index, winner) = match choice {
-            Some(choice) => choice,
-            None => {
-                counts.split_between_spans_failed.inc();
-                return Ok(false);
+        let suffix = bundle.split_at_span(live_ranges, input, output, index)?;
+
+        if let Some(reg) = winner {
+            let mut winning_reg = RegSet::new();
+            winning_reg.insert(reg);
+
+            suffix.add_hint(live_ranges, &winning_reg);
+            suffix.add_hint(live_ranges, &pref);
+
+            bundle.add_hint(live_ranges, &winning_reg);
+            // Note: `bundle` already has a hint of `pref`, no need to add it
+            // again.
+        }
+
+        // Push again with the same phase: we can afford to keep splitting
+        // between spans until we can't split between spans anymore.
+        self.push_bundle(input, live_ranges, bundle, entry.phase());
+        self.push_bundle(input, live_ranges, suffix, entry.phase());
+
+        Ok(true)
+    }
+
+    /// Split `entry`'s bundle in two, between uses inside one of its spans.
+    ///
+    /// Returns `false` and leaves the entry unqueued when we couldn't split the
+    /// bundle, so it can fallthrough to the next phase; returns `true` when the
+    /// bundle was split and both halves were requeued.
+    fn split_within_span(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &mut LiveRanges<E>,
+        counts: &mut Counts,
+        output: &mut OutputInner<E>,
+        entry: PqEntry<E>,
+    ) -> IResult<bool> {
+        let bundle = entry.bundle();
+
+        // Reject bundles that don't have a span with multiple uses we can cut
+        // between.
+        let cuttable = bundle.spans(live_ranges).any(|span| {
+            let mut uses = span.uses(live_ranges).into_iter();
+            match (uses.next(), uses.next_back()) {
+                (Some(first), Some(last)) => {
+                    first.point(live_ranges).inst() != last.point(live_ranges).inst()
+                }
+                _ => false,
+            }
+        });
+        if !cuttable {
+            counts.split_within_span_failed.inc();
+            return Ok(false);
+        }
+
+        self.fill_split_scratch(live_ranges, bundle);
+
+        let pref = bundle.preference(live_ranges).clone();
+
+        let rc = match bundle.constraint(live_ranges) {
+            OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
+            OperandConstraint::Reg(rc) => rc,
+            OperandConstraint::Stack => unreachable!("already handled"),
+            OperandConstraint::Reuse(_) => unreachable!("already resolved"),
+        };
+
+        let (cut, winner) = {
+            let RegionAllocation {
+                region_assignments,
+                split_spans,
+                split_uses,
+                interference_scratch,
+                ..
+            } = self;
+
+            match rc.members(input.machine) {
+                RegClassMembers::Regs(regs) => {
+                    let best = splitting::best_split_within_span(
+                        split_spans,
+                        split_uses,
+                        pref.iter()
+                            .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                        |reg, half| {
+                            region_assignments.interference_weight(
+                                core::iter::once(reg.units(input.machine)),
+                                half.iter(),
+                                interference_scratch,
+                                |victim| victim.spill_weight(live_ranges),
+                            )
+                        },
+                    )
+                    .expect("already rejected unsplittable bundles");
+                    (best.cut, Some(best.candidate))
+                }
+                RegClassMembers::Groups(groups) => {
+                    debug_assert!(pref.is_empty());
+                    let best = splitting::best_split_within_span(
+                        split_spans,
+                        split_uses,
+                        groups.iter().copied(),
+                        |group, half| {
+                            region_assignments.interference_weight(
+                                group
+                                    .members(input.machine)
+                                    .iter()
+                                    .map(|r| r.units(input.machine)),
+                                half.iter(),
+                                interference_scratch,
+                                |victim| victim.spill_weight(live_ranges),
+                            )
+                        },
+                    )
+                    .expect("already rejected unsplittable bundles");
+                    (best.cut, None)
+                }
             }
         };
 
-        let suffix = bundle.split_at_span(live_ranges, input, output, index)?;
+        self.split_spans.clear();
+        self.split_uses.clear();
+
+        let suffix = bundle.split_at_point(live_ranges, input, output, cut.index, cut.at)?;
 
         if let Some(reg) = winner {
             let mut winning_reg = RegSet::new();
@@ -566,21 +693,16 @@ where
             // Note: `bundle` already has a hint of `pref`.
         }
 
-        self.push_bundle(input, live_ranges, bundle, Phase::default());
-        self.push_bundle(input, live_ranges, suffix, Phase::default());
-        Ok(true)
-    }
+        // Requeue each half at the next phase. We don't want to slowly split
+        // off a single use at a time from each bundle in a high-conflict area,
+        // so we only split within a span once and if we have more conflicts
+        // after that, then we will split into minimal bundles and/or spill.
+        debug_assert!(entry.phase() <= Phase::SplitWithinSpan);
+        let phase = Phase::SplitWithinSpan.next();
+        self.push_bundle(input, live_ranges, bundle, phase);
+        self.push_bundle(input, live_ranges, suffix, phase);
 
-    fn split_at_blocks(
-        &mut self,
-        input: &Input<'_, impl InputFunction>,
-        live_ranges: &mut LiveRanges<E>,
-        counts: &mut Counts,
-        output: &mut OutputInner<E>,
-        entry: PqEntry<E>,
-    ) -> IResult<()> {
-        let _ = (input, live_ranges, counts, output, entry.bundle());
-        todo!()
+        Ok(true)
     }
 
     fn split_into_minimal_or_spill(
@@ -635,7 +757,7 @@ where
     // may itself be a class of register groups, so it has to answer the same
     // question that a `Reg` bundle does.
     let rc = match bundle.constraint(live_ranges) {
-        OperandConstraint::Any => bundle_reg_class(input, live_ranges, bundle),
+        OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
         OperandConstraint::Reg(rc) => rc,
         OperandConstraint::Stack => return 0,
         OperandConstraint::Reuse(_) => unreachable!(),
@@ -645,34 +767,6 @@ where
         RegClassMembers::Groups(groups) => groups[0].members(machine).len(),
         RegClassMembers::Regs(_) => 0,
     }
-}
-
-/// The register class that `bundle`'s values naturally belong within.
-fn bundle_reg_class<E>(
-    input: &Input<'_, impl InputFunction>,
-    live_ranges: &LiveRanges<E>,
-    bundle: LiveBundle<E>,
-) -> RegClass
-where
-    E: EntityRepr,
-{
-    let class_of = |span: LiveSpan<E>| {
-        let val = span.val(live_ranges).with_repr32();
-        input.func.value(val).reg_class()
-    };
-
-    let mut spans = bundle.spans(live_ranges);
-    let first = spans
-        .next()
-        .expect("a bundle always holds at least one span");
-    let rc = class_of(first);
-
-    debug_assert!(
-        spans.all(|span| class_of(span) == rc),
-        "the values in one bundle always share a register class",
-    );
-
-    rc
 }
 
 /// What phase of allocation is the associated bundle in?
@@ -697,12 +791,12 @@ pub enum Phase {
 
     /// The second split attempt.
     ///
-    /// We don't want to spend `N` queue-popping iterations on incrementally
-    /// splitting a large bundle into `N` pieces in a high-conflict scenario, so
-    /// eagerly split at basic block boundaries in addition to splitting to
-    /// resolve the current conflict, with the hope that this allows us to skip
-    /// a bunch of conflicts with a single step.
-    SplitAtBlocks = 2,
+    /// Split a bundle at the point between two uses in the same span, and then
+    /// try allocating each half again.
+    ///
+    /// A bundle that doesn't have two uses in the same span falls through to
+    /// the next phase immediately.
+    SplitWithinSpan = 2,
 
     /// The final phase.
     ///
@@ -725,7 +819,7 @@ impl Phase {
         match raw {
             0 => Some(Self::AssignEvict),
             1 => Some(Self::SplitBetweenSpans),
-            2 => Some(Self::SplitAtBlocks),
+            2 => Some(Self::SplitWithinSpan),
             3 => Some(Self::SplitIntoMinimalOrSpill),
             _ => None,
         }
@@ -1008,7 +1102,7 @@ mod tests {
     const PHASES: [Phase; 4] = [
         Phase::AssignEvict,
         Phase::SplitBetweenSpans,
-        Phase::SplitAtBlocks,
+        Phase::SplitWithinSpan,
         Phase::SplitIntoMinimalOrSpill,
     ];
 

@@ -81,13 +81,9 @@ impl Eq for SplitScore {}
 
 /// The cut to make, and the register to aim the halves at.
 #[derive(Clone, Copy, Debug)]
-pub struct SplitChoice<C> {
-    /// Where to split: `spans[..index]` lie before it and `spans[index..]` after
-    /// it.
-    ///
-    /// Always `1 <= index < spans.len()`, so neither half is ever left without
-    /// a span.
-    pub index: usize,
+pub struct SplitChoice<C, K> {
+    /// Where to cut.
+    pub cut: K,
 
     /// The candidate the cut was scored against.
     pub candidate: C,
@@ -96,12 +92,153 @@ pub struct SplitChoice<C> {
     pub score: SplitScore,
 }
 
-/// The places we could divide `spans` into two halves.
+/// Where to cut a bundle within one of its spans.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WithinSpanCut<E>
+where
+    E: EntityRepr,
+{
+    /// The index into `spans` of the span being divided.
+    pub index: usize,
+
+    /// The program point to cut at.
+    ///
+    /// Always at [`Position::Early`], and always strictly inside
+    /// `spans[index]`, so neither piece of the divided span is ever empty.
+    pub at: LivePoint<E>,
+}
+
+/// One half of a within-span split.
+///
+/// This exists so that the splitting kernel can hand its caller both halves
+/// without allocating or materializing the split span.
+#[derive(Clone, Copy, Debug)]
+pub struct HalfSpan<'a, E>
+where
+    E: EntityRepr,
+{
+    /// The spans on this side of the cut that the cut did not touch.
+    whole: &'a [Range<LivePoint<E>>],
+
+    /// The piece of the divided span that fell on this side.
+    ///
+    /// Held unpacked rather than as a `Range`, which is not `Copy`.
+    clipped_start: LivePoint<E>,
+    clipped_end: LivePoint<E>,
+
+    /// Whether `clipped` comes before `whole` (suffix) or after it (prefix).
+    clipped_first: bool,
+}
+
+impl<'a, E> HalfSpan<'a, E>
+where
+    E: EntityRepr,
+{
+    /// Get the prefix and suffix of the given split.
+    fn split(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> (Self, Self) {
+        (
+            Self::prefix(spans, index, at),
+            Self::suffix(spans, index, at),
+        )
+    }
+
+    /// The half before a cut at `at` inside `spans[index]`.
+    fn prefix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
+        HalfSpan {
+            whole: &spans[..index],
+            clipped_start: spans[index].start,
+            clipped_end: at,
+            clipped_first: false,
+        }
+    }
+
+    /// The half after a cut at `at` inside `spans[index]`.
+    fn suffix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
+        HalfSpan {
+            whole: &spans[index + 1..],
+            clipped_start: at,
+            clipped_end: spans[index].end,
+            clipped_first: true,
+        }
+    }
+
+    /// How many spans this half holds.
+    ///
+    /// Never zero.
+    pub fn len(&self) -> usize {
+        self.whole.len() + 1
+    }
+
+    /// Get this half's `i`th span, in ascending program order.
+    pub fn get(&self, i: usize) -> Range<LivePoint<E>> {
+        debug_assert!(i < self.len());
+        let clipped = self.clipped_start..self.clipped_end;
+        match (self.clipped_first, i) {
+            (true, 0) => clipped,
+            (true, i) => self.whole[i - 1].clone(),
+            (false, i) if i < self.whole.len() => self.whole[i].clone(),
+            (false, _) => clipped,
+        }
+    }
+
+    /// This half's spans, in ascending program order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone + '_ {
+        (0..self.len()).map(|i| self.get(i))
+    }
+}
+
+/// Walks `uses` in ascending order alongside ascending cut points, tracking the
+/// total weight of the uses that fall strictly before the current cut.
+struct UseWeightCursor<'a, E>
+where
+    E: EntityRepr,
+{
+    uses: &'a [SplitUse<E>],
+    cursor: usize,
+    prefix_weight: f32,
+    total_weight: f32,
+}
+
+impl<'a, E> UseWeightCursor<'a, E>
+where
+    E: EntityRepr,
+{
+    /// `uses` must be sorted by program point.
+    fn new(uses: &'a [SplitUse<E>]) -> Self {
+        debug_assert!(uses.windows(2).all(|pair| pair[0].point <= pair[1].point));
+        UseWeightCursor {
+            uses,
+            cursor: 0,
+            prefix_weight: 0.0,
+            total_weight: uses.iter().map(|u| u.weight).sum(),
+        }
+    }
+
+    /// Move to a cut at `at`, folding every use strictly before it into the
+    /// prefix's weight.
+    ///
+    /// `at` must be greater than or equal to every point already passed.
+    fn advance_to(&mut self, at: LivePoint<E>) {
+        while self.cursor < self.uses.len() && self.uses[self.cursor].point < at {
+            self.prefix_weight += self.uses[self.cursor].weight;
+            self.cursor += 1;
+        }
+    }
+
+    /// The lesser of the two halves' use weights.
+    fn min_use_weight(&self) -> f32 {
+        let suffix_weight = self.total_weight - self.prefix_weight;
+        self.prefix_weight.min(suffix_weight)
+    }
+}
+
+/// The places we could divide `spans` into two halves, without cutting any
+/// span.
 ///
 /// This filters out splits that would leave one half empty as well as splits
 /// that do not fall on an instruction boundary (which can create demands for
 /// moves that are unsatisfiable).
-fn split_points<E>(spans: &[Range<LivePoint<E>>]) -> impl Iterator<Item = usize> + Clone + '_
+fn between_span_cuts<E>(spans: &[Range<LivePoint<E>>]) -> impl Iterator<Item = usize> + Clone + '_
 where
     E: EntityRepr,
 {
@@ -125,8 +262,41 @@ where
     }
 }
 
-/// Find the best point to split `spans` at, or return `None` if there is no
-/// valid place to split between spans.
+/// All the places we could cut any span within `spans` in two.
+///
+/// For each pair of uses within the same span, we offer a potential cut just
+/// after the first use, and just before the second use, deduplicating when
+/// those two points are the same. We also filter out any illegal
+/// mid-instruction cut, as those can require unsatisfiable moves.
+///
+/// Potential cuts are yielded in ascending program order.
+fn within_span_cuts<'a, E>(
+    spans: &'a [Range<LivePoint<E>>],
+    uses: &'a [SplitUse<E>],
+) -> impl Iterator<Item = WithinSpanCut<E>> + Clone + 'a
+where
+    E: EntityRepr,
+{
+    spans.iter().enumerate().flat_map(move |(index, span)| {
+        let first = uses.partition_point(|u| u.point < span.start);
+        let last = uses.partition_point(|u| u.point < span.end);
+
+        uses[first..last].windows(2).flat_map(move |pair| {
+            debug_assert!(pair[0].point <= pair[1].point);
+            let earliest = pair[0].point.inst_boundary_after();
+            let latest = pair[1].point.inst_boundary_at_or_before();
+
+            (earliest <= latest)
+                .then_some(earliest)
+                .into_iter()
+                .chain((earliest < latest).then_some(latest))
+                .map(move |at| WithinSpanCut { index, at })
+        })
+    })
+}
+
+/// Find the best boundary between the given `spans` to split at, or return
+/// `None` if there is no valid place to split between spans.
 ///
 /// `uses` must be sorted by program point.
 ///
@@ -136,39 +306,29 @@ where
 /// `interference` is a function that calculates how much making room for one
 /// half of a proposed split would cost: that is, the weight of the other
 /// bundles that would need to be displaced.
-pub fn best_split_point<E, C>(
+///
+/// Returns an index `cut` where `1 <= cut < spans.len()` describing how `spans`
+/// should be split: `spans[..cut]` and `spans[cut..]`.
+pub fn best_split_between_spans<E, C>(
     spans: &[Range<LivePoint<E>>],
     uses: &[SplitUse<E>],
     candidates: impl IntoIterator<Item = C> + Clone,
     mut interference: impl FnMut(C, &[Range<LivePoint<E>>]) -> f32,
-) -> Option<SplitChoice<C>>
+) -> Option<SplitChoice<C, usize>>
 where
     E: EntityRepr,
     C: Copy,
 {
-    debug_assert!(uses.windows(2).all(|pair| pair[0].point <= pair[1].point));
+    let mut cursor = UseWeightCursor::new(uses);
+    let mut best: Option<SplitChoice<C, usize>> = None;
 
-    let total_use_weight: f32 = uses.iter().map(|u| u.weight).sum();
-
-    let mut best: Option<SplitChoice<C>> = None;
-    let mut uses_cursor = 0;
-    let mut prefix_use_weight = 0.0;
-
-    for k in split_points(spans) {
+    for k in between_span_cuts(spans) {
         debug_assert!(1 <= k && k < spans.len());
 
         let (prefix, suffix) = spans.split_at(k);
 
-        // Advance `uses_cursor` to the new split point and update the prefix's
-        // use weight.
-        let suffix_start = suffix[0].start;
-        while uses_cursor < uses.len() && uses[uses_cursor].point < suffix_start {
-            prefix_use_weight += uses[uses_cursor].weight;
-            uses_cursor += 1;
-        }
-
-        let suffix_use_weight = total_use_weight - prefix_use_weight;
-        let min_use_weight = prefix_use_weight.min(suffix_use_weight);
+        cursor.advance_to(suffix[0].start);
+        let min_use_weight = cursor.min_use_weight();
 
         for candidate in candidates.clone() {
             let prefix_interference = interference(candidate, prefix);
@@ -177,7 +337,59 @@ where
             let score = SplitScore::new(max_interference, min_use_weight);
             if best.is_none_or(|best| score > best.score) {
                 best = Some(SplitChoice {
-                    index: k,
+                    cut: k,
+                    candidate,
+                    score,
+                });
+            }
+        }
+    }
+
+    best
+}
+
+/// Find the best point within a span in `spans` to split at, or return `None`
+/// if no span holds two uses that a cut could come between.
+///
+/// `uses` must be sorted by program point, and every use must lie within a span
+/// in `spans`.
+///
+/// `spans` must be sorted and disjoint.
+///
+/// `candidates` and `interference` are the same as with
+/// `best_split_between_spans`, except that `interference` is handed a
+/// `HalfSpan`.
+pub fn best_split_within_span<E, C>(
+    spans: &[Range<LivePoint<E>>],
+    uses: &[SplitUse<E>],
+    candidates: impl IntoIterator<Item = C> + Clone,
+    mut interference: impl FnMut(C, HalfSpan<'_, E>) -> f32,
+) -> Option<SplitChoice<C, WithinSpanCut<E>>>
+where
+    E: EntityRepr,
+    C: Copy,
+{
+    let mut cursor = UseWeightCursor::new(uses);
+    let mut best: Option<SplitChoice<C, WithinSpanCut<E>>> = None;
+
+    for cut in within_span_cuts(spans, uses) {
+        debug_assert_eq!(cut.at.pos(), Position::Early);
+        debug_assert!(spans[cut.index].start < cut.at);
+        debug_assert!(cut.at < spans[cut.index].end);
+
+        cursor.advance_to(cut.at);
+        let min_use_weight = cursor.min_use_weight();
+
+        let (prefix, suffix) = HalfSpan::split(spans, cut.index, cut.at);
+
+        for candidate in candidates.clone() {
+            let prefix_interference = interference(candidate, prefix);
+            let suffix_interference = interference(candidate, suffix);
+            let max_interference = prefix_interference.max(suffix_interference);
+            let score = SplitScore::new(max_interference, min_use_weight);
+            if best.is_none_or(|best| score > best.score) {
+                best = Some(SplitChoice {
+                    cut,
                     candidate,
                     score,
                 });
@@ -384,7 +596,7 @@ mod tests {
     /// This ignores rounding entirely: for each adjacent pair it walks every
     /// instruction boundary in the whole program and asks whether that one lies
     /// in the gap.
-    fn oracle_points(spans: &[Range<LivePoint<u32>>]) -> Vec<usize> {
+    fn oracle_between_span_cuts(spans: &[Range<LivePoint<u32>>]) -> Vec<usize> {
         let mut out = Vec::new();
         for k in 1..spans.len() {
             let (before, after) = (&spans[k - 1], &spans[k]);
@@ -419,44 +631,362 @@ mod tests {
         )
     }
 
-    /// Check everything `best_split_point` promises about `piece`, and return
-    /// the two halves it chose, if it chose any.
-    fn check_split(piece: &Piece, parked: &[Parked]) -> Result<Option<(Piece, Piece)>, String> {
-        let spans = &piece.spans;
+    /// The within-span cuts `spans` admits, computed the dumb way.
+    ///
+    /// For every span, and every adjacent pair of uses inside it, this collects
+    /// *all* the points a cut could legally land on by walking every point in
+    /// the whole program and asking of each one whether it separates the pair,
+    /// then keeps the two ends of that set. The kernel instead rounds each use
+    /// to the nearest boundary and never enumerates the middle.
+    fn oracle_within_span_cuts(
+        spans: &[Range<LivePoint<u32>>],
+        uses: &[SplitUse<u32>],
+    ) -> Vec<WithinSpanCut<u32>> {
+        let mut out = Vec::new();
+        for (index, span) in spans.iter().enumerate() {
+            let inside: Vec<_> = uses
+                .iter()
+                .filter(|u| span.start <= u.point && u.point < span.end)
+                .collect();
+            for pair in inside.windows(2) {
+                let (u, v) = (pair[0], pair[1]);
+                let legal: Vec<_> = (0..=NUM_POINTS)
+                    .map(point)
+                    .filter(|at| at.pos() == Position::Early)
+                    // Strictly inside the span, so neither piece is empty...
+                    .filter(|at| span.start < *at && *at < span.end)
+                    // ...and separating the pair, so each piece keeps a use.
+                    .filter(|at| u.point < *at && *at <= v.point)
+                    .collect();
+                if let (Some(&first), Some(&last)) = (legal.first(), legal.last()) {
+                    out.push(WithinSpanCut { index, at: first });
+                    if last != first {
+                        out.push(WithinSpanCut { index, at: last });
+                    }
+                }
+            }
+        }
+        out
+    }
 
-        // The admissible cuts are exactly the ones the oracle finds, in
-        // ascending order, and neither half of any of them is span-less.
-        let actual: Vec<usize> = split_points(spans).collect();
-        let expected = oracle_points(spans);
+    /// The two halves cutting `spans[index]` at `at` leaves, as plain span lists.
+    fn oracle_halves(
+        spans: &[Range<LivePoint<u32>>],
+        index: usize,
+        at: LivePoint<u32>,
+    ) -> (Vec<Range<LivePoint<u32>>>, Vec<Range<LivePoint<u32>>>) {
+        let mut prefix = spans[..index].to_vec();
+        prefix.push(spans[index].start..at);
+
+        let mut suffix = vec![at..spans[index].end];
+        suffix.extend(spans[index + 1..].iter().cloned());
+
+        (prefix, suffix)
+    }
+
+    /// What cutting `piece` inside a span at `at` scores in `candidate`,
+    /// computed the dumb way.
+    fn oracle_within_span_score(
+        piece: &Piece,
+        parked: &[Parked],
+        candidate: u8,
+        cut: WithinSpanCut<u32>,
+    ) -> SplitScore {
+        let (before, after) = oracle_halves(&piece.spans, cut.index, cut.at);
+
+        let prefix: f32 = piece
+            .uses
+            .iter()
+            .filter(|u| u.point < cut.at)
+            .map(|u| u.weight)
+            .sum();
+        let total: f32 = piece.uses.iter().map(|u| u.weight).sum();
+
+        SplitScore::new(
+            interference(parked, candidate, &before).max(interference(parked, candidate, &after)),
+            prefix.min(total - prefix),
+        )
+    }
+
+    /// Dispatch to the checker for the rung being exercised.
+    fn check_split(
+        piece: &Piece,
+        parked: &[Parked],
+        within_span: bool,
+    ) -> Result<Option<(Piece, Piece)>, String> {
+        if within_span {
+            check_split_within_span(piece, parked)
+        } else {
+            check_split_between_spans(piece, parked)
+        }
+    }
+
+    /// Check everything `best_split_within_span` promises about `piece`, and
+    /// return the two halves it chose, if it chose any.
+    fn check_split_within_span(
+        piece: &Piece,
+        parked: &[Parked],
+    ) -> Result<Option<(Piece, Piece)>, String> {
+        let spans = &piece.spans;
+        let uses = &piece.uses;
+
+        let actual: Vec<_> = within_span_cuts(spans, uses).collect();
+        let expected = oracle_within_span_cuts(spans, uses);
         if actual != expected {
             return Err(format!(
-                "`split_points({spans:?})` gives {actual:?} but should give {expected:?}",
+                "`within_span_cuts({spans:?}, {uses:?})` gives {actual:?} but should give \
+                 {expected:?}",
             ));
         }
-        for pair in actual.windows(2) {
-            if pair[0] >= pair[1] {
+
+        for cut in &actual {
+            // Every cut lands on an instruction boundary, because a move cannot
+            // go between an instruction's uses and its defs.
+            if cut.at.pos() != Position::Early {
                 return Err(format!(
-                    "`split_points({spans:?})` gives {actual:?}, unordered"
+                    "`within_span_cuts({spans:?}, {uses:?})` gives {cut:?}, which is not on an \
+                     instruction boundary",
+                ));
+            }
+            // And strictly inside its span, so neither piece comes out empty.
+            let span = &spans[cut.index];
+            if !(span.start < cut.at && cut.at < span.end) {
+                return Err(format!(
+                    "`within_span_cuts({spans:?}, {uses:?})` gives {cut:?}, which is not inside \
+                     {span:?}",
                 ));
             }
         }
-        for &cut in &actual {
-            if !(1 <= cut && cut < spans.len()) {
+        for pair in actual.windows(2) {
+            if (pair[0].index, pair[0].at) >= (pair[1].index, pair[1].at) {
                 return Err(format!(
-                    "`split_points({spans:?})` gives {cut}, which leaves a half span-less",
+                    "`within_span_cuts({spans:?}, {uses:?})` gives {actual:?}, unordered",
                 ));
             }
         }
 
-        let choice = best_split_point(spans, &piece.uses, 0..NUM_CANDIDATES, |candidate, half| {
-            interference(parked, candidate, half)
+        // There is a cut exactly when some span holds two uses on distinct
+        // instructions -- nothing further can rule one out, because the
+        // boundary just after the first of the two and the one just before the
+        // second both land inside the span. `split_within_span` rejects a
+        // bundle up front on precisely this test rather than filling its
+        // scratch buffers to be told the same thing, so the two have to agree.
+        let two_uses_apart = spans.iter().any(|span| {
+            let mut inside = uses
+                .iter()
+                .filter(|u| span.start <= u.point && u.point < span.end);
+            match (inside.next(), inside.next_back()) {
+                (Some(first), Some(last)) => first.point.inst() != last.point.inst(),
+                _ => false,
+            }
+        });
+        if two_uses_apart != !actual.is_empty() {
+            return Err(format!(
+                "`within_span_cuts({spans:?}, {uses:?})` gives {actual:?}, but a span holding \
+                 two uses on distinct instructions is {two_uses_apart}",
+            ));
+        }
+
+        // `HalfSpan` presents the clipped span in its place among the whole
+        // ones, and presents all of them.
+        for cut in &actual {
+            let (want_prefix, want_suffix) = oracle_halves(spans, cut.index, cut.at);
+            let halves = [
+                (
+                    "prefix",
+                    HalfSpan::prefix(spans, cut.index, cut.at),
+                    want_prefix,
+                ),
+                (
+                    "suffix",
+                    HalfSpan::suffix(spans, cut.index, cut.at),
+                    want_suffix,
+                ),
+            ];
+            for (which, half, want) in halves {
+                let got: Vec<_> = half.iter().collect();
+                if got != want || half.len() != want.len() {
+                    return Err(format!(
+                        "the {which} `HalfSpan` of {cut:?} over {spans:?} is {got:?} with length \
+                         {}, but should be {want:?}",
+                        half.len(),
+                    ));
+                }
+            }
+        }
+
+        let choice = best_split_within_span(spans, uses, 0..NUM_CANDIDATES, |candidate, half| {
+            let half: Vec<_> = half.iter().collect();
+            interference(parked, candidate, &half)
         });
 
         let choice = match choice {
             None => {
                 if !expected.is_empty() {
                     return Err(format!(
-                        "`best_split_point` found no cut of {spans:?}, but {expected:?} are all \
+                        "`best_split_within_span` found no cut of {spans:?}, but {expected:?} \
+                         are all admissible",
+                    ));
+                }
+                return Ok(None);
+            }
+            Some(choice) => {
+                if expected.is_empty() {
+                    return Err(format!(
+                        "`best_split_within_span` chose {choice:?} for {spans:?}, which admits \
+                         no cut",
+                    ));
+                }
+                choice
+            }
+        };
+
+        let rank = match expected.iter().position(|c| *c == choice.cut) {
+            Some(rank) => rank,
+            None => {
+                return Err(format!(
+                    "`best_split_within_span` chose {:?} for {spans:?}, which is not one of the \
+                     admissible {expected:?}",
+                    choice.cut,
+                ));
+            }
+        };
+        if choice.candidate >= NUM_CANDIDATES {
+            return Err(format!(
+                "`best_split_within_span` chose candidate {}, which does not exist",
+                choice.candidate,
+            ));
+        }
+
+        // The score is what the oracle computes for that same cut and
+        // candidate.
+        let scored = oracle_within_span_score(piece, parked, choice.candidate, choice.cut);
+        if choice.score.normalized() != scored.normalized() {
+            return Err(format!(
+                "`best_split_within_span` scored {:?} at {choice:?}, but the oracle scores {:?}",
+                choice.score.normalized(),
+                scored.normalized(),
+            ));
+        }
+
+        // Nothing scores strictly better, and among equals the earliest cut won
+        // and, within a cut, the earliest candidate.
+        for (other_rank, &cut) in expected.iter().enumerate() {
+            for candidate in 0..NUM_CANDIDATES {
+                let other = oracle_within_span_score(piece, parked, candidate, cut);
+                if other > choice.score {
+                    return Err(format!(
+                        "`best_split_within_span` chose {choice:?} for {spans:?}, but cutting at \
+                         {cut:?} for candidate {candidate} scores {other:?}, which is better",
+                    ));
+                }
+                let tied = choice.score <= other;
+                if tied && (other_rank, candidate) < (rank, choice.candidate) {
+                    return Err(format!(
+                        "`best_split_within_span` chose {choice:?} for {spans:?}, but cutting at \
+                         {cut:?} for candidate {candidate} ties it and comes first",
+                    ));
+                }
+            }
+        }
+
+        // The halves partition the piece. They hold one more span between them
+        // than the piece did, because one span was divided, but the same
+        // instructions and the same uses -- and each half strictly fewer
+        // instructions than the piece, which is what makes splitting terminate.
+        let (before, after) = oracle_halves(spans, choice.cut.index, choice.cut.at);
+        let at = choice.cut.at;
+        let prefix = Piece {
+            spans: before,
+            uses: uses.iter().filter(|u| u.point < at).copied().collect(),
+        };
+        let suffix = Piece {
+            spans: after,
+            uses: uses.iter().filter(|u| u.point >= at).copied().collect(),
+        };
+
+        for half in [&prefix, &suffix] {
+            if half.len_insts() >= piece.len_insts() {
+                return Err(format!(
+                    "cutting {spans:?} at {:?} leaves a half covering {} of its {} \
+                     instructions, so splitting would not terminate",
+                    choice.cut,
+                    half.len_insts(),
+                    piece.len_insts(),
+                ));
+            }
+            if half.uses.is_empty() {
+                return Err(format!(
+                    "cutting {spans:?} at {:?} leaves a half with no uses, so it was not cut \
+                     between two uses",
+                    choice.cut,
+                ));
+            }
+        }
+        if prefix.spans.len() + suffix.spans.len() != spans.len() + 1 {
+            return Err(format!(
+                "cutting {spans:?} at {:?} creates or loses a span",
+                choice.cut,
+            ));
+        }
+        if prefix.uses.len() + suffix.uses.len() != uses.len() {
+            return Err(format!(
+                "cutting {spans:?} at {:?} creates or loses a use",
+                choice.cut,
+            ));
+        }
+        if prefix.len_insts() + suffix.len_insts() != piece.len_insts() {
+            return Err(format!(
+                "cutting {spans:?} at {:?} creates or loses an instruction",
+                choice.cut,
+            ));
+        }
+
+        Ok(Some((prefix, suffix)))
+    }
+
+    /// Check everything `best_split_between_spans` promises about `piece`, and return
+    /// the two halves it chose, if it chose any.
+    fn check_split_between_spans(
+        piece: &Piece,
+        parked: &[Parked],
+    ) -> Result<Option<(Piece, Piece)>, String> {
+        let spans = &piece.spans;
+
+        // The admissible cuts are exactly the ones the oracle finds, in
+        // ascending order, and neither half of any of them is span-less.
+        let actual: Vec<usize> = between_span_cuts(spans).collect();
+        let expected = oracle_between_span_cuts(spans);
+        if actual != expected {
+            return Err(format!(
+                "`between_span_cuts({spans:?})` gives {actual:?} but should give {expected:?}",
+            ));
+        }
+        for pair in actual.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(format!(
+                    "`between_span_cuts({spans:?})` gives {actual:?}, unordered"
+                ));
+            }
+        }
+        for &cut in &actual {
+            if !(1 <= cut && cut < spans.len()) {
+                return Err(format!(
+                    "`between_span_cuts({spans:?})` gives {cut}, which leaves a half span-less",
+                ));
+            }
+        }
+
+        let choice =
+            best_split_between_spans(spans, &piece.uses, 0..NUM_CANDIDATES, |candidate, half| {
+                interference(parked, candidate, half)
+            });
+
+        let choice = match choice {
+            None => {
+                if !expected.is_empty() {
+                    return Err(format!(
+                        "`best_split_between_spans` found no cut of {spans:?}, but {expected:?} are all \
                          admissible",
                     ));
                 }
@@ -465,33 +995,33 @@ mod tests {
             Some(choice) => {
                 if expected.is_empty() {
                     return Err(format!(
-                        "`best_split_point` chose {choice:?} for {spans:?}, which admits no cut",
+                        "`best_split_between_spans` chose {choice:?} for {spans:?}, which admits no cut",
                     ));
                 }
                 choice
             }
         };
 
-        if !expected.contains(&choice.index) {
+        if !expected.contains(&choice.cut) {
             return Err(format!(
-                "`best_split_point` chose {:?} for {spans:?}, which is not one of the admissible \
+                "`best_split_between_spans` chose {:?} for {spans:?}, which is not one of the admissible \
                  {expected:?}",
-                choice.index,
+                choice.cut,
             ));
         }
         if choice.candidate >= NUM_CANDIDATES {
             return Err(format!(
-                "`best_split_point` chose candidate {}, which does not exist",
+                "`best_split_between_spans` chose candidate {}, which does not exist",
                 choice.candidate,
             ));
         }
 
         // The score is what the oracle computes for that same cut and
         // candidate.
-        let scored = oracle_score(piece, parked, choice.candidate, choice.index);
+        let scored = oracle_score(piece, parked, choice.candidate, choice.cut);
         if choice.score.normalized() != scored.normalized() {
             return Err(format!(
-                "`best_split_point` scored {:?} at {choice:?}, but the oracle scores {:?}",
+                "`best_split_between_spans` scored {:?} at {choice:?}, but the oracle scores {:?}",
                 choice.score.normalized(),
                 scored.normalized(),
             ));
@@ -504,14 +1034,14 @@ mod tests {
                 let other = oracle_score(piece, parked, candidate, cut);
                 if other > choice.score {
                     return Err(format!(
-                        "`best_split_point` chose {choice:?} for {spans:?}, but cutting at \
+                        "`best_split_between_spans` chose {choice:?} for {spans:?}, but cutting at \
                          {cut} for candidate {candidate} scores {other:?}, which is better",
                     ));
                 }
                 let tied = choice.score <= other;
-                if tied && (cut, candidate) < (choice.index, choice.candidate) {
+                if tied && (cut, candidate) < (choice.cut, choice.candidate) {
                     return Err(format!(
-                        "`best_split_point` chose {choice:?} for {spans:?}, but cutting at \
+                        "`best_split_between_spans` chose {choice:?} for {spans:?}, but cutting at \
                          {cut} for candidate {candidate} ties it and comes first",
                     ));
                 }
@@ -520,7 +1050,7 @@ mod tests {
 
         // The halves partition the piece: every span in exactly one, order
         // preserved, both non-empty and each strictly smaller than the piece.
-        let k = choice.index;
+        let k = choice.cut;
         let (before, after) = spans.split_at(k);
         let cut = after[0].start;
         let prefix = Piece {
@@ -572,17 +1102,34 @@ mod tests {
         Ok(Some((prefix, suffix)))
     }
 
-    /// The pieces are still exactly the bundle splitting started from.
+    /// Fuse spans that touch, so that a span and the two pieces it was divided
+    /// into compare equal.
+    fn merge_adjacent(spans: &[Range<LivePoint<u32>>]) -> Vec<Range<LivePoint<u32>>> {
+        let mut out: Vec<Range<LivePoint<u32>>> = Vec::new();
+        for span in spans {
+            match out.last_mut() {
+                Some(last) if last.end == span.start => last.end = span.end,
+                _ => out.push(span.clone()),
+            }
+        }
+        out
+    }
+
+    /// The pieces still cover exactly the bundle splitting started from.
+    ///
+    /// Compared after fusing touching spans, because a within-span split leaves
+    /// two spans where the bundle had one; every other way of creating or
+    /// losing coverage still shows up here.
     fn check_pieces_partition(state: &State) -> Result<(), String> {
         let spans: Vec<_> = state
             .pieces
             .iter()
             .flat_map(|p| p.spans.iter().cloned())
             .collect();
-        if spans != state.whole.spans {
+        let (spans, whole) = (merge_adjacent(&spans), merge_adjacent(&state.whole.spans));
+        if spans != whole {
             return Err(format!(
-                "the pieces cover {spans:?}, but the bundle they came from covers {:?}",
-                state.whole.spans,
+                "the pieces cover {spans:?}, but the bundle they came from covers {whole:?}",
             ));
         }
         let num_uses: usize = state.pieces.iter().map(|p| p.uses.len()).sum();
@@ -600,6 +1147,10 @@ mod tests {
         /// Cut a piece at the best point, replacing it with its two halves.
         Split {
             piece: u8,
+
+            /// Which rung to cut on: within one of the piece's spans, or
+            /// between two of them.
+            within_span: bool,
         },
 
         /// Park a copy of a piece in a candidate, so that it stands in the way.
@@ -630,7 +1181,10 @@ mod tests {
 
     impl Default for Op {
         fn default() -> Self {
-            Op::Split { piece: 0 }
+            Op::Split {
+                piece: 0,
+                within_span: false,
+            }
         }
     }
 
@@ -721,7 +1275,17 @@ mod tests {
     }
 
     fn split(piece: u8) -> Op {
-        Op::Split { piece }
+        Op::Split {
+            piece,
+            within_span: false,
+        }
+    }
+
+    fn split_within(piece: u8) -> Op {
+        Op::Split {
+            piece,
+            within_span: true,
+        }
     }
 
     fn assign(piece: u8, candidate: u8) -> Op {
@@ -881,6 +1445,126 @@ mod tests {
                 split(1),
                 split(2),
             ],
+            // One span holding a single use. Nothing to cut between: the
+            // bail-out `split_within_span` depends on to fall through.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 6)], &[(2, 1)]),
+                split_within(0),
+            ],
+            // Two uses on the same instruction, one at each position. No move
+            // can go between an instruction's uses and its defs, so there is
+            // still no cut even though there are two uses.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 8)], &[(4, 1), (5, 1)]),
+                split_within(0),
+            ],
+            // Two uses on adjacent instructions. The two ends of the gap are
+            // the same point, so it yields exactly one cut, not a duplicate.
+            vec![
+                one_block.clone(),
+                rebuild(&[(2, 10)], &[(4, 1), (6, 1)]),
+                split_within(0),
+            ],
+            // A use at `(i, Late)` and one at `(j, Early)`: both ends have to
+            // round outward, away from the use, to reach a boundary.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 12)], &[(3, 1), (8, 1)]),
+                split_within(0),
+            ],
+            // A use sitting exactly on the span's first point and another on
+            // its last. The earliest cut may not land on `span.start` and the
+            // latest may not land on `span.end`, or a piece comes out empty.
+            vec![
+                one_block.clone(),
+                rebuild(&[(4, 11)], &[(4, 1), (10, 1)]),
+                split_within(0),
+            ],
+            // Three uses, so two gaps, so up to four cuts -- and the middle use
+            // belongs to both gaps. The running use-weight cursor has to stay
+            // in step as the cuts sweep across it.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 14)], &[(1, 1), (6, 4), (12, 1)]),
+                split_within(0),
+            ],
+            // Uses spread over several spans. Only the pairs *within* a span
+            // count; the gap between the last use of one span and the first of
+            // the next is `split_between_spans`' business.
+            vec![
+                one_block.clone(),
+                rebuild(
+                    &[(0, 4), (6, 8), (10, 15)],
+                    &[(0, 1), (2, 1), (6, 1), (11, 1), (14, 1)],
+                ),
+                split_within(0),
+            ],
+            // Uses only in the last span, so the first spans contribute no
+            // cuts at all and the contiguous run of uses belonging to the
+            // divided span does not start at zero.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 2), (4, 6), (8, 15)], &[(8, 1), (14, 1)]),
+                split_within(0),
+            ],
+            // A bundle parked across the middle of the span, in one candidate
+            // only. Cutting around it is the whole point of this rung: the
+            // clipped half must not be charged for the part of the span it no
+            // longer covers, or every candidate prices the same.
+            vec![
+                one_block.clone(),
+                rebuild(&[(6, 10)], &[(6, 1)]),
+                assign(0, 1),
+                rebuild(&[(0, 16)], &[(1, 4), (14, 4)]),
+                split_within(0),
+            ],
+            // The same, but with the obstruction covering the whole span in
+            // every candidate: no cut escapes it, so `max` over the halves
+            // keeps the score at one bundle's weight rather than doubling it.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 16)], &[(0, 1)]),
+                assign(0, 2),
+                assign(0, 0),
+                assign(0, 1),
+                rebuild(&[(0, 16)], &[(1, 1), (14, 1)]),
+                split_within(0),
+            ],
+            // All the weight on one side, so `balance` is the same at every
+            // cut and interference alone decides.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 16)], &[(1, 8), (2, 8), (14, 1)]),
+                split_within(0),
+            ],
+            // Cutting within a span and then between spans, and the reverse:
+            // the two rungs have to compose, since a bundle reaching the
+            // second one has already been through the first.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 6), (8, 16)], &[(0, 1), (4, 1), (8, 1), (14, 1)]),
+                split_within(0),
+                split(1),
+            ],
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 6), (8, 16)], &[(0, 1), (4, 1), (8, 1), (14, 1)]),
+                split(0),
+                split_within(1),
+                split_within(0),
+            ],
+            // Repeated within-span splitting down to uncuttable pieces, under
+            // the default block partition, with something in the way.
+            vec![
+                rebuild(&[(0, NUM_POINTS)], &[(1, 3), (5, 1), (11, 2), (13, 8)]),
+                assign(0, 0),
+                split_within(0),
+                split_within(0),
+                split_within(1),
+                split_within(2),
+            ],
         ];
         for ops in seeds.iter_mut() {
             fixup_ops(ops);
@@ -895,10 +1579,10 @@ mod tests {
 
         for op in ops {
             match op {
-                Op::Split { piece } => {
+                Op::Split { piece, within_span } => {
                     let index = usize::from(*piece) % state.pieces.len();
                     if let Some((prefix, suffix)) =
-                        check_split(&state.pieces[index], &state.parked)?
+                        check_split(&state.pieces[index], &state.parked, *within_span)?
                     {
                         state.pieces[index] = prefix;
                         state.pieces.insert(index + 1, suffix);
@@ -961,10 +1645,15 @@ mod tests {
 
     /// Splitting bottoms out.
     ///
-    /// Drive the piece with the most spans to a fixed point, checking at every
-    /// step that nothing is created and nothing is lost. Each half is strictly
-    /// smaller than the piece it came from, so `len(spans)` steps must be
-    /// enough to leave every piece uncuttable.
+    /// Cut whatever is still cuttable, on either rung, until nothing is,
+    /// checking at every step that nothing is created and nothing is lost.
+    ///
+    /// The budget is counted in instructions rather than in spans, because a
+    /// within-span split leaves *more* spans than it found. Every piece covers
+    /// at least one instruction and the pieces partition the bundle's
+    /// instructions, so there can never be more pieces than the bundle has
+    /// instructions; every split makes exactly one more piece, so that is also
+    /// a bound on how many splits there can be.
     #[test]
     fn splitting_terminates() -> CheckResult<Vec<Op>> {
         let mutator = m::default::<Vec<Op>>().map(|_ctx, ops| {
@@ -978,47 +1667,131 @@ mod tests {
             |ops: &Vec<Op>| -> Result<(), String> {
                 let mut state = run(ops)?;
 
-                let budget = state.whole.spans.len();
-                for step in 0..=budget {
-                    let (index, _) = state
-                        .pieces
-                        .iter()
-                        .enumerate()
-                        .max_by_key(|(_, piece)| piece.spans.len())
-                        .expect("there is always at least one piece");
-
-                    match check_split(&state.pieces[index], &state.parked)? {
-                        Some((prefix, suffix)) => {
-                            if step == budget {
-                                return Err(format!(
-                                    "still cutting {:?} after {budget} steps, but the bundle \
-                                     only ever held {budget} spans",
-                                    state.pieces[index].spans,
-                                ));
+                let budget = state.whole.len_insts();
+                for _ in 0..=budget {
+                    // Cut the first piece that will still take a cut, trying
+                    // both rungs in the order the allocator does.
+                    let mut cut = None;
+                    for index in 0..state.pieces.len() {
+                        for within_span in [false, true] {
+                            let halves =
+                                check_split(&state.pieces[index], &state.parked, within_span)?;
+                            if let Some(halves) = halves {
+                                cut = Some((index, halves));
+                                break;
                             }
-                            state.pieces[index] = prefix;
-                            state.pieces.insert(index + 1, suffix);
-                            check_pieces_partition(&state)?;
                         }
-                        None => {
-                            // The largest piece is uncuttable, so every piece
-                            // is: a smaller one has no more gaps to try.
-                            for piece in &state.pieces {
-                                if !oracle_points(&piece.spans).is_empty() {
-                                    return Err(format!(
-                                        "{:?} still admits a cut, but the largest piece does \
-                                         not",
-                                        piece.spans,
-                                    ));
-                                }
-                            }
-                            return Ok(());
+                        if cut.is_some() {
+                            break;
                         }
                     }
+
+                    let (index, (prefix, suffix)) = match cut {
+                        Some(cut) => cut,
+                        // Nothing is cuttable, which is where splitting has to
+                        // end up: the allocator has no rung after this one but
+                        // spilling.
+                        None => return Ok(()),
+                    };
+
+                    state.pieces[index] = prefix;
+                    state.pieces.insert(index + 1, suffix);
+                    check_pieces_partition(&state)?;
                 }
 
-                Ok(())
+                Err(format!(
+                    "still cutting after {budget} steps, but the bundle only ever covered \
+                     {budget} instructions, so it can hold at most that many pieces",
+                ))
             },
         )
+    }
+
+    /// The hand-written cases behind the seeds above, stated as what
+    /// `within_span_cuts` yields rather than as what splitting does with it.
+    fn cuts(spans: &[(u8, u8)], uses: &[u8]) -> Vec<(usize, u8)> {
+        let spans: Vec<_> = spans.iter().map(|&(s, e)| span(s, e)).collect();
+        let uses: Vec<_> = uses
+            .iter()
+            .map(|&p| SplitUse {
+                point: point(p),
+                weight: 1.0,
+            })
+            .collect();
+
+        // The oracle agrees, on every one of these, with the kernel.
+        assert_eq!(
+            within_span_cuts(&spans, &uses).collect::<Vec<_>>(),
+            oracle_within_span_cuts(&spans, &uses),
+        );
+
+        within_span_cuts(&spans, &uses)
+            .map(|cut| {
+                let at = u8::try_from(cut.at.inst().index() * 2).unwrap();
+                debug_assert_eq!(cut.at.pos(), Position::Early);
+                (cut.index, at)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_cut_without_two_uses() {
+        assert!(cuts(&[(0, 6)], &[]).is_empty());
+        assert!(cuts(&[(0, 6)], &[2]).is_empty());
+        // Two uses, but in different spans: that is the other rung's job.
+        assert!(cuts(&[(0, 4), (8, 12)], &[2, 8]).is_empty());
+    }
+
+    #[test]
+    fn no_cut_within_an_instruction() {
+        // Both positions of instruction two. A move cannot be inserted between
+        // an instruction's uses and its defs, so there is nowhere to cut.
+        assert!(cuts(&[(0, 8)], &[4, 5]).is_empty());
+    }
+
+    #[test]
+    fn one_cut_between_adjacent_instructions() {
+        // Instructions two and three: the earliest legal cut after the first
+        // use and the latest before the second are the same point, and it is
+        // reported once.
+        assert_eq!(cuts(&[(2, 10)], &[4, 6]), [(0, 6)]);
+        // The same when the first use is at `(2, Late)`.
+        assert_eq!(cuts(&[(2, 10)], &[5, 6]), [(0, 6)]);
+    }
+
+    #[test]
+    fn both_ends_of_a_wide_gap() {
+        // Instructions one and six, so the two ends are distinct: cut as late
+        // as possible while keeping the first use, or as early as possible
+        // while keeping the second.
+        assert_eq!(cuts(&[(0, 14)], &[2, 12]), [(0, 4), (0, 12)]);
+        // Rounding outward from `(1, Late)` and `(5, Late)` reaches the same
+        // pair of boundaries.
+        assert_eq!(cuts(&[(0, 14)], &[3, 11]), [(0, 4), (0, 10)]);
+    }
+
+    #[test]
+    fn cuts_stay_inside_their_span() {
+        // Uses on the span's first and last points. Cutting at `span.start`
+        // or at `span.end` would leave an empty piece.
+        assert_eq!(cuts(&[(4, 11)], &[4, 10]), [(0, 6), (0, 10)]);
+    }
+
+    #[test]
+    fn cuts_are_grouped_by_span() {
+        // Every span is offered its own cuts, indexed by its own position, and
+        // a span whose uses share an instruction contributes none.
+        assert_eq!(
+            cuts(&[(0, 6), (8, 14), (14, 16)], &[0, 4, 8, 12, 14, 15]),
+            [(0, 2), (0, 4), (1, 10), (1, 12)],
+        );
+    }
+
+    #[test]
+    fn three_uses_give_two_gaps() {
+        assert_eq!(
+            cuts(&[(0, 14)], &[1, 6, 12]),
+            [(0, 2), (0, 6), (0, 8), (0, 12)]
+        );
     }
 }
