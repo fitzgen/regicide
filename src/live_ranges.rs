@@ -313,20 +313,37 @@ pub(crate) fn normalize_spill_weight(total_use_cost: f32, sum_len_insts: usize) 
     (total_use_cost / denominator).min(f32::MAX)
 }
 
-/// Is a bundle covering `sum_len_insts` instructions minimal?
+/// Is a bundle holding `len_spans` spans, `len_uses` uses, and covering
+/// `sum_len_insts` instructions considered minimal?
 ///
-/// Minimal bundles cannot be split any further.
+/// A minimal bundle is one that cannot be meaningfully split any smaller: one
+/// span, holding either (a) zero uses or (b) exactly one use and covering at
+/// most one instruction.
 ///
-/// One instruction is the floor because moves go at instruction boundaries, and
-/// a one-instruction bundle has no interior boundary to put one at. On the
-/// other hand, a bundle holding two one-instruction spans can still be split
-/// into two bundles of one span each.
-pub(crate) fn is_minimal_bundle(sum_len_insts: usize) -> bool {
+/// * Bundles with multiple spans are not minimal: we could split out a bundle
+///   for each span.
+///
+/// * Bundles with one span and zero uses are considered minimal: we could
+///   *technically* keep splitting the span down into single instruction spans,
+///   but this is useless. A span is always within one basic block, so if we
+///   have so much interference that we will spill any of them to the stack, we
+///   might as well just spill the whole span to the stack, since zero uses
+///   means we aren't using the value in this block anyways. Even worse, it
+///   would also open the door to repeatedly spilling and reloading a value in a
+///   basic block where it isn't even used, adding more cost than if we just
+///   spilled the whole zero-use span from the start!
+///
+/// * Bundles with one span and one use are minimal if the span covers exactly
+///   one instruction: we can't make the span any smaller while still covering
+///   the use and allowing for moves to be inserted before or after it (which
+///   can only happen between instructions).
+pub(crate) fn is_minimal_bundle(len_spans: usize, len_uses: usize, sum_len_insts: usize) -> bool {
+    debug_assert!(len_spans >= 1, "a bundle always holds at least one span");
     debug_assert!(
-        sum_len_insts >= 1,
-        "a bundle always covers at least one instruction",
+        sum_len_insts >= len_spans,
+        "every span covers at least one instruction",
     );
-    sum_len_insts <= 1
+    len_spans == 1 && (len_uses == 0 || (len_uses == 1 && sum_len_insts == 1))
 }
 
 /// Round `weight` to the precision a bundle stores it at.
@@ -1037,11 +1054,14 @@ where
         let mut has_fixed_uses = false;
         let mut total_use_cost = 0.0;
         let mut sum_len_insts = 0;
+        let len_spans = self.spans(live_ranges).len();
+        let mut len_uses = 0;
 
         for span in self.spans(live_ranges) {
             has_fixed_uses |= span.has_fixed_use(live_ranges);
-            total_use_cost += span
-                .uses(live_ranges)
+            let uses = span.uses(live_ranges);
+            len_uses += uses.len();
+            total_use_cost += uses
                 .into_iter()
                 .map(|u| u.weight(live_ranges).as_f32())
                 .sum::<f32>();
@@ -1053,7 +1073,7 @@ where
         )
         .bits();
         debug_assert_eq!(weight_and_flags & !BUNDLE_SPILL_WEIGHT_MASK, 0);
-        if is_minimal_bundle(sum_len_insts) {
+        if is_minimal_bundle(len_spans, len_uses, sum_len_insts) {
             weight_and_flags |= BUNDLE_MINIMAL;
         }
         if has_fixed_uses {
@@ -2823,13 +2843,35 @@ mod tests {
         assert_eq!(normalize_spill_weight(0.0, 1_000), 0.0);
     }
 
-    /// The floor is one instruction, and it is a floor rather than a step: a
-    /// bundle that somehow came out smaller is still minimal.
+    /// One span holding at most one use, and, when it does hold one, covering
+    /// only that use's instruction.
     #[test]
-    fn the_minimal_floor_is_one_instruction() {
-        assert!(is_minimal_bundle(1));
-        assert!(!is_minimal_bundle(2));
-        assert!(!is_minimal_bundle(usize::MAX));
+    fn the_minimal_floor_is_one_span_holding_at_most_one_use() {
+        assert!(is_minimal_bundle(1, 1, 1));
+        assert!(is_minimal_bundle(1, 0, 1));
+
+        // How long a use-free span is does not matter. Cutting it up would
+        // only make more bundles to place, every one of them as happy on the
+        // stack as the whole span was.
+        assert!(is_minimal_bundle(1, 0, 2));
+        assert!(is_minimal_bundle(1, 0, usize::MAX));
+
+        // With a use, though, length is the whole question: an extra
+        // instruction is an interior boundary to cut at, and a move can go
+        // there.
+        assert!(!is_minimal_bundle(1, 1, 2));
+        assert!(!is_minimal_bundle(1, 1, usize::MAX));
+
+        // One use too many: two uses of one instruction can want to live in
+        // two different places.
+        assert!(!is_minimal_bundle(1, 2, 1));
+        assert!(!is_minimal_bundle(1, usize::MAX, 1));
+
+        // One span too many, however few uses: the spans could be handed out
+        // one bundle each.
+        assert!(!is_minimal_bundle(2, 1, 2));
+        assert!(!is_minimal_bundle(2, 0, 2));
+        assert!(!is_minimal_bundle(usize::MAX, 0, usize::MAX));
     }
 
     #[test]

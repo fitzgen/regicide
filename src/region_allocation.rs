@@ -11,7 +11,7 @@ use crate::{
     context::ContextInner,
     counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
-    error::IResult,
+    error::{Error, IResult},
     live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
     machine::RegClassMembers,
     output::OutputInner,
@@ -21,7 +21,7 @@ use crate::{
 use alloc::{collections::BinaryHeap, vec::Vec};
 use assignments::Assignments;
 use core::{fmt, marker::PhantomData, ops::Range};
-use splitting::SplitUse;
+use splitting::{Cut, SplitUse, WithinSpanCut};
 
 pub fn region_allocate<E>(
     context: &mut ContextInner<E>,
@@ -103,6 +103,9 @@ where
     /// Scratch space holding the uses of the bundle being split, likewise.
     split_uses: Vec<SplitUse<E>>,
 
+    /// Scratch space holding the cuts that shred a bundle into minimal pieces.
+    minimal_cuts: Vec<Cut<E>>,
+
     /// Scratch space for deduplicating the bundles in the way of a half, which
     /// [`Assignments::interference_weight`] borrows for the duration of a call
     /// and hands back empty.
@@ -123,6 +126,7 @@ where
             stack_bundles: Vec::new(),
             split_spans: Vec::new(),
             split_uses: Vec::new(),
+            minimal_cuts: Vec::new(),
             interference_scratch: Vec::new(),
         }
     }
@@ -137,6 +141,7 @@ where
             stack_bundles,
             split_spans,
             split_uses,
+            minimal_cuts,
             interference_scratch,
         } = self;
         assignments.reset();
@@ -147,6 +152,7 @@ where
         stack_bundles.clear();
         split_spans.clear();
         split_uses.clear();
+        minimal_cuts.clear();
         interference_scratch.clear();
     }
 
@@ -160,6 +166,7 @@ where
             stack_bundles,
             split_spans,
             split_uses,
+            minimal_cuts,
             interference_scratch,
         } = self;
         assignments.is_reset()
@@ -170,6 +177,7 @@ where
             && stack_bundles.is_empty()
             && split_spans.is_empty()
             && split_uses.is_empty()
+            && minimal_cuts.is_empty()
             && interference_scratch.is_empty()
     }
 
@@ -705,6 +713,12 @@ where
         Ok(true)
     }
 
+    /// The final phase for allocating a bundle: if it isn't already minimal,
+    /// then split it into minimal pieces and push those back on the queue;
+    /// otherwise, spill the bundle.
+    ///
+    /// There is nothing to fallthrough to from here, so we must handle the
+    /// bundle.
     fn split_into_minimal_or_spill(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -713,8 +727,61 @@ where
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<()> {
-        let _ = (input, live_ranges, counts, output, entry.bundle());
-        todo!()
+        let bundle = entry.bundle();
+        debug_assert_eq!(entry.phase(), Phase::SplitIntoMinimalOrSpill);
+
+        let mut cuts = core::mem::take(&mut self.minimal_cuts);
+        debug_assert!(cuts.is_empty());
+
+        self.fill_split_scratch(live_ranges, bundle);
+        cuts.extend(splitting::minimal_cuts(&self.split_spans, &self.split_uses));
+        self.split_spans.clear();
+        self.split_uses.clear();
+
+        debug_assert_eq!(
+            bundle.is_minimal(live_ranges),
+            cuts.is_empty(),
+            "a bundle is minimal iff there is nothing left to cut",
+        );
+
+        let result = (|| {
+            if cuts.is_empty() {
+                match bundle.constraint(live_ranges) {
+                    // Free to live on the stack.
+                    OperandConstraint::Any | OperandConstraint::Stack => {}
+                    // It wants a register, we could not find one for it, and
+                    // there is nothing left to try.
+                    OperandConstraint::Reg(_) => return output.error(Error::TooManyLiveRegs),
+                    OperandConstraint::Reuse(_) => unreachable!("already resolved"),
+                }
+                counts.spilled_bundles.inc();
+                self.stack_bundles.push(bundle);
+                return Ok(());
+            }
+
+            let pref = bundle.preference(live_ranges).clone();
+
+            for cut in cuts.drain(..).rev() {
+                let piece = match cut {
+                    Cut::BetweenSpans(k) => {
+                        bundle.split_at_span(live_ranges, input, output, k)?
+                    }
+                    Cut::WithinSpan(WithinSpanCut { index, at }) => {
+                        bundle.split_at_point(live_ranges, input, output, index, at)?
+                    }
+                };
+                piece.add_hint(live_ranges, &pref);
+                self.push_bundle(input, live_ranges, piece, Phase::SplitIntoMinimalOrSpill);
+            }
+
+            self.push_bundle(input, live_ranges, bundle, Phase::SplitIntoMinimalOrSpill);
+            Ok(())
+        })();
+
+        debug_assert!(self.minimal_cuts.is_empty());
+        self.minimal_cuts = cuts;
+
+        result
     }
 }
 

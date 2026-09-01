@@ -108,6 +108,23 @@ where
     pub at: LivePoint<E>,
 }
 
+/// A cut either between spans or within a span.
+///
+/// These cuts are relative to the original `spans` given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cut<E>
+where
+    E: EntityRepr,
+{
+    /// Cut between two spans, resulting in `spans[..i]` and `spans[i..]`.
+    ///
+    /// Always `1 <= i < spans.len()`, so neither half is ever empty.
+    BetweenSpans(usize),
+
+    /// Cut within a span.
+    WithinSpan(WithinSpanCut<E>),
+}
+
 /// One half of a within-span split.
 ///
 /// This exists so that the splitting kernel can hand its caller both halves
@@ -400,10 +417,85 @@ where
     best
 }
 
+/// Get every cut necessary to split the given `spans` into minimal pieces.
+///
+/// The cuts are yielded in ascending program order.
+///
+/// `uses` must be sorted by program point, and fall within a span in `spans`.
+///
+/// `spans` must be sorted and disjoint.
+pub fn minimal_cuts<'a, E>(
+    spans: &'a [Range<LivePoint<E>>],
+    uses: &'a [SplitUse<E>],
+) -> impl Iterator<Item = Cut<E>> + Clone + 'a
+where
+    E: EntityRepr,
+{
+    debug_assert!(uses.windows(2).all(|u| u[0].point <= u[1].point));
+    debug_assert!(spans.windows(2).all(|s| s[0].end <= s[1].start));
+
+    spans.iter().enumerate().flat_map(move |(index, span)| {
+        let gap = (index > 0 && gap_admits_a_cut(&spans[index - 1], span))
+            .then_some(Cut::BetweenSpans(index));
+        gap.into_iter()
+            .chain(minimal_cuts_within_span(index, span, uses))
+    })
+}
+
+/// Cut `span` into minimal pieces around each use in `uses`.
+///
+/// Cuts are in ascending program order.
+fn minimal_cuts_within_span<'a, E>(
+    index: usize,
+    span: &Range<LivePoint<E>>,
+    uses: &'a [SplitUse<E>],
+) -> impl Iterator<Item = Cut<E>> + Clone + 'a
+where
+    E: EntityRepr,
+{
+    debug_assert!(uses.windows(2).all(|u| u[0].point <= u[1].point));
+    let first = uses.partition_point(|u| u.point.inst_boundary_after() <= span.start);
+    let last = uses.partition_point(|u| u.point.inst_boundary_at_or_before() < span.end);
+    let in_span = &uses[first..last];
+
+    let start = span.start;
+    let end = span.end;
+
+    in_span
+        .iter()
+        .enumerate()
+        // Filter out uses at the same instruction as the last one, since they
+        // result in the same cut point.
+        .filter(move |(i, u)| {
+            *i == 0
+                || in_span[i - 1].point.inst_boundary_at_or_before()
+                    != u.point.inst_boundary_at_or_before()
+        })
+        .flat_map(move |(i, u)| {
+            let before = u.point.inst_boundary_at_or_before();
+            let after = u.point.inst_boundary_after();
+
+            // If this instruction is immediately following the last one, then
+            // the last `after` is identical to this `before`, and we can skip
+            // it.
+            let before_is_new = i == 0 || in_span[i - 1].point.inst_boundary_after() != before;
+
+            // A cut at or outside a span doesn't split it.
+            let should_cut_before = before_is_new && start < before && before < end;
+            let should_cut_after = start < after && after < end;
+
+            should_cut_before
+                .then_some(before)
+                .into_iter()
+                .chain(should_cut_after.then_some(after))
+                .map(move |at| Cut::WithinSpan(WithinSpanCut { index, at }))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Inst;
+    use crate::{Inst, live_ranges::is_minimal_bundle};
     use mutatis::{
         Mutate,
         check::{Check, CheckResult},
@@ -506,6 +598,17 @@ mod tests {
                 .iter()
                 .map(|s| s.end.prev_point().inst().index() - s.start.inst().index() + 1)
                 .sum()
+        }
+
+        /// The instructions this piece reaches into, as an inclusive range of
+        /// indices.
+        ///
+        /// Unlike `len_insts`, which sums over the spans, this counts an
+        /// instruction that two of the piece's spans both touch only once.
+        fn inst_range(&self) -> (usize, usize) {
+            let first = self.spans.first().unwrap().start.inst().index();
+            let last = self.spans.last().unwrap().end.prev_point().inst().index();
+            (first, last)
         }
     }
 
@@ -1102,6 +1205,249 @@ mod tests {
         Ok(Some((prefix, suffix)))
     }
 
+    /// The cuts shredding `spans` into minimal pieces, computed the dumb way.
+    ///
+    /// Where the kernel works forwards from each use to the two boundaries
+    /// around it, this walks every point in the whole program and asks of each
+    /// one whether it is a boundary of some use's instruction. Ascending order
+    /// and the absence of duplicates fall out of the enumeration rather than
+    /// being arranged, which is exactly what makes it worth comparing against.
+    fn oracle_minimal_cuts(
+        spans: &[Range<LivePoint<u32>>],
+        uses: &[SplitUse<u32>],
+    ) -> Vec<Cut<u32>> {
+        let mut out = Vec::new();
+        for (index, span) in spans.iter().enumerate() {
+            if index > 0 {
+                let before = &spans[index - 1];
+                let admits = (0..=NUM_INSTS).any(|i| {
+                    let boundary =
+                        LivePoint::new(Inst::try_new(usize::from(i)).unwrap(), Position::Early);
+                    before.end <= boundary && boundary <= span.start
+                });
+                if admits {
+                    out.push(Cut::BetweenSpans(index));
+                }
+            }
+
+            for at in (0..=NUM_POINTS).map(point) {
+                if at.pos() != Position::Early {
+                    continue;
+                }
+                // Strictly inside the span, so neither piece comes out empty.
+                if !(span.start < at && at < span.end) {
+                    continue;
+                }
+                // And bounding the instruction of some use of the bundle, so
+                // that it carves that use out into an instruction of its own.
+                // Note that the use need not be one of this span's own: see
+                // `minimal_cuts_within_span`.
+                let bounds_a_use = uses.iter().any(|u| {
+                    u.point.inst_boundary_at_or_before() == at
+                        || u.point.inst_boundary_after() == at
+                });
+                if bounds_a_use {
+                    out.push(Cut::WithinSpan(WithinSpanCut { index, at }));
+                }
+            }
+        }
+        out
+    }
+
+    /// A sort key placing a cut in program order.
+    ///
+    /// The gap before span `k` comes after everything inside span `k - 1` and
+    /// before everything inside span `k`, which the odd and even halves of the
+    /// first component arrange; `None` sorting before `Some` puts a gap ahead
+    /// of the points within the span that follows it.
+    fn minimal_cut_key(cut: Cut<u32>) -> (usize, Option<LivePoint<u32>>) {
+        match cut {
+            Cut::BetweenSpans(k) => (2 * k, None),
+            Cut::WithinSpan(WithinSpanCut { index, at }) => (2 * index + 1, Some(at)),
+        }
+    }
+
+    /// Cut `piece` into the pieces `cuts` describes.
+    ///
+    /// Works back to front, exactly as `split_into_minimal_or_spill` does, so
+    /// that this exercises the same index arithmetic the allocator relies on.
+    fn apply_minimal_cuts(piece: &Piece, cuts: &[Cut<u32>]) -> Vec<Piece> {
+        let mut spans = piece.spans.clone();
+        let mut pieces = Vec::new();
+
+        for cut in cuts.iter().rev() {
+            let suffix = match *cut {
+                Cut::BetweenSpans(k) => spans.split_off(k),
+                Cut::WithinSpan(WithinSpanCut { index, at }) => {
+                    let end = spans[index].end;
+                    spans[index].end = at;
+                    let mut suffix = vec![at..end];
+                    suffix.extend(spans.drain(index + 1..));
+                    suffix
+                }
+            };
+            pieces.push(suffix);
+        }
+        pieces.push(spans);
+        pieces.reverse();
+
+        pieces
+            .into_iter()
+            .map(|spans| Piece {
+                uses: piece
+                    .uses
+                    .iter()
+                    .filter(|u| spans.iter().any(|s| s.start <= u.point && u.point < s.end))
+                    .copied()
+                    .collect(),
+                spans,
+            })
+            .collect()
+    }
+
+    /// Check everything `minimal_cuts` promises about `piece`, and return the
+    /// pieces it shreds it into.
+    fn check_split_into_minimal(piece: &Piece) -> Result<Vec<Piece>, String> {
+        let spans = &piece.spans;
+        let uses = &piece.uses;
+
+        let actual: Vec<_> = minimal_cuts(spans, uses).collect();
+        let expected = oracle_minimal_cuts(spans, uses);
+        if actual != expected {
+            return Err(format!(
+                "`minimal_cuts({spans:?}, {uses:?})` gives {actual:?} but should give \
+                 {expected:?}",
+            ));
+        }
+
+        for pair in actual.windows(2) {
+            if minimal_cut_key(pair[0]) >= minimal_cut_key(pair[1]) {
+                return Err(format!(
+                    "`minimal_cuts({spans:?}, {uses:?})` gives {actual:?}, which is not in \
+                     ascending order without duplicates",
+                ));
+            }
+        }
+
+        // Every cut satisfies the preconditions of the split primitive that
+        // will be handed it.
+        for &cut in &actual {
+            match cut {
+                Cut::BetweenSpans(k) => {
+                    if !(1 <= k && k < spans.len()) {
+                        return Err(format!(
+                            "`minimal_cuts({spans:?}, {uses:?})` gives {cut:?}, which leaves a \
+                             piece span-less",
+                        ));
+                    }
+                }
+                Cut::WithinSpan(WithinSpanCut { index, at }) => {
+                    // A move cannot go between an instruction's uses and its
+                    // defs, so a cut has to land on an instruction boundary...
+                    if at.pos() != Position::Early {
+                        return Err(format!(
+                            "`minimal_cuts({spans:?}, {uses:?})` gives {cut:?}, which is not on \
+                             an instruction boundary",
+                        ));
+                    }
+                    // ...and strictly inside its span, or a piece comes out
+                    // empty.
+                    let span = &spans[index];
+                    if !(span.start < at && at < span.end) {
+                        return Err(format!(
+                            "`minimal_cuts({spans:?}, {uses:?})` gives {cut:?}, which is not \
+                             inside {span:?}",
+                        ));
+                    }
+                }
+            }
+        }
+
+        // A bundle that `is_minimal_bundle` calls minimal is small enough that
+        // there is nothing left to cut. The converse does not hold, and the
+        // pieces below are where that shows: two one-instruction spans touching
+        // at a `Late` point are uncuttable and yet are two spans.
+        if is_minimal_bundle(spans.len(), uses.len(), piece.len_insts()) && !actual.is_empty() {
+            return Err(format!(
+                "{spans:?} with {uses:?} is minimal, but `minimal_cuts` gives {actual:?}",
+            ));
+        }
+
+        let pieces = apply_minimal_cuts(piece, &actual);
+
+        // The pieces partition the bundle: one more piece than there were cuts,
+        // holding one more span between them for each span that was divided,
+        // and the same uses over the same instructions.
+        if pieces.len() != actual.len() + 1 {
+            return Err(format!(
+                "cutting {spans:?} at {actual:?} gives {} pieces, not {}",
+                pieces.len(),
+                actual.len() + 1,
+            ));
+        }
+        let divided = actual
+            .iter()
+            .filter(|c| matches!(c, Cut::WithinSpan(_)))
+            .count();
+        let num_spans: usize = pieces.iter().map(|p| p.spans.len()).sum();
+        if num_spans != spans.len() + divided {
+            return Err(format!(
+                "cutting {spans:?} at {actual:?} gives {num_spans} spans, not {}",
+                spans.len() + divided,
+            ));
+        }
+        let num_uses: usize = pieces.iter().map(|p| p.uses.len()).sum();
+        if num_uses != uses.len() {
+            return Err(format!(
+                "cutting {spans:?} at {actual:?} creates or loses a use",
+            ));
+        }
+        let num_insts: usize = pieces.iter().map(|p| p.len_insts()).sum();
+        if num_insts != piece.len_insts() {
+            return Err(format!(
+                "cutting {spans:?} at {actual:?} creates or loses an instruction",
+            ));
+        }
+
+        for p in &pieces {
+            if p.spans.is_empty() || p.spans.iter().any(|s| s.start >= s.end) {
+                return Err(format!(
+                    "cutting {spans:?} at {actual:?} leaves an empty piece {:?}",
+                    p.spans,
+                ));
+            }
+
+            // One pass already reaches a fixed point, which is what lets the
+            // allocator hand every piece straight back to the same rung and
+            // know it will spill rather than split again.
+            let again: Vec<_> = minimal_cuts(&p.spans, &p.uses).collect();
+            if !again.is_empty() {
+                return Err(format!(
+                    "cutting {spans:?} at {actual:?} leaves {:?}, which `minimal_cuts` would \
+                     cut again at {again:?}",
+                    p.spans,
+                ));
+            }
+
+            // A piece that holds a use holds it alone, in an instruction of its
+            // own: that is what "minimal" is for. Note that a piece can still
+            // reach that one instruction through two spans, when they touch at
+            // a `Late` point that nothing can be cut at.
+            if !p.uses.is_empty() {
+                let (first, last) = p.inst_range();
+                if first != last {
+                    return Err(format!(
+                        "cutting {spans:?} at {actual:?} leaves {:?}, which holds uses across \
+                         instructions {first} through {last}",
+                        p.spans,
+                    ));
+                }
+            }
+        }
+
+        Ok(pieces)
+    }
+
     /// Fuse spans that touch, so that a span and the two pieces it was divided
     /// into compare equal.
     fn merge_adjacent(spans: &[Range<LivePoint<u32>>]) -> Vec<Range<LivePoint<u32>>> {
@@ -1151,6 +1497,13 @@ mod tests {
             /// Which rung to cut on: within one of the piece's spans, or
             /// between two of them.
             within_span: bool,
+        },
+
+        /// Shred a piece into every minimal piece its shape allows, replacing
+        /// it with all of them. The bottom rung, which unlike the two above it
+        /// makes every cut it can rather than picking the best one.
+        SplitIntoMinimal {
+            piece: u8,
         },
 
         /// Park a copy of a piece in a candidate, so that it stands in the way.
@@ -1244,7 +1597,7 @@ mod tests {
         ops.truncate(MAX_OPS);
         for op in ops.iter_mut() {
             match op {
-                Op::Split { .. } | Op::Reset => {}
+                Op::Split { .. } | Op::SplitIntoMinimal { .. } | Op::Reset => {}
                 Op::Assign { candidate, .. } | Op::Evict { candidate } => {
                     *candidate %= NUM_CANDIDATES;
                 }
@@ -1290,6 +1643,10 @@ mod tests {
 
     fn assign(piece: u8, candidate: u8) -> Op {
         Op::Assign { piece, candidate }
+    }
+
+    fn split_minimal(piece: u8) -> Op {
+        Op::SplitIntoMinimal { piece }
     }
 
     fn seeds() -> Vec<Vec<Op>> {
@@ -1565,6 +1922,69 @@ mod tests {
                 split_within(1),
                 split_within(2),
             ],
+            // The bottom rung on its own, against the same bundle: one pass
+            // shreds what the rung above it took four to get through.
+            vec![
+                rebuild(&[(0, NUM_POINTS)], &[(1, 3), (5, 1), (11, 2), (13, 8)]),
+                split_minimal(0),
+            ],
+            // Two spans touching at `(i, Late)`, the case the rungs above
+            // cannot cut. The bottom rung carves the uses out but leaves the
+            // two spans that meet inside instruction three together, because
+            // no move can go there.
+            vec![
+                one_block.clone(),
+                rebuild(&[(5, 7), (7, 9)], &[(5, 1), (7, 1)]),
+                split_minimal(0),
+                split_minimal(0),
+                split_minimal(1),
+                split_minimal(2),
+            ],
+            // A use-free span, and a span of one instruction: the two shapes
+            // the bottom rung leaves alone, which is what sends them to the
+            // stack.
+            vec![
+                one_block.clone(),
+                rebuild(&[(2, 12)], &[]),
+                split_minimal(0),
+            ],
+            vec![
+                one_block.clone(),
+                rebuild(&[(4, 6)], &[(4, 1), (5, 1)]),
+                split_minimal(0),
+            ],
+            // Gaps of every kind at once: one wide enough for a cut, one that
+            // falls inside a single instruction and so admits none.
+            vec![
+                one_block.clone(),
+                rebuild(
+                    &[(1, 3), (3, 5), (8, 14)],
+                    &[(1, 1), (4, 1), (9, 1), (12, 1)],
+                ),
+                split_minimal(0),
+            ],
+            // Uses in adjacent instructions, and two uses of one instruction:
+            // the two ways the same boundary gets asked for twice.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, NUM_POINTS)], &[(4, 1), (6, 1), (8, 1)]),
+                split_minimal(0),
+            ],
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, NUM_POINTS)], &[(6, 1), (7, 1)]),
+                split_minimal(0),
+            ],
+            // The bottom rung after the rungs above it, which is the order the
+            // allocator reaches it in.
+            vec![
+                one_block.clone(),
+                rebuild(&[(0, 6), (8, 16)], &[(0, 1), (4, 1), (8, 1), (14, 1)]),
+                split(0),
+                split_within(0),
+                split_minimal(1),
+                split_minimal(0),
+            ],
         ];
         for ops in seeds.iter_mut() {
             fixup_ops(ops);
@@ -1587,6 +2007,12 @@ mod tests {
                         state.pieces[index] = prefix;
                         state.pieces.insert(index + 1, suffix);
                     }
+                }
+
+                Op::SplitIntoMinimal { piece } => {
+                    let index = usize::from(*piece) % state.pieces.len();
+                    let pieces = check_split_into_minimal(&state.pieces[index])?;
+                    state.pieces.splice(index..index + 1, pieces);
                 }
 
                 Op::Assign { piece, candidate } => {
@@ -1688,10 +2114,38 @@ mod tests {
 
                     let (index, (prefix, suffix)) = match cut {
                         Some(cut) => cut,
-                        // Nothing is cuttable, which is where splitting has to
-                        // end up: the allocator has no rung after this one but
-                        // spilling.
-                        None => return Ok(()),
+                        // Neither of the first two rungs will cut anything
+                        // more. The last one shreds whatever they left, and
+                        // after it nothing at all is cuttable, which is where
+                        // splitting has to end up: the allocator has no rung
+                        // after that one but spilling.
+                        None => {
+                            let mut shredded = Vec::new();
+                            for piece in &state.pieces {
+                                shredded.extend(check_split_into_minimal(piece)?);
+                            }
+                            state.pieces = shredded;
+                            check_pieces_partition(&state)?;
+
+                            for piece in &state.pieces {
+                                // `check_split_into_minimal` already made sure
+                                // the bottom rung has nothing more to say about
+                                // each piece; the two rungs above it must be
+                                // just as done, since the bottom one cuts
+                                // everywhere they would have.
+                                for within_span in [false, true] {
+                                    if check_split(piece, &state.parked, within_span)?.is_some() {
+                                        return Err(format!(
+                                            "{:?} came out of splitting into minimal pieces, but \
+                                             is still cuttable with within_span = {within_span}",
+                                            piece.spans,
+                                        ));
+                                    }
+                                }
+                            }
+
+                            return Ok(());
+                        }
                     };
 
                     state.pieces[index] = prefix;
@@ -1792,6 +2246,137 @@ mod tests {
         assert_eq!(
             cuts(&[(0, 14)], &[1, 6, 12]),
             [(0, 2), (0, 6), (0, 8), (0, 12)]
+        );
+    }
+    /// The same, for `minimal_cuts`.
+    ///
+    /// A cut between spans comes out as `(index, None)`, and a cut within one
+    /// as `(index, Some(point))`.
+    fn minimal(spans: &[(u8, u8)], uses: &[u8]) -> Vec<(usize, Option<u8>)> {
+        let spans: Vec<_> = spans.iter().map(|&(s, e)| span(s, e)).collect();
+        let uses: Vec<_> = uses
+            .iter()
+            .map(|&p| SplitUse {
+                point: point(p),
+                weight: 1.0,
+            })
+            .collect();
+
+        // The oracle agrees, on every one of these, with the kernel, and so do
+        // all the other promises the kernel makes.
+        check_split_into_minimal(&Piece {
+            spans: spans.clone(),
+            uses: uses.clone(),
+        })
+        .unwrap();
+
+        minimal_cuts(&spans, &uses)
+            .map(|cut| match cut {
+                Cut::BetweenSpans(index) => (index, None),
+                Cut::WithinSpan(WithinSpanCut { index, at }) => {
+                    debug_assert_eq!(at.pos(), Position::Early);
+                    (index, Some(u8::try_from(at.inst().index() * 2).unwrap()))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_minimal_cuts_for_a_single_instruction_span() {
+        // Instruction two, at both positions. There is no boundary inside it
+        // to cut at, which is what makes one instruction the floor.
+        assert!(minimal(&[(4, 6)], &[4]).is_empty());
+        assert!(minimal(&[(4, 6)], &[5]).is_empty());
+        assert!(minimal(&[(4, 6)], &[4, 5]).is_empty());
+        // A span running from one `Late` point to the next reaches into two
+        // instructions, so it does have a boundary inside it to cut at.
+        assert_eq!(minimal(&[(5, 7)], &[5, 6]), [(0, Some(6))]);
+    }
+
+    #[test]
+    fn no_minimal_cuts_for_a_use_free_span() {
+        // Nothing wants any particular part of this, so cutting it up would
+        // only make more bundles to place, all of them equally happy anywhere.
+        assert!(minimal(&[(0, NUM_POINTS)], &[]).is_empty());
+        assert!(minimal(&[(2, 6), (8, 12)], &[]) == [(1, None)]);
+    }
+
+    #[test]
+    fn a_use_carves_out_its_own_instruction() {
+        // The use is in instruction three, so the two boundaries around it are
+        // `(3, Early)` and `(4, Early)`: this allocator's `minimal_range_for_use`.
+        assert_eq!(minimal(&[(0, 16)], &[6]), [(0, Some(6)), (0, Some(8))]);
+        assert_eq!(minimal(&[(0, 16)], &[7]), [(0, Some(6)), (0, Some(8))]);
+
+        // A boundary at the span's own end does not divide it, so a use in the
+        // first or last instruction of a span asks for only one cut.
+        assert_eq!(minimal(&[(6, 16)], &[6]), [(0, Some(8))]);
+        assert_eq!(minimal(&[(0, 8)], &[6]), [(0, Some(6))]);
+    }
+
+    #[test]
+    fn uses_in_adjacent_instructions_share_a_boundary() {
+        // Instructions three and four. The boundary between them is the second
+        // use's `before` and the first use's `after`, and it is reported once.
+        assert_eq!(
+            minimal(&[(0, 16)], &[6, 8]),
+            [(0, Some(6)), (0, Some(8)), (0, Some(10))],
+        );
+        assert_eq!(
+            minimal(&[(0, 16)], &[7, 9]),
+            [(0, Some(6)), (0, Some(8)), (0, Some(10))],
+        );
+    }
+
+    #[test]
+    fn two_uses_in_one_instruction_are_not_separated() {
+        // Both positions of instruction three ask for the very same pair of
+        // boundaries, and nothing can go between them anyway.
+        assert_eq!(minimal(&[(0, 16)], &[6, 7]), [(0, Some(6)), (0, Some(8))]);
+    }
+
+    #[test]
+    fn abutting_spans_at_a_late_point_admit_no_cut() {
+        // The case the two rungs above this one cannot handle: two spans that
+        // meet at `(3, Late)`. The gap between them is inside instruction
+        // three, so there is no cut there, and shredding leaves them together.
+        assert_eq!(
+            minimal(&[(5, 7), (7, 9)], &[5, 7]),
+            [(0, Some(6)), (1, Some(8))]
+        );
+
+        // Cutting at those two points leaves the middle piece holding both
+        // spans, and it cannot be cut any further even though it is two spans.
+        assert!(minimal(&[(6, 7), (7, 8)], &[7]).is_empty());
+        assert!(!is_minimal_bundle(2, 1, 2));
+    }
+
+    #[test]
+    fn every_admissible_gap_is_cut() {
+        // The first gap is empty, sitting at the boundary `(6, Early)`, and
+        // the second is wide. Both take a cut; a gap inside an instruction,
+        // like the one in `abutting_spans_at_a_late_point_admit_no_cut`, does
+        // not.
+        assert_eq!(
+            minimal(&[(2, 12), (12, 14), (15, 16)], &[]),
+            [(1, None), (2, None)],
+        );
+    }
+
+    #[test]
+    fn minimal_cuts_are_ascending_and_deduplicated() {
+        // Gaps and interior cuts interleave in program order, each span's cuts
+        // indexed by its own position.
+        assert_eq!(
+            minimal(&[(0, 6), (8, 14), (14, 16)], &[0, 4, 8, 12, 14, 15]),
+            [
+                (0, Some(2)),
+                (0, Some(4)),
+                (1, None),
+                (1, Some(10)),
+                (1, Some(12)),
+                (2, None),
+            ],
         );
     }
 }
