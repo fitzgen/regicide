@@ -112,10 +112,6 @@ where
     /// Always resolved to remove `Reuse` constraints.
     set_constraint: SecondaryMap<LiveSpan<E>, OperandConstraint>,
 
-    /// Scratch space for a stack of regions during a traversal of the region
-    /// tree.
-    region_stack: Vec<Region<E>>,
-
     /// Scratch space for a region's blocks, sorted by priority.
     region_blocks: Vec<Block<E>>,
 
@@ -145,7 +141,6 @@ where
             set_head: SecondaryMap::new(None),
             set_tail: SecondaryMap::new(None),
             set_constraint: SecondaryMap::new(OperandConstraint::Any),
-            region_stack: Vec::new(),
             region_blocks: Vec::new(),
             val_exit_span: SecondaryMap::new(None),
             val_entry_span: SecondaryMap::new(None),
@@ -160,7 +155,6 @@ where
             set_head,
             set_tail,
             set_constraint,
-            region_stack,
             region_blocks,
             val_exit_span,
             val_entry_span,
@@ -173,7 +167,6 @@ where
         set_constraint.reset();
         val_exit_span.reset();
         val_entry_span.reset();
-        debug_assert!(region_stack.is_empty());
         debug_assert!(region_blocks.is_empty());
         debug_assert!(cross_region_affinities.is_empty());
     }
@@ -185,7 +178,6 @@ where
             set_head,
             set_tail,
             set_constraint,
-            region_stack,
             region_blocks,
             val_exit_span,
             val_entry_span,
@@ -196,7 +188,6 @@ where
             && set_head.is_reset()
             && set_tail.is_reset()
             && set_constraint.is_reset()
-            && region_stack.is_empty()
             && region_blocks.is_empty()
             && val_exit_span.is_reset()
             && val_entry_span.is_reset()
@@ -428,11 +419,7 @@ where
     debug_assert!(coalescing.is_reset());
 
     // Merge spans into sets within each region.
-    coalescing.region_stack.push(region_tree.root());
-    while let Some(region) = coalescing.region_stack.pop() {
-        coalescing
-            .region_stack
-            .extend(region.children(&region_tree));
+    for region in region_tree.pre_order_iter() {
         coalescing.coalesce_region(region_tree, live_ranges, input, output, region)?;
     }
 
@@ -805,12 +792,7 @@ fn build_bundles<E>(
 where
     E: EntityRepr,
 {
-    coalescing.region_stack.push(region_tree.root());
-    while let Some(region) = coalescing.region_stack.pop() {
-        coalescing
-            .region_stack
-            .extend(region.children(&region_tree));
-
+    for region in region_tree.pre_order_iter() {
         let start = live_ranges.next_bundle(output)?;
 
         for block in region.blocks(&region_tree) {

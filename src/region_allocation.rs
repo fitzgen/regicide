@@ -15,7 +15,6 @@ use crate::{
     live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
     machine::RegClassMembers,
     output::OutputInner,
-    region_tree::RegionTree,
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
@@ -41,34 +40,15 @@ where
         ..
     } = context;
 
-    let mut region_pre_order = core::mem::take(&mut region_allocation.region_pre_order);
-    find_region_pre_order(&mut region_pre_order, region_tree);
-
-    let result = (|| {
-        for region in region_pre_order.iter().copied().rev() {
-            region_allocation.allocate_region(input, live_ranges, counts, output, region)?;
-        }
-        Ok(())
-    })();
-
-    region_pre_order.clear();
-    debug_assert!(region_allocation.region_pre_order.is_empty());
-    region_allocation.region_pre_order = region_pre_order;
-
-    result?;
+    // Reverse the pre-order so we visit children before parents.
+    for region in region_tree.pre_order_iter().rev() {
+        region_allocation.allocate_region(input, live_ranges, counts, output, region)?;
+    }
 
     counts.final_live_spans += live_ranges.len_spans();
     counts.final_bundles += live_ranges.len_bundles();
 
     Ok(())
-}
-
-fn find_region_pre_order<E>(region_pre_order: &mut Vec<Region<E>>, region_tree: &RegionTree<E>)
-where
-    E: EntityRepr,
-{
-    let _ = (region_pre_order, region_tree);
-    todo!("fill `region_pre_order` with a pre-order traversal of the region tree")
 }
 
 pub struct RegionAllocation<E>
@@ -87,9 +67,6 @@ where
 
     /// Each bundle's current allocation priority.
     bundle_priority: SecondaryMap<LiveBundle<E>, Priority>,
-
-    /// Scratch space to hold a pre-order traversal of the region tree.
-    region_pre_order: Vec<Region<E>>,
 
     /// The set of bundles that must be allocated to stack slots.
     ///
@@ -122,7 +99,6 @@ where
             region_assignments: Assignments::new(),
             queue: BinaryHeap::new(),
             bundle_priority: SecondaryMap::new(Priority::ZERO),
-            region_pre_order: Vec::new(),
             stack_bundles: Vec::new(),
             split_spans: Vec::new(),
             split_uses: Vec::new(),
@@ -137,7 +113,6 @@ where
             region_assignments,
             queue,
             bundle_priority,
-            region_pre_order,
             stack_bundles,
             split_spans,
             split_uses,
@@ -148,7 +123,6 @@ where
         region_assignments.reset();
         queue.clear();
         bundle_priority.reset();
-        region_pre_order.clear();
         stack_bundles.clear();
         split_spans.clear();
         split_uses.clear();
@@ -162,7 +136,6 @@ where
             region_assignments,
             queue,
             bundle_priority,
-            region_pre_order,
             stack_bundles,
             split_spans,
             split_uses,
@@ -173,7 +146,6 @@ where
             && region_assignments.is_reset()
             && queue.is_empty()
             && bundle_priority.is_reset()
-            && region_pre_order.is_empty()
             && stack_bundles.is_empty()
             && split_spans.is_empty()
             && split_uses.is_empty()
@@ -763,9 +735,7 @@ where
 
             for cut in cuts.drain(..).rev() {
                 let piece = match cut {
-                    Cut::BetweenSpans(k) => {
-                        bundle.split_at_span(live_ranges, input, output, k)?
-                    }
+                    Cut::BetweenSpans(k) => bundle.split_at_span(live_ranges, input, output, k)?,
                     Cut::WithinSpan(WithinSpanCut { index, at }) => {
                         bundle.split_at_point(live_ranges, input, output, index, at)?
                     }

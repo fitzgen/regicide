@@ -60,6 +60,16 @@ where
     /// The contiguous storage for the children that belong to each region.
     region_children_storage: PrimaryMap<RegionChildrenStorageIndex<E>, Region<E>>,
 
+    /// A pre-order traversal of the region tree: every region appears exactly
+    /// once, and always before any of its descendants.
+    pre_order: Vec<Region<E>>,
+
+    /// Scratch space: the depth-first stack used to build `pre_order`.
+    ///
+    /// Always empty outside of `construct`; a field only so that we reuse its
+    /// allocation across resets.
+    pre_order_stack: Vec<Region<E>>,
+
     /// Scratch space: each block paired with its region, sorted by region so that
     /// we can lay each region's blocks out contiguously.
     ///
@@ -95,6 +105,8 @@ where
             region_parent: SecondaryMap::new(None),
             region_children: SecondaryMap::new(EntityRange::empty()),
             region_children_storage: PrimaryMap::new(),
+            pre_order: Vec::new(),
+            pre_order_stack: Vec::new(),
             blocks_by_region: Vec::new(),
             distinct_regions: Vec::new(),
             children_by_parent: Vec::new(),
@@ -111,6 +123,8 @@ where
             region_parent,
             region_children,
             region_children_storage,
+            pre_order,
+            pre_order_stack,
             blocks_by_region,
             distinct_regions,
             children_by_parent,
@@ -123,6 +137,8 @@ where
         region_parent.reset();
         region_children.reset();
         region_children_storage.reset();
+        pre_order.clear();
+        debug_assert!(pre_order_stack.is_empty());
         debug_assert!(blocks_by_region.is_empty());
         debug_assert!(distinct_regions.is_empty());
         debug_assert!(children_by_parent.is_empty());
@@ -138,6 +154,8 @@ where
             region_parent,
             region_children,
             region_children_storage,
+            pre_order,
+            pre_order_stack,
             blocks_by_region,
             distinct_regions,
             children_by_parent,
@@ -150,6 +168,8 @@ where
             && region_parent.is_reset()
             && region_children.is_reset()
             && region_children_storage.is_reset()
+            && pre_order.is_empty()
+            && pre_order_stack.is_empty()
             && blocks_by_region.is_empty()
             && distinct_regions.is_empty()
             && children_by_parent.is_empty()
@@ -164,6 +184,8 @@ where
     ) -> IResult<()> {
         let _timing = Timing::new("region tree");
 
+        debug_assert!(self.pre_order.is_empty());
+        debug_assert!(self.pre_order_stack.is_empty());
         debug_assert!(self.blocks_by_region.is_empty());
         debug_assert!(self.distinct_regions.is_empty());
         debug_assert!(self.children_by_parent.is_empty());
@@ -172,6 +194,7 @@ where
         self.construct_regions(func, output)?;
         self.construct_region_blocks(func, output)?;
         self.construct_region_tree(func, output)?;
+        self.construct_pre_order();
 
         counts.regions += self.distinct_regions.len();
         self.distinct_regions.clear();
@@ -350,11 +373,44 @@ where
         Ok(Some(outside.region(self)))
     }
 
+    /// Fill `pre_order` with a pre-order traversal of the region tree.
+    fn construct_pre_order(&mut self) {
+        let mut pre_order = core::mem::take(&mut self.pre_order);
+        let mut stack = core::mem::take(&mut self.pre_order_stack);
+        debug_assert!(pre_order.is_empty());
+        debug_assert!(stack.is_empty());
+
+        pre_order.reserve(self.distinct_regions.len());
+
+        stack.push(self.root());
+        while let Some(region) = stack.pop() {
+            pre_order.push(region);
+
+            // Push the children in reverse so that they are popped, and
+            // therefore visited, in order.
+            stack.extend(region.children(self).rev());
+        }
+
+        self.pre_order = pre_order;
+        self.pre_order_stack = stack;
+    }
+
     /// Get the root of the region tree: the function entry block's region.
     #[allow(dead_code, reason = "will probably need it")]
     pub fn root(&self) -> Region<E> {
         self.root
             .expect("should always have a root after construction")
+    }
+
+    /// Iterate over this tree's regions in pre-order: every region appears
+    /// exactly once, and always before any of its descendants.
+    ///
+    /// Iterating in reverse therefore gives a bottom-up order, where every
+    /// region appears after all of its descendants.
+    pub(crate) fn pre_order_iter(
+        &self,
+    ) -> impl ExactSizeIterator<Item = Region<E>> + DoubleEndedIterator + '_ {
+        self.pre_order.iter().copied()
     }
 }
 
@@ -402,11 +458,10 @@ where
     }
 
     /// Get the immediate child regions of this region.
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn children(
         self,
         region_tree: &RegionTree<E>,
-    ) -> impl ExactSizeIterator<Item = Region<E>> + '_ {
+    ) -> impl ExactSizeIterator<Item = Region<E>> + DoubleEndedIterator + '_ {
         region_tree.region_children[self].indices().map(move |i| {
             let i = RegionChildrenStorageIndex::try_new(i).unwrap();
             region_tree.region_children_storage[i]
@@ -612,6 +667,171 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    /// Build a region tree with the given shape directly, without going through
+    /// a control-flow graph: `children[i]` holds the child regions of region
+    /// `i`, and region `0` is the root.
+    ///
+    /// The generated `TestFunction`s are small enough that their region trees
+    /// are never more than a root and a single child, which is not enough to
+    /// tell a pre-order traversal apart from any other order that visits
+    /// parents first. This lets us check the traversal itself against shapes
+    /// that do.
+    fn tree_with_shape(children: &[&[usize]]) -> RegionTree<u32> {
+        let mut output = OutputInner::<u32>::new();
+        let mut tree = RegionTree::<u32>::new();
+
+        let region = |i: usize| Region::<u32>::try_new(i).unwrap();
+        tree.root = Some(region(0));
+
+        for (parent, kids) in children.iter().enumerate() {
+            let start = tree.region_children_storage.next_key(&mut output).unwrap();
+            for &kid in *kids {
+                tree.region_parent[region(kid)] = Some(region(parent));
+                tree.region_children_storage
+                    .push(&mut output, region(kid))
+                    .unwrap();
+            }
+            let end = tree.region_children_storage.next_key(&mut output).unwrap();
+            tree.region_children[region(parent)] = EntityRange { start, end };
+        }
+
+        tree.construct_pre_order();
+        tree
+    }
+
+    /// `pre_order_iter` is depth-first, visiting each region's children in
+    /// order, and not merely parents-before-children.
+    #[test]
+    fn pre_order_iter_is_depth_first() {
+        // region0
+        // ├── region1
+        // │   ├── region2
+        // │   └── region3
+        // └── region4
+        //     └── region5
+        let tree = tree_with_shape(&[&[1, 4], &[2, 3], &[], &[], &[5], &[]]);
+
+        let actual: Vec<usize> = tree.pre_order_iter().map(|r| r.index()).collect();
+        assert_eq!(actual, alloc::vec![0, 1, 2, 3, 4, 5]);
+
+        let backwards: Vec<usize> = tree.pre_order_iter().rev().map(|r| r.index()).collect();
+        assert_eq!(backwards, alloc::vec![5, 4, 3, 2, 1, 0]);
+    }
+
+    /// A tree that is a single chain, and one that is a single region.
+    #[test]
+    fn pre_order_iter_degenerate_shapes() {
+        let tree = tree_with_shape(&[&[1], &[2], &[]]);
+        let actual: Vec<usize> = tree.pre_order_iter().map(|r| r.index()).collect();
+        assert_eq!(actual, alloc::vec![0, 1, 2]);
+
+        let tree = tree_with_shape(&[&[]]);
+        let actual: Vec<usize> = tree.pre_order_iter().map(|r| r.index()).collect();
+        assert_eq!(actual, alloc::vec![0]);
+    }
+
+    #[test]
+    fn pre_order_iter_properties() -> CheckResult<TestFunction> {
+        Check::new()
+            .iters(10_000)
+            .run(|func: &TestFunction| -> Result<(), String> {
+                let tree = construct(func)?;
+
+                let pre_order: Vec<Region> = tree.pre_order_iter().collect();
+
+                // Property 1: the traversal visits every region exactly once.
+                let mut seen = BTreeSet::new();
+                for region in &pre_order {
+                    if !seen.insert(*region) {
+                        return Err(format!(
+                            "`pre_order_iter` visits {region:?} more than once: {pre_order:?}"
+                        ));
+                    }
+                }
+                let expected: BTreeSet<Region> =
+                    func.blocks().map(|(b, _)| b.region(&tree)).collect();
+                if seen != expected {
+                    return Err(format!(
+                        "`pre_order_iter` visits {seen:?} but the function's regions are \
+                         {expected:?}"
+                    ));
+                }
+
+                // Property 2: the iterator reports its length correctly, and
+                // iterating from the back gives the same sequence reversed.
+                if tree.pre_order_iter().len() != pre_order.len() {
+                    return Err(format!(
+                        "`pre_order_iter().len()` is {} but it yields {} regions",
+                        tree.pre_order_iter().len(),
+                        pre_order.len(),
+                    ));
+                }
+                let mut backwards: Vec<Region> = tree.pre_order_iter().rev().collect();
+                backwards.reverse();
+                if backwards != pre_order {
+                    return Err(format!(
+                        "`pre_order_iter` yields {pre_order:?} forwards but {:?} backwards",
+                        backwards.iter().rev().collect::<Vec<_>>(),
+                    ));
+                }
+
+                // Property 3: the root comes first, and every other region comes
+                // after its parent.
+                let position: HashMap<Region, usize> = pre_order
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &region)| (region, i))
+                    .collect();
+                let root = tree.root();
+                if pre_order.first() != Some(&root) {
+                    return Err(format!(
+                        "`pre_order_iter` starts with {:?} but the root region is {root:?}",
+                        pre_order.first(),
+                    ));
+                }
+                for (i, region) in pre_order.iter().enumerate() {
+                    if let Some(parent) = region.parent(&tree) {
+                        if position[&parent] >= i {
+                            return Err(format!(
+                                "{region:?} is at index {i} but its parent {parent:?} is at \
+                                 index {}, so the traversal is not a pre-order",
+                                position[&parent],
+                            ));
+                        }
+                    }
+                }
+
+                // Property 4: the traversal is depth-first, not merely
+                // parent-before-child: each region's descendants occupy the
+                // entries immediately following it.
+                let mut descendants: HashMap<Region, BTreeSet<Region>> =
+                    pre_order.iter().map(|&r| (r, BTreeSet::new())).collect();
+                for region in &pre_order {
+                    let mut curr = region.parent(&tree);
+                    while let Some(ancestor) = curr {
+                        descendants.get_mut(&ancestor).unwrap().insert(*region);
+                        curr = ancestor.parent(&tree);
+                    }
+                }
+                for (i, region) in pre_order.iter().enumerate() {
+                    let subtree = &descendants[region];
+                    let actual: BTreeSet<Region> = pre_order[i + 1..][..subtree.len()]
+                        .iter()
+                        .copied()
+                        .collect();
+                    if actual != *subtree {
+                        return Err(format!(
+                            "{region:?}'s descendants are {subtree:?}, but the {} entries \
+                             following it in {pre_order:?} are {actual:?}",
+                            subtree.len(),
+                        ));
+                    }
+                }
+
+                Ok(())
+            })
     }
 
     #[test]
