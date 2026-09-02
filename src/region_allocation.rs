@@ -165,9 +165,9 @@ where
 
         // Insert each bundle in this region into the queue.
         //
-        // Okay to call `region_bundles` because we haven't split any of this
-        // region's bundles yet, because we haven't allocated registers within
-        // this region yet.
+        // Okay to call `region.bundles(..)` because we haven't split any of
+        // this region's bundles yet, because we haven't allocated registers
+        // within this region yet.
         for bundle in region.bundles(live_ranges) {
             self.push_bundle(input, live_ranges, bundle, Phase::default());
         }
@@ -214,8 +214,9 @@ where
             counts.split_into_minimal_or_spill.inc();
         }
 
-        // TODO: merge `self.region_assignments` into `self.assignments` and
-        // clear `self.region_assignments`.
+        // Finally, commit this region's assignments.
+        self.assignments.merge(&self.region_assignments);
+        self.region_assignments.reset();
 
         Ok(())
     }

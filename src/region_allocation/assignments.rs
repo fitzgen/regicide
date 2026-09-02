@@ -88,6 +88,23 @@ where
         assignments.is_reset()
     }
 
+    /// Iterate over the existing assignments in `unit` that overlap `span`.
+    fn overlapping(
+        &self,
+        unit: RegUnit,
+        span: Range<LivePoint<E>>,
+    ) -> impl Iterator<Item = &Assignment<E>> {
+        let (start, end) = (span.start, span.end);
+        self.assignments[unit]
+            .range(..AssignmentKey::new(end))
+            .rev()
+            .take_while(move |(_, existing)| start < existing.end)
+            .filter(move |(existing_key, existing)| {
+                LivePoint::spans_overlap(start, end, existing_key.start, existing.end)
+            })
+            .map(|(_, existing)| existing)
+    }
+
     /// Call `f` on every existing assignment that overlaps one of the given
     /// spans.
     fn for_each_overlapping<T>(
@@ -98,20 +115,9 @@ where
     ) -> Option<T> {
         for unit in iter_reg_units(reg_units) {
             for span in spans.clone() {
-                for (existing_key, existing) in self.assignments[unit]
-                    .range(..AssignmentKey::new(span.end))
-                    .rev()
-                    .take_while(|(_, existing)| span.start < existing.end)
-                {
-                    if LivePoint::spans_overlap(
-                        span.start,
-                        span.end,
-                        existing_key.start,
-                        existing.end,
-                    ) {
-                        if let ControlFlow::Break(result) = f(existing) {
-                            return Some(result);
-                        }
+                for existing in self.overlapping(unit, span) {
+                    if let ControlFlow::Break(result) = f(existing) {
+                        return Some(result);
                     }
                 }
             }
@@ -384,6 +390,41 @@ where
             eviction_cost,
             bundle_spans,
         )
+    }
+
+    /// Merge all of `other`'s assignments into `self`.
+    ///
+    /// None of `other`'s assignments may conflict with any assignment already
+    /// in `self`.
+    pub fn merge(&mut self, other: &Self) {
+        for (unit, other_unit_assignments) in other.assignments.iter() {
+            if other_unit_assignments.is_empty() {
+                continue;
+            }
+
+            // Check the whole unit before touching `self`, so that the check
+            // sees exactly the assignments we already had.
+            if cfg!(debug_assertions) {
+                for (key, assignment) in other_unit_assignments {
+                    debug_assert!(
+                        self.overlapping(unit, key.start..assignment.end)
+                            .next()
+                            .is_none(),
+                        "merging {:?}'s assignment of {:?}..{:?} to {unit:?} conflicts with an \
+                         existing assignment",
+                        assignment.bundle,
+                        key.start,
+                        assignment.end,
+                    );
+                }
+            }
+
+            let unit_assignments = &mut self.assignments[unit];
+            for (key, assignment) in other_unit_assignments {
+                let old_entry = unit_assignments.insert(*key, assignment.clone());
+                debug_assert!(old_entry.is_none());
+            }
+        }
     }
 }
 
@@ -1705,10 +1746,88 @@ mod tests {
                     check_no_overlaps(&assignments)?;
                     check_conflicts_agree(&assignments, &oracle)?;
                     check_interference_weight_agrees(&assignments, &oracle)?;
+
+                    // Merging this state into an empty set of assignments must
+                    // reproduce it exactly, so the oracle we already have
+                    // describes the result as well.
+                    let mut merged = Assignments::<u32>::new();
+                    merged.merge(&assignments);
+                    check_agree(&merged, &oracle)?;
+                    check_no_overlaps(&merged)?;
+                    check_conflicts_agree(&merged, &oracle)?;
+
+                    // And merging an empty set of assignments in must leave
+                    // this state alone.
+                    assignments.merge(&Assignments::new());
+                    check_agree(&assignments, &oracle)?;
                 }
 
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn merge_disjoint() {
+        let mut a = Assignments::<u32>::new();
+        let mut b = Assignments::<u32>::new();
+
+        assert!(a.try_assign_to_reg(bundle(0), [reg(R0)], reg_units, [span(0, 2)].into_iter()));
+        assert!(b.try_assign_to_reg(bundle(1), [reg(R0)], reg_units, [span(2, 4)].into_iter()));
+        assert!(b.try_assign_to_reg_group(
+            bundle(2),
+            [group(G1)],
+            group_units,
+            [span(0, 6)].into_iter(),
+        ));
+
+        a.merge(&b);
+
+        // `a` now holds exactly the union of what the two of them held.
+        let mut oracle = Vec::new();
+        oracle_insert(&mut oracle, bundle(0), &[reg_units(reg(R0))], &[span(0, 2)]);
+        oracle_insert(&mut oracle, bundle(1), &[reg_units(reg(R0))], &[span(2, 4)]);
+        oracle_insert(
+            &mut oracle,
+            bundle(2),
+            &group_units(group(G1)).collect::<Vec<_>>(),
+            &[span(0, 6)],
+        );
+        check_agree(&a, &oracle).unwrap();
+        check_no_overlaps(&a).unwrap();
+        check_conflicts_agree(&a, &oracle).unwrap();
+
+        // The merge left `b` alone.
+        let mut b_oracle = Vec::new();
+        oracle_insert(
+            &mut b_oracle,
+            bundle(1),
+            &[reg_units(reg(R0))],
+            &[span(2, 4)],
+        );
+        oracle_insert(
+            &mut b_oracle,
+            bundle(2),
+            &group_units(group(G1)).collect::<Vec<_>>(),
+            &[span(0, 6)],
+        );
+        check_agree(&b, &b_oracle).unwrap();
+    }
+
+    /// Merging assignments that are in the way of each other is a bug in the
+    /// caller, and debug builds catch it. The two registers here are different
+    /// but alias the same unit, so this is a conflict that only the units, not
+    /// the registers, reveal.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic = "conflicts with an existing assignment"]
+    fn merge_conflicting() {
+        let mut a = Assignments::<u32>::new();
+        let mut b = Assignments::<u32>::new();
+
+        assert!(a.try_assign_to_reg(bundle(0), [reg(R4)], reg_units, [span(0, 6)].into_iter()));
+        assert!(b.try_assign_to_reg(bundle(1), [reg(R1)], reg_units, [span(2, 4)].into_iter()));
+
+        a.merge(&b);
     }
 }
