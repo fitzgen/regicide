@@ -39,6 +39,7 @@ mod packed_float;
 mod parallel_moves;
 mod region_allocation;
 mod region_tree;
+mod rpo;
 mod sccs;
 mod spill_slots;
 mod timing;
@@ -51,7 +52,7 @@ pub mod checker;
 pub mod test;
 
 pub use context::Context;
-pub use entity::{Block, Entity, EntityRepr, Inst, SpillSlot, Val};
+pub use entity::{Block, Entity, EntityRepr, Inst, Val};
 pub use error::{Error, Result};
 pub use input::{
     DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand, OperandConstraint,
@@ -59,6 +60,7 @@ pub use input::{
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
+pub use spill_slots::SpillSlot;
 
 use context::ContextInner;
 use error::{IResult, InternalError};
@@ -152,18 +154,21 @@ where
     }
 
     context
+        .rpo
+        .construct(input.func, &mut context.dfs, output)?;
+    context
         .region_tree
         .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
     context
         .liveness
-        .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
+        .construct(input.func, &mut context.counts, &context.rpo, output)?;
     context
         .live_ranges
         .construct(input, &mut context.counts, &mut context.liveness, output)?;
 
     coalescing::coalesce(context, input, output)?;
     region_allocation::region_allocate(context, input, output)?;
-    spill_slots::allocate_spill_slots(context, input.func)?;
+    spill_slots::allocate_spill_slots(context, input, output)?;
     move_elimination::eliminate_moves(context, input.func)?;
 
     output.construct(context, input.func)?;

@@ -7,7 +7,7 @@ mod assignments;
 mod splitting;
 
 use crate::{
-    Entity, Input, InputFunction, OperandConstraint, RegSet,
+    Entity, Input, InputFunction, OperandConstraint, Position, RegSet,
     context::ContextInner,
     counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
@@ -153,6 +153,11 @@ where
             && interference_scratch.is_empty()
     }
 
+    /// The bundles that must live in memory, and so need a spill slot.
+    pub(crate) fn stack_bundles(&self) -> &[LiveBundle<E>] {
+        &self.stack_bundles
+    }
+
     fn allocate_region(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -209,7 +214,6 @@ where
                 continue;
             }
 
-            debug_assert_eq!(phase, Phase::SplitIntoMinimalOrSpill);
             self.split_into_minimal_or_spill(input, live_ranges, counts, output, entry)?;
             counts.split_into_minimal_or_spill.inc();
         }
@@ -434,7 +438,12 @@ where
         }
     }
 
-    fn fill_split_scratch(&mut self, live_ranges: &LiveRanges<E>, bundle: LiveBundle<E>) {
+    fn fill_split_scratch(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+        bundle: LiveBundle<E>,
+    ) {
         debug_assert!(self.split_spans.is_empty());
         debug_assert!(self.split_uses.is_empty());
 
@@ -444,13 +453,31 @@ where
                 .map(|s| s.start(live_ranges)..s.end(live_ranges)),
         );
 
-        self.split_uses
-            .extend(bundle.spans(live_ranges).flat_map(|span| {
-                span.uses(live_ranges).into_iter().map(|u| SplitUse {
-                    point: u.point(live_ranges),
-                    weight: u.weight(live_ranges).as_f32(),
-                })
-            }));
+        let mut prev = None;
+        for span in bundle.spans(live_ranges) {
+            let start = span.start(live_ranges);
+
+            // A cut may only go immediately before a use at a `Late` point only
+            // when that use is the start of its span and no use in the span
+            // before it is reuse-tied to it. If it was not the start of the
+            // span or it is reuse-tied to another use, then splitting would
+            // demand a move in the middle of the instruction, where we cannot
+            // place it.
+            let cut_at_start = prev.is_none_or(|prev| !span.is_tied_to(live_ranges, input, prev));
+
+            self.split_uses
+                .extend(span.uses(live_ranges).into_iter().map(|u| {
+                    let point = u.point(live_ranges);
+                    SplitUse {
+                        point,
+                        weight: u.weight(live_ranges).as_f32(),
+                        cut_before_allowed: point.pos() == Position::Early
+                            || (point == start && cut_at_start),
+                    }
+                }));
+
+            prev = Some(span);
+        }
     }
 
     /// Split `entry`'s bundle in two, between spans.
@@ -475,7 +502,7 @@ where
             return Ok(false);
         }
 
-        self.fill_split_scratch(live_ranges, bundle);
+        self.fill_split_scratch(input, live_ranges, bundle);
 
         let pref = bundle.preference(live_ranges).clone();
 
@@ -486,7 +513,7 @@ where
             OperandConstraint::Reuse(_) => unreachable!("already resolved"),
         };
 
-        let (index, winner) = {
+        let best = {
             let RegionAllocation {
                 region_assignments,
                 split_spans,
@@ -496,28 +523,25 @@ where
             } = self;
 
             match rc.members(input.machine) {
-                RegClassMembers::Regs(regs) => {
-                    let best = splitting::best_split_between_spans(
-                        split_spans,
-                        split_uses,
-                        pref.iter()
-                            .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                        |reg, half| {
-                            region_assignments.interference_weight(
-                                core::iter::once(reg.units(input.machine)),
-                                half.iter().cloned(),
-                                interference_scratch,
-                                |victim| victim.spill_weight(live_ranges),
-                            )
-                        },
-                    )
-                    .expect("already filtered out bundles without spans we could split");
-                    (best.cut, Some(best.candidate))
-                }
+                RegClassMembers::Regs(regs) => splitting::best_split_between_spans(
+                    split_spans,
+                    split_uses,
+                    pref.iter()
+                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                    |reg, half| {
+                        region_assignments.interference_weight(
+                            core::iter::once(reg.units(input.machine)),
+                            half.iter(),
+                            interference_scratch,
+                            |victim| victim.spill_weight(live_ranges),
+                        )
+                    },
+                )
+                .map(|best| (best.cut, Some(best.candidate))),
 
                 RegClassMembers::Groups(groups) => {
                     debug_assert!(pref.is_empty());
-                    let best = splitting::best_split_between_spans(
+                    splitting::best_split_between_spans(
                         split_spans,
                         split_uses,
                         groups.iter().copied(),
@@ -527,20 +551,24 @@ where
                                     .members(input.machine)
                                     .iter()
                                     .map(|r| r.units(input.machine)),
-                                half.iter().cloned(),
+                                half.iter(),
                                 interference_scratch,
                                 |victim| victim.spill_weight(live_ranges),
                             )
                         },
                     )
-                    .expect("already filtered out bundles without spans we could split");
-                    (best.cut, None)
+                    .map(|best| (best.cut, None))
                 }
             }
         };
 
         self.split_spans.clear();
         self.split_uses.clear();
+
+        let Some((index, winner)) = best else {
+            counts.split_between_spans_failed.inc();
+            return Ok(false);
+        };
 
         let suffix = bundle.split_at_span(live_ranges, input, output, index)?;
 
@@ -595,7 +623,7 @@ where
             return Ok(false);
         }
 
-        self.fill_split_scratch(live_ranges, bundle);
+        self.fill_split_scratch(input, live_ranges, bundle);
 
         let pref = bundle.preference(live_ranges).clone();
 
@@ -701,12 +729,11 @@ where
         entry: PqEntry<E>,
     ) -> IResult<()> {
         let bundle = entry.bundle();
-        debug_assert_eq!(entry.phase(), Phase::SplitIntoMinimalOrSpill);
 
         let mut cuts = core::mem::take(&mut self.minimal_cuts);
         debug_assert!(cuts.is_empty());
 
-        self.fill_split_scratch(live_ranges, bundle);
+        self.fill_split_scratch(input, live_ranges, bundle);
         cuts.extend(splitting::minimal_cuts(&self.split_spans, &self.split_uses));
         self.split_spans.clear();
         self.split_uses.clear();

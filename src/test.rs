@@ -7,12 +7,11 @@ use crate::{
     RegClass, RegGroup, RegUnit, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
-    entity::{
-        Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SccBlockIndex, SecondaryMap, SpillSlot,
-    },
+    entity::{Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SccBlockIndex, SecondaryMap},
     input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position, RematCost},
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
+    spill_slots::SpillSlot,
     union_find::UnionFind,
 };
 use alloc::{vec, vec::Vec};
@@ -1333,6 +1332,13 @@ pub struct TestMachine {
 
 #[derive(Clone, Debug, Default, Hash, Mutate)]
 pub struct TestBank {
+    /// The base-two logarithm of this bank's registers' byte size.
+    ///
+    /// Stored as the logarithm because `declare_reg_bank` only accepts powers
+    /// of two, so generating the exponent means every generated machine is
+    /// valid without a fixup rejecting anything.
+    log2_size: u8,
+
     /// One entry per register the allocator owns: how many register units wide
     /// it is.
     regs: Vec<u8>,
@@ -1401,6 +1407,14 @@ impl TestMachine {
     /// The widest a generated register may be, in register units.
     const MAX_REG_UNITS: u8 = 2;
 
+    /// The largest generated register size, as a base-two logarithm: banks hold
+    /// registers of one, two, four, or eight bytes.
+    ///
+    /// More than one size, so that spill slots really do get pooled separately;
+    /// few enough that two banks often land on the same size, which is the case
+    /// where they share a pool.
+    const MAX_LOG2_REG_SIZE: u8 = 3;
+
     /// The class holding both of [`TestMachine::two_registers`]' registers,
     /// and so the only one of its classes that a value can belong to while
     /// still meeting either an `rc0` or an `rc1` operand constraint.
@@ -1418,6 +1432,7 @@ impl TestMachine {
         };
         let mut machine = TestMachine {
             banks: vec![TestBank {
+                log2_size: 3,
                 regs: vec![1, 1],
                 non_allocatable: 0,
                 groups: Vec::new(),
@@ -1452,6 +1467,8 @@ impl TestMachine {
         }
 
         for bank in &mut self.banks {
+            bank.log2_size %= Self::MAX_LOG2_REG_SIZE + 1;
+
             // A bank needs a register that the allocator owns for
             // stack-to-stack moves.
             bank.regs.truncate(Self::MAX_REGS_PER_BANK);
@@ -1536,7 +1553,7 @@ impl TestMachine {
         let mut builder = MachineBuilder::new();
 
         for bank in &self.banks {
-            let reg_bank = builder.declare_reg_bank().unwrap();
+            let reg_bank = builder.declare_reg_bank(1 << bank.log2_size).unwrap();
 
             let mut next_unit = 0;
             let regs: Vec<Reg> = bank

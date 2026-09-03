@@ -5,6 +5,7 @@ use crate::{
     entity::{Block, Entity as _, EntityRepr, Inst, Val},
     error::IResult,
     live_ranges::MAX_OPERANDS_PER_INST,
+    machine::RegBank,
     output::OutputInner,
     packed_float::PackedPositiveFloat,
 };
@@ -634,6 +635,26 @@ pub trait InputValue<'a> {
     fn reg_class(&self) -> RegClass;
 }
 
+/// Machine queries about a value.
+impl<E> Val<E>
+where
+    E: EntityRepr,
+{
+    /// The register bank this value naturally belongs to.
+    pub(crate) fn reg_bank(self, input: &Input<'_, impl InputFunction>) -> RegBank {
+        input
+            .func
+            .value(self.with_repr32())
+            .reg_class()
+            .bank(input.machine)
+    }
+
+    /// The `log2(size)` of this value's size.
+    pub(crate) fn log2_size(self, input: &Input<'_, impl InputFunction>) -> u8 {
+        self.reg_bank(input).log2_size(input.machine)
+    }
+}
+
 /// An instruction in a [`InputBlock`].
 pub trait InputInst<'a> {
     /// Get this instruction's `Inst`.
@@ -1043,7 +1064,7 @@ mod tests {
     /// intersection to find and a pair with none.
     fn merge_test_machine() -> (Machine, RegClass, RegClass, RegClass) {
         let mut builder = crate::MachineBuilder::new();
-        let bank = builder.declare_reg_bank().unwrap();
+        let bank = builder.declare_reg_bank(8).unwrap();
         let r: Vec<crate::Reg> = (0..3)
             .map(|i| {
                 let unit = |i| crate::RegUnit::try_new(i).unwrap();

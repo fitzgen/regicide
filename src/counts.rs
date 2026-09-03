@@ -78,6 +78,9 @@ pub struct Counts {
     pub split_within_span_failed: Count,
     pub split_into_minimal_or_spill: Count,
     pub spilled_bundles: Count,
+    pub spilled_values: Count,
+    pub spill_slots: Count,
+    pub spill_slot_assignments: Count,
     pub final_live_spans: Count,
     pub final_bundles: Count,
 }
@@ -102,6 +105,9 @@ impl Counts {
             split_within_span_failed: Count::new(),
             split_into_minimal_or_spill: Count::new(),
             spilled_bundles: Count::new(),
+            spilled_values: Count::new(),
+            spill_slots: Count::new(),
+            spill_slot_assignments: Count::new(),
             final_live_spans: Count::new(),
             final_bundles: Count::new(),
         }
@@ -130,6 +136,9 @@ impl Counts {
             split_within_span_failed,
             split_into_minimal_or_spill,
             spilled_bundles,
+            spilled_values,
+            spill_slots,
+            spill_slot_assignments,
             final_live_spans,
             final_bundles,
         } = self;
@@ -150,6 +159,9 @@ impl Counts {
             && split_within_span_failed.is_reset()
             && split_into_minimal_or_spill.is_reset()
             && spilled_bundles.is_reset()
+            && spilled_values.is_reset()
+            && spill_slots.is_reset()
+            && spill_slot_assignments.is_reset()
             && final_live_spans.is_reset()
             && final_bundles.is_reset()
     }

@@ -362,10 +362,6 @@ define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct RegionChildrenStorageIndex = "region_children_storage_index";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct SpillSlot = "spill_slot";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

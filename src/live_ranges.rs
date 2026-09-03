@@ -313,37 +313,64 @@ pub(crate) fn normalize_spill_weight(total_use_cost: f32, sum_len_insts: usize) 
     (total_use_cost / denominator).min(f32::MAX)
 }
 
-/// Is a bundle holding `len_spans` spans, `len_uses` uses, and covering
-/// `sum_len_insts` instructions considered minimal?
+/// Do the spans `[.., end)` and `[start, ..)` touch in the middle of an
+/// instruction?
+#[inline]
+pub(crate) fn touch_mid_inst<E>(end: LivePoint<E>, start: LivePoint<E>) -> bool
+where
+    E: EntityRepr,
+{
+    debug_assert!(end <= start);
+    end.pos() == Position::Late && start.inst() == end.inst()
+}
+
+/// Is the described bundle minimal?
 ///
-/// A minimal bundle is one that cannot be meaningfully split any smaller: one
-/// span, holding either (a) zero uses or (b) exactly one use and covering at
-/// most one instruction.
+/// `len_cuttable_gaps` is the number of places that it could be cut.
 ///
-/// * Bundles with multiple spans are not minimal: we could split out a bundle
-///   for each span.
+/// `len_uses` is the number of uses inside the bundle.
 ///
-/// * Bundles with one span and zero uses are considered minimal: we could
-///   *technically* keep splitting the span down into single instruction spans,
-///   but this is useless. A span is always within one basic block, so if we
+/// `len_insts` is the number of distinct instructions the bundle covers.
+///
+/// A minimal bundle is one that cannot be meaningfully split any smaller:
+///
+/// * A bundle with a cuttable gap between two of its spans in is not minimal:
+///   we could split out a bundle for each span.
+///
+///   (Note that not all gaps between spans are cuttable: two spans may be tied
+///   together via, e.g., `Reuse` constraints. See `LiveSpan::is_tied_to` for
+///   details.)
+///
+/// * Bundles with zero uses are minimal as soon as they have no cuttable gap
+///   between spans.
+///
+///   (We could *technically* keep shaving off single-instruction spans off of
+///   it, but this is useless. A span is always within one basic block, so if we
 ///   have so much interference that we will spill any of them to the stack, we
 ///   might as well just spill the whole span to the stack, since zero uses
 ///   means we aren't using the value in this block anyways. Even worse, it
 ///   would also open the door to repeatedly spilling and reloading a value in a
 ///   basic block where it isn't even used, adding more cost than if we just
-///   spilled the whole zero-use span from the start!
+///   spilled the whole zero-use span from the start!)
 ///
-/// * Bundles with one span and one use are minimal if the span covers exactly
-///   one instruction: we can't make the span any smaller while still covering
-///   the use and allowing for moves to be inserted before or after it (which
-///   can only happen between instructions).
-pub(crate) fn is_minimal_bundle(len_spans: usize, len_uses: usize, sum_len_insts: usize) -> bool {
-    debug_assert!(len_spans >= 1, "a bundle always holds at least one span");
+/// * Bundles with uses are minimal once they cover exactly one instruction: we
+///   can't make them any smaller while still covering their uses and allowing
+///   for moves to be inserted before or after them (which can only happen
+///   between instructions, not in the middle of one).
+///
+///   (Note that a bundle need not cover that one instruction with a single
+///   span: for example, two spans that are reuse-tied together can both cover
+///   the same instruction, and the bundle could still be minimal.)
+pub(crate) fn is_minimal_bundle(
+    len_cuttable_gaps: usize,
+    len_uses: usize,
+    len_insts: usize,
+) -> bool {
     debug_assert!(
-        sum_len_insts >= len_spans,
-        "every span covers at least one instruction",
+        len_insts >= 1,
+        "a bundle always covers at least one instruction",
     );
-    len_spans == 1 && (len_uses == 0 || (len_uses == 1 && sum_len_insts == 1))
+    len_cuttable_gaps == 0 && (len_uses == 0 || len_insts == 1)
 }
 
 /// Round `weight` to the precision a bundle stores it at.
@@ -697,6 +724,7 @@ where
     /// ascending program order.
     pub(crate) fn push_bundle(
         &mut self,
+        input: &Input<'_, impl InputFunction>,
         output: &mut OutputInner<E>,
         region: Region<E>,
         constraint: OperandConstraint,
@@ -708,7 +736,14 @@ where
         }
         let end = self.bundle_spans_storage.next_key(output)?;
 
-        LiveBundle::new(self, output, region, constraint, EntityRange { start, end })
+        LiveBundle::new(
+            self,
+            input,
+            output,
+            region,
+            constraint,
+            EntityRange { start, end },
+        )
     }
 
     /// Construct the live spans for `func`'s values.
@@ -924,6 +959,29 @@ where
         live_ranges.spans[self].uses
     }
 
+    /// The subrange of this span's uses that sit at `point`.
+    #[inline]
+    pub(crate) fn uses_at(
+        self,
+        live_ranges: &LiveRanges<E>,
+        point: LivePoint<E>,
+    ) -> EntityRange<Use<E>> {
+        let uses = self.uses(live_ranges);
+        if uses.is_empty() {
+            return EntityRange::empty();
+        }
+
+        let indices = uses.indices();
+        let sorted = &live_ranges.uses.as_slice()[indices.clone()];
+        let first = sorted.partition_point(|u| u.point < point);
+        let last = sorted.partition_point(|u| u.point <= point);
+
+        EntityRange {
+            start: Use::try_new(indices.start + first).unwrap(),
+            end: Use::try_new(indices.start + last).unwrap(),
+        }
+    }
+
     /// The start of this span, inclusive.
     #[inline]
     pub(crate) fn start(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
@@ -966,6 +1024,69 @@ where
     #[inline]
     pub(crate) fn has_fixed_use(self, live_ranges: &LiveRanges<E>) -> bool {
         live_ranges.spans[self].flags & SPAN_HAS_FIXED_USE != 0
+    }
+
+    /// Must this span stay in the same bundle as `prev`, the span immediately
+    /// before it in some bundle?
+    ///
+    /// The spans must stay together when they touch in the middle of an
+    /// instruction (so there is no place to put a move instruction between
+    /// them, if necessary) and either:
+    ///
+    /// * the spans are associated with the same value, or
+    ///
+    /// * one span has a use with a `Reuse(_)` constraint naming a use in the
+    ///   other span.
+    ///
+    /// Any other scenario either has an instruction boundary between the two
+    /// spans where we can place any moves between them, if necessary, or else
+    /// there is nothing that could demand a move between the two spans.
+    pub(crate) fn is_tied_to(
+        self,
+        live_ranges: &LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+        prev: LiveSpan<E>,
+    ) -> bool {
+        let at = self.start(live_ranges);
+        debug_assert!(prev.end(live_ranges) <= at);
+        if !touch_mid_inst(prev.end(live_ranges), at) {
+            return false;
+        }
+
+        // Two pieces of one value need the value moved from one to the other.
+        if self.val(live_ranges) == prev.val(live_ranges) {
+            return true;
+        }
+
+        // A span only ever begins at a def or a block's first instruction, and
+        // a block begins at an `Early` point, so a span starting in the middle
+        // of an instruction (a `Late` point) must begin with its def.
+        debug_assert_eq!(at.pos(), Position::Late);
+
+        let early = at.inst_boundary_at_or_before();
+        debug_assert_eq!(early.inst(), at.inst());
+
+        let input_inst = input.func.inst(at.inst().with_repr32());
+        let reuses = |operand: usize, target: usize| {
+            matches!(
+                input_inst.operand(operand).constraint(),
+                OperandConstraint::Reuse(i) if i == target
+            )
+        };
+
+        let late_uses = self.uses_at(live_ranges, at);
+        let early_uses = prev.uses_at(live_ranges, early);
+
+        late_uses.into_iter().any(|late| {
+            let late = late.operand(live_ranges);
+            early_uses.into_iter().any(|early| {
+                let early = early.operand(live_ranges);
+                // Validation rules out reuse chains, so at most one of these
+                // two can hold; checking both saves us from depending on which
+                // side of the instruction the reusing operand sits on.
+                reuses(late, early) || reuses(early, late)
+            })
+        })
     }
 
     /// Get the bundle that this span is associated with, if any.
@@ -1015,6 +1136,7 @@ where
     /// `constraint` must already be resolved (i.e. not `Reuse`).
     fn new(
         live_ranges: &mut LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
         output: &mut OutputInner<E>,
         region: Region<E>,
         constraint: OperandConstraint,
@@ -1044,18 +1166,29 @@ where
         )?;
         debug_assert_eq!(pushed, bundle);
 
-        bundle.recompute_weight_and_flags(live_ranges);
+        bundle.recompute_weight_and_flags(live_ranges, input);
         Ok(bundle)
     }
 
     /// Recompute the cached `has_fixed_uses`, `is_minimal` and spill weight
     /// from the spans this bundle currently holds.
-    fn recompute_weight_and_flags(self, live_ranges: &mut LiveRanges<E>) {
+    fn recompute_weight_and_flags(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+    ) {
         let mut has_fixed_uses = false;
         let mut total_use_cost = 0.0;
         let mut sum_len_insts = 0;
-        let len_spans = self.spans(live_ranges).len();
         let mut len_uses = 0;
+
+        // How many of the gaps between this bundle's spans a cut could go in,
+        // and how many instructions two of its spans both touch. Both come out
+        // of walking each adjacent pair, and together they are what decides
+        // minimality.
+        let mut len_cuttable_gaps = 0;
+        let mut shared_insts = 0;
+        let mut prev: Option<LiveSpan<E>> = None;
 
         for span in self.spans(live_ranges) {
             has_fixed_uses |= span.has_fixed_use(live_ranges);
@@ -1066,14 +1199,34 @@ where
                 .map(|u| u.weight(live_ranges).as_f32())
                 .sum::<f32>();
             sum_len_insts += span.len_insts(live_ranges);
+
+            if let Some(prev) = prev {
+                if touch_mid_inst(prev.end(live_ranges), span.start(live_ranges)) {
+                    // The two spans meet in the middle of an instruction, so
+                    // they both cover it, and a cut between them is only legal
+                    // if it demands no move.
+                    shared_insts += 1;
+                    if !span.is_tied_to(live_ranges, input, prev) {
+                        len_cuttable_gaps += 1;
+                    }
+                } else {
+                    len_cuttable_gaps += 1;
+                }
+            }
+            prev = Some(span);
         }
+
+        // The spill weight blends a use count with a use *density*, so it wants
+        // the summed lengths; minimality wants the instructions actually
+        // covered, counting a shared one once.
+        let len_insts = sum_len_insts - shared_insts;
 
         let mut weight_and_flags = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(
             normalize_spill_weight(total_use_cost, sum_len_insts),
         )
         .bits();
         debug_assert_eq!(weight_and_flags & !BUNDLE_SPILL_WEIGHT_MASK, 0);
-        if is_minimal_bundle(len_spans, len_uses, sum_len_insts) {
+        if is_minimal_bundle(len_cuttable_gaps, len_uses, len_insts) {
             weight_and_flags |= BUNDLE_MINIMAL;
         }
         if has_fixed_uses {
@@ -1159,7 +1312,7 @@ where
         };
 
         live_ranges.bundles[self].spans = prefix;
-        self.recompute_weight_and_flags(live_ranges);
+        self.recompute_weight_and_flags(live_ranges, input);
         self.recompute_constraint(live_ranges, input);
 
         for index in suffix {
@@ -1167,7 +1320,24 @@ where
             debug_assert_eq!(live_ranges.span_bundle[span], Some(self));
             live_ranges.span_bundle[span] = None;
         }
-        let new = LiveBundle::new(live_ranges, output, region, OperandConstraint::Any, suffix)?;
+
+        // When the two halves touch in the middle of an instruction, the new
+        // bundle would begin at a `Late` point, where no move can be inserted,
+        // so move the new bundle's start up to the instruction boundary.
+        let first = live_ranges.bundle_spans_storage[mid];
+        let start = live_ranges.spans[first].start;
+        if start.pos() == Position::Late {
+            live_ranges.spans[first].start = start.inst_boundary_at_or_before();
+        }
+
+        let new = LiveBundle::new(
+            live_ranges,
+            input,
+            output,
+            region,
+            OperandConstraint::Any,
+            suffix,
+        )?;
         new.recompute_constraint(live_ranges, input);
         Ok(new)
     }
@@ -1343,7 +1513,7 @@ where
         debug_assert_eq!(suffix_spans.indices().len(), suffix_len_spans);
 
         live_ranges.bundles[self].spans = prefix_spans;
-        self.recompute_weight_and_flags(live_ranges);
+        self.recompute_weight_and_flags(live_ranges, input);
         self.recompute_constraint(live_ranges, input);
 
         // Clear out the old span-to-bundle associations.
@@ -1354,6 +1524,7 @@ where
         }
         let new = LiveBundle::new(
             live_ranges,
+            input,
             output,
             region,
             OperandConstraint::Any,
@@ -1363,18 +1534,16 @@ where
 
         #[cfg(debug_assertions)]
         {
+            // Splitting moves uses between the two bundles but never creates or
+            // destroys one.
             let self_len_uses = self
                 .spans(live_ranges)
                 .map(|s| s.uses(live_ranges).len())
                 .sum::<usize>();
-            debug_assert!(self_len_uses < orig_len_uses);
-
             let new_len_uses = new
                 .spans(live_ranges)
                 .map(|s| s.uses(live_ranges).len())
                 .sum::<usize>();
-            debug_assert!(new_len_uses < orig_len_uses);
-
             debug_assert_eq!(self_len_uses + new_len_uses, orig_len_uses);
         }
 
@@ -1720,6 +1889,7 @@ mod tests {
     use crate::entity::Block;
     use crate::input::BlockFrequency;
     use crate::region_tree::RegionTree;
+    use crate::rpo::Rpo;
     use crate::test::{TestFunction, TestInput};
     use mutatis::check::{Check, CheckResult};
     use std::{
@@ -1984,6 +2154,7 @@ mod tests {
     fn analyze_spans(test_input: &TestInput) -> Result<(Liveness<u32>, LiveRanges<u32>), String> {
         let mut counts = Counts::new();
         let mut dfs = Dfs::<u32>::new();
+        let mut rpo = Rpo::<u32>::new();
         let mut region_tree = RegionTree::<u32>::new();
         let mut liveness = Liveness::<u32>::new();
         let mut live_ranges = LiveRanges::<u32>::new();
@@ -1993,9 +2164,9 @@ mod tests {
 
         let result = test_input.with_input(|input| {
             let func = input.func;
-            region_tree
-                .construct(func, &mut counts, &mut dfs, &mut output)
-                .and_then(|()| liveness.construct(func, &mut counts, &mut dfs, &mut output))
+            rpo.construct(func, &mut dfs, &mut output)
+                .and_then(|()| region_tree.construct(func, &mut counts, &mut dfs, &mut output))
+                .and_then(|()| liveness.construct(func, &mut counts, &rpo, &mut output))
                 .and_then(|()| {
                     live_ranges.construct(input, &mut counts, &mut liveness, &mut output)
                 })
@@ -2157,22 +2328,27 @@ mod tests {
             let mut output = OutputInner::<u32>::new();
             let (cut, rest) = (evens(&spans), odds(&spans));
 
-            let prefix = live_ranges
-                .push_bundle(
-                    &mut output,
-                    region,
-                    OperandConstraint::Any,
-                    cut.iter().copied(),
-                )
-                .unwrap();
-            let tail = live_ranges
-                .push_bundle(
-                    &mut output,
-                    region,
-                    OperandConstraint::Any,
-                    rest.iter().copied(),
-                )
-                .unwrap();
+            let (prefix, tail) = test_input.with_input(|input| {
+                let prefix = live_ranges
+                    .push_bundle(
+                        input,
+                        &mut output,
+                        region,
+                        OperandConstraint::Any,
+                        cut.iter().copied(),
+                    )
+                    .unwrap();
+                let tail = live_ranges
+                    .push_bundle(
+                        input,
+                        &mut output,
+                        region,
+                        OperandConstraint::Any,
+                        rest.iter().copied(),
+                    )
+                    .unwrap();
+                (prefix, tail)
+            });
             let parent_run = prefix.spans_storage(&live_ranges);
 
             let suffix = test_input
@@ -2216,22 +2392,27 @@ mod tests {
             let (mut reference, ref_spans) = build();
             let mut ref_output = OutputInner::<u32>::new();
             let ref_cut = evens(&ref_spans);
-            let want_prefix = reference
-                .push_bundle(
-                    &mut ref_output,
-                    region,
-                    OperandConstraint::Any,
-                    ref_cut[..prefix_end].iter().copied(),
-                )
-                .unwrap();
-            let want_suffix = reference
-                .push_bundle(
-                    &mut ref_output,
-                    region,
-                    OperandConstraint::Any,
-                    ref_cut[prefix_end..].iter().copied(),
-                )
-                .unwrap();
+            let (want_prefix, want_suffix) = test_input.with_input(|input| {
+                let want_prefix = reference
+                    .push_bundle(
+                        input,
+                        &mut ref_output,
+                        region,
+                        OperandConstraint::Any,
+                        ref_cut[..prefix_end].iter().copied(),
+                    )
+                    .unwrap();
+                let want_suffix = reference
+                    .push_bundle(
+                        input,
+                        &mut ref_output,
+                        region,
+                        OperandConstraint::Any,
+                        ref_cut[prefix_end..].iter().copied(),
+                    )
+                    .unwrap();
+                (want_prefix, want_suffix)
+            });
             test_input.with_input(|input| {
                 want_prefix.recompute_constraint(&mut reference, input);
                 want_suffix.recompute_constraint(&mut reference, input);
@@ -2342,33 +2523,38 @@ mod tests {
                     let mut output = OutputInner::<u32>::new();
                     let leftovers = odds(&live_ranges.spans().collect::<Vec<_>>());
 
-                    let bundle = live_ranges
-                        .push_bundle(
-                            &mut output,
-                            region,
-                            OperandConstraint::Any,
-                            spans[..num_owned].iter().copied(),
-                        )
-                        .unwrap();
-
-                    // Whatever the bundle did not take goes into bundles of its
-                    // own, so that every slot of the storage starts out owned
-                    // and there is a run after the one being cut.
-                    let mut followers = Vec::new();
-                    for rest in [&spans[num_owned..], &leftovers[..]] {
-                        if rest.is_empty() {
-                            continue;
-                        }
-                        let follower = live_ranges
+                    let (bundle, followers) = test_input.with_input(|input| {
+                        let bundle = live_ranges
                             .push_bundle(
+                                input,
                                 &mut output,
                                 region,
                                 OperandConstraint::Any,
-                                rest.iter().copied(),
+                                spans[..num_owned].iter().copied(),
                             )
                             .unwrap();
-                        followers.push((follower, follower.spans_storage(&live_ranges)));
-                    }
+
+                        // Whatever the bundle did not take goes into bundles of
+                        // its own, so that every slot of the storage starts out
+                        // owned and there is a run after the one being cut.
+                        let mut followers = Vec::new();
+                        for rest in [&spans[num_owned..], &leftovers[..]] {
+                            if rest.is_empty() {
+                                continue;
+                            }
+                            let follower = live_ranges
+                                .push_bundle(
+                                    input,
+                                    &mut output,
+                                    region,
+                                    OperandConstraint::Any,
+                                    rest.iter().copied(),
+                                )
+                                .unwrap();
+                            followers.push((follower, follower.spans_storage(&live_ranges)));
+                        }
+                        (bundle, followers)
+                    });
 
                     let parent_run = bundle.spans_storage(&live_ranges);
                     let divided = spans[i];
@@ -2516,16 +2702,19 @@ mod tests {
                             let span = live_ranges.bundle_spans_storage[slot];
                             live_ranges.span_bundle[span] = None;
                         }
-                        let want = LiveBundle::new(
-                            &mut live_ranges,
-                            &mut output,
-                            region,
-                            OperandConstraint::Any,
-                            run,
-                        )
-                        .unwrap();
-                        test_input
-                            .with_input(|input| want.recompute_constraint(&mut live_ranges, input));
+                        let want = test_input.with_input(|input| {
+                            let want = LiveBundle::new(
+                                &mut live_ranges,
+                                input,
+                                &mut output,
+                                region,
+                                OperandConstraint::Any,
+                                run,
+                            )
+                            .unwrap();
+                            want.recompute_constraint(&mut live_ranges, input);
+                            want
+                        });
 
                         assert_eq!(constraint, want.constraint(&live_ranges), "{context}");
                         assert_eq!(
@@ -2843,34 +3032,36 @@ mod tests {
         assert_eq!(normalize_spill_weight(0.0, 1_000), 0.0);
     }
 
-    /// One span holding at most one use, and, when it does hold one, covering
-    /// only that use's instruction.
+    /// No gap left to cut, and, if the bundle holds any use at all, only one
+    /// instruction left to cover.
     #[test]
-    fn the_minimal_floor_is_one_span_holding_at_most_one_use() {
-        assert!(is_minimal_bundle(1, 1, 1));
-        assert!(is_minimal_bundle(1, 0, 1));
+    fn the_minimal_floor_is_no_cuttable_gap_and_one_instruction() {
+        assert!(is_minimal_bundle(0, 1, 1));
+        assert!(is_minimal_bundle(0, 0, 1));
 
-        // How long a use-free span is does not matter. Cutting it up would
+        // Several uses of the same instruction are fine. A move can only go
+        // between instructions, so there is nowhere to separate them; that is
+        // also why they may share a bundle even when they are unrelated.
+        assert!(is_minimal_bundle(0, 2, 1));
+        assert!(is_minimal_bundle(0, usize::MAX, 1));
+
+        // How long a use-free bundle is does not matter. Cutting it up would
         // only make more bundles to place, every one of them as happy on the
-        // stack as the whole span was.
-        assert!(is_minimal_bundle(1, 0, 2));
-        assert!(is_minimal_bundle(1, 0, usize::MAX));
+        // stack as the whole thing was.
+        assert!(is_minimal_bundle(0, 0, 2));
+        assert!(is_minimal_bundle(0, 0, usize::MAX));
 
         // With a use, though, length is the whole question: an extra
         // instruction is an interior boundary to cut at, and a move can go
         // there.
-        assert!(!is_minimal_bundle(1, 1, 2));
-        assert!(!is_minimal_bundle(1, 1, usize::MAX));
+        assert!(!is_minimal_bundle(0, 1, 2));
+        assert!(!is_minimal_bundle(0, 1, usize::MAX));
 
-        // One use too many: two uses of one instruction can want to live in
-        // two different places.
-        assert!(!is_minimal_bundle(1, 2, 1));
-        assert!(!is_minimal_bundle(1, usize::MAX, 1));
-
-        // One span too many, however few uses: the spans could be handed out
-        // one bundle each.
-        assert!(!is_minimal_bundle(2, 1, 2));
-        assert!(!is_minimal_bundle(2, 0, 2));
+        // A cuttable gap settles it on its own, however few uses and however
+        // little the bundle covers: the two sides could be handed out one
+        // bundle each.
+        assert!(!is_minimal_bundle(1, 1, 1));
+        assert!(!is_minimal_bundle(1, 0, 1));
         assert!(!is_minimal_bundle(usize::MAX, 0, usize::MAX));
     }
 
@@ -3054,6 +3245,39 @@ mod tests {
                     }
                     Ok(())
                 })?;
+
+                // 1e. `uses_at` brackets exactly the uses at a point. It
+                // binary searches, which property 1b's ascending order
+                // licenses; the oracle here is the linear scan that the binary
+                // search replaced.
+                for span in live_ranges.spans() {
+                    let mut points: Vec<LivePoint<u32>> = span
+                        .uses(&live_ranges)
+                        .into_iter()
+                        .map(|u| u.point(&live_ranges))
+                        .collect();
+                    // Points with no use at all, on both sides of the span, so
+                    // that the empty answer is checked too.
+                    points.push(span.start(&live_ranges));
+                    points.push(span.end(&live_ranges));
+                    points.push(span.start(&live_ranges).inst_boundary_at_or_before());
+
+                    for point in points {
+                        let expected: Vec<_> = span
+                            .uses(&live_ranges)
+                            .into_iter()
+                            .filter(|u| u.point(&live_ranges) == point)
+                            .collect();
+                        let actual: Vec<_> =
+                            span.uses_at(&live_ranges, point).into_iter().collect();
+                        if actual != expected {
+                            return Err(format!(
+                                "{span:?}'s uses at {point:?} are {expected:?}, but `uses_at` \
+                                 answered {actual:?}",
+                            ));
+                        }
+                    }
+                }
 
                 // 2. A value has at most one span per block, and its spans are
                 // pairwise disjoint.

@@ -60,7 +60,6 @@ use crate::{
     Inst,
     btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
-    dfs::{Dfs, DfsEvent},
     entity::{
         Block, Entity as _, EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap, Val,
     },
@@ -68,6 +67,7 @@ use crate::{
     input::{DefUse, InputBlock, InputFunction, InputInst as _, Position},
     live_ranges::{LivePoint, Use, UseData},
     output::OutputInner,
+    rpo::Rpo,
     timing::Timing,
 };
 use alloc::vec::Vec;
@@ -101,10 +101,6 @@ where
     /// Whether each block is already on the worklist, so that it is never
     /// enqueued twice.
     on_worklist: EntitySet<Block<E>>,
-
-    /// Whether we've seen a block during our initial traversal that seeds the
-    /// worklist.
-    seen: EntitySet<Block<E>>,
 
     /// Scratch for live span construction: where each currently-open span
     /// ends, exclusive.
@@ -148,7 +144,6 @@ where
             live: BTreeSet::new(),
             live_across_edge: BTreeSet::new(),
             worklist: Vec::new(),
-            seen: EntitySet::new(),
             on_worklist: EntitySet::new(),
             span_end: SecondaryMap::new(None),
             pending_head: SecondaryMap::new(NO_PENDING_USE),
@@ -165,7 +160,6 @@ where
             live,
             live_across_edge,
             worklist,
-            seen,
             on_worklist,
             span_end,
             pending_uses,
@@ -178,7 +172,6 @@ where
         live_in.reset();
         live_out.reset();
         worklist.clear();
-        seen.reset();
         on_worklist.reset();
         span_end.reset();
         pending_uses.clear();
@@ -194,7 +187,6 @@ where
             live,
             live_across_edge,
             worklist,
-            seen,
             on_worklist,
             span_end,
             pending_uses,
@@ -207,7 +199,6 @@ where
             && live.is_empty()
             && live_across_edge.is_empty()
             && worklist.is_empty()
-            && seen.is_reset()
             && on_worklist.is_reset()
             && span_end.is_reset()
             && pending_uses.is_empty()
@@ -220,7 +211,7 @@ where
         &mut self,
         func: &impl InputFunction,
         counts: &mut Counts,
-        dfs: &mut Dfs<E>,
+        rpo: &Rpo<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         let _timing = Timing::new("liveness");
@@ -229,8 +220,8 @@ where
         self.live_out.reserve(func.len_blocks());
         self.worklist.reserve(func.len_blocks());
 
-        self.seed_worklist(func, dfs, output)?;
-        self.run_to_fixed_point(func, counts, output)?;
+        self.seed_worklist(rpo);
+        self.run_to_fixed_point(func, counts, rpo, output)?;
 
         if cfg!(debug_assertions) {
             // The only values that may be live on entry to the function are the
@@ -258,27 +249,13 @@ where
     /// a block is not processed until all of its successors are already
     /// processed, and we are flowing backwards from successors to predecessors,
     /// we only need to process each block once (modulo loops).
-    fn seed_worklist(
-        &mut self,
-        func: &impl InputFunction,
-        dfs: &mut Dfs<E>,
-        output: &mut OutputInner<E>,
-    ) -> IResult<()> {
-        dfs.construct(func, output)?;
-        while let Some(event) = dfs.next(func, output, |block| self.seen.contains(block))? {
-            match event {
-                DfsEvent::Pre(block) => {
-                    self.seen.insert(block);
-                }
-                DfsEvent::Post(block) => {
-                    self.on_worklist.insert(block);
-                    self.worklist.push(block);
-                }
-                DfsEvent::AfterEdge(..) => {}
-            }
+    fn seed_worklist(&mut self, rpo: &Rpo<E>) {
+        // The worklist is popped from its end, so pushing in reverse post-order
+        // means we pop in post-order.
+        for block in rpo.iter() {
+            self.on_worklist.insert(block);
+            self.worklist.push(block);
         }
-        self.worklist.reverse();
-        Ok(())
     }
 
     /// Process the worklist, running the backwards dataflow to a fixed point.
@@ -286,6 +263,7 @@ where
         &mut self,
         func: &impl InputFunction,
         counts: &mut Counts,
+        rpo: &Rpo<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         let Self {
@@ -295,7 +273,6 @@ where
             live,
             live_across_edge,
             worklist,
-            seen,
             on_worklist,
             span_end: _,
             pending_uses: _,
@@ -329,7 +306,7 @@ where
             if live_in[block].union_with(arena, live) {
                 for pred in func.block(block.with_repr32()).predecessors() {
                     let pred = output.with_repr(pred)?;
-                    if seen.contains(pred) && !on_worklist.contains(pred) {
+                    if rpo.is_reachable(pred) && !on_worklist.contains(pred) {
                         on_worklist.insert(pred);
                         worklist.push(pred);
                     }
@@ -360,7 +337,6 @@ where
             live,
             live_across_edge: _,
             worklist: _,
-            seen: _,
             on_worklist: _,
             span_end,
             pending_uses,
@@ -692,7 +668,7 @@ pub(crate) fn block_last_inst<'a>(input_block: &impl InputBlock<'a>) -> Inst {
 /// sharing a slot are visited in descending index order, which is the same
 /// reversal applied one level down: the liveness dataflow does not care, but it
 /// keeps the uses that live span construction chains up in ascending order.
-fn for_each_operand_rev<'a, E, F>(
+pub(crate) fn for_each_operand_rev<'a, E, F>(
     input_block: &impl InputBlock<'a>,
     output: &mut OutputInner<E>,
     mut f: F,
@@ -747,7 +723,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test::TestFunction;
+    use crate::{dfs::Dfs, test::TestFunction};
     use mutatis::check::{Check, CheckResult};
     use std::{
         collections::{BTreeSet as Set, HashMap},
@@ -760,21 +736,31 @@ mod tests {
         let mut liveness = Liveness::<u32>::new();
         let mut counts = Counts::new();
         let mut dfs = Dfs::<u32>::new();
+        let mut rpo = Rpo::<u32>::new();
         let mut output = OutputInner::<u32>::new();
 
         assert!(liveness.is_reset());
 
+        if rpo.construct(func, &mut dfs, &mut output).is_err() {
+            return Err(format!(
+                "`Rpo::construct` failed: {:?}",
+                output.take_error()
+            ));
+        }
+
+        // `Rpo::construct` is done with the `Dfs` when it returns, and drains
+        // it.
+        if !dfs.is_reset() {
+            return Err("`Rpo::construct` left the `Dfs` un-reset".to_string());
+        }
+
         if liveness
-            .construct(func, &mut counts, &mut dfs, &mut output)
+            .construct(func, &mut counts, &rpo, &mut output)
             .is_err()
         {
             return Err(format!("`construct` failed: {:?}", output.take_error()));
         }
 
-        // `construct` is done with the `Dfs` when it returns, and drains it.
-        if !dfs.is_reset() {
-            return Err("`construct` left the `Dfs` un-reset".to_string());
-        }
         if liveness.is_reset() {
             return Err("`is_reset` is true after a successful `construct`".to_string());
         }

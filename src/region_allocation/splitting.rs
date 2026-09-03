@@ -1,9 +1,9 @@
 //! Choosing where to split a bundle.
 
 use crate::{
-    entity::{Entity, EntityRepr},
+    entity::EntityRepr,
     input::Position,
-    live_ranges::LivePoint,
+    live_ranges::{LivePoint, touch_mid_inst},
 };
 use core::{cmp::Ordering, ops::Range};
 
@@ -18,6 +18,16 @@ where
 
     /// What keeping it in a register is worth.
     pub weight: f32,
+
+    /// May a cut be placed immediately before this use?
+    ///
+    /// Always true for a use at `Position::Early`, which is an instruction
+    /// boundary and so always somewhere a move can go. A use at
+    /// `Position::Late` is another matter: a cut there would have to put its
+    /// move in the middle of the instruction.
+    ///
+    /// See `LiveSpan::is_tied_to` for details.
+    pub cut_before_allowed: bool,
 }
 
 /// How good a split is, for one candidate register.
@@ -119,6 +129,11 @@ where
     /// Cut between two spans, resulting in `spans[..i]` and `spans[i..]`.
     ///
     /// Always `1 <= i < spans.len()`, so neither half is ever empty.
+    ///
+    /// `spans[i]` may begin in the middle of an instruction, when the two spans
+    /// touch there and nothing ties their uses together. Applying such a cut
+    /// obliges the caller to widen the suffix back to the instruction boundary,
+    /// however.
     BetweenSpans(usize),
 
     /// Cut within a span.
@@ -255,28 +270,49 @@ where
 /// This filters out splits that would leave one half empty as well as splits
 /// that do not fall on an instruction boundary (which can create demands for
 /// moves that are unsatisfiable).
-fn between_span_cuts<E>(spans: &[Range<LivePoint<E>>]) -> impl Iterator<Item = usize> + Clone + '_
+fn between_span_cuts<'a, E>(
+    spans: &'a [Range<LivePoint<E>>],
+    uses: &'a [SplitUse<E>],
+) -> impl Iterator<Item = usize> + Clone + 'a
 where
     E: EntityRepr,
 {
     spans
         .windows(2)
         .enumerate()
-        .filter(|(_i, pair)| gap_admits_a_cut(&pair[0], &pair[1]))
+        .filter(move |(_i, pair)| gap_admits_a_cut(&pair[0], &pair[1], uses))
         .map(|(i, _pair)| i + 1)
 }
 
-/// Does an instruction boundary fall in the gap between `before` and `after`?
-fn gap_admits_a_cut<E>(before: &Range<LivePoint<E>>, after: &Range<LivePoint<E>>) -> bool
+/// Can a cut go in the gap between `before` and `after`?
+///
+/// Either an instruction boundary falls in the gap, so any move the cut demands
+/// has somewhere to go, or the two spans touch in the middle of an instruction
+/// and the cut demands no move at all.
+fn gap_admits_a_cut<E>(
+    before: &Range<LivePoint<E>>,
+    after: &Range<LivePoint<E>>,
+    uses: &[SplitUse<E>],
+) -> bool
 where
     E: EntityRepr,
 {
     debug_assert!(before.end <= after.start);
+    !touch_mid_inst(before.end, after.start) || cut_is_allowed_at(uses, after.start)
+}
 
-    match before.end.pos() {
-        Position::Early => true,
-        Position::Late => after.start.inst().index() > before.end.inst().index(),
-    }
+/// Do all of the uses at `at`, if any, allow a cut immediately before them?
+///
+/// `uses` must be sorted by program point.
+fn cut_is_allowed_at<E>(uses: &[SplitUse<E>], at: LivePoint<E>) -> bool
+where
+    E: EntityRepr,
+{
+    let first = uses.partition_point(|u| u.point < at);
+    uses[first..]
+        .iter()
+        .take_while(|u| u.point == at)
+        .all(|u| u.cut_before_allowed)
 }
 
 /// All the places we could cut any span within `spans` in two.
@@ -330,7 +366,7 @@ pub fn best_split_between_spans<E, C>(
     spans: &[Range<LivePoint<E>>],
     uses: &[SplitUse<E>],
     candidates: impl IntoIterator<Item = C> + Clone,
-    mut interference: impl FnMut(C, &[Range<LivePoint<E>>]) -> f32,
+    mut interference: impl FnMut(C, HalfSpan<'_, E>) -> f32,
 ) -> Option<SplitChoice<C, usize>>
 where
     E: EntityRepr,
@@ -339,12 +375,17 @@ where
     let mut cursor = UseWeightCursor::new(uses);
     let mut best: Option<SplitChoice<C, usize>> = None;
 
-    for k in between_span_cuts(spans) {
+    for k in between_span_cuts(spans, uses) {
         debug_assert!(1 <= k && k < spans.len());
 
-        let (prefix, suffix) = spans.split_at(k);
+        let start = spans[k].start;
 
-        cursor.advance_to(suffix[0].start);
+        // The prefix keeps its spans exactly; the suffix gains the first half of
+        // the instruction it starts inside of, if it starts inside one.
+        let prefix = HalfSpan::prefix(spans, k - 1, spans[k - 1].end);
+        let suffix = HalfSpan::suffix(spans, k, start.inst_boundary_at_or_before());
+
+        cursor.advance_to(start);
         let min_use_weight = cursor.min_use_weight();
 
         for candidate in candidates.clone() {
@@ -435,7 +476,7 @@ where
     debug_assert!(spans.windows(2).all(|s| s[0].end <= s[1].start));
 
     spans.iter().enumerate().flat_map(move |(index, span)| {
-        let gap = (index > 0 && gap_admits_a_cut(&spans[index - 1], span))
+        let gap = (index > 0 && gap_admits_a_cut(&spans[index - 1], span, uses))
             .then_some(Cut::BetweenSpans(index));
         gap.into_iter()
             .chain(minimal_cuts_within_span(index, span, uses))
@@ -495,7 +536,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Inst, live_ranges::is_minimal_bundle};
+    use crate::{Inst, entity::Entity as _, live_ranges::is_minimal_bundle};
     use mutatis::{
         Mutate,
         check::{Check, CheckResult},
@@ -600,6 +641,30 @@ mod tests {
                 .sum()
         }
 
+        /// How many distinct instructions this piece touches.
+        ///
+        /// Unlike `len_insts`, which sums over the spans, an instruction that
+        /// two of the piece's spans both touch is counted once. That is what
+        /// `is_minimal_bundle` wants: a bundle reaching one instruction through
+        /// two spans is as small as a bundle can get.
+        fn len_distinct_insts(&self) -> usize {
+            let mut n = 0;
+            let mut prev: Option<usize> = None;
+            for s in &self.spans {
+                let first = s.start.inst().index();
+                let last = s.end.prev_point().inst().index();
+                let first = match prev {
+                    Some(prev) if prev >= first => prev + 1,
+                    _ => first,
+                };
+                if first <= last {
+                    n += last - first + 1;
+                }
+                prev = Some(last);
+            }
+            n
+        }
+
         /// The instructions this piece reaches into, as an inclusive range of
         /// indices.
         ///
@@ -616,6 +681,19 @@ mod tests {
         /// The block partition, which the kernel never sees but which decides
         /// where the spans are cut and therefore which cuts exist.
         blocks: u16,
+
+        /// Which instructions a tie crosses the middle of, one bit per
+        /// instruction.
+        ///
+        /// When bit `i` is set, no cut may go immediately before a use at
+        /// `(i, Late)`: separating that use from the rest of instruction `i`
+        /// would demand a move in the middle of the instruction, and there is
+        /// nowhere to put one. The allocator works this out from reuse
+        /// constraints and value identity (see
+        /// `crate::live_ranges::LiveSpan::is_tied_to`); the kernel only ever
+        /// sees the answer, as `SplitUse::cut_before_allowed`, so a bitmask is
+        /// all the model needs.
+        tied: u16,
 
         /// The bundle as generated, before clipping.
         source_spans: Vec<(u8, u8)>,
@@ -639,6 +717,7 @@ mod tests {
         fn new() -> Self {
             let mut state = State {
                 blocks: BLOCKS,
+                tied: 0,
                 source_spans: vec![(0, NUM_POINTS)],
                 source_uses: vec![(1, 4), (5, 1), (11, 2), (13, 8)],
                 whole: Piece {
@@ -665,6 +744,7 @@ mod tests {
                     .map(|&(p, w)| SplitUse {
                         point: point(p),
                         weight: f32::from(w),
+                        cut_before_allowed: oracle_cut_before_allowed(point(p), self.tied),
                     })
                     .collect(),
             };
@@ -699,26 +779,55 @@ mod tests {
     /// This ignores rounding entirely: for each adjacent pair it walks every
     /// instruction boundary in the whole program and asks whether that one lies
     /// in the gap.
-    fn oracle_between_span_cuts(spans: &[Range<LivePoint<u32>>]) -> Vec<usize> {
-        let mut out = Vec::new();
-        for k in 1..spans.len() {
-            let (before, after) = (&spans[k - 1], &spans[k]);
-            let admits = (0..=NUM_INSTS).any(|i| {
-                let boundary =
-                    LivePoint::new(Inst::try_new(usize::from(i)).unwrap(), Position::Early);
-                before.end <= boundary && boundary <= after.start
-            });
-            if admits {
-                out.push(k);
-            }
-        }
-        out
+    fn oracle_between_span_cuts(
+        spans: &[Range<LivePoint<u32>>],
+        uses: &[SplitUse<u32>],
+    ) -> Vec<usize> {
+        (1..spans.len())
+            .filter(|&k| oracle_gap_admits_a_cut(&spans[k - 1], &spans[k], uses))
+            .collect()
+    }
+
+    /// May a cut go immediately before a use at `at`?
+    ///
+    /// This is the rule the allocator applies when it fills in
+    /// `SplitUse::cut_before_allowed`, restated over the model's tie bitmask.
+    fn oracle_cut_before_allowed(at: LivePoint<u32>, tied: u16) -> bool {
+        at.pos() == Position::Early || tied & (1 << at.inst().index()) == 0
+    }
+
+    /// Can a cut go in the gap between `before` and `after`, computed the dumb
+    /// way?
+    ///
+    /// Either some instruction boundary falls in the gap, so a move has
+    /// somewhere to go, or the gap sits inside an instruction and every use
+    /// starting where `after` does says a cut there needs no move.
+    fn oracle_gap_admits_a_cut(
+        before: &Range<LivePoint<u32>>,
+        after: &Range<LivePoint<u32>>,
+        uses: &[SplitUse<u32>],
+    ) -> bool {
+        let boundary_in_gap = (0..=NUM_INSTS).any(|i| {
+            let boundary = LivePoint::new(Inst::try_new(usize::from(i)).unwrap(), Position::Early);
+            before.end <= boundary && boundary <= after.start
+        });
+        boundary_in_gap
+            || uses
+                .iter()
+                .filter(|u| u.point == after.start)
+                .all(|u| u.cut_before_allowed)
     }
 
     /// What cutting `piece` at `k` scores in `candidate`, computed the dumb way.
     fn oracle_score(piece: &Piece, parked: &[Parked], candidate: u8, k: usize) -> SplitScore {
         let (before, after) = piece.spans.split_at(k);
         let cut = after[0].start;
+
+        // The suffix as it will really exist: `LiveBundle::split_at_span`
+        // widens a suffix that starts mid-instruction back to the instruction
+        // boundary, so that is the extent whose interference we must price.
+        let mut after = after.to_vec();
+        after[0].start = cut.inst_boundary_at_or_before();
 
         let prefix: f32 = piece
             .uses
@@ -729,7 +838,7 @@ mod tests {
         let total: f32 = piece.uses.iter().map(|u| u.weight).sum();
 
         SplitScore::new(
-            interference(parked, candidate, before).max(interference(parked, candidate, after)),
+            interference(parked, candidate, before).max(interference(parked, candidate, &after)),
             prefix.min(total - prefix),
         )
     }
@@ -1058,31 +1167,35 @@ mod tests {
 
         // The admissible cuts are exactly the ones the oracle finds, in
         // ascending order, and neither half of any of them is span-less.
-        let actual: Vec<usize> = between_span_cuts(spans).collect();
-        let expected = oracle_between_span_cuts(spans);
+        let uses = &piece.uses;
+        let actual: Vec<usize> = between_span_cuts(spans, uses).collect();
+        let expected = oracle_between_span_cuts(spans, uses);
         if actual != expected {
             return Err(format!(
-                "`between_span_cuts({spans:?})` gives {actual:?} but should give {expected:?}",
+                "`between_span_cuts({spans:?}, {uses:?})` gives {actual:?} but should give \
+                 {expected:?}",
             ));
         }
         for pair in actual.windows(2) {
             if pair[0] >= pair[1] {
                 return Err(format!(
-                    "`between_span_cuts({spans:?})` gives {actual:?}, unordered"
+                    "`between_span_cuts({spans:?}, {uses:?})` gives {actual:?}, unordered"
                 ));
             }
         }
         for &cut in &actual {
             if !(1 <= cut && cut < spans.len()) {
                 return Err(format!(
-                    "`between_span_cuts({spans:?})` gives {cut}, which leaves a half span-less",
+                    "`between_span_cuts({spans:?}, {uses:?})` gives {cut}, which leaves a half \
+                     span-less",
                 ));
             }
         }
 
         let choice =
             best_split_between_spans(spans, &piece.uses, 0..NUM_CANDIDATES, |candidate, half| {
-                interference(parked, candidate, half)
+                let half: Vec<_> = half.iter().collect();
+                interference(parked, candidate, &half)
             });
 
         let choice = match choice {
@@ -1218,16 +1331,8 @@ mod tests {
     ) -> Vec<Cut<u32>> {
         let mut out = Vec::new();
         for (index, span) in spans.iter().enumerate() {
-            if index > 0 {
-                let before = &spans[index - 1];
-                let admits = (0..=NUM_INSTS).any(|i| {
-                    let boundary =
-                        LivePoint::new(Inst::try_new(usize::from(i)).unwrap(), Position::Early);
-                    before.end <= boundary && boundary <= span.start
-                });
-                if admits {
-                    out.push(Cut::BetweenSpans(index));
-                }
+            if index > 0 && oracle_gap_admits_a_cut(&spans[index - 1], span, uses) {
+                out.push(Cut::BetweenSpans(index));
             }
 
             for at in (0..=NUM_POINTS).map(point) {
@@ -1363,13 +1468,19 @@ mod tests {
             }
         }
 
-        // A bundle that `is_minimal_bundle` calls minimal is small enough that
-        // there is nothing left to cut. The converse does not hold, and the
-        // pieces below are where that shows: two one-instruction spans touching
-        // at a `Late` point are uncuttable and yet are two spans.
-        if is_minimal_bundle(spans.len(), uses.len(), piece.len_insts()) && !actual.is_empty() {
+        // `is_minimal_bundle` calls a bundle minimal exactly when there is
+        // nothing left to cut, which is what lets the allocator ask the cheap
+        // question instead of running `minimal_cuts` to find out. Both
+        // directions matter: calling a cuttable bundle minimal spills something
+        // that could have been split, and calling an uncuttable one splittable
+        // sends it around the loop forever.
+        let len_cuttable_gaps = oracle_between_span_cuts(spans, uses).len();
+        let is_minimal =
+            is_minimal_bundle(len_cuttable_gaps, uses.len(), piece.len_distinct_insts());
+        if is_minimal != actual.is_empty() {
             return Err(format!(
-                "{spans:?} with {uses:?} is minimal, but `minimal_cuts` gives {actual:?}",
+                "`is_minimal_bundle` says {spans:?} with {uses:?} is minimal = {is_minimal}, but \
+                 `minimal_cuts` gives {actual:?}",
             ));
         }
 
@@ -1523,6 +1634,12 @@ mod tests {
             mask: u16,
         },
 
+        /// Retie the bundle, taking gaps that sit inside an instruction in and
+        /// out of play without moving a single span or use.
+        SetTies {
+            mask: u16,
+        },
+
         /// Start over from a different bundle, keeping the landscape.
         Rebuild {
             spans: Vec<(u8, u8)>,
@@ -1606,6 +1723,9 @@ mod tests {
                     // the end of the program starts one.
                     *mask = (*mask | 1) & ((1 << NUM_INSTS) - 1);
                 }
+                Op::SetTies { mask } => {
+                    *mask &= (1 << NUM_INSTS) - 1;
+                }
                 Op::Rebuild { spans, uses } => {
                     fixup_spans(spans);
                     fixup_uses(uses, spans);
@@ -1624,6 +1744,12 @@ mod tests {
     fn blocks(insts: &[u8]) -> Op {
         Op::SetBlockBoundaries {
             mask: insts.iter().fold(1, |mask, &i| mask | (1 << i)),
+        }
+    }
+
+    fn ties(insts: &[u8]) -> Op {
+        Op::SetTies {
+            mask: insts.iter().fold(0, |mask, &i| mask | (1 << i)),
         }
     }
 
@@ -1659,9 +1785,18 @@ mod tests {
             // One span and no gap, so there is nothing to cut. The bail-out
             // `split_between_spans` depends on to terminate.
             vec![one_block.clone(), rebuild(&[(0, 6)], &[(1, 3)]), split(0)],
-            // Two spans that merely touch at `(i, Late)`. Nothing separates
-            // them, so there is no cut: the known gap that
-            // `split_into_minimal_or_spill` has to cover.
+            // Two spans that merely touch at `(i, Late)`, with the use that
+            // starts the second tied to the first. A cut there would demand a
+            // move in the middle of the instruction, so there is none: the
+            // known gap that `split_into_minimal_or_spill` has to cover.
+            vec![
+                one_block.clone(),
+                ties(&[3]),
+                rebuild(&[(5, 7), (7, 9)], &[(5, 1), (7, 1)]),
+                split(0),
+            ],
+            // The very same shape untied, which *does* admit a cut. The caller
+            // widens the suffix back to `(3, Early)` afterwards.
             vec![
                 one_block.clone(),
                 rebuild(&[(5, 7), (7, 9)], &[(5, 1), (7, 1)]),
@@ -1696,12 +1831,14 @@ mod tests {
             ],
             // Three spans whose first and third gaps admit a cut but whose
             // middle one does not, so an index has to stay attached to its own
-            // gap across a skip.
+            // gap across a skip. The tie is what closes the middle gap; without
+            // it all three would be cuttable and there would be no skip.
             vec![
                 one_block.clone(),
+                ties(&[2]),
                 rebuild(
                     &[(0, 2), (4, 5), (5, 7), (9, 11)],
-                    &[(0, 1), (4, 1), (9, 1)],
+                    &[(0, 1), (4, 1), (5, 1), (9, 1)],
                 ),
                 split(0),
             ],
@@ -2035,6 +2172,11 @@ mod tests {
                     state.rebuild();
                 }
 
+                Op::SetTies { mask } => {
+                    state.tied = *mask;
+                    state.rebuild();
+                }
+
                 Op::Rebuild { spans, uses } => {
                     state.source_spans.clone_from(spans);
                     state.source_uses.clone_from(uses);
@@ -2170,6 +2312,7 @@ mod tests {
             .map(|&p| SplitUse {
                 point: point(p),
                 weight: 1.0,
+                cut_before_allowed: true,
             })
             .collect();
 
@@ -2248,17 +2391,24 @@ mod tests {
             [(0, 2), (0, 6), (0, 8), (0, 12)]
         );
     }
-    /// The same, for `minimal_cuts`.
+    /// The same, for `minimal_cuts`, with nothing tied.
     ///
     /// A cut between spans comes out as `(index, None)`, and a cut within one
     /// as `(index, Some(point))`.
     fn minimal(spans: &[(u8, u8)], uses: &[u8]) -> Vec<(usize, Option<u8>)> {
+        minimal_tied(spans, uses, 0)
+    }
+
+    /// The same, with `tied` naming the instructions a tie crosses the middle
+    /// of, as in [`State::tied`].
+    fn minimal_tied(spans: &[(u8, u8)], uses: &[u8], tied: u16) -> Vec<(usize, Option<u8>)> {
         let spans: Vec<_> = spans.iter().map(|&(s, e)| span(s, e)).collect();
         let uses: Vec<_> = uses
             .iter()
             .map(|&p| SplitUse {
                 point: point(p),
                 weight: 1.0,
+                cut_before_allowed: oracle_cut_before_allowed(point(p), tied),
             })
             .collect();
 
@@ -2336,19 +2486,34 @@ mod tests {
     }
 
     #[test]
-    fn abutting_spans_at_a_late_point_admit_no_cut() {
-        // The case the two rungs above this one cannot handle: two spans that
-        // meet at `(3, Late)`. The gap between them is inside instruction
-        // three, so there is no cut there, and shredding leaves them together.
+    fn abutting_spans_at_a_late_point_need_a_tie_to_stay_together() {
+        // Two spans meeting at `(3, Late)`, which is inside instruction three:
+        // any move a cut there demands has nowhere to go. When the use starting
+        // the second span is tied to the first -- it reuses that operand's
+        // allocation, or it is another piece of the same value -- the cut would
+        // demand one, so the gap admits none and shredding leaves the two spans
+        // together.
         assert_eq!(
-            minimal(&[(5, 7), (7, 9)], &[5, 7]),
-            [(0, Some(6)), (1, Some(8))]
+            minimal_tied(&[(5, 7), (7, 9)], &[5, 7], 1 << 3),
+            [(0, Some(6)), (1, Some(8))],
         );
 
         // Cutting at those two points leaves the middle piece holding both
         // spans, and it cannot be cut any further even though it is two spans.
-        assert!(minimal(&[(6, 7), (7, 8)], &[7]).is_empty());
-        assert!(!is_minimal_bundle(2, 1, 2));
+        assert!(minimal_tied(&[(6, 7), (7, 8)], &[7], 1 << 3).is_empty());
+        assert!(is_minimal_bundle(0, 1, 1));
+
+        // Untie them -- two unrelated values that coalescing happened to put in
+        // one bundle -- and the same gap takes a cut after all, because neither
+        // half needs anything moved across it. The caller widens the suffix back
+        // to `(3, Early)` afterwards; that is
+        // `LiveBundle::split_at_span`'s job, not the kernel's.
+        assert_eq!(
+            minimal(&[(5, 7), (7, 9)], &[5, 7]),
+            [(0, Some(6)), (1, None), (1, Some(8))],
+        );
+        assert_eq!(minimal(&[(6, 7), (7, 8)], &[7]), [(1, None)]);
+        assert!(!is_minimal_bundle(1, 1, 1));
     }
 
     #[test]
@@ -2361,6 +2526,84 @@ mod tests {
             minimal(&[(2, 12), (12, 14), (15, 16)], &[]),
             [(1, None), (2, None)],
         );
+    }
+
+    /// A suffix that begins in the middle of an instruction is priced as the
+    /// caller will actually build it: widened back to the instruction boundary.
+    ///
+    /// The layout, with instruction three the one the cut lands inside of:
+    ///
+    /// ```text
+    ///   point:  2   3   4   5   6   7   8   9  10  11
+    ///   spans:  [--A--) [-----B-----) [-------C------ ...
+    ///   parked:                 [-p1-)     [--p2--)
+    /// ```
+    ///
+    /// `p1` sits in exactly the half-instruction that the widening adds to `C`,
+    /// so cutting before `C` costs `p1` even though the unwidened `C` clears it.
+    /// Charging for it is what stops the mid-instruction cut from winning on an
+    /// estimate that applying it would immediately invalidate.
+    #[test]
+    fn a_mid_instruction_cut_is_priced_widened() {
+        let spans = [span(2, 4), span(4, 7), span(7, 10)];
+
+        // Uses that leave both cuts equally balanced, so that the interference
+        // is the only thing telling them apart. Nothing ties the use at
+        // `(3, Late)` to the span before it, so the gap there takes a cut.
+        let uses = [
+            SplitUse {
+                point: point(2),
+                weight: 2.0,
+                cut_before_allowed: true,
+            },
+            SplitUse {
+                point: point(7),
+                weight: 2.0,
+                cut_before_allowed: true,
+            },
+        ];
+        assert_eq!(between_span_cuts(&spans, &uses).collect::<Vec<_>>(), [1, 2]);
+
+        let parked = [
+            Parked {
+                candidate: 0,
+                spans: vec![span(6, 7)],
+                weight: 1.0,
+            },
+            Parked {
+                candidate: 0,
+                spans: vec![span(9, 11)],
+                weight: 1.0,
+            },
+        ];
+
+        let mut halves: Vec<Vec<Range<LivePoint<u32>>>> = Vec::new();
+        let best = best_split_between_spans(&spans, &uses, [0u8], |candidate, half| {
+            let half: Vec<_> = half.iter().collect();
+            let weight = interference(&parked, candidate, &half);
+            halves.push(half);
+            weight
+        })
+        .unwrap();
+
+        // Every half is one of the four the two cuts produce, and the one after
+        // the mid-instruction cut reaches back to `(3, Early)`.
+        assert_eq!(
+            halves,
+            [
+                vec![span(2, 4)],
+                vec![span(4, 7), span(7, 10)],
+                vec![span(2, 4), span(4, 7)],
+                vec![span(6, 10)],
+            ],
+        );
+
+        // Cutting between `B` and `C` displaces `p1` and `p2` on one side, for
+        // 2.0, which is what cutting between `A` and `B` already costs; the tie
+        // goes to the earlier cut. Were the suffix priced unwidened it would
+        // clear `p1` and score 1.0, and win.
+        assert_eq!(best.cut, 1);
+        assert_eq!(best.score.normalized().max_interference, 2.0);
     }
 
     #[test]

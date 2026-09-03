@@ -1,6 +1,7 @@
 use crate::{
     coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
-    liveness::Liveness, region_allocation::RegionAllocation, region_tree::RegionTree,
+    liveness::Liveness, region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
+    spill_slots::SpillSlots,
 };
 
 /// TODO FITZGEN
@@ -72,63 +73,75 @@ impl Context {
 
 pub(crate) struct ContextInner<E: EntityRepr> {
     pub counts: Counts,
+    pub rpo: Rpo<E>,
     pub region_tree: RegionTree<E>,
     pub liveness: Liveness<E>,
     pub live_ranges: LiveRanges<E>,
     pub dfs: Dfs<E>,
     pub coalescing: Coalescing<E>,
     pub region_allocation: RegionAllocation<E>,
+    pub spill_slots: SpillSlots<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
     const fn new() -> Self {
         Self {
             counts: Counts::new(),
+            rpo: Rpo::new(),
             region_tree: RegionTree::new(),
             liveness: Liveness::new(),
             live_ranges: LiveRanges::new(),
             dfs: Dfs::new(),
             coalescing: Coalescing::new(),
             region_allocation: RegionAllocation::new(),
+            spill_slots: SpillSlots::new(),
         }
     }
 
     pub fn reset(&mut self) {
         let Self {
             counts,
+            rpo,
             region_tree,
             liveness,
             live_ranges,
             dfs,
             coalescing,
             region_allocation,
+            spill_slots,
         } = self;
         counts.reset();
+        rpo.reset();
         region_tree.reset();
         liveness.reset();
         live_ranges.reset();
         dfs.reset();
         coalescing.reset();
         region_allocation.reset();
+        spill_slots.reset();
     }
 
     pub fn is_reset(&self) -> bool {
         let Self {
             counts,
+            rpo,
             region_tree,
             liveness,
             live_ranges,
             dfs,
             coalescing,
             region_allocation,
+            spill_slots,
         } = self;
         counts.is_reset()
+            && rpo.is_reset()
             && region_tree.is_reset()
             && liveness.is_reset()
             && live_ranges.is_reset()
             && dfs.is_reset()
             && coalescing.is_reset()
             && region_allocation.is_reset()
+            && spill_slots.is_reset()
     }
 }
 

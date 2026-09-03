@@ -424,7 +424,7 @@ where
     }
 
     // Then build our bundles from the merged span sets.
-    build_bundles(coalescing, region_tree, live_ranges, counts, output)?;
+    build_bundles(coalescing, region_tree, live_ranges, counts, input, output)?;
 
     // And finally propagate hints across regions.
     hint_across_regions(coalescing, region_tree, live_ranges, input.machine);
@@ -787,6 +787,7 @@ fn build_bundles<E>(
     region_tree: &RegionTree<E>,
     live_ranges: &mut LiveRanges<E>,
     counts: &mut crate::counts::Counts,
+    input: &Input<'_, impl InputFunction>,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
@@ -808,7 +809,7 @@ where
                 let next_span = &coalescing.next_span;
                 let members = core::iter::successors(head, |&s| next_span[s]);
 
-                live_ranges.push_bundle(output, region, constraint, members)?;
+                live_ranges.push_bundle(input, output, region, constraint, members)?;
             }
         }
 
@@ -875,6 +876,7 @@ mod tests {
     use crate::input::BlockFrequency;
     use crate::live_ranges::{
         LiveBundle, is_minimal_bundle, normalize_spill_weight, round_bundle_spill_weight,
+        touch_mid_inst,
     };
     use crate::test::{TestFunction, TestInput};
     use mutatis::check::{Check, CheckResult};
@@ -894,6 +896,7 @@ mod tests {
         let result = test_input.with_input(|input| -> IResult<()> {
             let context = &mut context.context32;
             let func = input.func;
+            context.rpo.construct(func, &mut context.dfs, &mut output)?;
             context.region_tree.construct(
                 func,
                 &mut context.counts,
@@ -902,7 +905,7 @@ mod tests {
             )?;
             context
                 .liveness
-                .construct(func, &mut context.counts, &mut context.dfs, &mut output)?;
+                .construct(func, &mut context.counts, &context.rpo, &mut output)?;
             context.live_ranges.construct(
                 input,
                 &mut context.counts,
@@ -1351,18 +1354,28 @@ mod tests {
                 // 11. A bundle's weight, its fixed-use flag, and its
                 // minimality are exactly what its spans say they are: the flag
                 // is the OR of theirs, the weight is their uses' weights over
-                // their length, normalized, and the minimality is
-                // `is_minimal_bundle` of their count, their uses' count, and
-                // their summed length. Recomputing the weight from
-                // the *packed* per-use weights and rounding the result the way
-                // the bundle does makes that one an equality rather than an
-                // approximation.
+                // their summed length, normalized, and the minimality is
+                // `is_minimal_bundle` of the gaps a cut could go in, their
+                // uses' count, and the instructions they actually cover.
+                // Recomputing the weight from the *packed* per-use weights and
+                // rounding the result the way the bundle does makes that one an
+                // equality rather than an approximation.
+                test_input.with_input(|input| -> Result<(), String> {
                 for bundle in live_ranges.bundles() {
                     let mut expected_fixed = false;
                     let mut total_cost = 0.0;
                     let mut num_insts = 0;
                     let num_spans = bundle.spans(live_ranges).len();
                     let mut num_uses = 0;
+
+                    // A gap between two spans takes a cut unless they touch in
+                    // the middle of an instruction and something across the gap
+                    // needs a move, and two spans touching like that both cover
+                    // the instruction they touch in.
+                    let mut num_cuttable_gaps = 0;
+                    let mut shared_insts = 0;
+                    let mut prev: Option<LiveSpan> = None;
+
                     for span in bundle.spans(live_ranges) {
                         expected_fixed |= span.has_fixed_use(live_ranges);
                         let uses = span.uses(live_ranges);
@@ -1372,6 +1385,17 @@ mod tests {
                             .map(|u| u.weight(live_ranges).as_f32())
                             .sum::<f32>();
                         num_insts += span.len_insts(live_ranges);
+
+                        if let Some(prev) = prev {
+                            let tied = span.is_tied_to(live_ranges, input, prev);
+                            if touch_mid_inst(prev.end(live_ranges), span.start(live_ranges)) {
+                                shared_insts += 1;
+                            }
+                            if !tied {
+                                num_cuttable_gaps += 1;
+                            }
+                        }
+                        prev = Some(span);
                     }
 
                     if bundle.has_fixed_uses(live_ranges) != expected_fixed {
@@ -1396,24 +1420,32 @@ mod tests {
                         return Err(format!("{bundle:?} weighs {actual}, which is not a weight"));
                     }
 
-                    let expected_minimal = is_minimal_bundle(num_spans, num_uses, num_insts);
+                    let distinct_insts = num_insts - shared_insts;
+                    let expected_minimal =
+                        is_minimal_bundle(num_cuttable_gaps, num_uses, distinct_insts);
                     if bundle.is_minimal(live_ranges) != expected_minimal {
                         return Err(format!(
                             "{bundle:?} reports is_minimal = {}, but it holds {num_spans} spans \
-                             and {num_uses} uses across {num_insts} instructions",
+                             with {num_cuttable_gaps} cuttable gaps between them and {num_uses} \
+                             uses across {distinct_insts} instructions",
                             bundle.is_minimal(live_ranges),
                         ));
                     }
                     // Implied by the definition, but worth stating: a minimal
                     // bundle is never a set of spans that could be handed out
-                    // one bundle each.
-                    if expected_minimal && num_spans != 1 {
+                    // one bundle each. It may still be more than one span, when
+                    // two of them touch at a `Late` point that a cut cannot go
+                    // at.
+                    if expected_minimal && num_spans != 1 + shared_insts {
                         return Err(format!(
-                            "{bundle:?} is minimal but holds {num_spans} spans, which could be \
+                            "{bundle:?} is minimal but holds {num_spans} spans, only \
+                             {shared_insts} of whose gaps are uncuttable, so the rest could be \
                              split into one bundle each",
                         ));
                     }
                 }
+                Ok(())
+                })?;
 
                 // 12. Everything the pass touched resets cleanly.
                 context.reset();
