@@ -83,6 +83,7 @@ pub struct Counts {
     pub spill_slot_assignments: Count,
     pub final_live_spans: Count,
     pub final_bundles: Count,
+    pub spills_placed: Count,
 }
 
 impl Counts {
@@ -110,6 +111,7 @@ impl Counts {
             spill_slot_assignments: Count::new(),
             final_live_spans: Count::new(),
             final_bundles: Count::new(),
+            spills_placed: Count::new(),
         }
     }
 
@@ -141,6 +143,7 @@ impl Counts {
             spill_slot_assignments,
             final_live_spans,
             final_bundles,
+            spills_placed,
         } = self;
         sccs.is_reset()
             && regions.is_reset()
@@ -164,5 +167,6 @@ impl Counts {
             && spill_slot_assignments.is_reset()
             && final_live_spans.is_reset()
             && final_bundles.is_reset()
+            && spills_placed.is_reset()
     }
 }

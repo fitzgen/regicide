@@ -4,10 +4,8 @@
 //! stack. We haven't decided which stack slot a value gets spilled to or how
 //! many total spill slots we need. That is this pass's job.
 //!
-//! # The algorithm
-//!
 //! We color the interference graph of the spilled values directly, with the
-//! classic SSA coloring of Hack, Grund, and Goos:
+//! classic SSA coloring algorithm of Hack, Grund, and Goos:
 //!
 //! * Visit the blocks in reverse post-order, and within a block visit program
 //!   points in program order. Because a value's definition dominates every
@@ -27,61 +25,15 @@
 //! precisely the set of colors we must avoid, and greedily avoiding them is a
 //! complete coloring.
 //!
-//! Note that *which* free slot we pick does not matter, only that we prefer any
-//! free slot over a fresh one: we create a slot only at a point where every
-//! existing slot of that size is live, so each creation coincides with a new
-//! record high in simultaneously live values, and the total therefore lands on
-//! the maximum however we break ties. We keep a free list per size class and
-//! pop the most recently freed slot off it, which is deterministic and costs
-//! `O(1)` where scanning for the lowest-numbered free slot would cost `O(n)`.
-//!
-//! To follow the walk we need, per block, the points at which each spilled
-//! value's live range ends. A backwards pass over the block's operands
-//! collects them — mirroring the backwards pass in [`crate::liveness`], and
-//! sharing its `for_each_operand_rev` so the two cannot disagree about where a
-//! live range ends — and then the forward pass drains them in order. Live
-//! ranges are half-open, so a value whose range ends at point `p` has already
-//! released its slot by the time a value defined at `p` asks for one.
-//!
-//! # Why this algorithm, here
-//!
-//! The interference graph of a strict SSA program is chordal, and a dominance
-//! order is a perfect elimination order for it, so greedy coloring in that
-//! order uses exactly `ω` colors — the size of the largest clique, which is the
-//! maximum number of simultaneously live values. In other words the coloring is
-//! *optimal*: no assignment uses fewer slots. For us that means the smallest
-//! possible stack frame, which is worth having, and it comes with no
-//! backtracking, no iteration to a fixed point, and no heuristics to tune. We
-//! assert the optimality at the end of the pass (`max_live` versus the number
-//! of slots created per size class), so a bug in the walk shows up as a failed
-//! assertion rather than as quietly larger frames.
-//!
-//! The reason we cannot allocate *registers* this way — and the reason this
-//! module looks nothing like [`crate::region_allocation`] — is that the theorem
-//! only speaks to the chromatic number. It says how many colors suffice; it
-//! says nothing about *which* color a value may take. Real register allocation
-//! is full of constraints on which color: an operand pinned to a particular
-//! register, register classes that overlap and alias, register groups, a
-//! caller-saved register clobbered by a call. And the resource is finite, so
-//! when `ω > k` something must be evicted, split, or spilled, and splitting
-//! destroys the SSA form the theorem needs. None of that is true of stack
-//! slots. Slots are interchangeable within a size class, there is no `k` to
-//! exceed, and creating another slot never fails. What is a hard problem for
-//! registers is the textbook easy case for slots, so we solve it exactly.
-//!
-//! # The size class is a size, not a bank
-//!
-//! Registers are grouped into banks, and a value can only live in a register of
-//! its own bank. Stack slots have no such rule: a slot is just bytes in the
-//! frame, so all that a value asks of one is that it be wide enough. Two banks
-//! whose registers are the same width therefore draw upon a single pool of
-//! slots, and a function that spills an integer and a float with disjoint live
-//! ranges spends one slot on them rather than two.
-//!
-//! Sizes are powers of two ([`crate::MachineBuilder::declare_reg_bank`] rejects
-//! anything else), so a size class is an index
-//! [`RegBank::log2_size`][crate::machine::RegBank::log2_size] into a fixed
-//! array of [`RegBank::NUM_SIZES`] entries, and needs no map.
+//! Why use this allocation algorithm here? Why not reuse the region allocation
+//! algorithm? Hack et al showed that the above algorithm is optimal: there is
+//! no coloring that uses fewer colors (spill slots). This gives us optimally
+//! sized stack frames and avoids stack-to-stack moves. To flip the question on
+//! its head: why don't we use this algorithm for region allocation? Because
+//! things like a fixed number of colors (registers) and pre-coloring (fixed
+//! register constraints) break the algorithm and force a return to either
+//! NP-completeness or suboptimality. Spill slot allocation just happens to
+//! perfectly fit into the shape that this algorithm requires.
 //!
 //! References:
 //!
@@ -104,19 +56,6 @@
 //! * Philip Brisk, Foad Dabiri, Jamie Macbeth, and Majid Sarrafzadeh,
 //!   "Polynomial-Time Graph Coloring Register Allocation", IWLS 2005. (Proves
 //!   the weaker result that strict SSA interference graphs are perfect.)
-//!
-//! # What this pass does not do
-//!
-//! It assigns slot *indices*, not stack frame offsets: laying the frame out is
-//! a downstream concern, and later phases may still add slots of their own
-//! (see [`crate::parallel_moves`]).
-//!
-//! It also assigns a slot to a value's *whole* live range, including the
-//! stretches where region allocation kept the value in a register. That is a
-//! deliberate over-approximation, and it buys two things: all of a value's
-//! split pieces share one slot, so a stack-to-stack move is never needed; and a
-//! value that was reloaded but not modified still has the current value sitting
-//! in its slot, so re-spilling it later needs no store at all.
 
 use crate::{
     Block, Entity as _, Val,
@@ -155,13 +94,11 @@ where
     let ContextInner {
         counts,
         rpo,
-        region_tree: _,
         liveness,
         live_ranges,
-        dfs: _,
-        coalescing: _,
         region_allocation,
         spill_slots,
+        ..
     } = context;
 
     spill_slots.allocate(
@@ -302,6 +239,12 @@ where
     #[allow(dead_code, reason = "consumed by the phases that are still to come")]
     pub fn len_slots(&self) -> usize {
         self.slots.len()
+    }
+
+    /// The values that region allocation left on the stack, and that therefore
+    /// have a slot.
+    pub(crate) fn spilled(&self) -> &EntitySet<Val<E>> {
+        &self.spilled
     }
 
     /// Allocate every spilled value a stack slot.

@@ -3,7 +3,7 @@ use crate::context::ContextInner;
 use crate::entity::{Block, Entity, EntityRepr, Val};
 use crate::error::{IResult, InternalError};
 use crate::input::InputFunction;
-use crate::spill_slots::SpillSlot;
+use crate::spill_slot_allocation::SpillSlot;
 use crate::timing::Timing;
 use alloc::vec::Vec;
 

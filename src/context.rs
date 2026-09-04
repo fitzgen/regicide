@@ -1,7 +1,7 @@
 use crate::{
     coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
     liveness::Liveness, region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
-    spill_slots::SpillSlots,
+    spill_placement::SpillPlacement, spill_slot_allocation::SpillSlots,
 };
 
 /// TODO FITZGEN
@@ -81,6 +81,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub coalescing: Coalescing<E>,
     pub region_allocation: RegionAllocation<E>,
     pub spill_slots: SpillSlots<E>,
+    pub spill_placement: SpillPlacement<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
@@ -95,6 +96,7 @@ impl<E: EntityRepr> ContextInner<E> {
             coalescing: Coalescing::new(),
             region_allocation: RegionAllocation::new(),
             spill_slots: SpillSlots::new(),
+            spill_placement: SpillPlacement::new(),
         }
     }
 
@@ -109,6 +111,7 @@ impl<E: EntityRepr> ContextInner<E> {
             coalescing,
             region_allocation,
             spill_slots,
+            spill_placement,
         } = self;
         counts.reset();
         rpo.reset();
@@ -119,6 +122,7 @@ impl<E: EntityRepr> ContextInner<E> {
         coalescing.reset();
         region_allocation.reset();
         spill_slots.reset();
+        spill_placement.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -132,6 +136,7 @@ impl<E: EntityRepr> ContextInner<E> {
             coalescing,
             region_allocation,
             spill_slots,
+            spill_placement,
         } = self;
         counts.is_reset()
             && rpo.is_reset()
@@ -142,6 +147,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && coalescing.is_reset()
             && region_allocation.is_reset()
             && spill_slots.is_reset()
+            && spill_placement.is_reset()
     }
 }
 

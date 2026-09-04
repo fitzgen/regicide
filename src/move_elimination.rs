@@ -1,3 +1,7 @@
+//! Move elimination.
+//!
+//! TODO: overview
+
 use crate::context::ContextInner;
 use crate::entity::EntityRepr;
 use crate::error::IResult;
@@ -14,9 +18,14 @@ where
     let _timing = Timing::new("eliminate moves");
     let _ = (context, func);
 
-    // TODO: fixed-point data-flow analysis to find (a) moves that simply move
-    // the value that is already in that location into that location again, and
-    // (b) moves that can be replaced with rematerialization.
+    // TODO: add `InputOptions` field for whether to do a full, global fixpoint
+    // (regalloc3 style) or block-local, single-pass (regalloc2 style) dataflow
+    // analysis / abstract interpretation to determine what registers and spill
+    // slots hold which value at each program point. Default to the full
+    // fixpoint.
+    //
+    // TODO: use the results of that analysis to eliminate redundant moves:
+    // moves that put a value V into location L when L already contains V.
 
     todo!()
 }

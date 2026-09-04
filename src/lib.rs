@@ -34,6 +34,7 @@ mod live_ranges;
 mod liveness;
 mod machine;
 mod move_elimination;
+mod move_generation;
 mod output;
 mod packed_float;
 mod parallel_moves;
@@ -41,7 +42,8 @@ mod region_allocation;
 mod region_tree;
 mod rpo;
 mod sccs;
-mod spill_slots;
+mod spill_placement;
+mod spill_slot_allocation;
 mod timing;
 mod union_find;
 mod validation;
@@ -60,7 +62,7 @@ pub use input::{
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
-pub use spill_slots::SpillSlot;
+pub use spill_slot_allocation::SpillSlot;
 
 use context::ContextInner;
 use error::{IResult, InternalError};
@@ -168,7 +170,9 @@ where
 
     coalescing::coalesce(context, input, output)?;
     region_allocation::region_allocate(context, input, output)?;
-    spill_slots::allocate_spill_slots(context, input, output)?;
+    spill_slot_allocation::allocate_spill_slots(context, input, output)?;
+    spill_placement::place_spills(context, input, output)?;
+    move_generation::generate_moves(context, input.func)?;
     move_elimination::eliminate_moves(context, input.func)?;
 
     output.construct(context, input.func)?;

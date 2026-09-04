@@ -11,7 +11,7 @@ use crate::{
     input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position, RematCost},
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
-    spill_slots::SpillSlot,
+    spill_slot_allocation::SpillSlot,
     union_find::UnionFind,
 };
 use alloc::{vec, vec::Vec};
@@ -2000,6 +2000,130 @@ impl TestInput {
             BlockData {
                 params: vec![param_val],
                 insts: vec![inst(3), inst(4)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A diamond whose merge block takes a parameter that has to spend part of
+    /// its live range on the stack.
+    ///
+    /// `block0` defines a value and branches to `block1` and `block2`, which
+    /// each pass it to `block3` as a block argument. The parameter is used
+    /// first in a register and then on the stack, so it starts `block3` in a
+    /// register and ends up in its slot.
+    ///
+    /// A block parameter is logically defined on the control-flow edges that
+    /// reach its block, so this is the shape that would expose a store placed
+    /// on one of those edges but not the others.
+    pub fn with_spilled_merge_param() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let arg_val = Val::try_new(0).unwrap();
+        let param_val = Val::try_new(1).unwrap();
+        let def = Inst::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let merge = block(3);
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult { inst: def, i: 0 },
+            ValDef::BlockParam { block: merge, i: 0 },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let reg = OperandConstraint::Reg(
+            RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+        );
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+        let branch = |target, args| InstData::Branch {
+            operands: vec![],
+            targets: vec![BlockCall { target, args }],
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the value and fork.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, arg_val),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: block(1),
+                        args: vec![],
+                    },
+                    BlockCall {
+                        target: block(2),
+                        args: vec![],
+                    },
+                ],
+            },
+            // block1 and block2: pass the value to the merge block.
+            branch(merge, vec![arg_val]),
+            branch(merge, vec![arg_val]),
+            // block3: the parameter arrives in a register and then has to be
+            // read off the stack, so its live range gets split. The last
+            // instruction is a terminator of the block's own, so that
+            // `ensure_terminators` does not take the stack use away.
+            op(Position::Early, DefUse::Use, reg, param_val),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                param_val,
+            ),
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(3)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param_val],
+                insts: vec![inst(4), inst(5), inst(6)],
                 frequency: 0,
             },
         ] {
