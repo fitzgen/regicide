@@ -9,6 +9,12 @@ extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
 
+// `alloc` has no hash map, and `src/move_generation.rs` needs one.
+#[cfg(not(any(feature = "std", feature = "hashbrown")))]
+compile_error!(
+    "regicide needs a hash map: enable either the `std` feature or the `hashbrown` feature"
+);
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! trace {
@@ -61,13 +67,27 @@ pub use input::{
     Position, RematCost,
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
-pub use output::{Allocation, CriticalEdgeMove, Edit, Move, Output, Remat};
-pub use spill_slot_allocation::SpillSlot;
+pub use output::{
+    Allocation, CriticalEdgeEdit, EdgeEdit, Edit, Move, Output, RegAllocation, Remat,
+    ScalarAllocation, StackAllocation,
+};
+pub use spill_slot_allocation::{SpillSlot, SpillSlotGroup};
 
 use context::ContextInner;
 use error::{IResult, InternalError};
 use input::DisplayWithOutput;
 use output::{OutputInner, WhichOutput};
+
+mod hash_map {
+    #[cfg(not(feature = "std"))]
+    pub use hashbrown::{HashMap, hash_map::Entry};
+    #[cfg(feature = "std")]
+    pub use std::collections::{HashMap, hash_map::Entry};
+
+    use rustc_hash::FxBuildHasher;
+
+    pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
+}
 
 /// TODO FITZGEN
 pub fn run(
@@ -172,7 +192,7 @@ where
     region_allocation::region_allocate(context, input, output)?;
     spill_slot_allocation::allocate_spill_slots(context, input, output)?;
     spill_placement::place_spills(context, input, output)?;
-    move_generation::generate_moves(context, input.func)?;
+    move_generation::generate_moves(context, input, output)?;
     move_elimination::eliminate_moves(context, input.func)?;
 
     output.construct(context, input.func)?;

@@ -2,6 +2,10 @@
 
 #![allow(missing_docs, reason = "internal test utilities")]
 
+mod parallel_moves;
+
+pub use parallel_moves::*;
+
 use crate::{
     Block, InputBlock, InputFunction, InputInst, InputValue, Machine, MachineBuilder, Operand, Reg,
     RegClass, RegGroup, RegUnit, Val,
@@ -1450,6 +1454,34 @@ impl TestMachine {
         machine
     }
 
+    /// The class holding [`TestMachine::one_register_group`]'s only register
+    /// group, and its only class.
+    pub const GROUP_CLASS: u8 = 0;
+
+    /// A machine of one bank whose two registers form its only register group,
+    /// with one class, `rc0`, holding that group.
+    ///
+    /// A value here occupies both registers at once, so spilling one takes two
+    /// slots and moving one takes two moves.
+    pub fn one_register_group() -> Self {
+        let mut machine = TestMachine {
+            banks: vec![TestBank {
+                log2_size: 3,
+                regs: vec![1, 1],
+                non_allocatable: 0,
+                groups: vec![TestGroup {
+                    members: vec![0, 1],
+                }],
+                classes: vec![TestClass {
+                    members: TestClassMembers::Groups(vec![0]),
+                    spill_cost: 0,
+                }],
+            }],
+        };
+        machine.fixup();
+        machine
+    }
+
     /// How many register classes this machine defines, which is the number of
     /// classes an operand may name.
     ///
@@ -1721,6 +1753,39 @@ impl TestInput {
     /// `Reg(rc1)` are the pair of constraints that conflict and `Reg(rc2)` is
     /// the one that can be met alongside either.
     pub fn with_use_constraints(constraints: &[OperandConstraint]) -> Self {
+        Self::with_use_constraints_in(
+            TestMachine::two_registers(),
+            TestMachine::BOTH_REGS_CLASS,
+            OperandConstraint::Any,
+            constraints,
+        )
+    }
+
+    /// As [`TestInput::with_use_constraints`], but on
+    /// [`TestMachine::one_register_group`], where the value occupies a whole
+    /// register group.
+    ///
+    /// The definition is pinned to the group rather than left to `Any`, which
+    /// the allocator is free to satisfy on the stack, so that a use on the
+    /// stack really is a spill.
+    pub fn with_group_use_constraints(constraints: &[OperandConstraint]) -> Self {
+        let class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
+        Self::with_use_constraints_in(
+            TestMachine::one_register_group(),
+            TestMachine::GROUP_CLASS,
+            OperandConstraint::Reg(class),
+            constraints,
+        )
+    }
+
+    /// [`TestInput::with_use_constraints`] on any machine, with the value in
+    /// `reg_class` and defined under `def_constraint`.
+    fn with_use_constraints_in(
+        machine: TestMachine,
+        reg_class: u8,
+        def_constraint: OperandConstraint,
+        constraints: &[OperandConstraint],
+    ) -> Self {
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
 
@@ -1732,7 +1797,7 @@ impl TestInput {
             .push(
                 &mut output,
                 ValData {
-                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    reg_class,
                     def: ValDef::InstResult { inst: def, i: 0 },
                     remat: 0,
                 },
@@ -1747,7 +1812,7 @@ impl TestInput {
                     operands: vec![Operand::new(
                         Position::Late,
                         DefUse::Def,
-                        OperandConstraint::Any,
+                        def_constraint,
                         val,
                     )],
                     side_effects: true,
@@ -1791,10 +1856,7 @@ impl TestInput {
             )
             .unwrap();
 
-        let mut input = TestInput {
-            machine: TestMachine::two_registers(),
-            func,
-        };
+        let mut input = TestInput { machine, func };
         input.fixup();
         input
     }
@@ -2124,6 +2186,118 @@ impl TestInput {
             BlockData {
                 params: vec![param_val],
                 insts: vec![inst(4), inst(5), inst(6)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A block parameter that lives in a spill slot, passed an argument that
+    /// lives in a different one.
+    ///
+    /// `block0` defines a value, reads it off the stack, and passes it to
+    /// `block1` as a block argument. `block1` reads its parameter off the
+    /// stack, and then reads the argument off the stack again, which keeps the
+    /// argument live into `block1` so that the two cannot share a slot.
+    ///
+    /// Only the edge can fill the parameter's slot: spill placement stores a
+    /// value into its own home and never into another value's, so this is the
+    /// shape where a missing destination half leaves the slot holding whatever
+    /// was in it before.
+    pub fn with_stack_param_and_arg() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let arg_val = Val::try_new(0).unwrap();
+        let param_val = Val::try_new(1).unwrap();
+        let def = Inst::try_new(0).unwrap();
+        let target = Block::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult { inst: def, i: 0 },
+            ValDef::BlockParam {
+                block: target,
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the value, read it off the stack so that it is
+            // there at the branch, and pass it along.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, arg_val),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                arg_val,
+            ),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target,
+                    args: vec![arg_val],
+                }],
+            },
+            // block1: the parameter off the stack, then the argument off the
+            // stack again. The last instruction is a terminator of the block's
+            // own, so that `ensure_terminators` does not take the uses away.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                param_val,
+            ),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                arg_val,
+            ),
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param_val],
+                insts: vec![inst(3), inst(4), inst(5)],
                 frequency: 0,
             },
         ] {

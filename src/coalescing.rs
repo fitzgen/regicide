@@ -664,7 +664,7 @@ fn region_blocks_by_priority<E>(
             // d'etre is holding the moves that we are trying to remove via
             // coalescing. We don't require that the embedder has already split
             // the critical edges in the input function, letting the embedder
-            // lazily split them on demand by returning `Edit::CriticalEdgeMove`
+            // lazily split them on demand by returning `Edit::CriticalEdge`
             // instead, so this comparison rarely affects the blocks
             // order. However, some embedders eagerly split critical edges
             // anyways, and if we didn't have this comparison tier, then these

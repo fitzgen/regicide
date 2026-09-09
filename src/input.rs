@@ -379,6 +379,18 @@ pub enum Position {
     Late = 1,
 }
 
+impl Position {
+    /// Is this `Position::Early`?
+    pub fn is_early(self) -> bool {
+        matches!(self, Self::Early)
+    }
+
+    /// Is this `Position::Late`?
+    pub fn is_late(self) -> bool {
+        matches!(self, Self::Late)
+    }
+}
+
 /// A definition or use of an associated value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
@@ -575,6 +587,8 @@ pub trait InputBlock<'a> {
     fn dominates(&self, other: Block) -> bool;
 
     /// How many successors does this block have in the control-flow graph?
+    ///
+    /// A block must have no more than `u16::MAX` successors.
     fn len_successors(&self) -> usize;
 
     /// The iterator type returned by [`InputBlock::successors`].
@@ -627,8 +641,6 @@ pub trait InputValue<'a> {
     fn val(&self) -> Val;
 
     /// Get the cost of rematerializing this value, if possible.
-    ///
-    /// TODO: expand this
     fn remat_cost(&self) -> Option<RematCost>;
 
     /// Get the register class that this value naturally belongs within.
@@ -642,16 +654,17 @@ where
 {
     /// The register bank this value naturally belongs to.
     pub(crate) fn reg_bank(self, input: &Input<'_, impl InputFunction>) -> RegBank {
-        input
-            .func
-            .value(self.with_repr32())
-            .reg_class()
-            .bank(input.machine)
+        self.reg_class(input).bank(input.machine)
     }
 
-    /// The `log2(size)` of this value's size.
-    pub(crate) fn log2_size(self, input: &Input<'_, impl InputFunction>) -> u8 {
-        self.reg_bank(input).log2_size(input.machine)
+    /// The register class this value naturally belongs within.
+    pub(crate) fn reg_class(self, input: &Input<'_, impl InputFunction>) -> RegClass {
+        input.func.value(self.with_repr32()).reg_class()
+    }
+
+    /// How many registers this value occupies.
+    pub(crate) fn num_regs(self, input: &Input<'_, impl InputFunction>) -> usize {
+        self.reg_class(input).group_size(input.machine).unwrap_or(1)
     }
 }
 

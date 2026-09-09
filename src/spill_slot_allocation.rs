@@ -61,13 +61,13 @@ use crate::{
     Block, Entity as _, Val,
     context::ContextInner,
     counts::Counts,
-    entity::{EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
+    entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
     error::IResult,
     input::{DefUse, Input, InputBlock as _, InputFunction, Position},
-    live_ranges::{LivePoint, LiveRanges},
+    live_ranges::{LivePoint, LiveRanges, LiveSpan},
     liveness::{Liveness, for_each_operand_rev},
     machine::RegBank,
-    output::OutputInner,
+    output::{Allocation, OutputInner, StackAllocation},
     region_allocation::RegionAllocation,
     rpo::Rpo,
     timing::Timing,
@@ -78,6 +78,16 @@ define_entities! {
     /// A slot in the stack frame that a spilled value lives in.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct SpillSlot = "stack";
+
+    /// The spill slots that together hold one value in a class of register
+    /// groups: one slot per group member, in member order.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SpillSlotGroup = "stack_group";
+
+    /// An index into the contiguous storage of every spill slot group's
+    /// members.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct SpillSlotGroupMembersIndex = "spill_slot_group_members_index";
 }
 
 /// Run the spill slot allocation pass.
@@ -135,9 +145,16 @@ where
     /// the values it holds.
     slots: PrimaryMap<SpillSlot<E>, u8>,
 
-    /// The slot each spilled value lives in, or `None` for values that were
-    /// never spilled.
-    val_slot: SecondaryMap<Val<E>, Option<SpillSlot<E>>>,
+    /// Every group of slots we have created, and where its members are in
+    /// `group_members`.
+    groups: PrimaryMap<SpillSlotGroup<E>, EntityRange<SpillSlotGroupMembersIndex<E>>>,
+
+    /// Contiguous storage for the members of every group of slots.
+    group_members: PrimaryMap<SpillSlotGroupMembersIndex<E>, SpillSlot<E>>,
+
+    /// Where each spilled value lives on the stack, or `None` for values that
+    /// are never spilled.
+    val_home: SecondaryMap<Val<E>, Option<StackAllocation<E>>>,
 
     /// The values that need a slot, gathered from region allocation's stack
     /// bundles.
@@ -169,6 +186,10 @@ where
 
     /// The spilled values live at the walk's current point.
     live: EntitySet<Val<E>>,
+
+    /// The emergency slot of each size, created on demand by
+    /// [`Self::emergency_slot`] and indexed by that size's base-two log.
+    emergency: [Option<SpillSlot<E>>; RegBank::NUM_SIZES],
 }
 
 impl<E> SpillSlots<E>
@@ -178,7 +199,9 @@ where
     pub const fn new() -> Self {
         SpillSlots {
             slots: PrimaryMap::new(),
-            val_slot: SecondaryMap::new(None),
+            groups: PrimaryMap::new(),
+            group_members: PrimaryMap::new(),
+            val_home: SecondaryMap::new(None),
             spilled: EntitySet::new(),
             max_live: [0; RegBank::NUM_SIZES],
             live_count: [0; RegBank::NUM_SIZES],
@@ -186,13 +209,16 @@ where
             free_slots: [const { Vec::new() }; RegBank::NUM_SIZES],
             events: Vec::new(),
             live: EntitySet::new(),
+            emergency: [None; RegBank::NUM_SIZES],
         }
     }
 
     pub fn reset(&mut self) {
         let Self {
             slots,
-            val_slot,
+            groups,
+            group_members,
+            val_home,
             spilled,
             max_live,
             live_count,
@@ -200,9 +226,12 @@ where
             free_slots,
             events,
             live,
+            emergency,
         } = self;
         slots.reset();
-        val_slot.reset();
+        groups.reset();
+        group_members.reset();
+        val_home.reset();
         spilled.reset();
         *max_live = [0; RegBank::NUM_SIZES];
         debug_assert!(live_count.iter().all(|&n| n == 0));
@@ -210,12 +239,15 @@ where
         debug_assert!(free_slots.iter().all(|free| free.is_empty()));
         debug_assert!(events.is_empty());
         debug_assert!(live.is_empty());
+        *emergency = [None; RegBank::NUM_SIZES];
     }
 
     pub fn is_reset(&self) -> bool {
         let Self {
             slots,
-            val_slot,
+            groups,
+            group_members,
+            val_home,
             spilled,
             max_live,
             live_count,
@@ -223,9 +255,12 @@ where
             free_slots,
             events,
             live,
+            emergency,
         } = self;
         slots.is_reset()
-            && val_slot.is_reset()
+            && groups.is_reset()
+            && group_members.is_reset()
+            && val_home.is_reset()
             && spilled.is_reset()
             && max_live.iter().all(|&n| n == 0)
             && live_count.iter().all(|&n| n == 0)
@@ -233,6 +268,7 @@ where
             && free_slots.iter().all(|free| free.is_empty())
             && events.is_empty()
             && live.is_empty()
+            && emergency.iter().all(|slot| slot.is_none())
     }
 
     /// How many stack slots did we create?
@@ -245,6 +281,34 @@ where
     /// have a slot.
     pub(crate) fn spilled(&self) -> &EntitySet<Val<E>> {
         &self.spilled
+    }
+
+    /// Get a spill slot of the given size that no value is assigned to, for
+    /// move generation to borrow when it must break a cycle of parallel moves
+    /// and no register is free.
+    ///
+    /// A value stays there only across one batch, and batches are
+    /// sequentialized independently, so one slot per size class is enough
+    /// however many cycles we break.
+    pub(crate) fn emergency_slot(
+        &mut self,
+        counts: &mut Counts,
+        log2_size: u8,
+        output: &mut OutputInner<E>,
+    ) -> IResult<SpillSlot<E>> {
+        if let Some(slot) = self.emergency[usize::from(log2_size)] {
+            return Ok(slot);
+        }
+
+        let slot = self.slots.push(output, log2_size)?;
+        self.emergency[usize::from(log2_size)] = Some(slot);
+        counts.emergency_spill_slots.inc();
+        counts.spill_slots.inc();
+        trace!(
+            "spill slots: created emergency {slot:?} ({} bytes)",
+            1u32 << log2_size
+        );
+        Ok(slot)
     }
 
     /// Allocate every spilled value a stack slot.
@@ -369,12 +433,10 @@ where
         // First color the live-in values that already have spill slot
         // assignments. We want to make sure they retain their same slot.
         for val in block.live_in(liveness) {
-            if !self.spilled.contains(val) {
+            if !self.spilled.contains(val) || self.val_home[val].is_none() {
                 continue;
             }
-            if let Some(slot) = self.val_slot[val] {
-                self.occupy(input, slot, val);
-            }
+            self.occupy_val_slots(input, val);
         }
 
         // All other slots are free in this block. Rebuild the free lists
@@ -389,7 +451,7 @@ where
         // Color the live-in values that did not already have slots assigned,
         // which therefore must be this block's live block parameters.
         for val in block.live_in(liveness) {
-            if !self.spilled.contains(val) || self.val_slot[val].is_some() {
+            if !self.spilled.contains(val) || self.val_home[val].is_some() {
                 continue;
             }
             debug_assert!(
@@ -489,54 +551,83 @@ where
     ) -> IResult<()> {
         debug_assert!(self.spilled.contains(val));
         debug_assert!(
-            self.val_slot[val].is_none(),
+            self.val_home[val].is_none(),
             "{val:?} has a single definition in SSA, so we color it exactly once",
         );
 
-        let log2_size = val.log2_size(input);
-        let slot = match self.free_slots[usize::from(log2_size)].pop() {
-            Some(slot) => slot,
-            None => self.slots.push(output, log2_size)?,
+        let log2_size = val.reg_bank(input).log2_size(input.machine);
+        let num_regs = val.num_regs(input);
+
+        let home = if num_regs == 1 {
+            StackAllocation::SpillSlot(self.alloc_slot(log2_size, output)?)
+        } else {
+            let start = self.group_members.next_key(output)?;
+            for _ in 0..num_regs {
+                let slot = self.alloc_slot(log2_size, output)?;
+                self.group_members.push(output, slot)?;
+            }
+            let end = self.group_members.next_key(output)?;
+            let group = self.groups.push(output, EntityRange { start, end })?;
+            StackAllocation::SpillSlotGroup(group)
         };
 
-        self.val_slot[val] = Some(slot);
-        self.occupy(input, slot, val);
+        self.val_home[val] = Some(home);
+        self.occupy_val_slots(input, val);
+
         counts.spill_slot_assignments.inc();
         trace!(
-            "spill slots: assigned {val:?} to {slot:?} ({} bytes)",
-            1 << log2_size
+            "spill slots: assigned {val:?} to {home:?}: {num_regs} slot(s) of {} bytes",
+            1u32 << log2_size,
         );
         Ok(())
     }
 
-    /// Mark `slot` occupied by `val`, which is live at the walk's current
-    /// point.
-    fn occupy(&mut self, input: &Input<'_, impl InputFunction>, slot: SpillSlot<E>, val: Val<E>) {
-        let inserted = self.in_use.insert(slot);
-        debug_assert!(
-            inserted,
-            "{slot:?} is already occupied, so {val:?} may not have it too",
-        );
-
-        let log2_size = usize::from(val.log2_size(input));
-        debug_assert_eq!(usize::from(self.slots[slot]), log2_size);
-
-        self.live_count[log2_size] += 1;
-        self.max_live[log2_size] =
-            core::cmp::max(self.max_live[log2_size], self.live_count[log2_size]);
+    /// Take a free slot of the given size, creating a new one when every
+    /// existing slot of that size is occupied.
+    fn alloc_slot(&mut self, log2_size: u8, output: &mut OutputInner<E>) -> IResult<SpillSlot<E>> {
+        match self.free_slots[usize::from(log2_size)].pop() {
+            Some(slot) => Ok(slot),
+            None => self.slots.push(output, log2_size),
+        }
     }
 
-    /// Release the slot that `val` occupies: its live range has ended.
+    /// Mark all of `val`'s slots as occupied by `val`, which is live at the
+    /// walk's current point.
+    fn occupy_val_slots(&mut self, input: &Input<'_, impl InputFunction>, val: Val<E>) {
+        let home = self.val_home[val].expect("only a value with a stack home can be occupied");
+        for i in 0..home.len_scalars(self) {
+            let slot = home.nth_scalar(self, i);
+
+            let inserted = self.in_use.insert(slot);
+            debug_assert!(
+                inserted,
+                "{slot:?} is already occupied, so {val:?} may not have it too",
+            );
+
+            let log2_size = usize::from(val.reg_bank(input).log2_size(input.machine));
+            debug_assert_eq!(usize::from(self.slots[slot]), log2_size);
+
+            self.live_count[log2_size] += 1;
+
+            self.max_live[log2_size] =
+                core::cmp::max(self.max_live[log2_size], self.live_count[log2_size]);
+        }
+    }
+
+    /// Release the slots that `val` occupies.
     fn free(&mut self, input: &Input<'_, impl InputFunction>, val: Val<E>) {
-        let slot = self.val_slot[val].expect("only a value with an assigned slot can be killed");
-        let removed = self.in_use.remove(slot);
-        debug_assert!(removed, "{val:?} held {slot:?}, so it was occupied");
+        let home = self.val_home[val].expect("only a value with assigned slots can be killed");
 
-        let log2_size = usize::from(val.log2_size(input));
-        debug_assert_eq!(usize::from(self.slots[slot]), log2_size);
+        let log2_size = usize::from(val.reg_bank(input).log2_size(input.machine));
+        for i in 0..home.len_scalars(self) {
+            let slot = home.nth_scalar(self, i);
+            let removed = self.in_use.remove(slot);
+            debug_assert!(removed, "{val:?} held {slot:?}, so it was occupied");
+            debug_assert_eq!(usize::from(self.slots[slot]), log2_size);
 
-        self.free_slots[log2_size].push(slot);
-        self.live_count[log2_size] -= 1;
+            self.free_slots[log2_size].push(slot);
+            self.live_count[log2_size] -= 1;
+        }
     }
 
     fn check_every_spilled_value_has_a_slot(&self) {
@@ -545,7 +636,7 @@ where
         }
         for val in self.spilled.iter() {
             debug_assert!(
-                self.val_slot[val].is_some(),
+                self.val_home[val].is_some(),
                 "{val:?} needs a stack slot but never got one; is it defined in an unreachable \
                  block?",
             );
@@ -590,10 +681,55 @@ impl<E> Val<E>
 where
     E: EntityRepr,
 {
-    /// The stack slot this value lives in, or `None` if it was never spilled.
-    #[allow(dead_code, reason = "consumed by the phases that are still to come")]
-    pub(crate) fn spill_slot(self, spill_slots: &SpillSlots<E>) -> Option<SpillSlot<E>> {
-        spill_slots.val_slot[self]
+    /// The stack slots this value lives in, one per register it occupies, or
+    /// empty if it was never spilled.
+    #[cfg(test)]
+    pub(crate) fn spill_slots(
+        self,
+        spill_slots: &SpillSlots<E>,
+    ) -> impl Iterator<Item = SpillSlot<E>> + Clone + '_ {
+        self.stack_home(spill_slots)
+            .into_iter()
+            .flat_map(|home| home.slots(spill_slots))
+    }
+
+    /// Where this value lives on the stack, or `None` if it was never spilled.
+    pub(crate) fn stack_home(self, spill_slots: &SpillSlots<E>) -> Option<StackAllocation<E>> {
+        spill_slots.val_home[self]
+    }
+}
+
+impl<E> SpillSlotGroup<E>
+where
+    E: EntityRepr,
+{
+    /// Iterate over the `SpillSlot`s in this group.
+    pub(crate) fn members(
+        self,
+        spill_slots: &SpillSlots<E>,
+    ) -> impl ExactSizeIterator<Item = SpillSlot<E>> + Clone + '_ {
+        spill_slots.groups[self]
+            .into_iter()
+            .map(|index| spill_slots.group_members[index])
+    }
+}
+
+/// Spill slot queries about a span.
+impl<E> LiveSpan<E>
+where
+    E: EntityRepr,
+{
+    /// Where this span's value lives over this span.
+    pub(crate) fn allocation(
+        self,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+    ) -> Allocation<E> {
+        let bundle = self.bundle(live_ranges).unwrap();
+        match bundle.reg_allocation(live_ranges) {
+            Some(alloc) => Allocation::Reg(alloc),
+            None => Allocation::Stack(self.val(live_ranges).stack_home(spill_slots).unwrap()),
+        }
     }
 }
 
@@ -799,7 +935,7 @@ mod tests {
             let actual: BTreeSet<Val<u32>> = vals
                 .iter()
                 .copied()
-                .filter(|val| val.spill_slot(spill_slots).is_some())
+                .filter(|val| val.stack_home(spill_slots).is_some())
                 .collect();
             if actual != spilled {
                 return Err(format!(
@@ -811,17 +947,21 @@ mod tests {
             let ranges = live_ranges_of(context);
             let log2_size_of = |val: Val<u32>| val.reg_bank(input).log2_size(input.machine);
 
+            // A value in a register group has one slot per member, so compare
+            // whole stack homes: any slot the two share is a slot they can
+            // clobber each other in.
+            let slots_of = |val: Val<u32>| -> BTreeSet<SpillSlot<u32>> {
+                val.spill_slots(spill_slots).collect()
+            };
+
             for (&a, a_ranges) in &ranges {
                 for (&b, b_ranges) in &ranges {
                     if a >= b {
                         continue;
                     }
-                    let (Some(a_slot), Some(b_slot)) =
-                        (a.spill_slot(spill_slots), b.spill_slot(spill_slots))
-                    else {
-                        continue;
-                    };
-                    if a_slot != b_slot {
+                    let shared: BTreeSet<SpillSlot<u32>> =
+                        slots_of(a).intersection(&slots_of(b)).copied().collect();
+                    if shared.is_empty() {
                         continue;
                     }
 
@@ -829,7 +969,7 @@ mod tests {
                     // the same time, so neither can clobber the other.
                     if ranges_overlap(a_ranges, b_ranges) {
                         return Err(format!(
-                            "{a:?} and {b:?} both live in {a_slot:?} but their live ranges \
+                            "{a:?} and {b:?} both live in {shared:?} but their live ranges \
                              {a_ranges:?} and {b_ranges:?} overlap"
                         ));
                     }
@@ -839,8 +979,8 @@ mod tests {
                     // slots across banks of equal size is the whole point.
                     if log2_size_of(a) != log2_size_of(b) {
                         return Err(format!(
-                            "{a:?} and {b:?} both live in {a_slot:?} but they are {} and {} \
-                             bytes wide",
+                            "{a:?} and {b:?} both live in {shared:?} but their registers are {} \
+                             and {} bytes wide",
                             1 << log2_size_of(a),
                             1 << log2_size_of(b),
                         ));
@@ -848,10 +988,47 @@ mod tests {
                 }
             }
 
-            // Property 4: the allocation is optimal. For each size, we created
-            // exactly as many slots as the largest number of spilled values of
-            // that size that are ever simultaneously live. No allocation can do
-            // better, because those values all need distinct slots at that
+            // Property 4: a value's stack home is one slot per register it
+            // occupies — a lone slot for an ordinary value, a group of one slot
+            // per member for a value in a register group — and each of them is
+            // the size of one of its registers.
+            for &val in ranges.keys() {
+                let home = val.stack_home(spill_slots);
+                let shape_matches = match home {
+                    Some(StackAllocation::SpillSlot(_)) => val.num_regs(input) == 1,
+                    Some(StackAllocation::SpillSlotGroup(_)) => val.num_regs(input) > 1,
+                    None => false,
+                };
+                if !shape_matches {
+                    return Err(format!(
+                        "{val:?} occupies {} registers but its stack home is {home:?}",
+                        val.num_regs(input),
+                    ));
+                }
+
+                let slots: Vec<SpillSlot<u32>> = val.spill_slots(spill_slots).collect();
+                let distinct: BTreeSet<SpillSlot<u32>> = slots.iter().copied().collect();
+                if slots.len() != val.num_regs(input) || distinct.len() != slots.len() {
+                    return Err(format!(
+                        "{val:?} occupies {} registers but its stack home is {slots:?}",
+                        val.num_regs(input),
+                    ));
+                }
+                for slot in slots {
+                    if slot.log2_size(spill_slots) != log2_size_of(val) {
+                        return Err(format!(
+                            "{val:?} has {}-byte registers but {slot:?} is {} bytes",
+                            1 << log2_size_of(val),
+                            slot.size(spill_slots),
+                        ));
+                    }
+                }
+            }
+
+            // Property 5: the allocation is optimal. For each size, we created
+            // exactly as many slots as the largest number of slots that the
+            // spilled values of that size ever need at once. No allocation can
+            // do better, because those values all need distinct slots at that
             // point.
             let mut created: BTreeMap<u16, usize> = BTreeMap::new();
             for (slot, _) in spill_slots.slots.iter() {
@@ -871,7 +1048,8 @@ mod tests {
                         .iter()
                         .any(|&(start, end)| start <= point && point < end)
                     {
-                        *live_here.entry(1 << log2_size_of(val)).or_default() += 1;
+                        *live_here.entry(1 << log2_size_of(val)).or_default() +=
+                            val.num_regs(input);
                     }
                 }
                 for (size, count) in live_here {
@@ -882,8 +1060,8 @@ mod tests {
 
             if created != needed {
                 return Err(format!(
-                    "created {created:?} slots per size, but the maximum number of \
-                     simultaneously live spilled values per size is {needed:?}"
+                    "created {created:?} slots per size, but the maximum number of slots that \
+                     simultaneously live spilled values need per size is {needed:?}"
                 ));
             }
 
@@ -933,7 +1111,10 @@ mod tests {
         assert_eq!(spill_slots.len_slots(), 1);
 
         let val = Val::<u32>::try_new(0).unwrap();
-        let slot = val.spill_slot(spill_slots).unwrap();
+        let slot = match val.stack_home(spill_slots) {
+            Some(StackAllocation::SpillSlot(slot)) => slot,
+            home => panic!("expected a single slot, got {home:?}"),
+        };
         assert_eq!(slot.index(), 0);
     }
 
@@ -949,7 +1130,7 @@ mod tests {
         assert_eq!(spill_slots.len_slots(), 0);
         assert!(spill_slots.spilled.is_empty());
         assert_eq!(
-            Val::<u32>::try_new(0).unwrap().spill_slot(spill_slots),
+            Val::<u32>::try_new(0).unwrap().stack_home(spill_slots),
             None
         );
     }

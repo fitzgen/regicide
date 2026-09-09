@@ -152,7 +152,7 @@ where
     }
 
     /// Do the given spans conflict with any existing assignments in `reg_units`?
-    fn conflicts(
+    pub(crate) fn conflicts(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
@@ -233,43 +233,43 @@ where
     /// Try to insert an assignment.
     ///
     /// If the proposed assignment does not conflict with any existing
-    /// assignments, insert it and return `true`. Otherwise, when it does
-    /// conflict with an existing assignment, return `false` and leave `self`
-    /// unmodified.
+    /// assignments, insert it and return the candidate it was assigned to.
+    /// Otherwise, when every candidate conflicts with an existing assignment,
+    /// return `None` and leave `self` unmodified.
     pub fn try_assign_to_reg(
         &mut self,
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = Reg>,
         reg_units: impl Fn(Reg) -> Range<RegUnit>,
         spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
-    ) -> bool {
+    ) -> Option<Reg> {
         debug_assert!(spans.len() > 0);
 
         for reg in candidates {
             let units = iter::once(reg_units(reg));
             if !self.conflicts(units.clone(), spans.clone()) {
                 self.insert_assignment(bundle, units, spans);
-                return true;
+                return Some(reg);
             }
         }
 
-        false
+        None
     }
 
     /// Try to insert an assignment of `bundle` to one of the candidate register
     /// groups.
     ///
     /// If the proposed assignment does not conflict with any existing
-    /// assignments, insert it and return `true`. Otherwise, when it does
-    /// conflict with an existing assignment, return `false` and leave `self`
-    /// unmodified.
+    /// assignments, insert it and return the candidate it was assigned to.
+    /// Otherwise, when every candidate conflicts with an existing assignment,
+    /// return `None` and leave `self` unmodified.
     pub fn try_assign_to_reg_group<GroupUnits>(
         &mut self,
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = RegGroup>,
         group_units: impl Fn(RegGroup) -> GroupUnits,
         spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
-    ) -> bool
+    ) -> Option<RegGroup>
     where
         GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
     {
@@ -279,11 +279,11 @@ where
             let units = group_units(group);
             if !self.conflicts(units.clone(), spans.clone()) {
                 self.insert_assignment(bundle, units, spans);
-                return true;
+                return Some(group);
             }
         }
 
-        false
+        None
     }
 
     fn try_evict_and_assign<C, Units, Spans>(
@@ -294,7 +294,7 @@ where
         max_cost: EvictionCost,
         eviction_cost: impl Fn(LiveBundle<E>, C) -> EvictionCost,
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
-    ) -> Option<LiveBundle<E>>
+    ) -> Option<(C, LiveBundle<E>)>
     where
         C: Copy,
         Units: Iterator<Item = Range<RegUnit>> + Clone,
@@ -338,14 +338,15 @@ where
 
         self.remove_assignment(other_bundle, bundle_spans(other_bundle));
         self.insert_assignment(bundle, candidate_units(candidate), spans);
-        Some(other_bundle)
+        Some((candidate, other_bundle))
     }
 
     /// Try to insert an assignment for `bundle`, evicting another bundle if
     /// necessary.
     ///
-    /// If `bundle` was assigned, then returns the other `LiveBundle` that was
-    /// evicted. Otherwise, returns `None` and `self` is unmodified.
+    /// If `bundle` was assigned, then returns the candidate it was assigned to
+    /// along with the other `LiveBundle` that was evicted to make room for it.
+    /// Otherwise, returns `None` and `self` is unmodified.
     pub fn try_evict_reg_and_assign<Spans>(
         &mut self,
         bundle: LiveBundle<E>,
@@ -354,7 +355,7 @@ where
         max_cost: EvictionCost,
         eviction_cost: impl Fn(LiveBundle<E>, Reg) -> EvictionCost,
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
-    ) -> Option<LiveBundle<E>>
+    ) -> Option<(Reg, LiveBundle<E>)>
     where
         Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
     {
@@ -377,7 +378,7 @@ where
         max_cost: EvictionCost,
         eviction_cost: impl Fn(LiveBundle<E>, RegGroup) -> EvictionCost,
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
-    ) -> Option<LiveBundle<E>>
+    ) -> Option<(RegGroup, LiveBundle<E>)>
     where
         GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
         Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
@@ -432,6 +433,7 @@ where
 mod tests {
     use super::*;
     use crate::{Inst, Position, live_ranges::SpillWeight};
+    use core::fmt;
     use mutatis::{
         Mutate,
         check::{Check, CheckResult},
@@ -942,23 +944,36 @@ mod tests {
         Ok(())
     }
 
+    /// Which candidate did `try_assign_*`/`try_evict_*_and_assign` choose?
+    ///
+    /// The oracle answers in indices but the methods in registers, so map back.
+    fn candidate_index<C>(candidates: &[C], chosen: C) -> usize
+    where
+        C: Copy + PartialEq + fmt::Debug,
+    {
+        candidates
+            .iter()
+            .position(|&c| c == chosen)
+            .unwrap_or_else(|| panic!("{chosen:?} is not one of the candidates {candidates:?}"))
+    }
+
     fn check_try_assign(
         assignments: &Assignments<u32>,
         what: &str,
         candidates: &[Vec<Range<RegUnit>>],
         spans: &[Range<LivePoint<u32>>],
-        actual: bool,
+        actual: Option<usize>,
         expected: Option<usize>,
     ) -> Result<(), String> {
-        if actual != expected.is_some() {
+        if actual != expected {
             return Err(match expected {
                 Some(index) => format!(
-                    "assigning {what} for {spans:?} returned {actual}, but it should have gone \
+                    "assigning {what} for {spans:?} returned {actual:?}, but it should have gone \
                      in candidate {index}, which covers {:?}",
                     candidates[index],
                 ),
                 None => format!(
-                    "assigning {what} for {spans:?} returned {actual}, but every candidate is \
+                    "assigning {what} for {spans:?} returned {actual:?}, but every candidate is \
                      in conflict",
                 ),
             });
@@ -984,10 +999,10 @@ mod tests {
         what: &str,
         candidates: &[Vec<Range<RegUnit>>],
         spans: &[Range<LivePoint<u32>>],
-        actual: Option<LiveBundle<u32>>,
+        actual: Option<(LiveBundle<u32>, usize)>,
         expected: Option<(LiveBundle<u32>, usize)>,
     ) -> Result<(), String> {
-        if actual != expected.map(|(victim, _)| victim) {
+        if actual != expected {
             return Err(match expected {
                 Some((victim, index)) => format!(
                     "evicting to assign {what} for {spans:?} returned {actual:?}, but it should \
@@ -1550,12 +1565,14 @@ mod tests {
                                 candidates.iter().map(|&r| vec![reg_units(r)]).collect();
 
                             let expected = oracle_try_assign(&mut oracle, b, &units, &spans);
-                            let actual = assignments.try_assign_to_reg(
-                                b,
-                                candidates.iter().copied(),
-                                reg_units,
-                                spans.iter().cloned(),
-                            );
+                            let actual = assignments
+                                .try_assign_to_reg(
+                                    b,
+                                    candidates.iter().copied(),
+                                    reg_units,
+                                    spans.iter().cloned(),
+                                )
+                                .map(|r| candidate_index(&candidates, r));
                             check_try_assign(
                                 &assignments,
                                 &format!("{b:?} to one of {candidates:?}"),
@@ -1582,12 +1599,14 @@ mod tests {
                                 .collect();
 
                             let expected = oracle_try_assign(&mut oracle, b, &units, &spans);
-                            let actual = assignments.try_assign_to_reg_group(
-                                b,
-                                candidates.iter().copied(),
-                                group_units,
-                                spans.iter().cloned(),
-                            );
+                            let actual = assignments
+                                .try_assign_to_reg_group(
+                                    b,
+                                    candidates.iter().copied(),
+                                    group_units,
+                                    spans.iter().cloned(),
+                                )
+                                .map(|g| candidate_index(&candidates, g));
                             check_try_assign(
                                 &assignments,
                                 &format!("{b:?} to one of {candidates:?}"),
@@ -1646,14 +1665,16 @@ mod tests {
                                 max_cost,
                                 |victim, index| cost(victim, candidates[index]),
                             );
-                            let actual = assignments.try_evict_reg_and_assign(
-                                b,
-                                candidates.iter().copied(),
-                                reg_units,
-                                max_cost,
-                                cost,
-                                bundle_spans,
-                            );
+                            let actual = assignments
+                                .try_evict_reg_and_assign(
+                                    b,
+                                    candidates.iter().copied(),
+                                    reg_units,
+                                    max_cost,
+                                    cost,
+                                    bundle_spans,
+                                )
+                                .map(|(r, victim)| (victim, candidate_index(&candidates, r)));
                             check_try_evict(
                                 &assignments,
                                 &format!("{b:?} to one of {candidates:?}"),
@@ -1713,14 +1734,16 @@ mod tests {
                                 max_cost,
                                 |victim, index| cost(victim, candidates[index]),
                             );
-                            let actual = assignments.try_evict_reg_group_and_assign(
-                                b,
-                                candidates.iter().copied(),
-                                group_units,
-                                max_cost,
-                                cost,
-                                bundle_spans,
-                            );
+                            let actual = assignments
+                                .try_evict_reg_group_and_assign(
+                                    b,
+                                    candidates.iter().copied(),
+                                    group_units,
+                                    max_cost,
+                                    cost,
+                                    bundle_spans,
+                                )
+                                .map(|(g, victim)| (victim, candidate_index(&candidates, g)));
                             check_try_evict(
                                 &assignments,
                                 &format!("{b:?} to one of {candidates:?}"),
@@ -1772,14 +1795,23 @@ mod tests {
         let mut a = Assignments::<u32>::new();
         let mut b = Assignments::<u32>::new();
 
-        assert!(a.try_assign_to_reg(bundle(0), [reg(R0)], reg_units, [span(0, 2)].into_iter()));
-        assert!(b.try_assign_to_reg(bundle(1), [reg(R0)], reg_units, [span(2, 4)].into_iter()));
-        assert!(b.try_assign_to_reg_group(
-            bundle(2),
-            [group(G1)],
-            group_units,
-            [span(0, 6)].into_iter(),
-        ));
+        assert!(
+            a.try_assign_to_reg(bundle(0), [reg(R0)], reg_units, [span(0, 2)].into_iter())
+                .is_some()
+        );
+        assert!(
+            b.try_assign_to_reg(bundle(1), [reg(R0)], reg_units, [span(2, 4)].into_iter())
+                .is_some()
+        );
+        assert!(
+            b.try_assign_to_reg_group(
+                bundle(2),
+                [group(G1)],
+                group_units,
+                [span(0, 6)].into_iter(),
+            )
+            .is_some()
+        );
 
         a.merge(&b);
 
@@ -1825,8 +1857,14 @@ mod tests {
         let mut a = Assignments::<u32>::new();
         let mut b = Assignments::<u32>::new();
 
-        assert!(a.try_assign_to_reg(bundle(0), [reg(R4)], reg_units, [span(0, 6)].into_iter()));
-        assert!(b.try_assign_to_reg(bundle(1), [reg(R1)], reg_units, [span(2, 4)].into_iter()));
+        assert!(
+            a.try_assign_to_reg(bundle(0), [reg(R4)], reg_units, [span(0, 6)].into_iter())
+                .is_some()
+        );
+        assert!(
+            b.try_assign_to_reg(bundle(1), [reg(R1)], reg_units, [span(2, 4)].into_iter())
+                .is_some()
+        );
 
         a.merge(&b);
     }

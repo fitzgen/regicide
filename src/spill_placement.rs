@@ -91,6 +91,7 @@ where
         region_allocation,
         spill_slots,
         spill_placement,
+        move_generation: _,
     } = context;
 
     spill_placement.place(
@@ -136,7 +137,7 @@ where
     /// The block that this spill site is in.
     #[cfg(test)]
     fn block(self, func: &impl InputFunction, live_ranges: &LiveRanges<E>) -> Block<E> {
-        span_block(func, live_ranges, self.span)
+        self.span.block(func, live_ranges)
     }
 
     /// The span holding the value in a register at this spill's point, and
@@ -472,7 +473,7 @@ where
         // Place the spill for each on-stack span.
         for &span in val_spans {
             if self.on_stack(span, live_ranges) {
-                self.place_one_spill(input, def_block, span_block(input.func, live_ranges, span));
+                self.place_one_spill(input, def_block, span.block(input.func, live_ranges));
             }
         }
 
@@ -509,14 +510,14 @@ where
     ) {
         let mut prev_block = None;
         for &span in val_spans {
-            let block = span_block(input.func, live_ranges, span);
+            let block = span.block(input.func, live_ranges);
             if prev_block == Some(block) {
                 continue;
             }
             prev_block = Some(block);
 
             if !self.on_stack(span, live_ranges)
-                && span.start(live_ranges) == block_entry(input, block)
+                && span.start(live_ranges) == block.start_point(input)
             {
                 self.legal[block] = Some(span);
             }
@@ -619,36 +620,6 @@ where
         let bundle = span.bundle(live_ranges).unwrap();
         self.stack_bundles.contains(bundle)
     }
-}
-
-/// The program point at which `block` begins.
-fn block_entry<E>(input: &Input<'_, impl InputFunction>, block: Block<E>) -> LivePoint<E>
-where
-    E: EntityRepr,
-{
-    let input_block = input.func.block(block.with_repr32());
-    let first_inst = block_first_inst(&input_block)
-        .with_repr::<E>()
-        .expect("every instruction index already fit in `E` in the earlier passes");
-    LivePoint::new(first_inst, Position::Early)
-}
-
-/// The block that `span` lies within.
-///
-/// Live spans never cross a block boundary, so the block containing the
-/// instruction that the span's start point names contains all of it.
-fn span_block<E>(
-    func: &impl InputFunction,
-    live_ranges: &LiveRanges<E>,
-    span: LiveSpan<E>,
-) -> Block<E>
-where
-    E: EntityRepr,
-{
-    func.inst(span.start(live_ranges).inst().with_repr32())
-        .block()
-        .with_repr::<E>()
-        .expect("every block index already fit in `E` in the earlier passes")
 }
 
 /// The immediate dominator of `block`, or `None` for the entry block.

@@ -36,25 +36,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every entry needs either `std` or `hashbrown`, because the crate
+        # needs a hash map and `alloc` has none; `timing` implies `std`.
         include:
-          - name: no-default-features
-            flags: --no-default-features
-          - name: all-features
-            flags: --all-features
+          - name: hashbrown
+            flags: --no-default-features --features hashbrown
           - name: std
             flags: --no-default-features --features std
+          - name: std+hashbrown
+            flags: --no-default-features --features std,hashbrown
+          - name: all-features
+            flags: --all-features
           - name: checker
-            flags: --no-default-features --features checker
+            flags: --no-default-features --features hashbrown,checker
           - name: timing
             flags: --no-default-features --features timing
           - name: trace-log
-            flags: --no-default-features --features trace-log
+            flags: --no-default-features --features hashbrown,trace-log
           - name: entity-repr-8
-            flags: --no-default-features --features entity-repr-8
+            flags: --no-default-features --features hashbrown,entity-repr-8
           - name: entity-repr-16
-            flags: --no-default-features --features entity-repr-16
+            flags: --no-default-features --features hashbrown,entity-repr-16
           - name: entity-repr-8+entity-repr-16
-            flags: --no-default-features --features entity-repr-8,entity-repr-16
+            flags: --no-default-features --features hashbrown,entity-repr-8,entity-repr-16
           - name: std+checker
             flags: --no-default-features --features std,checker
     steps:

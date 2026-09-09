@@ -135,7 +135,7 @@
 //! registers and register units.
 
 use crate::{
-    Entity, Error, Result,
+    Entity, EntityRepr, Error, Result,
     entity::{FixedEntitySet, PrimaryMap, words_for},
 };
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
@@ -250,25 +250,29 @@ impl RegUnit {
 impl Reg {
     /// The maximum number of `Reg`s supported.
     pub const MAX: usize = 512;
+}
 
+impl<E> Reg<E>
+where
+    E: EntityRepr,
+{
     /// The range of units that this register covers.
     #[inline]
     pub(crate) fn units(self, machine: &Machine) -> Range<RegUnit> {
-        machine.registers[self].units.clone()
+        machine.registers[self.with_repr32()].units.clone()
     }
 
     /// This register's associated register bank.
     #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
     pub(crate) fn bank(self, machine: &Machine) -> RegBank {
-        machine.registers[self].bank
+        machine.registers[self.with_repr32()].bank
     }
 
     /// Does this register cover any units, and so may be allocated?
     #[inline]
     #[expect(dead_code, reason = "will probably need it")]
     pub(crate) fn is_allocatable(self, machine: &Machine) -> bool {
-        let units = &machine.registers[self].units;
+        let units = &machine.registers[self.with_repr32()].units;
         units.start != units.end
     }
 
@@ -302,7 +306,10 @@ impl RegGroup {
 
     /// This register group's associated register bank.
     #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
+    #[expect(
+        dead_code,
+        reason = "the sibling of Reg::bank and RegClass::bank, kept for symmetry"
+    )]
     pub(crate) fn bank(self, machine: &Machine) -> RegBank {
         machine.groups[self].bank
     }
@@ -334,6 +341,16 @@ impl RegClass {
         match self.members(machine) {
             RegClassMembers::Regs(regs) => regs.len() == 1,
             RegClassMembers::Groups(groups) => groups.len() == 1,
+        }
+    }
+
+    /// How many registers a value of this register-group class occupies, or
+    /// `None` when it is a single-register class.
+    #[inline]
+    pub(crate) fn group_size(self, machine: &Machine) -> Option<usize> {
+        match self.members(machine) {
+            RegClassMembers::Groups(groups) => Some(groups[0].members(machine).len()),
+            RegClassMembers::Regs(_) => None,
         }
     }
 
@@ -392,10 +409,10 @@ impl RegBank {
         &machine.banks[self].registers
     }
 
-    /// The subset of `self.registers(machine)` that may be used as a temporary
-    /// for splitting stack-to-stack moves.
+    /// The subset of `self.registers(machine)` that may be borrowed as a
+    /// scratch register to split a stack-to-stack move in two or break a
+    /// parallel-move cycle.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn stack_to_stack_move_regs(self, machine: &Machine) -> RegSet {
         let bank = &machine.banks[self];
         debug_assert!(bank.non_allocatable.is_subset_of(&bank.registers));

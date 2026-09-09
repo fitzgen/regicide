@@ -13,8 +13,8 @@ use crate::{
     entity::{EntityRepr, Region, SecondaryMap},
     error::{Error, IResult},
     live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
-    machine::RegClassMembers,
-    output::OutputInner,
+    machine::{Machine, Reg, RegClassMembers},
+    output::{OutputInner, RegAllocation},
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
@@ -158,6 +158,18 @@ where
         &self.stack_bundles
     }
 
+    /// Did we leave `reg` unassigned over all of `span`?
+    pub(crate) fn is_reg_free(
+        &self,
+        machine: &Machine,
+        reg: Reg<E>,
+        span: Range<LivePoint<E>>,
+    ) -> bool {
+        !self
+            .assignments
+            .conflicts(core::iter::once(reg.units(machine)), core::iter::once(span))
+    }
+
     fn allocate_region(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -185,17 +197,19 @@ where
 
             let phase = entry.phase();
 
-            if self.assign_to_preferred(input, live_ranges, entry) {
+            if self.assign_to_preferred(input, live_ranges, output, entry)? {
                 counts.preferred_assignments.inc();
                 continue;
             }
 
-            if self.assign_to_non_preferred(input, live_ranges, entry) {
+            if self.assign_to_non_preferred(input, live_ranges, output, entry)? {
                 counts.non_preferred_assignments.inc();
                 continue;
             }
 
-            if phase <= Phase::AssignEvict && self.assign_via_eviction(input, live_ranges, entry) {
+            if phase <= Phase::AssignEvict
+                && self.assign_via_eviction(input, live_ranges, output, entry)?
+            {
                 counts.evictions.inc();
                 continue;
             }
@@ -248,14 +262,15 @@ where
     fn assign_to_preferred(
         &mut self,
         input: &Input<'_, impl InputFunction>,
-        live_ranges: &LiveRanges<E>,
+        live_ranges: &mut LiveRanges<E>,
+        output: &mut OutputInner<E>,
         entry: PqEntry<E>,
-    ) -> bool {
+    ) -> IResult<bool> {
         let bundle = entry.bundle();
 
         let pref = bundle.preference(live_ranges);
         if pref.is_empty() {
-            return false;
+            return Ok(false);
         }
 
         // If this bundle has a register preference, then that preference had
@@ -284,22 +299,32 @@ where
             }
         }
 
-        self.region_assignments.try_assign_to_reg(
+        let assigned = self.region_assignments.try_assign_to_reg(
             bundle,
             pref.iter(),
             |r| r.units(input.machine),
             bundle
                 .spans(live_ranges)
                 .map(|s| s.start(live_ranges)..s.end(live_ranges)),
-        )
+        );
+
+        match assigned {
+            None => Ok(false),
+            Some(reg) => {
+                let reg = output.with_repr::<E, _>(reg)?;
+                bundle.set_reg_allocation(live_ranges, RegAllocation::Reg(reg));
+                Ok(true)
+            }
+        }
     }
 
     fn assign_to_non_preferred(
         &mut self,
         input: &Input<'_, impl InputFunction>,
-        live_ranges: &LiveRanges<E>,
+        live_ranges: &mut LiveRanges<E>,
+        output: &mut OutputInner<E>,
         entry: PqEntry<E>,
-    ) -> bool {
+    ) -> IResult<bool> {
         let bundle = entry.bundle();
         let pref = bundle.preference(live_ranges);
 
@@ -312,34 +337,48 @@ where
             OperandConstraint::Reg(rc) => rc,
             OperandConstraint::Stack => {
                 self.stack_bundles.push(bundle);
-                return true;
+                return Ok(true);
             }
             OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
         };
 
-        match rc.members(input.machine) {
-            RegClassMembers::Regs(regs) => self.region_assignments.try_assign_to_reg(
-                bundle,
-                regs.iter().copied().filter(|r| !pref.contains(*r)),
-                |r| r.units(input.machine),
-                bundle
-                    .spans(live_ranges)
-                    .map(|s| s.start(live_ranges)..s.end(live_ranges)),
-            ),
-            RegClassMembers::Groups(groups) => {
-                debug_assert!(pref.is_empty());
-                self.region_assignments.try_assign_to_reg_group(
+        let assigned = match rc.members(input.machine) {
+            RegClassMembers::Regs(regs) => self
+                .region_assignments
+                .try_assign_to_reg(
                     bundle,
-                    groups.iter().copied(),
-                    |g| {
-                        g.members(input.machine)
-                            .iter()
-                            .map(|r| r.units(input.machine))
-                    },
+                    regs.iter().copied().filter(|r| !pref.contains(*r)),
+                    |r| r.units(input.machine),
                     bundle
                         .spans(live_ranges)
                         .map(|s| s.start(live_ranges)..s.end(live_ranges)),
                 )
+                .map(|reg| output.with_repr::<E, _>(reg).map(RegAllocation::Reg))
+                .transpose()?,
+            RegClassMembers::Groups(groups) => {
+                debug_assert!(pref.is_empty());
+                self.region_assignments
+                    .try_assign_to_reg_group(
+                        bundle,
+                        groups.iter().copied(),
+                        |g| {
+                            g.members(input.machine)
+                                .iter()
+                                .map(|r| r.units(input.machine))
+                        },
+                        bundle
+                            .spans(live_ranges)
+                            .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+                    )
+                    .map(RegAllocation::RegGroup)
+            }
+        };
+
+        match assigned {
+            None => Ok(false),
+            Some(alloc) => {
+                bundle.set_reg_allocation(live_ranges, alloc);
+                Ok(true)
             }
         }
     }
@@ -363,9 +402,10 @@ where
     fn assign_via_eviction(
         &mut self,
         input: &Input<'_, impl InputFunction>,
-        live_ranges: &LiveRanges<E>,
+        live_ranges: &mut LiveRanges<E>,
+        output: &mut OutputInner<E>,
         entry: PqEntry<E>,
-    ) -> bool {
+    ) -> IResult<bool> {
         let machine = input.machine;
         let bundle = entry.bundle();
         let pref = bundle.preference(live_ranges);
@@ -390,35 +430,17 @@ where
         };
 
         let evicted = match rc.members(machine) {
-            RegClassMembers::Regs(regs) => self.region_assignments.try_evict_reg_and_assign(
-                bundle,
-                pref.iter()
-                    .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                |r| r.units(machine),
-                max_cost,
-                |victim, reg| {
-                    let broken_hints = usize::from(victim.preference(live_ranges).contains(reg));
-                    EvictionCost::new(
-                        broken_hints,
-                        SpillWeight::new(victim.spill_weight(live_ranges)),
-                    )
-                },
-                bundle_spans,
-            ),
-            RegClassMembers::Groups(groups) => {
-                debug_assert!(pref.is_empty());
-                self.region_assignments.try_evict_reg_group_and_assign(
+            RegClassMembers::Regs(regs) => self
+                .region_assignments
+                .try_evict_reg_and_assign(
                     bundle,
-                    groups.iter().copied(),
-                    |g| g.members(machine).iter().map(|r| r.units(machine)),
+                    pref.iter()
+                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                    |r| r.units(machine),
                     max_cost,
-                    |victim, group| {
-                        let broken_hints = usize::from(
-                            !victim
-                                .preference(live_ranges)
-                                .intersection(group.member_set(machine))
-                                .is_empty(),
-                        );
+                    |victim, reg| {
+                        let broken_hints =
+                            usize::from(victim.preference(live_ranges).contains(reg));
                         EvictionCost::new(
                             broken_hints,
                             SpillWeight::new(victim.spill_weight(live_ranges)),
@@ -426,14 +448,45 @@ where
                     },
                     bundle_spans,
                 )
+                .map(|(reg, evicted)| {
+                    output
+                        .with_repr::<E, _>(reg)
+                        .map(|reg| (RegAllocation::Reg(reg), evicted))
+                })
+                .transpose()?,
+            RegClassMembers::Groups(groups) => {
+                debug_assert!(pref.is_empty());
+                self.region_assignments
+                    .try_evict_reg_group_and_assign(
+                        bundle,
+                        groups.iter().copied(),
+                        |g| g.members(machine).iter().map(|r| r.units(machine)),
+                        max_cost,
+                        |victim, group| {
+                            let broken_hints = usize::from(
+                                !victim
+                                    .preference(live_ranges)
+                                    .intersection(group.member_set(machine))
+                                    .is_empty(),
+                            );
+                            EvictionCost::new(
+                                broken_hints,
+                                SpillWeight::new(victim.spill_weight(live_ranges)),
+                            )
+                        },
+                        bundle_spans,
+                    )
+                    .map(|(group, evicted)| (RegAllocation::RegGroup(group), evicted))
             }
         };
 
         match evicted {
-            None => false,
-            Some(evicted) => {
+            None => Ok(false),
+            Some((alloc, evicted)) => {
+                evicted.clear_reg_allocation(live_ranges);
+                bundle.set_reg_allocation(live_ranges, alloc);
                 self.push_bundle(input, live_ranges, evicted, Phase::AssignEvict);
-                true
+                Ok(true)
             }
         }
     }
@@ -828,10 +881,7 @@ where
         OperandConstraint::Reuse(_) => unreachable!(),
     };
 
-    match rc.members(machine) {
-        RegClassMembers::Groups(groups) => groups[0].members(machine).len(),
-        RegClassMembers::Regs(_) => 0,
-    }
+    rc.group_size(machine).unwrap_or(0)
 }
 
 /// What phase of allocation is the associated bundle in?

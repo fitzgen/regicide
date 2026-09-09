@@ -84,6 +84,14 @@ pub struct Counts {
     pub final_live_spans: Count,
     pub final_bundles: Count,
     pub spills_placed: Count,
+    pub half_move_sources: Count,
+    pub half_move_dests: Count,
+    pub moves_emitted: Count,
+    pub remats_emitted: Count,
+    pub critical_edge_edits: Count,
+    pub move_cycles_broken: Count,
+    pub stack_to_stack_moves: Count,
+    pub emergency_spill_slots: Count,
 }
 
 impl Counts {
@@ -112,6 +120,14 @@ impl Counts {
             final_live_spans: Count::new(),
             final_bundles: Count::new(),
             spills_placed: Count::new(),
+            half_move_sources: Count::new(),
+            half_move_dests: Count::new(),
+            moves_emitted: Count::new(),
+            remats_emitted: Count::new(),
+            critical_edge_edits: Count::new(),
+            move_cycles_broken: Count::new(),
+            stack_to_stack_moves: Count::new(),
+            emergency_spill_slots: Count::new(),
         }
     }
 
@@ -144,6 +160,14 @@ impl Counts {
             final_live_spans,
             final_bundles,
             spills_placed,
+            half_move_sources,
+            half_move_dests,
+            moves_emitted,
+            remats_emitted,
+            critical_edge_edits: critical_edge_moves,
+            move_cycles_broken,
+            stack_to_stack_moves,
+            emergency_spill_slots,
         } = self;
         sccs.is_reset()
             && regions.is_reset()
@@ -168,5 +192,13 @@ impl Counts {
             && final_live_spans.is_reset()
             && final_bundles.is_reset()
             && spills_placed.is_reset()
+            && half_move_sources.is_reset()
+            && half_move_dests.is_reset()
+            && moves_emitted.is_reset()
+            && remats_emitted.is_reset()
+            && critical_edge_moves.is_reset()
+            && move_cycles_broken.is_reset()
+            && stack_to_stack_moves.is_reset()
+            && emergency_spill_slots.is_reset()
     }
 }

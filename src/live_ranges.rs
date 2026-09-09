@@ -10,7 +10,7 @@ use crate::input::{
 };
 use crate::liveness::{Liveness, block_first_inst, block_last_inst};
 use crate::machine::{Machine, RegClassMembers};
-use crate::output::{Allocation, OutputInner};
+use crate::output::{OutputInner, RegAllocation};
 use crate::packed_float::PackedPositiveFloat;
 use crate::timing::Timing;
 use crate::{RegClass, RegSet};
@@ -127,6 +127,23 @@ where
         debug_assert!(bits > 0, "the first program point has no predecessor");
         LivePoint {
             bits: E::Wide::from_usize(bits - 1),
+        }
+    }
+
+    /// This point's packed representation, for packing it inside a larger key.
+    ///
+    /// Always fits in 32 bits, as `E::Wide` is at most a `u32`.
+    #[inline]
+    pub fn to_bits(self) -> usize {
+        self.bits.to_usize()
+    }
+
+    /// Reconstruct a point from `Self::to_bits`.
+    #[inline]
+    pub fn from_bits(bits: usize) -> Self {
+        debug_assert!(<E::Wide as WideInt>::try_from_usize(bits).is_some());
+        LivePoint {
+            bits: E::Wide::from_usize(bits),
         }
     }
 
@@ -511,8 +528,8 @@ where
     /// Empty means no preference.
     preference: RegSet,
 
-    /// Where this bundle is currently allocated.
-    allocation: Option<Allocation<E>>,
+    /// The registers this bundle is currently allocated to.
+    reg_allocation: Option<RegAllocation<E>>,
 
     /// Packed weight and flags.
     ///
@@ -1020,6 +1037,14 @@ where
         live_ranges.spans[self].val
     }
 
+    /// The block this span lies within; spans never cross a block boundary.
+    pub(crate) fn block(self, func: &impl InputFunction, live_ranges: &LiveRanges<E>) -> Block<E> {
+        func.inst(self.start(live_ranges).inst().with_repr32())
+            .block()
+            .with_repr::<E>()
+            .expect("every block index already fit in `E` in the earlier passes")
+    }
+
     /// Does this span contain a use with a fixed register constraint?
     #[inline]
     pub(crate) fn has_fixed_use(self, live_ranges: &LiveRanges<E>) -> bool {
@@ -1160,7 +1185,7 @@ where
                 region,
                 constraint,
                 preference: RegSet::new(),
-                allocation: None,
+                reg_allocation: None,
                 weight_and_flags: 0,
             },
         )?;
@@ -1296,7 +1321,7 @@ where
     ) -> IResult<LiveBundle<E>> {
         let data = &live_ranges.bundles[self];
         let (region, spans) = (data.region, data.spans);
-        debug_assert!(data.allocation.is_none());
+        debug_assert!(data.reg_allocation.is_none());
 
         let indices = spans.indices();
         debug_assert!(1 <= i && i < indices.len());
@@ -1383,7 +1408,7 @@ where
     ) -> IResult<LiveBundle<E>> {
         let data = &live_ranges.bundles[self];
         let (region, spans) = (data.region, data.spans);
-        debug_assert!(data.allocation.is_none());
+        debug_assert!(data.reg_allocation.is_none());
         debug_assert_eq!(at.pos(), Position::Early);
 
         let indices = spans.indices();
@@ -1453,10 +1478,13 @@ where
         }
 
         let prefix_len_spans = i + 1;
-        debug_assert!(prefix_len_spans <= orig_len_spans);
-
         let suffix_len_spans = n - i;
-        debug_assert!(suffix_len_spans <= orig_len_spans);
+
+        #[cfg(debug_assertions)]
+        {
+            assert!(prefix_len_spans <= orig_len_spans);
+            assert!(suffix_len_spans <= orig_len_spans);
+        }
 
         // Now we need to fix the range of spans that each new bundle
         // covers. Bundles reference their spans indirectly by naming a
@@ -1601,11 +1629,31 @@ where
         &live_ranges.bundles[self].preference
     }
 
-    /// Where this bundle is currently allocated.
+    /// The registers this bundle is currently allocated to.
+    ///
+    /// `None` until region allocation gives it a register, and forever for a
+    /// bundle that lives in memory: a bundle can hold several coalesced values
+    /// while stack homes are per-value, so see `Val::stack_home` for those.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub(crate) fn allocation(self, live_ranges: &LiveRanges<E>) -> Option<Allocation<E>> {
-        live_ranges.bundles[self].allocation
+    pub(crate) fn reg_allocation(self, live_ranges: &LiveRanges<E>) -> Option<RegAllocation<E>> {
+        live_ranges.bundles[self].reg_allocation
+    }
+
+    /// Record where region allocation decided to put this bundle.
+    #[inline]
+    pub(crate) fn set_reg_allocation(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        alloc: RegAllocation<E>,
+    ) {
+        live_ranges.bundles[self].reg_allocation = Some(alloc);
+    }
+
+    /// Forget where this bundle was allocated, because it was just evicted from
+    /// there.
+    #[inline]
+    pub(crate) fn clear_reg_allocation(self, live_ranges: &mut LiveRanges<E>) {
+        live_ranges.bundles[self].reg_allocation = None;
     }
 
     /// Is this bundle minimal, i.e. too small to be split any further?
@@ -1709,6 +1757,24 @@ impl<E> Block<E>
 where
     E: EntityRepr,
 {
+    /// The program point at which this block begins.
+    pub(crate) fn start_point(self, input: &Input<'_, impl InputFunction>) -> LivePoint<E> {
+        let input_block = input.func.block(self.with_repr32());
+        let first_inst = block_first_inst(&input_block)
+            .with_repr::<E>()
+            .expect("every instruction index already fit in `E` in the earlier passes");
+        LivePoint::new(first_inst, Position::Early)
+    }
+
+    /// The program point just past the end of this block.
+    pub(crate) fn end_point(self, input: &Input<'_, impl InputFunction>) -> LivePoint<E> {
+        let input_block = input.func.block(self.with_repr32());
+        let last = block_last_inst(&input_block)
+            .with_repr::<E>()
+            .expect("every instruction index already fit in `E` in the earlier passes");
+        LivePoint::new(last, Position::Late).next_point()
+    }
+
     /// Get the spans within this block.
     ///
     /// Only valid before any live span has been split (i.e. before region
@@ -1848,7 +1914,10 @@ where
                 )?;
                 counts.eager_splits.inc();
 
-                piece_start = point;
+                // The new piece starts at the last instruction boundary, not at
+                // the conflicting use, because a move between the two pieces
+                // cannot happen in the middle of an instruction.
+                piece_start = point.inst_boundary_at_or_before();
                 piece_uses_start = use_;
                 piece_constraint = resolved;
                 piece_has_fixed_use = is_fixed;
@@ -2044,7 +2113,7 @@ mod tests {
             region: Region::try_new(0).unwrap(),
             constraint: OperandConstraint::Any,
             preference: RegSet::new(),
-            allocation: None,
+            reg_allocation: None,
             weight_and_flags,
         }
     }
@@ -3279,18 +3348,15 @@ mod tests {
                     }
                 }
 
-                // 2. A value has at most one span per block, and its spans are
-                // pairwise disjoint.
+                // 2. A value has at most one span per block, and its spans
+                // barely overlap.
                 //
-                // Splitting a conflict is what makes it "at most one" rather
-                // than "exactly one": a value's pieces within a block are
-                // ascending and leave no gap between them, and any two pieces
-                // are disjoint except for the single program point that a
-                // conflict between two uses of one instruction leaves them
-                // sharing, at which both of them record a use. Nothing else may
-                // overlap, because a value in two places at once needs a move
-                // between them, and there is nowhere to put a move except
-                // between two instructions.
+                // Splitting a conflict is what makes it "at most one": a
+                // value's pieces in a block ascend and leave no gap, and may
+                // overlap only within the instruction the later one begins at,
+                // which it always does at that instruction's boundary. Anything
+                // wider, or a piece starting mid-instruction, would need a move
+                // where there is no gap to put one.
                 for ((val, block), spans) in &spans_of {
                     for pair in spans.windows(2) {
                         let (previous, next) = (pair[0], pair[1]);
@@ -3332,16 +3398,22 @@ mod tests {
                             (span_b, span_a)
                         };
                         let point = second.start(&live_ranges);
-                        let both_use_it = [first, second].into_iter().all(|span| {
-                            span.uses(&live_ranges)
-                                .into_iter()
-                                .any(|u| u.point(&live_ranges) == point)
-                        });
-                        if first.end(&live_ranges) != point.next_point() || !both_use_it {
+
+                        // The later piece begins at an instruction boundary,
+                        // which is the only place a move between the two
+                        // allocations can go.
+                        let start_is_legal = point.pos() == Position::Early;
+
+                        // And the overlap stays inside that instruction.
+                        let overlap_is_narrow =
+                            first.end(&live_ranges) <= point.inst_boundary_after();
+
+                        if !start_is_legal || !overlap_is_narrow {
                             return Err(format!(
                                 "{span_a:?} ({a_start:?}..{a_end:?}) and {span_b:?} \
-                                 ({b_start:?}..{b_end:?}) are both for {:?} and overlap by more \
-                                 than the one program point at which both of them record a use",
+                                 ({b_start:?}..{b_end:?}) are both for {:?}, but {second:?} does \
+                                 not begin at an instruction boundary or they overlap by more \
+                                 than the instruction it begins at",
                                 span_a.val(&live_ranges),
                             ));
                         }

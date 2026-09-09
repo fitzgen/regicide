@@ -1,7 +1,8 @@
 use crate::{
     coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
-    liveness::Liveness, region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
-    spill_placement::SpillPlacement, spill_slot_allocation::SpillSlots,
+    liveness::Liveness, move_generation::MoveGeneration, region_allocation::RegionAllocation,
+    region_tree::RegionTree, rpo::Rpo, spill_placement::SpillPlacement,
+    spill_slot_allocation::SpillSlots,
 };
 
 /// TODO FITZGEN
@@ -82,6 +83,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub region_allocation: RegionAllocation<E>,
     pub spill_slots: SpillSlots<E>,
     pub spill_placement: SpillPlacement<E>,
+    pub move_generation: MoveGeneration<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
@@ -97,6 +99,7 @@ impl<E: EntityRepr> ContextInner<E> {
             region_allocation: RegionAllocation::new(),
             spill_slots: SpillSlots::new(),
             spill_placement: SpillPlacement::new(),
+            move_generation: MoveGeneration::new(),
         }
     }
 
@@ -112,6 +115,7 @@ impl<E: EntityRepr> ContextInner<E> {
             region_allocation,
             spill_slots,
             spill_placement,
+            move_generation,
         } = self;
         counts.reset();
         rpo.reset();
@@ -123,6 +127,7 @@ impl<E: EntityRepr> ContextInner<E> {
         region_allocation.reset();
         spill_slots.reset();
         spill_placement.reset();
+        move_generation.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -137,6 +142,7 @@ impl<E: EntityRepr> ContextInner<E> {
             region_allocation,
             spill_slots,
             spill_placement,
+            move_generation,
         } = self;
         counts.is_reset()
             && rpo.is_reset()
@@ -148,6 +154,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && region_allocation.is_reset()
             && spill_slots.is_reset()
             && spill_placement.is_reset()
+            && move_generation.is_reset()
     }
 }
 
