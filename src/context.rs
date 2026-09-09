@@ -1,12 +1,13 @@
 use crate::{
     coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
-    liveness::Liveness, move_generation::MoveGeneration, region_allocation::RegionAllocation,
-    region_tree::RegionTree, rpo::Rpo, spill_placement::SpillPlacement,
-    spill_slot_allocation::SpillSlots,
+    liveness::Liveness, move_generation::MoveGeneration, output::OutputInner,
+    region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
+    spill_placement::SpillPlacement, spill_slot_allocation::SpillSlots,
 };
 
 /// TODO FITZGEN
 pub struct Context {
+    pub(crate) which: Option<WhichContext>,
     #[cfg(feature = "entity-repr-8")]
     pub(crate) context8: ContextInner<u8>,
     #[cfg(feature = "entity-repr-16")]
@@ -24,6 +25,7 @@ impl Context {
     /// TODO FITZGEN
     pub const fn new() -> Self {
         Self {
+            which: None,
             #[cfg(feature = "entity-repr-8")]
             context8: ContextInner::new(),
             #[cfg(feature = "entity-repr-16")]
@@ -35,12 +37,14 @@ impl Context {
     /// TODO FITZGEN
     pub fn reset(&mut self) {
         let Self {
+            which,
             #[cfg(feature = "entity-repr-8")]
             context8,
             #[cfg(feature = "entity-repr-16")]
             context16,
             context32,
         } = self;
+        *which = None;
         #[cfg(feature = "entity-repr-8")]
         context8.reset();
         #[cfg(feature = "entity-repr-16")]
@@ -51,6 +55,7 @@ impl Context {
     /// TODO FITZGEN
     pub fn is_reset(&self) -> bool {
         let Self {
+            which,
             #[cfg(feature = "entity-repr-8")]
             context8,
             #[cfg(feature = "entity-repr-16")]
@@ -68,8 +73,17 @@ impl Context {
             return false;
         }
 
-        context32.is_reset()
+        which.is_none() && context32.is_reset()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WhichContext {
+    #[cfg(feature = "entity-repr-8")]
+    Context8,
+    #[cfg(feature = "entity-repr-16")]
+    Context16,
+    Context32,
 }
 
 pub(crate) struct ContextInner<E: EntityRepr> {
@@ -84,10 +98,11 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub spill_slots: SpillSlots<E>,
     pub spill_placement: SpillPlacement<E>,
     pub move_generation: MoveGeneration<E>,
+    pub output: OutputInner<E>,
 }
 
 impl<E: EntityRepr> ContextInner<E> {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             counts: Counts::new(),
             rpo: Rpo::new(),
@@ -100,6 +115,7 @@ impl<E: EntityRepr> ContextInner<E> {
             spill_slots: SpillSlots::new(),
             spill_placement: SpillPlacement::new(),
             move_generation: MoveGeneration::new(),
+            output: OutputInner::new(),
         }
     }
 
@@ -116,6 +132,7 @@ impl<E: EntityRepr> ContextInner<E> {
             spill_slots,
             spill_placement,
             move_generation,
+            output,
         } = self;
         counts.reset();
         rpo.reset();
@@ -128,6 +145,7 @@ impl<E: EntityRepr> ContextInner<E> {
         spill_slots.reset();
         spill_placement.reset();
         move_generation.reset();
+        output.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -143,6 +161,7 @@ impl<E: EntityRepr> ContextInner<E> {
             spill_slots,
             spill_placement,
             move_generation,
+            output,
         } = self;
         counts.is_reset()
             && rpo.is_reset()
@@ -155,6 +174,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && spill_slots.is_reset()
             && spill_placement.is_reset()
             && move_generation.is_reset()
+            && output.is_reset()
     }
 }
 

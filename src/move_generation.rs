@@ -48,7 +48,7 @@
 //!    if/when it is necessary.
 
 use crate::{
-    Block, Entity as _, Val,
+    Block, Entity as _, Inst, Val,
     context::ContextInner,
     counts::Counts,
     entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
@@ -79,7 +79,6 @@ use core::{marker::PhantomData, ops::Range};
 pub(crate) fn generate_moves<E>(
     context: &mut ContextInner<E>,
     input: &Input<'_, impl InputFunction>,
-    output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -95,6 +94,7 @@ where
         spill_slots,
         spill_placement,
         move_generation,
+        output,
         ..
     } = context;
 
@@ -152,8 +152,11 @@ where
     /// `tag = 0` is a point inside a block: `hi` is a `LivePoint`'s bits and
     /// `lo` is zero.
     ///
-    /// `tag = 1` is a critical edge: `hi` is which of the predecessor's
-    /// outgoing edges it is, `lo` the predecessor's index.
+    /// `tag = 1` is a critical edge: `hi` is the predecessor's index and `lo`
+    /// is which of the predecessor's outgoing edges it is. The predecessor
+    /// comes first so that sorting groups every edge edit by the block it
+    /// leaves, which is how `Output::block_insts_and_edits` finds a block's
+    /// edge edits as one contiguous slice.
     bits: u64,
 
     _marker: PhantomData<E>,
@@ -177,7 +180,7 @@ where
 
     /// Create a move on `pred`'s `succ`th outgoing edge.
     fn critical_edge(pred: Block<E>, succ: u16) -> Self {
-        Self::pack(1, succ.into(), pred.index())
+        Self::pack(1, pred.index(), succ.into())
     }
 
     fn pack(tag: usize, hi: usize, lo: usize) -> Self {
@@ -216,13 +219,21 @@ where
         self.field(Self::TAG_BITS, Self::TAG_SHIFT) == 0
     }
 
+    /// Is this a point position at or before `point`?
+    ///
+    /// A critical edge is never at or before a point: it is not anywhere in the
+    /// block yet, which is the whole reason the client has to split it.
+    pub(crate) fn is_at_or_before(self, point: LivePoint<E>) -> bool {
+        self.is_point() && self.hi() <= point.to_bits()
+    }
+
     pub(crate) fn unpack(self) -> MovePosition<E> {
         if self.is_point() {
             debug_assert_eq!(self.lo(), 0);
             MovePosition::Point(LivePoint::from_bits(self.hi()))
         } else {
-            let pred = Block::try_new(self.lo()).unwrap();
-            let succ = self.hi();
+            let pred = Block::try_new(self.hi()).unwrap();
+            let succ = self.lo();
             MovePosition::CriticalEdge { pred, succ }
         }
     }
@@ -459,6 +470,29 @@ where
     #[allow(dead_code, reason = "consumed by the phases that are still to come")]
     pub(crate) fn edits(&self) -> &[(PackedMovePosition<E>, Edit<E>)] {
         &self.edits
+    }
+
+    /// The edits at program points inside the block whose instructions run from
+    /// `first` to `last`, in program order.
+    pub(crate) fn block_point_edits(
+        &self,
+        first: Inst<E>,
+        last: Inst<E>,
+    ) -> &[(PackedMovePosition<E>, Edit<E>)] {
+        let start = PackedMovePosition::point(LivePoint::new(first, Position::Early));
+        let end = PackedMovePosition::point(LivePoint::new(last, Position::Late).next_point());
+        let lo = self.edits.partition_point(|&(pos, _)| pos < start);
+        let hi = self.edits.partition_point(|&(pos, _)| pos < end);
+        &self.edits[lo..hi]
+    }
+
+    /// The edits on critical edges leaving `pred`, in outgoing-edge order.
+    pub(crate) fn block_edge_edits(&self, pred: Block<E>) -> &[(PackedMovePosition<E>, Edit<E>)] {
+        let start = PackedMovePosition::<E>::pack(1, pred.index(), 0);
+        let end = PackedMovePosition::<E>::pack(1, pred.index() + 1, 0);
+        let lo = self.edits.partition_point(|&(pos, _)| pos < start);
+        let hi = self.edits.partition_point(|&(pos, _)| pos < end);
+        &self.edits[lo..hi]
     }
 
     fn generate(
@@ -934,14 +968,7 @@ where
                 };
                 trace!("move generation: rematerialize {val:?} into {dest:?} at {pos:?}");
                 counts.remats_emitted.inc();
-                self.remats.push((
-                    pos,
-                    Remat {
-                        val,
-                        srcs: [None, None],
-                        dest,
-                    },
-                ));
+                self.remats.push((pos, Remat { val, dest }));
                 continue;
             }
 
@@ -1139,8 +1166,8 @@ where
                     return None;
                 }
 
-                let log2_size = bank.log2_size(machine);
-                let Ok(slot) = spill_slots.emergency_slot(counts, log2_size, output) else {
+                let size = bank.size(machine);
+                let Ok(slot) = spill_slots.emergency_slot(counts, size, output) else {
                     scratch_failed = true;
                     return None;
                 };
@@ -1403,28 +1430,36 @@ mod tests {
     /// itself gave up, e.g. for want of registers, leaving nothing to check.
     fn generate(test_input: &TestInput) -> Result<Option<Context>, String> {
         let mut context = Context::new();
-        let mut output = OutputInner::<u32>::new();
         assert!(context.is_reset());
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let ctx = &mut context.context32;
-            let func = input.func;
-            ctx.rpo.construct(func, &mut ctx.dfs, &mut output)?;
-            ctx.region_tree
-                .construct(func, &mut ctx.counts, &mut ctx.dfs, &mut output)?;
-            ctx.liveness
-                .construct(func, &mut ctx.counts, &ctx.rpo, &mut output)?;
-            ctx.live_ranges
-                .construct(input, &mut ctx.counts, &mut ctx.liveness, &mut output)?;
-            crate::coalescing::coalesce(ctx, input, &mut output)?;
-            crate::region_allocation::region_allocate(ctx, input, &mut output)?;
-            crate::spill_slot_allocation::allocate_spill_slots(ctx, input, &mut output)?;
-            crate::spill_placement::place_spills(ctx, input, &mut output)?;
-            generate_moves(ctx, input, &mut output)
+            {
+                let ContextInner {
+                    counts,
+                    rpo,
+                    region_tree,
+                    liveness,
+                    live_ranges,
+                    dfs,
+                    output,
+                    ..
+                } = &mut *ctx;
+                let func = input.func;
+                rpo.construct(func, dfs, output)?;
+                region_tree.construct(func, counts, dfs, output)?;
+                liveness.construct(func, counts, rpo, output)?;
+                live_ranges.construct(input, counts, liveness, output)?;
+            }
+            crate::coalescing::coalesce(ctx, input)?;
+            crate::region_allocation::region_allocate(ctx, input)?;
+            crate::spill_slot_allocation::allocate_spill_slots(ctx, input)?;
+            crate::spill_placement::place_spills(ctx, input)?;
+            generate_moves(ctx, input)
         });
 
         if result.is_err() {
-            return match output.take_error() {
+            return match context.context32.output.take_error() {
                 // Not every function fits on every machine.
                 InternalError::Error(Error::TooManyLiveRegs) => Ok(None),
                 error => Err(format!("allocation failed: {error:?}")),
@@ -2023,7 +2058,7 @@ mod tests {
             let Some(StackAllocation::SpillSlotGroup(group)) = home else {
                 panic!("a value in a class of register groups has a group of slots, got {home:?}");
             };
-            let slots = group.members(&ctx.spill_slots).collect::<Vec<_>>();
+            let slots = group.members(&ctx.spill_slots).to_vec();
             assert_eq!(slots.len(), members.len(), "one slot per member");
             assert_ne!(slots[0], slots[1], "the members do not share a slot");
             assert!(

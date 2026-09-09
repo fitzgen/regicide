@@ -90,11 +90,57 @@ define_entities! {
     struct SpillSlotGroupMembersIndex = "spill_slot_group_members_index";
 }
 
+/// The size of a spill slot: a power-of-two number of bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SpillSlotSize(u8);
+
+impl SpillSlotSize {
+    /// Create a `SpillSlotSize` of `size` bytes.
+    ///
+    /// Returns `None` if `size` is not a power of two.
+    #[inline]
+    pub fn new(size: u16) -> Option<Self> {
+        if size.is_power_of_two() {
+            let log2_size = u8::try_from(size.trailing_zeros()).unwrap();
+            Some(Self::from_log2(log2_size))
+        } else {
+            None
+        }
+    }
+
+    /// The byte size of a spill slot of this size.
+    #[inline]
+    pub fn size(self) -> u16 {
+        1 << self.0
+    }
+
+    /// The base-two logarithm of the byte size of a spill slot of this size.
+    #[inline]
+    pub fn log2_size(self) -> u8 {
+        self.0
+    }
+
+    /// Create a `SpillSlotSize` from the base-two logarithm of a byte size.
+    #[inline]
+    pub(crate) fn from_log2(log2_size: u8) -> Self {
+        debug_assert!(usize::from(log2_size) < RegBank::NUM_SIZES);
+        Self(log2_size)
+    }
+
+    /// This size's index into the per-size pools, which have one bucket per
+    /// distinct size a machine can have.
+    #[inline]
+    pub(crate) fn index(self) -> usize {
+        let index = usize::from(self.0);
+        debug_assert!(index < RegBank::NUM_SIZES);
+        index
+    }
+}
+
 /// Run the spill slot allocation pass.
 pub(crate) fn allocate_spill_slots<E>(
     context: &mut ContextInner<E>,
     input: &Input<'_, impl InputFunction>,
-    output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -108,6 +154,7 @@ where
         live_ranges,
         region_allocation,
         spill_slots,
+        output,
         ..
     } = context;
 
@@ -141,9 +188,8 @@ pub struct SpillSlots<E>
 where
     E: EntityRepr,
 {
-    /// Every slot we have created, and the base-two logarithm of the size of
-    /// the values it holds.
-    slots: PrimaryMap<SpillSlot<E>, u8>,
+    /// Every slot we have created, and the size of the values it holds.
+    slots: PrimaryMap<SpillSlot<E>, SpillSlotSize>,
 
     /// Every group of slots we have created, and where its members are in
     /// `group_members`.
@@ -277,6 +323,15 @@ where
         self.slots.len()
     }
 
+    /// The size of every slot we created, indexed by slot.
+    ///
+    /// The element type does not mention `E`, which is what lets
+    /// `Output::spill_slots` iterate the slots of any representation with one
+    /// concrete iterator type.
+    pub(crate) fn sizes(&self) -> &[SpillSlotSize] {
+        self.slots.as_slice()
+    }
+
     /// The values that region allocation left on the stack, and that therefore
     /// have a slot.
     pub(crate) fn spilled(&self) -> &EntitySet<Val<E>> {
@@ -293,20 +348,20 @@ where
     pub(crate) fn emergency_slot(
         &mut self,
         counts: &mut Counts,
-        log2_size: u8,
+        size: SpillSlotSize,
         output: &mut OutputInner<E>,
     ) -> IResult<SpillSlot<E>> {
-        if let Some(slot) = self.emergency[usize::from(log2_size)] {
+        if let Some(slot) = self.emergency[size.index()] {
             return Ok(slot);
         }
 
-        let slot = self.slots.push(output, log2_size)?;
-        self.emergency[usize::from(log2_size)] = Some(slot);
+        let slot = self.slots.push(output, size)?;
+        self.emergency[size.index()] = Some(slot);
         counts.emergency_spill_slots.inc();
         counts.spill_slots.inc();
         trace!(
             "spill slots: created emergency {slot:?} ({} bytes)",
-            1u32 << log2_size
+            size.size()
         );
         Ok(slot)
     }
@@ -442,9 +497,9 @@ where
         // All other slots are free in this block. Rebuild the free lists
         // accordingly.
         debug_assert!(self.free_slots.iter().all(|free| free.is_empty()));
-        for (slot, &log2_size) in self.slots.iter() {
+        for (slot, &size) in self.slots.iter() {
             if !self.in_use.contains(slot) {
-                self.free_slots[usize::from(log2_size)].push(slot);
+                self.free_slots[size.index()].push(slot);
             }
         }
 
@@ -555,15 +610,15 @@ where
             "{val:?} has a single definition in SSA, so we color it exactly once",
         );
 
-        let log2_size = val.reg_bank(input).log2_size(input.machine);
+        let size = val.reg_bank(input).size(input.machine);
         let num_regs = val.num_regs(input);
 
         let home = if num_regs == 1 {
-            StackAllocation::SpillSlot(self.alloc_slot(log2_size, output)?)
+            StackAllocation::SpillSlot(self.alloc_slot(size, output)?)
         } else {
             let start = self.group_members.next_key(output)?;
             for _ in 0..num_regs {
-                let slot = self.alloc_slot(log2_size, output)?;
+                let slot = self.alloc_slot(size, output)?;
                 self.group_members.push(output, slot)?;
             }
             let end = self.group_members.next_key(output)?;
@@ -577,17 +632,21 @@ where
         counts.spill_slot_assignments.inc();
         trace!(
             "spill slots: assigned {val:?} to {home:?}: {num_regs} slot(s) of {} bytes",
-            1u32 << log2_size,
+            size.size(),
         );
         Ok(())
     }
 
     /// Take a free slot of the given size, creating a new one when every
     /// existing slot of that size is occupied.
-    fn alloc_slot(&mut self, log2_size: u8, output: &mut OutputInner<E>) -> IResult<SpillSlot<E>> {
-        match self.free_slots[usize::from(log2_size)].pop() {
+    fn alloc_slot(
+        &mut self,
+        size: SpillSlotSize,
+        output: &mut OutputInner<E>,
+    ) -> IResult<SpillSlot<E>> {
+        match self.free_slots[size.index()].pop() {
             Some(slot) => Ok(slot),
-            None => self.slots.push(output, log2_size),
+            None => self.slots.push(output, size),
         }
     }
 
@@ -604,13 +663,13 @@ where
                 "{slot:?} is already occupied, so {val:?} may not have it too",
             );
 
-            let log2_size = usize::from(val.reg_bank(input).log2_size(input.machine));
-            debug_assert_eq!(usize::from(self.slots[slot]), log2_size);
+            let size = val.reg_bank(input).size(input.machine);
+            debug_assert_eq!(self.slots[slot], size);
 
-            self.live_count[log2_size] += 1;
+            self.live_count[size.index()] += 1;
 
-            self.max_live[log2_size] =
-                core::cmp::max(self.max_live[log2_size], self.live_count[log2_size]);
+            self.max_live[size.index()] =
+                core::cmp::max(self.max_live[size.index()], self.live_count[size.index()]);
         }
     }
 
@@ -618,15 +677,15 @@ where
     fn free(&mut self, input: &Input<'_, impl InputFunction>, val: Val<E>) {
         let home = self.val_home[val].expect("only a value with assigned slots can be killed");
 
-        let log2_size = usize::from(val.reg_bank(input).log2_size(input.machine));
+        let size = val.reg_bank(input).size(input.machine);
         for i in 0..home.len_scalars(self) {
             let slot = home.nth_scalar(self, i);
             let removed = self.in_use.remove(slot);
             debug_assert!(removed, "{val:?} held {slot:?}, so it was occupied");
-            debug_assert_eq!(usize::from(self.slots[slot]), log2_size);
+            debug_assert_eq!(self.slots[slot], size);
 
-            self.free_slots[log2_size].push(slot);
-            self.live_count[log2_size] -= 1;
+            self.free_slots[size.index()].push(slot);
+            self.live_count[size.index()] -= 1;
         }
     }
 
@@ -651,8 +710,8 @@ where
             return;
         }
         let mut per_size = [0u32; RegBank::NUM_SIZES];
-        for log2_size in self.slots.values() {
-            per_size[usize::from(*log2_size)] += 1;
+        for size in self.slots.values() {
+            per_size[size.index()] += 1;
         }
         for (log2_size, count) in per_size.iter().copied().enumerate() {
             debug_assert_eq!(
@@ -660,7 +719,7 @@ where
                 self.max_live[log2_size],
                 "created {count} slots of {} bytes but at most {} values of that size are ever \
                  simultaneously live; the coloring should be optimal",
-                1 << log2_size,
+                1u32 << log2_size,
                 self.max_live[log2_size],
             );
         }
@@ -703,14 +762,9 @@ impl<E> SpillSlotGroup<E>
 where
     E: EntityRepr,
 {
-    /// Iterate over the `SpillSlot`s in this group.
-    pub(crate) fn members(
-        self,
-        spill_slots: &SpillSlots<E>,
-    ) -> impl ExactSizeIterator<Item = SpillSlot<E>> + Clone + '_ {
-        spill_slots.groups[self]
-            .into_iter()
-            .map(|index| spill_slots.group_members[index])
+    /// The `SpillSlot`s in this group, in member order.
+    pub(crate) fn members(self, spill_slots: &SpillSlots<E>) -> &[SpillSlot<E>] {
+        &spill_slots.group_members.as_slice()[spill_slots.groups[self].indices()]
     }
 }
 
@@ -737,16 +791,10 @@ impl<E> SpillSlot<E>
 where
     E: EntityRepr,
 {
-    /// The base-two logarithm of the byte size of the values this slot holds.
-    #[allow(dead_code, reason = "consumed by the phases that are still to come")]
-    pub(crate) fn log2_size(self, spill_slots: &SpillSlots<E>) -> u8 {
+    /// The size of the values this slot holds.
+    #[cfg(test)]
+    pub(crate) fn size(self, spill_slots: &SpillSlots<E>) -> SpillSlotSize {
         spill_slots.slots[self]
-    }
-
-    /// The byte size of this slot.
-    #[allow(dead_code, reason = "consumed by the phases that are still to come")]
-    pub(crate) fn size(self, spill_slots: &SpillSlots<E>) -> u16 {
-        1 << self.log2_size(spill_slots)
     }
 }
 
@@ -774,35 +822,18 @@ mod tests {
     /// has; there are no spill slots to check in that case.
     fn allocate(test_input: &TestInput) -> Result<Option<Context>, String> {
         let mut context = Context::new();
-        let mut output = OutputInner::<u32>::new();
         assert!(context.is_reset());
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let context = &mut context.context32;
-            let func = input.func;
-            context.rpo.construct(func, &mut context.dfs, &mut output)?;
-            context.region_tree.construct(
-                func,
-                &mut context.counts,
-                &mut context.dfs,
-                &mut output,
-            )?;
-            context
-                .liveness
-                .construct(func, &mut context.counts, &context.rpo, &mut output)?;
-            context.live_ranges.construct(
-                input,
-                &mut context.counts,
-                &mut context.liveness,
-                &mut output,
-            )?;
-            crate::coalescing::coalesce(context, input, &mut output)?;
-            crate::region_allocation::region_allocate(context, input, &mut output)?;
-            allocate_spill_slots(context, input, &mut output)
+            analyze(context, input).map_err(|_| ())?;
+            crate::coalescing::coalesce(context, input)?;
+            crate::region_allocation::region_allocate(context, input)?;
+            allocate_spill_slots(context, input)
         });
 
         if result.is_err() {
-            return match output.take_error() {
+            return match context.context32.output.take_error() {
                 // Not every function can be allocated on every machine, and
                 // that is not this pass's problem.
                 crate::error::InternalError::Error(crate::Error::TooManyLiveRegs) => Ok(None),
@@ -818,30 +849,23 @@ mod tests {
     fn analyze(
         context: &mut ContextInner<u32>,
         input: &Input<'_, crate::test::TestFunction>,
-        output: &mut OutputInner<u32>,
     ) -> Result<(), String> {
+        let ContextInner {
+            counts,
+            rpo,
+            region_tree,
+            liveness,
+            live_ranges,
+            dfs,
+            output,
+            ..
+        } = context;
         let func = input.func;
-        let result = context
-            .rpo
-            .construct(func, &mut context.dfs, output)
-            .and_then(|()| {
-                context
-                    .region_tree
-                    .construct(func, &mut context.counts, &mut context.dfs, output)
-            })
-            .and_then(|()| {
-                context
-                    .liveness
-                    .construct(func, &mut context.counts, &context.rpo, output)
-            })
-            .and_then(|()| {
-                context.live_ranges.construct(
-                    input,
-                    &mut context.counts,
-                    &mut context.liveness,
-                    output,
-                )
-            });
+        let result = rpo
+            .construct(func, dfs, output)
+            .and_then(|()| region_tree.construct(func, counts, dfs, output))
+            .and_then(|()| liveness.construct(func, counts, rpo, output))
+            .and_then(|()| live_ranges.construct(input, counts, liveness, output));
         result.map_err(|()| format!("analysis failed: {:?}", output.take_error()))
     }
 
@@ -883,11 +907,10 @@ mod tests {
     /// range, and check the properties the coloring is supposed to have.
     fn check_coloring(test_input: &TestInput, stride: usize) -> Result<(), String> {
         let mut context = Context::new();
-        let mut output = OutputInner::<u32>::new();
 
         test_input.with_input(|input| -> Result<(), String> {
             let context = &mut context.context32;
-            analyze(context, input, &mut output)?;
+            analyze(context, input)?;
 
             // Choose which values to spill. Only values that have a live range
             // are eligible: a value that is neither defined nor used anywhere
@@ -917,16 +940,19 @@ mod tests {
                 .map(|(_, val)| val)
                 .collect();
 
-            context
-                .spill_slots
-                .color(
-                    input,
-                    &mut context.counts,
-                    &context.rpo,
-                    &context.liveness,
-                    &mut output,
-                )
-                .map_err(|()| format!("coloring failed: {:?}", output.take_error()))?;
+            {
+                let ContextInner {
+                    counts,
+                    rpo,
+                    liveness,
+                    spill_slots,
+                    output,
+                    ..
+                } = &mut *context;
+                spill_slots
+                    .color(input, counts, rpo, liveness, output)
+                    .map_err(|()| format!("coloring failed: {:?}", output.take_error()))?;
+            }
 
             let spill_slots = &context.spill_slots;
 
@@ -945,7 +971,7 @@ mod tests {
             }
 
             let ranges = live_ranges_of(context);
-            let log2_size_of = |val: Val<u32>| val.reg_bank(input).log2_size(input.machine);
+            let size_of = |val: Val<u32>| val.reg_bank(input).size(input.machine);
 
             // A value in a register group has one slot per member, so compare
             // whole stack homes: any slot the two share is a slot they can
@@ -977,12 +1003,12 @@ mod tests {
                     // Property 3: values that share a slot are the same size.
                     // Note that they need *not* be in the same bank: pooling
                     // slots across banks of equal size is the whole point.
-                    if log2_size_of(a) != log2_size_of(b) {
+                    if size_of(a) != size_of(b) {
                         return Err(format!(
                             "{a:?} and {b:?} both live in {shared:?} but their registers are {} \
                              and {} bytes wide",
-                            1 << log2_size_of(a),
-                            1 << log2_size_of(b),
+                            size_of(a).size(),
+                            size_of(b).size(),
                         ));
                     }
                 }
@@ -1015,11 +1041,11 @@ mod tests {
                     ));
                 }
                 for slot in slots {
-                    if slot.log2_size(spill_slots) != log2_size_of(val) {
+                    if slot.size(spill_slots) != size_of(val) {
                         return Err(format!(
                             "{val:?} has {}-byte registers but {slot:?} is {} bytes",
-                            1 << log2_size_of(val),
-                            slot.size(spill_slots),
+                            size_of(val).size(),
+                            slot.size(spill_slots).size(),
                         ));
                     }
                 }
@@ -1030,7 +1056,7 @@ mod tests {
             // spilled values of that size ever need at once. No allocation can
             // do better, because those values all need distinct slots at that
             // point.
-            let mut created: BTreeMap<u16, usize> = BTreeMap::new();
+            let mut created: BTreeMap<SpillSlotSize, usize> = BTreeMap::new();
             for (slot, _) in spill_slots.slots.iter() {
                 *created.entry(slot.size(spill_slots)).or_default() += 1;
             }
@@ -1038,18 +1064,17 @@ mod tests {
             // A maximum clique of an interval graph is always found at some
             // interval's start point, so those are the only points we need to
             // look at.
-            let mut needed: BTreeMap<u16, usize> = BTreeMap::new();
+            let mut needed: BTreeMap<SpillSlotSize, usize> = BTreeMap::new();
             let points: Vec<LivePoint<u32>> =
                 ranges.values().flatten().map(|&(start, _)| start).collect();
             for point in points {
-                let mut live_here: BTreeMap<u16, usize> = BTreeMap::new();
+                let mut live_here: BTreeMap<SpillSlotSize, usize> = BTreeMap::new();
                 for (&val, val_ranges) in &ranges {
                     if val_ranges
                         .iter()
                         .any(|&(start, end)| start <= point && point < end)
                     {
-                        *live_here.entry(1 << log2_size_of(val)).or_default() +=
-                            val.num_regs(input);
+                        *live_here.entry(size_of(val)).or_default() += val.num_regs(input);
                     }
                 }
                 for (size, count) in live_here {

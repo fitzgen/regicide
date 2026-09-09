@@ -18,7 +18,7 @@ use crate::{
     },
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
-    spill_slot_allocation::SpillSlot,
+    spill_slot_allocation::{SpillSlot, SpillSlotSize},
     union_find::UnionFind,
 };
 use alloc::{vec, vec::Vec};
@@ -1597,7 +1597,8 @@ impl TestMachine {
         let mut builder = MachineBuilder::new();
 
         for bank in &self.banks {
-            let reg_bank = builder.declare_reg_bank(1 << bank.log2_size).unwrap();
+            let size = SpillSlotSize::from_log2(bank.log2_size);
+            let reg_bank = builder.declare_reg_bank(size).unwrap();
 
             let mut next_unit = 0;
             let regs: Vec<Reg> = bank

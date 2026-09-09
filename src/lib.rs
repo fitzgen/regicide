@@ -68,15 +68,14 @@ pub use input::{
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{
-    Allocation, CriticalEdgeEdit, EdgeEdit, Edit, Move, Output, RegAllocation, Remat,
-    ScalarAllocation, StackAllocation,
+    Allocation, CriticalEdgeEdit, EdgeEdit, Edit, InstOrEdit, Move, Output, OutputIter,
+    RegAllocation, Remat, ScalarAllocation, StackAllocation,
 };
-pub use spill_slot_allocation::{SpillSlot, SpillSlotGroup};
+pub use spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize};
 
-use context::ContextInner;
+use context::{ContextInner, WhichContext};
 use error::{IResult, InternalError};
-use input::DisplayWithOutput;
-use output::{OutputInner, WhichOutput};
+use input::DisplayWithContext;
 
 mod hash_map {
     #[cfg(not(feature = "std"))]
@@ -90,20 +89,21 @@ mod hash_map {
 }
 
 /// TODO FITZGEN
-pub fn run(
-    context: &mut Context,
-    output: &mut Output,
-    input: &Input<impl InputFunction>,
-) -> Result<()> {
+pub fn run<'a>(context: &'a mut Context, input: &Input<impl InputFunction>) -> Result<Output<'a>> {
+    run_dispatch(context, input)?;
+    Ok(Output::new(context))
+}
+
+/// Solve `input` under the narrowest entity representation it fits in.
+fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Result<()> {
     assert!(context.is_reset());
-    assert!(output.is_reset());
 
     #[cfg(feature = "entity-repr-8")]
     if entity_repr_can_likely_fit::<u8>(input) {
-        output.which = Some(WhichOutput::Output8);
-        match run_inner(&mut context.context8, &mut output.output8, input) {
+        context.which = Some(WhichContext::Context8);
+        match run_inner(&mut context.context8, input) {
             Ok(()) => return Ok(()),
-            Err(()) => match output.output8.take_error() {
+            Err(()) => match context.context8.output.take_error() {
                 InternalError::EntityReprTooSmall => {}
                 InternalError::Error(e) => return Err(e),
             },
@@ -112,22 +112,22 @@ pub fn run(
 
     #[cfg(feature = "entity-repr-16")]
     if entity_repr_can_likely_fit::<u16>(input) {
-        output.which = Some(WhichOutput::Output16);
-        match run_inner(&mut context.context16, &mut output.output16, input) {
+        context.which = Some(WhichContext::Context16);
+        match run_inner(&mut context.context16, input) {
             Ok(()) => return Ok(()),
-            Err(()) => match output.output16.take_error() {
+            Err(()) => match context.context16.output.take_error() {
                 InternalError::EntityReprTooSmall => {}
                 InternalError::Error(e) => return Err(e),
             },
         }
     }
 
-    output.which = Some(WhichOutput::Output32);
-    match run_inner(&mut context.context32, &mut output.output32, input) {
+    context.which = Some(WhichContext::Context32);
+    match run_inner(&mut context.context32, input) {
         Ok(()) => Ok(()),
-        Err(()) => match output.output32.take_error() {
+        Err(()) => match context.context32.output.take_error() {
             InternalError::EntityReprTooSmall => unreachable!(),
-            InternalError::Error(e) => return Err(e),
+            InternalError::Error(e) => Err(e),
         },
     }
 }
@@ -154,16 +154,11 @@ where
     )
 }
 
-fn run_inner<E>(
-    context: &mut ContextInner<E>,
-    output: &mut OutputInner<E>,
-    input: &Input<impl InputFunction>,
-) -> IResult<()>
+fn run_inner<E>(context: &mut ContextInner<E>, input: &Input<impl InputFunction>) -> IResult<()>
 where
     E: EntityRepr,
 {
     assert!(context.is_reset());
-    assert!(output.is_reset());
 
     trace!(
         "====== register allocation input ======\n\
@@ -171,37 +166,51 @@ where
          ======================================="
     );
 
-    if input.options.validate_input {
-        validation::validate(input, output)?;
+    {
+        let ContextInner {
+            counts,
+            rpo,
+            region_tree,
+            liveness,
+            live_ranges,
+            dfs,
+            output,
+            ..
+        } = &mut *context;
+
+        if input.options.validate_input {
+            validation::validate(input, output)?;
+        }
+
+        rpo.construct(input.func, dfs, output)?;
+        region_tree.construct(input.func, counts, dfs, output)?;
+        liveness.construct(input.func, counts, rpo, output)?;
+        live_ranges.construct(input, counts, liveness, output)?;
     }
 
-    context
-        .rpo
-        .construct(input.func, &mut context.dfs, output)?;
-    context
-        .region_tree
-        .construct(input.func, &mut context.counts, &mut context.dfs, output)?;
-    context
-        .liveness
-        .construct(input.func, &mut context.counts, &context.rpo, output)?;
-    context
-        .live_ranges
-        .construct(input, &mut context.counts, &mut context.liveness, output)?;
+    coalescing::coalesce(context, input)?;
+    region_allocation::region_allocate(context, input)?;
+    spill_slot_allocation::allocate_spill_slots(context, input)?;
+    spill_placement::place_spills(context, input)?;
+    move_generation::generate_moves(context, input)?;
+    move_elimination::eliminate_moves(context, input)?;
 
-    coalescing::coalesce(context, input, output)?;
-    region_allocation::region_allocate(context, input, output)?;
-    spill_slot_allocation::allocate_spill_slots(context, input, output)?;
-    spill_placement::place_spills(context, input, output)?;
-    move_generation::generate_moves(context, input, output)?;
-    move_elimination::eliminate_moves(context, input, output)?;
-
-    output.construct(context, input.func)?;
+    {
+        let ContextInner {
+            rpo,
+            live_ranges,
+            spill_slots,
+            output,
+            ..
+        } = &mut *context;
+        output.construct(input.func, rpo, live_ranges, spill_slots)?;
+    }
 
     trace!(
         "====== register allocation output ======\n\
          {}\n\
          ========================================",
-        DisplayWithOutput::new(input.func.display(), output),
+        DisplayWithContext::new(input.func.display(), context),
     );
     trace!("counts = {:#?}", context.counts);
     Ok(())

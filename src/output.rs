@@ -1,19 +1,16 @@
-use crate::context::ContextInner;
-use crate::entity::{Block, Entity, EntityRepr, Val};
+use crate::context::{Context, WhichContext};
+use crate::entity::{Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, SecondaryMap, Val};
 use crate::error::{IResult, InternalError};
-use crate::input::InputFunction;
+use crate::input::{InputBlock, InputFunction, InputInst as _, Position};
+use crate::live_ranges::{LivePoint, LiveRanges};
+use crate::liveness::block_inst_bounds;
 use crate::machine::{Interfere, Machine, Reg, RegGroup};
-use crate::spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlots};
+use crate::move_generation::{MoveGeneration, PackedMovePosition};
+use crate::rpo::Rpo;
+use crate::spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize, SpillSlots};
 use crate::timing::Timing;
-use alloc::vec::Vec;
 
-/// Everywhere a value lives at some point in the program.
-///
-/// A value occupies one location per register of its register class, which is
-/// more than one when that class is a class of register groups, so this is a
-/// register or a group of them, or a spill slot or a group of them. The
-/// locations of a group are enumerated by [`Self::len_scalars`] and
-/// [`Self::nth_scalar`], and a [`ScalarAllocation`] is a single one of them.
+/// Where a value lives at some point in the program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Allocation<E = u32>
 where
@@ -26,7 +23,7 @@ where
     Stack(StackAllocation<E>),
 }
 
-/// Everywhere a value lives when it lives in registers.
+/// Where a value lives in registers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RegAllocation<E = u32>
 where
@@ -39,7 +36,7 @@ where
     RegGroup(RegGroup),
 }
 
-/// Everywhere a value lives when it lives on the stack.
+/// Where a value lives on the stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StackAllocation<E = u32>
 where
@@ -150,10 +147,7 @@ where
         debug_assert!(i < self.len_scalars(spill_slots));
         match self {
             StackAllocation::SpillSlot(slot) => slot,
-            StackAllocation::SpillSlotGroup(group) => group
-                .members(spill_slots)
-                .nth(i)
-                .expect("checked just above"),
+            StackAllocation::SpillSlotGroup(group) => group.members(spill_slots)[i],
         }
     }
 
@@ -325,17 +319,9 @@ where
 {
     /// TODO FITZGEN
     pub val: Val<E>,
-
-    /// The registers the rematerializing instruction reads, always
-    /// `[None, None]` today, as regicide only rematerializes values whose
-    /// definition has no register operands.
-    ///
-    /// TODO FITZGEN: needs a more expressive representation before we
-    /// rematerialize instructions that do read registers.
-    pub srcs: [Option<Reg<E>>; 2],
-
     /// TODO FITZGEN
     pub dest: Reg<E>,
+    // TODO: `srcs: FixedVec<[Reg<E>; 2]>` or something?
 }
 
 /// An edit that goes on an edge the client has to split first.
@@ -355,8 +341,7 @@ where
     pub edit: EdgeEdit<E>,
 }
 
-/// What a [`CriticalEdgeEdit`] does once the edge is split: [`Edit`] without
-/// the edge itself, an edge being no different from anywhere else.
+/// What a [`CriticalEdgeEdit`] does once the edge is split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EdgeEdit<E = u32>
 where
@@ -385,132 +370,510 @@ where
     CriticalEdge(CriticalEdgeEdit<E>),
 }
 
-/// TODO FITZGEN
-pub struct Output {
-    pub(crate) which: Option<WhichOutput>,
-    #[cfg(feature = "entity-repr-8")]
-    pub(crate) output8: OutputInner<u8>,
-    #[cfg(feature = "entity-repr-16")]
-    pub(crate) output16: OutputInner<u16>,
-    pub(crate) output32: OutputInner<u32>,
+macro_rules! impl_enum_with_repr32 {
+    ( $( $ty:ident { $( $variant:ident $fields:tt => $build:expr ),* $(,)? } )* ) => {
+        $(
+            impl<E> $ty<E>
+            where
+                E: EntityRepr,
+            {
+                /// Widen this value's entities to the public representation.
+                pub(crate) fn with_repr32(self) -> $ty<u32> {
+                    match self {
+                        $( $ty::$variant $fields => $build, )*
+                    }
+                }
+            }
+        )*
+    };
 }
 
-#[allow(dead_code, reason = "not consumed yet")] // TODO FITZGEN
-pub(crate) enum WhichOutput {
-    #[cfg(feature = "entity-repr-8")]
-    Output8,
-    #[cfg(feature = "entity-repr-16")]
-    Output16,
-    Output32,
-}
+impl_enum_with_repr32! {
+    Allocation {
+        Reg(alloc) => Allocation::Reg(alloc.with_repr32()),
+        Stack(alloc) => Allocation::Stack(alloc.with_repr32()),
+    }
 
-impl Default for Output {
-    fn default() -> Self {
-        Self::new()
+    RegAllocation {
+        Reg(reg) => RegAllocation::Reg(reg.with_repr32()),
+        RegGroup(group) => RegAllocation::RegGroup(group),
+    }
+
+    StackAllocation {
+        SpillSlot(slot) => StackAllocation::SpillSlot(slot.with_repr32()),
+        SpillSlotGroup(group) => StackAllocation::SpillSlotGroup(group.with_repr32()),
+    }
+
+    Move {
+        RegReg { from, to } => Move::RegReg {
+            from: from.with_repr32(),
+            to: to.with_repr32(),
+        },
+        Spill { from, to } => Move::Spill {
+            from: from.with_repr32(),
+            to: to.with_repr32(),
+        },
+        Reload { from, to } => Move::Reload {
+            from: from.with_repr32(),
+            to: to.with_repr32(),
+        },
+    }
+
+    EdgeEdit {
+        Move(mv) => EdgeEdit::Move(mv.with_repr32()),
+        Remat(remat) => EdgeEdit::Remat(remat.with_repr32()),
+    }
+
+    Edit {
+        Move(mv) => Edit::Move(mv.with_repr32()),
+        Remat(remat) => Edit::Remat(remat.with_repr32()),
+        CriticalEdge(edit) => Edit::CriticalEdge(edit.with_repr32()),
     }
 }
 
-impl Output {
-    /// TODO FITZGEN
-    pub const fn new() -> Self {
-        Self {
-            which: None,
-            #[cfg(feature = "entity-repr-8")]
-            output8: OutputInner::new(),
-            #[cfg(feature = "entity-repr-16")]
-            output16: OutputInner::new(),
-            output32: OutputInner::new(),
+impl<E> Remat<E>
+where
+    E: EntityRepr,
+{
+    /// Widen this rematerialization's entities to the public representation.
+    pub(crate) fn with_repr32(self) -> Remat<u32> {
+        let Self { val, dest } = self;
+        Remat {
+            val: val.with_repr32(),
+            dest: dest.with_repr32(),
         }
     }
+}
 
-    /// TODO FITZGEN
-    pub fn reset(&mut self) {
-        let Self {
-            which,
+impl<E> CriticalEdgeEdit<E>
+where
+    E: EntityRepr,
+{
+    /// Widen this edge edit's entities to the public representation.
+    pub(crate) fn with_repr32(self) -> CriticalEdgeEdit<u32> {
+        let Self { target, succ, edit } = self;
+        CriticalEdgeEdit {
+            target: target.with_repr32(),
+            succ,
+            edit: edit.with_repr32(),
+        }
+    }
+}
+
+/// The results of register allocation.
+pub struct Output<'a> {
+    context: &'a Context,
+}
+
+/// Run `$body` with `context{8,16,32}` (based on `WhichContext`) bound to
+/// `$inner`.
+macro_rules! with_inner {
+    ( $output:expr, |$inner:ident| $body:expr ) => {
+        match $output.which() {
             #[cfg(feature = "entity-repr-8")]
-            output8,
+            WhichContext::Context8 => {
+                let $inner = &$output.context.context8;
+                $body
+            }
             #[cfg(feature = "entity-repr-16")]
-            output16,
-            output32,
-        } = self;
-        *which = None;
-        #[cfg(feature = "entity-repr-8")]
-        output8.reset();
-        #[cfg(feature = "entity-repr-16")]
-        output16.reset();
-        output32.reset();
+            WhichContext::Context16 => {
+                let $inner = &$output.context.context16;
+                $body
+            }
+            WhichContext::Context32 => {
+                let $inner = &$output.context.context32;
+                $body
+            }
+        }
+    };
+}
+
+/// Like `with_inner` but wrap the result in `$wrapper::Reptr{8,16,32}`.
+macro_rules! with_inner_wrapped {
+    ( $output:expr, $wrapper:ident, |$inner:ident| $body:expr ) => {
+        match $output.which() {
+            #[cfg(feature = "entity-repr-8")]
+            WhichContext::Context8 => {
+                let $inner = &$output.context.context8;
+                $wrapper::Repr8($body)
+            }
+            #[cfg(feature = "entity-repr-16")]
+            WhichContext::Context16 => {
+                let $inner = &$output.context.context16;
+                $wrapper::Repr16($body)
+            }
+            WhichContext::Context32 => {
+                let $inner = &$output.context.context32;
+                $wrapper::Repr32($body)
+            }
+        }
+    };
+}
+
+/// Like `with_inner` but matching on `$wrapper::Repr{8,16,32}`.
+macro_rules! match_repr {
+    ( $place:expr, $wrapper:ident, |$inner:ident| $body:expr ) => {
+        match $place {
+            #[cfg(feature = "entity-repr-8")]
+            $wrapper::Repr8($inner) => $body,
+            #[cfg(feature = "entity-repr-16")]
+            $wrapper::Repr16($inner) => $body,
+            $wrapper::Repr32($inner) => $body,
+        }
+    };
+}
+
+impl<'a> Output<'a> {
+    pub(crate) fn new(context: &'a Context) -> Self {
+        debug_assert!(context.which.is_some());
+        Self { context }
     }
 
-    /// TODO FITZGEN
-    pub fn is_reset(&self) -> bool {
-        let Self {
-            which,
-            #[cfg(feature = "entity-repr-8")]
-            output8,
-            #[cfg(feature = "entity-repr-16")]
-            output16,
-            output32,
-        } = self;
-
-        #[cfg(feature = "entity-repr-8")]
-        if !output8.is_reset() {
-            return false;
-        }
-
-        #[cfg(feature = "entity-repr-16")]
-        if !output16.is_reset() {
-            return false;
-        }
-
-        which.is_none() && output32.is_reset()
+    /// Which representation the results this views are stored under.
+    fn which(&self) -> WhichContext {
+        self.context
+            .which
+            .expect("an `Output` is only ever created by a successful `run`")
     }
 
-    /// TODO FITZGEN
+    /// The allocations of `inst`'s operands, in operand order.
+    ///
+    /// The `i`th element is where the `i`th operand of `inst` lives, so this is
+    /// exactly as long as the instruction's operand list.
+    pub fn inst_allocs(&self, inst: Inst) -> &[Allocation] {
+        with_inner!(self, |inner| inner.output.inst_allocs(inst))
+    }
+
+    /// Iterate over `block`'s instructions and the edits to insert around them,
+    /// in the order the rewritten block should have them.
+    ///
+    /// An [`InstOrEdit::Inst`] is an instruction of the original function, to
+    /// be kept where it is. An [`InstOrEdit::Edit`] is a move, a
+    /// rematerialization, or a request to split a critical edge, to be inserted
+    /// at the point the iterator yields it.
+    ///
+    /// Edits leaving the block on a critical edge come last, after every
+    /// instruction.
     pub fn block_insts_and_edits(&self, func: &impl InputFunction, block: Block) -> OutputIter<'_> {
-        let _ = (func, block);
-        OutputIter { output: self }
+        let inner = with_inner_wrapped!(self, OutputIterInner, |inner| block_iter(
+            &inner.move_generation,
+            func,
+            block
+        ));
+        OutputIter { inner }
+    }
+
+    /// Every spill slot register allocation created, and its size.
+    pub fn spill_slots(&self) -> impl ExactSizeIterator<Item = (SpillSlot, SpillSlotSize)> + '_ {
+        let sizes: &[SpillSlotSize] = with_inner!(self, |inner| inner.spill_slots.sizes());
+        sizes.iter().copied().enumerate().map(|(index, size)| {
+            let slot = SpillSlot::try_new(index).unwrap();
+            (slot, size)
+        })
+    }
+
+    /// The size of the given spill slot.
+    pub fn spill_slot(&self, slot: SpillSlot) -> SpillSlotSize {
+        let sizes: &[SpillSlotSize] = with_inner!(self, |inner| inner.spill_slots.sizes());
+        *sizes
+            .get(slot.index())
+            .expect("no such spill slot in these results")
+    }
+
+    /// The slots that make up `group`, in the order of the register group whose
+    /// members they stand in for.
+    pub fn spill_slot_group_members(
+        &self,
+        group: SpillSlotGroup,
+    ) -> impl ExactSizeIterator<Item = SpillSlot> + '_ {
+        let inner = with_inner_wrapped!(self, SpillSlotGroupMembersInner, |inner| {
+            let group = group.with_repr().unwrap();
+            group.members(&inner.spill_slots).iter()
+        });
+        SpillSlotGroupMembers { inner }
     }
 }
 
-/// TODO FITZGEN
-pub struct OutputIter<'a> {
-    #[allow(dead_code, reason = "not consumed yet")] // TODO FITZGEN
-    output: &'a Output,
-    // TODO: ...
+/// One element of the stream [`Output::block_insts_and_edits`] yields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstOrEdit {
+    /// An instruction of the original function, which stays where it is.
+    Inst(Inst),
+
+    /// An edit to insert at this point in the block.
+    Edit(Edit),
 }
 
-pub(crate) struct OutputInner<E: EntityRepr> {
+/// An iterator over a block's instructions and edits, as returned by
+/// [`Output::block_insts_and_edits`].
+pub struct OutputIter<'a> {
+    inner: OutputIterInner<'a>,
+}
+
+enum OutputIterInner<'a> {
+    #[cfg(feature = "entity-repr-8")]
+    Repr8(BlockInstsAndEdits<'a, u8>),
+
+    #[cfg(feature = "entity-repr-16")]
+    Repr16(BlockInstsAndEdits<'a, u16>),
+
+    Repr32(BlockInstsAndEdits<'a, u32>),
+}
+
+impl Iterator for OutputIter<'_> {
+    type Item = InstOrEdit;
+
+    fn next(&mut self) -> Option<InstOrEdit> {
+        match_repr!(&mut self.inner, OutputIterInner, |iter| iter.next())
+    }
+}
+
+/// Build the instruction-and-edit stream for `block` out of the edits that move
+/// generation left under the `E` representation.
+fn block_iter<'a, E>(
+    move_generation: &'a MoveGeneration<E>,
+    func: &impl InputFunction,
+    block: Block,
+) -> BlockInstsAndEdits<'a, E>
+where
+    E: EntityRepr,
+{
+    let input_block = func.block(block);
+    let (first, last) = block_inst_bounds(&input_block);
+
+    let insts = first.index()..last.index() + 1;
+
+    let block = block.with_repr::<E>().unwrap();
+    let first = first.with_repr::<E>().unwrap();
+    let last = last.with_repr::<E>().unwrap();
+
+    BlockInstsAndEdits {
+        insts,
+        point_edits: move_generation.block_point_edits(first, last),
+        edge_edits: move_generation.block_edge_edits(block),
+    }
+}
+
+/// One representation's worth of [`OutputIter`].
+struct BlockInstsAndEdits<'a, E>
+where
+    E: EntityRepr,
+{
+    /// The indices of the block's instructions that have not been yielded yet.
+    insts: core::ops::Range<usize>,
+
+    /// The block's edits at program points inside it, in program order.
+    point_edits: &'a [(PackedMovePosition<E>, Edit<E>)],
+
+    /// The edits on critical edges leaving the block, which the client must
+    /// split before it can place them.
+    edge_edits: &'a [(PackedMovePosition<E>, Edit<E>)],
+}
+
+impl<E> Iterator for BlockInstsAndEdits<'_, E>
+where
+    E: EntityRepr,
+{
+    type Item = InstOrEdit;
+
+    fn next(&mut self) -> Option<InstOrEdit> {
+        if !self.insts.is_empty() {
+            let inst = Inst::<E>::try_new(self.insts.start)
+                .expect("the block's instructions all fit in `E`");
+
+            // Every edit up to and including this instruction's early point
+            // goes before the instruction; one at its late point goes after it,
+            // and so belongs to the next iteration.
+            if let Some((&(pos, edit), rest)) = self.point_edits.split_first() {
+                if pos.is_at_or_before(LivePoint::new(inst, Position::Early)) {
+                    self.point_edits = rest;
+                    return Some(InstOrEdit::Edit(edit.with_repr32()));
+                }
+            }
+
+            self.insts.start += 1;
+            return Some(InstOrEdit::Inst(inst.with_repr32()));
+        }
+
+        // The block's instructions are exhausted, so everything still left goes
+        // after all of them.
+        if let Some((&(_, edit), rest)) = self.point_edits.split_first() {
+            self.point_edits = rest;
+            return Some(InstOrEdit::Edit(edit.with_repr32()));
+        }
+
+        let (&(_, edit), rest) = self.edge_edits.split_first()?;
+        self.edge_edits = rest;
+        Some(InstOrEdit::Edit(edit.with_repr32()))
+    }
+}
+
+struct SpillSlotGroupMembers<'a> {
+    inner: SpillSlotGroupMembersInner<'a>,
+}
+
+enum SpillSlotGroupMembersInner<'a> {
+    #[cfg(feature = "entity-repr-8")]
+    Repr8(core::slice::Iter<'a, SpillSlot<u8>>),
+
+    #[cfg(feature = "entity-repr-16")]
+    Repr16(core::slice::Iter<'a, SpillSlot<u16>>),
+
+    Repr32(core::slice::Iter<'a, SpillSlot<u32>>),
+}
+
+impl Iterator for SpillSlotGroupMembers<'_> {
+    type Item = SpillSlot;
+
+    fn next(&mut self) -> Option<SpillSlot> {
+        match_repr!(&mut self.inner, SpillSlotGroupMembersInner, |iter| {
+            iter.next().map(|slot| slot.with_repr32())
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for SpillSlotGroupMembers<'_> {
+    fn len(&self) -> usize {
+        match_repr!(&self.inner, SpillSlotGroupMembersInner, |iter| iter.len())
+    }
+}
+
+define_entities! {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct OperandAllocation = "operand_allocation";
+}
+
+/// What an operand's allocation slot holds until the scatter fills it in.
+const UNALLOCATED: Allocation =
+    Allocation::Reg(RegAllocation::Reg(<Reg as Entity>::MAX_REPRESENTABLE));
+
+/// The register allocation results under one entity representation.
+pub(crate) struct OutputInner<E>
+where
+    E: EntityRepr,
+{
     error: Option<InternalError>,
-    edits: Vec<Edit<E>>,
+
+    /// Contiguous storage for every instruction's operands' allocations.
+    ///
+    /// The allocations are stored under the public `u32` representation, rather
+    /// than under `E`, so that `inst_allocs` can hand out a `&[Allocation]`.
+    operand_allocs: PrimaryMap<OperandAllocation<E>, Allocation>,
+
+    /// Where each instruction's operands' allocations live within
+    /// `operand_allocs`.
+    inst_allocs: SecondaryMap<Inst<E>, EntityRange<OperandAllocation<E>>>,
 }
 
 impl<E: EntityRepr> OutputInner<E> {
     pub const fn new() -> Self {
         Self {
             error: None,
-            edits: Vec::new(),
+            operand_allocs: PrimaryMap::new(),
+            inst_allocs: SecondaryMap::new(EntityRange::empty()),
         }
     }
 
-    fn reset(&mut self) {
-        let Self { error, edits } = self;
+    pub fn reset(&mut self) {
+        let Self {
+            error,
+            operand_allocs: inst_allocation_storage,
+            inst_allocs,
+        } = self;
         *error = None;
-        edits.clear();
+        inst_allocation_storage.reset();
+        inst_allocs.reset();
     }
 
     pub fn is_reset(&self) -> bool {
-        let Self { error, edits } = self;
-        error.is_none() && edits.is_empty()
+        let Self {
+            error,
+            operand_allocs: inst_allocation_storage,
+            inst_allocs,
+        } = self;
+        error.is_none() && inst_allocation_storage.is_reset() && inst_allocs.is_reset()
     }
 
     pub fn construct(
         &mut self,
-        context: &mut ContextInner<E>,
         func: &impl InputFunction,
+        rpo: &Rpo<E>,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
     ) -> IResult<()> {
+        debug_assert!(self.is_reset());
         let _timing = Timing::new("output");
-        let _ = (self, context, func);
-        todo!()
+
+        self.operand_allocs.reserve(func.len_insts());
+        for (_, input_block) in func.blocks() {
+            self.reserve_block_inst_allocs(&input_block)?;
+        }
+
+        for block in rpo.iter() {
+            for u in block.uses(live_ranges) {
+                let inst = u.point(live_ranges).inst();
+                let operand = u.operand(live_ranges);
+                let alloc = u.span(live_ranges).allocation(live_ranges, spill_slots);
+
+                let range = self.inst_allocs[inst];
+                let index = range.start.index() + operand;
+                debug_assert!(index < range.end.index());
+                self.operand_allocs.as_mut_slice()[index] = alloc.with_repr32();
+            }
+        }
+
+        if cfg!(debug_assertions) {
+            for block in rpo.iter() {
+                self.debug_assert_block_allocated(&func.block(block.with_repr32()));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Give each of `input_block`'s instructions' operands a placeholder slot
+    /// in the flat storage, and record the instruction's range within it.
+    fn reserve_block_inst_allocs<'a>(&mut self, input_block: &impl InputBlock<'a>) -> IResult<()> {
+        for (inst, input_inst) in input_block.insts() {
+            let inst = self.with_repr::<E, _>(inst)?;
+
+            let start_index = self.operand_allocs.len();
+            let end_index = start_index + input_inst.operands_len();
+            let start = self.entity::<OperandAllocation<E>>(start_index)?;
+            let end = self.entity::<OperandAllocation<E>>(end_index)?;
+
+            for _ in start_index..end_index {
+                self.operand_allocs.push_unwrap(UNALLOCATED);
+            }
+            self.inst_allocs[inst] = EntityRange { start, end };
+        }
+        Ok(())
+    }
+
+    /// Assert that the scatter left no operand of `input_block` unallocated.
+    fn debug_assert_block_allocated<'a>(&self, input_block: &impl InputBlock<'a>) {
+        for (inst, _) in input_block.insts() {
+            for (i, alloc) in self.inst_allocs(inst).iter().enumerate() {
+                debug_assert_ne!(
+                    *alloc, UNALLOCATED,
+                    "operand {i} of {inst:?} never got an allocation",
+                );
+            }
+        }
+    }
+
+    /// The allocations of `inst`'s operands, in operand order.
+    pub fn inst_allocs(&self, inst: Inst) -> &[Allocation] {
+        let Some(inst) = inst.with_repr::<E>() else {
+            return &[];
+        };
+        let range = self.inst_allocs[inst];
+        &self.operand_allocs.as_slice()[range.indices()]
     }
 
     #[inline]
@@ -569,12 +932,177 @@ impl<E: EntityRepr> OutputInner<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
+    use crate::test::TestInput;
+    use mutatis::check::{Check, CheckResult};
+    use std::{format, string::String, vec::Vec};
+
+    /// How many edits move generation produced, across the whole function.
+    fn total_edits(output: &Output<'_>) -> usize {
+        with_inner!(output, |inner| inner.move_generation.edits().len())
+    }
 
     #[test]
     fn output_is_send_sync() {
         fn assert_send<T: Send>() {}
         fn assert_sync<T: Sync>() {}
-        assert_send::<Output>();
-        assert_sync::<Output>();
+        assert_send::<Output<'_>>();
+        assert_sync::<Output<'_>>();
+    }
+
+    /// The results `Output` hands back describe the whole function: every
+    /// operand has an allocation, every instruction is yielded exactly once in
+    /// program order, and every edit move generation produced is yielded
+    /// exactly once.
+    #[test]
+    fn output_properties() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(10_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let mut context = Context::new();
+                test_input.with_input(|input| {
+                    let func = input.func;
+
+                    let output = match crate::run(&mut context, input) {
+                        Ok(output) => output,
+                        // Not every function fits on every machine, and that
+                        // is not this pass's problem.
+                        Err(Error::TooManyLiveRegs) => return Ok(()),
+                        Err(error) => return Err(format!("allocation failed: {error:?}")),
+                    };
+
+                    // Every operand gets exactly one allocation, and no two
+                    // operands of one instruction that are in registers share a
+                    // register unless they are the same value.
+                    for (_, input_block) in func.blocks() {
+                        for (inst, input_inst) in input_block.insts() {
+                            let allocs = output.inst_allocs(inst);
+                            if allocs.len() != input_inst.operands_len() {
+                                return Err(format!(
+                                    "{inst:?} has {} operands but {} allocations",
+                                    input_inst.operands_len(),
+                                    allocs.len(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Every instruction is yielded exactly once, in program
+                    // order, and no edit is dropped or duplicated.
+                    let mut num_edits = 0;
+                    for (block, input_block) in func.blocks() {
+                        let expected: Vec<Inst> =
+                            input_block.insts().map(|(inst, _)| inst).collect();
+
+                        let mut insts = Vec::new();
+                        let mut seen_last_inst = false;
+                        for item in output.block_insts_and_edits(func, block) {
+                            match item {
+                                InstOrEdit::Inst(inst) => {
+                                    seen_last_inst = insts.len() + 1 == expected.len();
+                                    insts.push(inst);
+                                }
+                                InstOrEdit::Edit(edit) => {
+                                    num_edits += 1;
+                                    // A critical edge is split on the way out
+                                    // of the block, so its edits come after
+                                    // every instruction in it.
+                                    if matches!(edit, Edit::CriticalEdge(_)) && !seen_last_inst {
+                                        return Err(format!(
+                                            "{block:?} yielded {edit:?} before its terminator",
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        if insts != expected {
+                            return Err(format!(
+                                "{block:?} yielded instructions {insts:?} but contains {expected:?}",
+                            ));
+                        }
+                    }
+
+                    let total = total_edits(&output);
+                    if num_edits != total {
+                        return Err(format!(
+                            "the blocks yielded {num_edits} edits but move generation produced \
+                             {total}",
+                        ));
+                    }
+
+                    Ok(())
+                })
+            })
+    }
+
+    /// The spill slot queries agree with each other and cover every slot.
+    #[test]
+    fn spill_slot_queries_agree() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(10_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let mut context = Context::new();
+                test_input.with_input(|input| {
+                    let output = match crate::run(&mut context, input) {
+                        Ok(output) => output,
+                        Err(Error::TooManyLiveRegs) => return Ok(()),
+                        Err(error) => return Err(format!("allocation failed: {error:?}")),
+                    };
+
+                    let slots: Vec<(SpillSlot, SpillSlotSize)> = output.spill_slots().collect();
+                    if slots.len() != output.spill_slots().len() {
+                        return Err(format!(
+                            "`spill_slots` reports {} slots but yields {}",
+                            output.spill_slots().len(),
+                            slots.len(),
+                        ));
+                    }
+
+                    for (i, (slot, size)) in slots.iter().copied().enumerate() {
+                        if slot.index() != i {
+                            return Err(format!("the {i}th slot yielded is {slot:?}"));
+                        }
+                        if output.spill_slot(slot) != size {
+                            return Err(format!(
+                                "`spill_slots` says {slot:?} is {size:?} but `spill_slot` says \
+                                 {:?}",
+                                output.spill_slot(slot),
+                            ));
+                        }
+                    }
+
+                    // Every group is made of slots that exist and that no other
+                    // member of the group is.
+                    for (_, input_block) in input.func.blocks() {
+                        for (inst, _) in input_block.insts() {
+                            for alloc in output.inst_allocs(inst) {
+                                let Allocation::Stack(StackAllocation::SpillSlotGroup(group)) =
+                                    *alloc
+                                else {
+                                    continue;
+                                };
+                                let members: Vec<SpillSlot> =
+                                    output.spill_slot_group_members(group).collect();
+                                for (i, member) in members.iter().copied().enumerate() {
+                                    if member.index() >= slots.len() {
+                                        return Err(format!(
+                                            "{group:?} contains {member:?}, which \
+                                                            is not a slot we created"
+                                        ));
+                                    }
+                                    if members[..i].contains(&member) {
+                                        return Err(format!(
+                                            "{group:?} contains {member:?} more than once",
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Ok(())
+                })
+            })
     }
 }

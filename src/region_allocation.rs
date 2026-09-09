@@ -25,7 +25,6 @@ use splitting::{Cut, SplitUse, WithinSpanCut};
 pub fn region_allocate<E>(
     context: &mut ContextInner<E>,
     input: &Input<'_, impl InputFunction>,
-    output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -37,6 +36,7 @@ where
         region_tree,
         live_ranges,
         region_allocation,
+        output,
         ..
     } = context;
 

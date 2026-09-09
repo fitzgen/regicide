@@ -2,6 +2,7 @@ use core::{cell::RefCell, fmt, marker::PhantomData};
 
 use crate::{
     Machine, RegClass, RegSet,
+    context::ContextInner,
     entity::{Block, Entity as _, EntityRepr, Inst, Val},
     error::IResult,
     live_ranges::MAX_OPERANDS_PER_INST,
@@ -734,53 +735,53 @@ pub enum RematCost {
 
 /// A trait for formatting something, optionally with the result of register
 /// allocation.
-pub(crate) trait FmtWithOutput<E>
+pub(crate) trait FmtWithContext<E>
 where
     E: EntityRepr,
 {
     /// Format `self` into `f`, optionally adding extra information from
-    /// `output` if present.
-    fn fmt_with_output(
+    /// `context` if present.
+    fn fmt_with_context(
         &self,
         f: &mut fmt::Formatter<'_>,
-        output: &mut OutputInner<E>,
+        context: &mut ContextInner<E>,
     ) -> IResult<()>;
 }
 
-/// Adapt a `FmtWithOutput` into a `Display` that formats with a particular
-/// output, rather than with an empty scratch output.
-pub(crate) struct DisplayWithOutput<'a, T, E>
+/// Adapt a `FmtWithContext` into a `Display` that formats with a particular
+/// context, rather than with an empty scratch context.
+pub(crate) struct DisplayWithContext<'a, T, E>
 where
     E: EntityRepr,
 {
     value: T,
-    output: RefCell<&'a mut OutputInner<E>>,
+    context: RefCell<&'a mut ContextInner<E>>,
 }
 
-impl<'a, T, E> DisplayWithOutput<'a, T, E>
+impl<'a, T, E> DisplayWithContext<'a, T, E>
 where
     E: EntityRepr,
 {
-    /// Format `value` with `output`.
-    pub(crate) fn new(value: T, output: &'a mut OutputInner<E>) -> Self {
+    /// Format `value` with `context`.
+    pub(crate) fn new(value: T, context: &'a mut ContextInner<E>) -> Self {
         Self {
             value,
-            output: RefCell::new(output),
+            context: RefCell::new(context),
         }
     }
 }
 
-impl<T, E> fmt::Display for DisplayWithOutput<'_, T, E>
+impl<T, E> fmt::Display for DisplayWithContext<'_, T, E>
 where
-    T: FmtWithOutput<E>,
+    T: FmtWithContext<E>,
     E: EntityRepr,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut output = self.output.borrow_mut();
-        match self.value.fmt_with_output(f, &mut output) {
+        let mut context = self.context.borrow_mut();
+        match self.value.fmt_with_context(f, &mut context) {
             Ok(()) => Ok(()),
             Err(()) => {
-                let _ = output.take_error();
+                let _ = context.output.take_error();
                 Err(fmt::Error)
             }
         }
@@ -792,31 +793,35 @@ where
     F: InputFunction,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut output = OutputInner::<u32>::new();
-        match self.fmt_with_output(f, &mut output) {
+        let mut context = ContextInner::<u32>::new();
+        match self.fmt_with_context(f, &mut context) {
             Ok(()) => Ok(()),
             Err(()) => {
-                let _ = fmt::Debug::fmt(&output.take_error(), f);
+                let _ = fmt::Debug::fmt(&context.output.take_error(), f);
                 Err(fmt::Error)
             }
         }
     }
 }
 
-impl<E, F> FmtWithOutput<E> for Input<'_, F>
+impl<E, F> FmtWithContext<E> for Input<'_, F>
 where
     E: EntityRepr,
     F: InputFunction,
 {
-    fn fmt_with_output(
+    fn fmt_with_context(
         &self,
         f: &mut fmt::Formatter<'_>,
-        output: &mut OutputInner<E>,
+        context: &mut ContextInner<E>,
     ) -> IResult<()> {
-        output.result(writeln!(f, "Options: {:#?}", self.options))?;
-        output.result(writeln!(f, "Machine: {:#?}", self.machine))?;
+        context
+            .output
+            .result(writeln!(f, "Options: {:#?}", self.options))?;
+        context
+            .output
+            .result(writeln!(f, "Machine: {:#?}", self.machine))?;
 
-        DisplayInputFunction(self.func).fmt_with_output(f, output)
+        DisplayInputFunction(self.func).fmt_with_context(f, context)
     }
 }
 
@@ -830,90 +835,92 @@ where
     F: InputFunction,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut output = OutputInner::<u32>::new();
-        match self.fmt_with_output(f, &mut output) {
+        let mut context = ContextInner::<u32>::new();
+        match self.fmt_with_context(f, &mut context) {
             Ok(()) => Ok(()),
             Err(()) => {
-                let _ = fmt::Debug::fmt(&output.take_error(), f);
+                let _ = fmt::Debug::fmt(&context.output.take_error(), f);
                 Err(fmt::Error)
             }
         }
     }
 }
 
-impl<E, F> FmtWithOutput<E> for DisplayInputFunction<'_, F>
+impl<E, F> FmtWithContext<E> for DisplayInputFunction<'_, F>
 where
     E: EntityRepr,
     F: InputFunction,
 {
-    fn fmt_with_output(
+    fn fmt_with_context(
         &self,
         f: &mut fmt::Formatter<'_>,
-        output: &mut OutputInner<E>,
+        context: &mut ContextInner<E>,
     ) -> IResult<()> {
-        output.result(writeln!(f, "Function {{"))?;
+        context.output.result(writeln!(f, "Function {{"))?;
         {
             let entry = self.0.entry_block();
             for (block, input_block) in self.0.blocks() {
-                output.result(write!(f, "  "))?;
+                context.output.result(write!(f, "  "))?;
                 if block == entry {
-                    output.result(write!(f, "entry "))?;
+                    context.output.result(write!(f, "entry "))?;
                 }
-                output.result(write!(f, "{block:?}"))?;
-                fmt_val_list(f, output, input_block.params())?;
-                output.result(writeln!(f, ":"))?;
-                DisplayInputBlock(input_block).fmt_with_output(f, output)?;
-                output.result(writeln!(f))?;
+                context.output.result(write!(f, "{block:?}"))?;
+                fmt_val_list(f, &mut context.output, input_block.params())?;
+                context.output.result(writeln!(f, ":"))?;
+                DisplayInputBlock(input_block).fmt_with_context(f, context)?;
+                context.output.result(writeln!(f))?;
             }
         }
-        output.result(writeln!(f, "}}"))
+        context.output.result(writeln!(f, "}}"))
     }
 }
 
 /// TODO FITZGEN
 pub struct DisplayInputBlock<B>(B);
 
-impl<'a, E, B> FmtWithOutput<E> for DisplayInputBlock<B>
+impl<'a, E, B> FmtWithContext<E> for DisplayInputBlock<B>
 where
     E: EntityRepr,
     B: InputBlock<'a>,
 {
-    fn fmt_with_output(
+    fn fmt_with_context(
         &self,
         f: &mut fmt::Formatter<'_>,
-        output: &mut OutputInner<E>,
+        context: &mut ContextInner<E>,
     ) -> IResult<()> {
         for (inst, input_inst) in self.0.insts() {
-            output.result(writeln!(f, "    {inst:?}"))?;
+            context.output.result(writeln!(f, "    {inst:?}"))?;
             for arg in input_inst.operands() {
-                output.result(write!(f, "      "))?;
+                context.output.result(write!(f, "      "))?;
                 match arg.pos() {
-                    Position::Early => output.result(write!(f, "early "))?,
-                    Position::Late => output.result(write!(f, "late "))?,
+                    Position::Early => context.output.result(write!(f, "early "))?,
+                    Position::Late => context.output.result(write!(f, "late "))?,
                 }
                 match arg.kind() {
-                    DefUse::Def => output.result(write!(f, "def "))?,
-                    DefUse::Use => output.result(write!(f, "use "))?,
+                    DefUse::Def => context.output.result(write!(f, "def "))?,
+                    DefUse::Use => context.output.result(write!(f, "use "))?,
                 }
-                output.result(write!(f, "{:?} ", arg.val()))?;
+                context.output.result(write!(f, "{:?} ", arg.val()))?;
                 match arg.constraint() {
-                    OperandConstraint::Any => output.result(write!(f, "any"))?,
-                    OperandConstraint::Reg(class) => output.result(write!(f, "in {class:?}"))?,
-                    OperandConstraint::Stack => output.result(write!(f, "on stack"))?,
+                    OperandConstraint::Any => context.output.result(write!(f, "any"))?,
+                    OperandConstraint::Reg(class) => {
+                        context.output.result(write!(f, "in {class:?}"))?
+                    }
+                    OperandConstraint::Stack => context.output.result(write!(f, "on stack"))?,
                     OperandConstraint::Reuse(i) => {
-                        output.result(write!(f, "reusing operand {i}"))?
+                        context.output.result(write!(f, "reusing operand {i}"))?
                     }
                 }
-                output.result(writeln!(f))?;
+                context.output.result(writeln!(f))?;
             }
         }
         if self.0.len_successors() == 0 {
-            output.result(writeln!(f, "    --> returns"))?;
+            context.output.result(writeln!(f, "    --> returns"))?;
         } else {
             for (i, block) in self.0.successors().enumerate() {
-                output.result(write!(f, "    --> {block:?}"))?;
-                fmt_val_list(f, output, self.0.successor_block_args(i))?;
-                output.result(writeln!(f))?;
+                context.output.result(write!(f, "    --> {block:?}"))?;
+                fmt_val_list(f, &mut context.output, self.0.successor_block_args(i))?;
+                context.output.result(writeln!(f))?;
             }
         }
         Ok(())
@@ -1097,7 +1104,9 @@ mod tests {
     /// intersection to find and a pair with none.
     fn merge_test_machine() -> (Machine, RegClass, RegClass, RegClass) {
         let mut builder = crate::MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(crate::SpillSlotSize::new(8).unwrap())
+            .unwrap();
         let r: Vec<crate::Reg> = (0..3)
             .map(|i| {
                 let unit = |i| crate::RegUnit::try_new(i).unwrap();

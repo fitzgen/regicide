@@ -137,6 +137,7 @@
 use crate::{
     Entity, EntityRepr, Error, Result,
     entity::{FixedEntitySet, PrimaryMap, words_for},
+    spill_slot_allocation::SpillSlotSize,
 };
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
 use core::ops::Range;
@@ -293,7 +294,7 @@ impl RegGroup {
 
     /// The members of this group, in order.
     #[inline]
-    pub(crate) fn members(self, machine: &Machine) -> &[Reg] {
+    pub fn members(self, machine: &Machine) -> &[Reg] {
         &machine.groups[self].members
     }
 
@@ -392,14 +393,10 @@ impl RegBank {
     /// them: `1 << 0` through `1 << 15`.
     pub(crate) const NUM_SIZES: usize = 16;
 
-    /// The base-two logarithm of the byte size of this bank's registers.
-    ///
-    /// This is always less than `RegBank::NUM_SIZES`.
+    /// The size of a spill slot holding one of this bank's registers.
     #[inline]
-    pub(crate) fn log2_size(self, machine: &Machine) -> u8 {
-        let log2_size = machine.banks[self].log2_size;
-        debug_assert!(usize::from(log2_size) < Self::NUM_SIZES);
-        log2_size
+    pub(crate) fn size(self, machine: &Machine) -> SpillSlotSize {
+        machine.banks[self].size
     }
 
     /// The set of registers that belong to this register bank.
@@ -483,8 +480,8 @@ pub(crate) struct RegBankDef {
     /// The subset of `self.registers` that are "non-allocatable".
     non_allocatable: RegSet,
 
-    /// The base-two logarithm of the byte size of this bank's registers.
-    log2_size: u8,
+    /// The size of a spill slot holding one of this bank's registers.
+    size: SpillSlotSize,
 }
 
 /// Trait for checking interference (conflict) between two things.
@@ -595,7 +592,7 @@ impl Machine {
 /// registers, and you can ignore the distinction.
 ///
 /// ```
-/// use regicide::{Entity, MachineBuilder, RegUnit};
+/// use regicide::{Entity, MachineBuilder, RegUnit, SpillSlotSize};
 ///
 /// let mut builder = MachineBuilder::new();
 ///
@@ -605,8 +602,8 @@ impl Machine {
 /// // Both banks hold eight-byte registers because this model has no
 /// // subregisters and treats an `xmm` as the eight bytes a IEEE754 value
 /// // actually occupies.
-/// let gpr = builder.declare_reg_bank(8)?;
-/// let sse = builder.declare_reg_bank(8)?;
+/// let gpr = builder.declare_reg_bank(SpillSlotSize::new(8).unwrap())?;
+/// let sse = builder.declare_reg_bank(SpillSlotSize::new(8).unwrap())?;
 ///
 /// let unit = |i: usize| RegUnit::try_new(i).unwrap();
 ///
@@ -666,13 +663,13 @@ impl Machine {
 /// `d0`.
 ///
 /// ```
-/// use regicide::{Entity, MachineBuilder, RegUnit};
+/// use regicide::{Entity, MachineBuilder, RegUnit, SpillSlotSize};
 ///
 /// let mut builder = MachineBuilder::new();
 ///
 /// // An `s` register is four bytes wide and a `d` register is eight.
-/// let s_bank = builder.declare_reg_bank(4)?;
-/// let d_bank = builder.declare_reg_bank(8)?;
+/// let s_bank = builder.declare_reg_bank(SpillSlotSize::new(4).unwrap())?;
+/// let d_bank = builder.declare_reg_bank(SpillSlotSize::new(8).unwrap())?;
 ///
 /// let unit = |i: usize| RegUnit::try_new(i).unwrap();
 ///
@@ -735,22 +732,17 @@ impl MachineBuilder {
     /// different banks may overlap. A bank is the set of registers that a value
     /// can be moved between.
     ///
-    /// The size is the byte size of a spilled value of this bank occupies on
-    /// the stack. It must be a power of two.
+    /// The size is what a spilled value of this bank occupies on the stack.
     ///
     /// # Errors
     ///
-    /// Returns an error if `byte_size` is not a power of two, or if the machine
-    /// already has [`RegBank::MAX`] banks.
-    pub fn declare_reg_bank(&mut self, byte_size: u16) -> Result<RegBank> {
-        if !byte_size.is_power_of_two() {
-            return Err(Error::BadRegBankSize { size: byte_size });
-        }
+    /// Returns an error if the machine already has [`RegBank::MAX`] banks.
+    pub fn declare_reg_bank(&mut self, size: SpillSlotSize) -> Result<RegBank> {
         if self.banks.len() < RegBank::MAX {
             Ok(self.banks.push_unwrap(RegBankDef {
                 registers: RegSet::new(),
                 non_allocatable: RegSet::new(),
-                log2_size: u8::try_from(byte_size.trailing_zeros()).unwrap(),
+                size,
             }))
         } else {
             Err(Error::MachineCapacityExceeded {
@@ -1268,22 +1260,22 @@ mod tests {
         RegUnit::try_new(i).unwrap()
     }
 
-    /// A bank's register size must be a power of two, because it is stored as a
-    /// base-two logarithm and used to index the spill slot pools.
+    /// A bank's register size must be a power of two, which `SpillSlotSize`
+    /// enforces on the way in, and it must round-trip through the bank.
     #[test]
     fn reg_bank_sizes_must_be_powers_of_two() {
         let mut builder = MachineBuilder::new();
         for size in [1, 2, 4, 8, 16, 1 << 15] {
+            let size = SpillSlotSize::new(size).unwrap();
             let bank = builder.declare_reg_bank(size).unwrap();
-            let machine_size = 1u16 << builder.banks[bank].log2_size;
-            assert_eq!(machine_size, size, "{size} did not round-trip");
+            assert_eq!(
+                builder.banks[bank].size, size,
+                "{size:?} did not round-trip"
+            );
         }
         for size in [0, 3, 6, 7, 100, u16::MAX] {
             assert!(
-                matches!(
-                    builder.declare_reg_bank(size),
-                    Err(Error::BadRegBankSize { size: bad }) if bad == size,
-                ),
+                SpillSlotSize::new(size).is_none(),
                 "{size} is not a power of two, so it should be rejected",
             );
         }
@@ -1298,8 +1290,12 @@ mod tests {
         // overlap the first bank's, which is legal precisely because they are in
         // another bank.
         let mut builder = MachineBuilder::new();
-        let gpr = builder.declare_reg_bank(8).unwrap();
-        let vector = builder.declare_reg_bank(8).unwrap();
+        let gpr = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
+        let vector = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
 
         let r: Vec<Reg> = (0..4)
             .map(|i| builder.define_reg(gpr, unit(i)..unit(i + 1)).unwrap())
@@ -1359,7 +1355,9 @@ mod tests {
     #[test]
     fn reject_overlapping_regs_in_one_bank() {
         let mut builder = MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         let a = builder.define_reg(bank, unit(0)..unit(2)).unwrap();
         let b = builder.define_reg(bank, unit(1)..unit(3)).unwrap();
         builder.define_reg_class(bank, 1.0, [a, b]).unwrap();
@@ -1374,7 +1372,9 @@ mod tests {
         // A bank whose every register is non-allocatable has nowhere to stage a
         // stack-to-stack move.
         let mut builder = MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         builder.define_non_allocatable_reg(bank).unwrap();
         assert!(matches!(
             builder.finish().unwrap_err(),
@@ -1388,7 +1388,9 @@ mod tests {
     #[test]
     fn allow_non_allocatable_reg_in_a_class() {
         let mut builder = MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         let r0 = builder.define_reg(bank, unit(0)..unit(1)).unwrap();
         let flags = builder.define_non_allocatable_reg(bank).unwrap();
 
@@ -1413,8 +1415,12 @@ mod tests {
     #[test]
     fn reject_bad_groups_and_banks() {
         let mut builder = MachineBuilder::new();
-        let x = builder.declare_reg_bank(8).unwrap();
-        let y = builder.declare_reg_bank(8).unwrap();
+        let x = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
+        let y = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         let x0 = builder.define_reg(x, unit(0)..unit(1)).unwrap();
         let x1 = builder.define_reg(x, unit(1)..unit(2)).unwrap();
         let y0 = builder.define_reg(y, unit(0)..unit(1)).unwrap();
@@ -1450,7 +1456,9 @@ mod tests {
     #[test]
     fn reject_empty_classes() {
         let mut builder = MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         assert!(matches!(
             builder.define_reg_class(bank, 1.0, []).unwrap_err(),
             Error::EmptyRegClass { .. }
@@ -1466,8 +1474,12 @@ mod tests {
     #[test]
     fn derive_class_intersections() {
         let mut builder = MachineBuilder::new();
-        let gpr = builder.declare_reg_bank(8).unwrap();
-        let vector = builder.declare_reg_bank(8).unwrap();
+        let gpr = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
+        let vector = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
 
         let r: Vec<Reg> = (0..4)
             .map(|i| builder.define_reg(gpr, unit(i)..unit(i + 1)).unwrap())
@@ -1578,7 +1590,9 @@ mod tests {
     #[test]
     fn reject_too_many_derived_classes() {
         let mut builder = MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         let r: Vec<Reg> = (0..16)
             .map(|i| builder.define_reg(bank, unit(i)..unit(i + 1)).unwrap())
             .collect();
@@ -1603,7 +1617,9 @@ mod tests {
     #[test]
     fn reject_mixed_group_sizes_in_a_class() {
         let mut builder = MachineBuilder::new();
-        let bank = builder.declare_reg_bank(8).unwrap();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
         let r: Vec<Reg> = (0..5)
             .map(|i| builder.define_reg(bank, unit(i)..unit(i + 1)).unwrap())
             .collect();

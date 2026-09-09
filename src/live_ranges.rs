@@ -1800,7 +1800,7 @@ where
     }
 
     /// Get the range of uses that construction recorded for this block.
-    fn uses(self, live_ranges: &LiveRanges<E>) -> EntityRange<Use<E>> {
+    pub(crate) fn uses(self, live_ranges: &LiveRanges<E>) -> EntityRange<Use<E>> {
         live_ranges.block_uses[self]
     }
 }

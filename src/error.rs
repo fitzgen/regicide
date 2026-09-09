@@ -212,13 +212,6 @@ pub enum Error {
         max: usize,
     },
 
-    /// A register bank was declared with a register size that is not a power of
-    /// two.
-    BadRegBankSize {
-        /// The size, in bytes, that was given.
-        size: u16,
-    },
-
     /// A machine description named a register bank that was never declared.
     UnknownRegBank {
         /// The undeclared [`RegBank`].
@@ -487,12 +480,6 @@ impl fmt::Debug for Error {
             }
             Self::MachineCapacityExceeded { what, max } => {
                 write!(f, "a machine may have at most {max} {what}")
-            }
-            Self::BadRegBankSize { size } => {
-                write!(
-                    f,
-                    "a register bank's size of {size} bytes is not a power of two"
-                )
             }
             Self::UnknownRegBank { bank } => write!(f, "{bank:?} was never declared"),
             Self::BadRegUnitRange { reg } => {

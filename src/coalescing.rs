@@ -401,7 +401,6 @@ where
 pub(crate) fn coalesce<E>(
     context: &mut ContextInner<E>,
     input: &Input<'_, impl InputFunction>,
-    output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -413,6 +412,7 @@ where
         region_tree,
         live_ranges,
         coalescing,
+        output,
         ..
     } = context;
 
@@ -887,35 +887,40 @@ mod tests {
         vec::Vec,
     };
 
+    /// Run every analysis that coalescing depends on.
+    fn analyze(context: &mut ContextInner<u32>, input: &Input<'_, TestFunction>) -> IResult<()> {
+        let ContextInner {
+            counts,
+            rpo,
+            region_tree,
+            liveness,
+            live_ranges,
+            dfs,
+            output,
+            ..
+        } = context;
+        let func = input.func;
+        rpo.construct(func, dfs, output)?;
+        region_tree.construct(func, counts, dfs, output)?;
+        liveness.construct(func, counts, rpo, output)?;
+        live_ranges.construct(input, counts, liveness, output)
+    }
+
     /// Run every analysis up through coalescing.
     fn coalesce_input(test_input: &TestInput) -> Result<Context, String> {
         let mut context = Context::new();
-        let mut output = OutputInner::<u32>::new();
         assert!(context.is_reset());
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let context = &mut context.context32;
-            let func = input.func;
-            context.rpo.construct(func, &mut context.dfs, &mut output)?;
-            context.region_tree.construct(
-                func,
-                &mut context.counts,
-                &mut context.dfs,
-                &mut output,
-            )?;
-            context
-                .liveness
-                .construct(func, &mut context.counts, &context.rpo, &mut output)?;
-            context.live_ranges.construct(
-                input,
-                &mut context.counts,
-                &mut context.liveness,
-                &mut output,
-            )?;
-            coalesce(context, input, &mut output)
+            analyze(context, input)?;
+            coalesce(context, input)
         });
         if result.is_err() {
-            return Err(format!("coalescing failed: {:?}", output.take_error()));
+            return Err(format!(
+                "coalescing failed: {:?}",
+                context.context32.output.take_error()
+            ));
         }
 
         Ok(context)

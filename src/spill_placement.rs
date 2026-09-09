@@ -73,7 +73,6 @@ use alloc::vec::Vec;
 pub(crate) fn place_spills<E>(
     context: &mut ContextInner<E>,
     input: &Input<'_, impl InputFunction>,
-    output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -83,15 +82,12 @@ where
     let ContextInner {
         counts,
         rpo,
-        region_tree: _,
-        liveness: _,
         live_ranges,
-        dfs: _,
-        coalescing: _,
         region_allocation,
         spill_slots,
         spill_placement,
-        move_generation: _,
+        output,
+        ..
     } = context;
 
     spill_placement.place(
@@ -667,36 +663,35 @@ mod tests {
     /// has; there are no spills to check in that case.
     fn place(test_input: &TestInput) -> Result<Option<Context>, String> {
         let mut context = Context::new();
-        let mut output = OutputInner::<u32>::new();
         assert!(context.is_reset());
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let context = &mut context.context32;
-            let func = input.func;
-            context.rpo.construct(func, &mut context.dfs, &mut output)?;
-            context.region_tree.construct(
-                func,
-                &mut context.counts,
-                &mut context.dfs,
-                &mut output,
-            )?;
-            context
-                .liveness
-                .construct(func, &mut context.counts, &context.rpo, &mut output)?;
-            context.live_ranges.construct(
-                input,
-                &mut context.counts,
-                &mut context.liveness,
-                &mut output,
-            )?;
-            crate::coalescing::coalesce(context, input, &mut output)?;
-            crate::region_allocation::region_allocate(context, input, &mut output)?;
-            crate::spill_slot_allocation::allocate_spill_slots(context, input, &mut output)?;
-            place_spills(context, input, &mut output)
+            {
+                let ContextInner {
+                    counts,
+                    rpo,
+                    region_tree,
+                    liveness,
+                    live_ranges,
+                    dfs,
+                    output,
+                    ..
+                } = &mut *context;
+                let func = input.func;
+                rpo.construct(func, dfs, output)?;
+                region_tree.construct(func, counts, dfs, output)?;
+                liveness.construct(func, counts, rpo, output)?;
+                live_ranges.construct(input, counts, liveness, output)?;
+            }
+            crate::coalescing::coalesce(context, input)?;
+            crate::region_allocation::region_allocate(context, input)?;
+            crate::spill_slot_allocation::allocate_spill_slots(context, input)?;
+            place_spills(context, input)
         });
 
         if result.is_err() {
-            return match output.take_error() {
+            return match context.context32.output.take_error() {
                 // Not every function can be allocated on every machine, and
                 // that is not this pass's problem.
                 InternalError::Error(Error::TooManyLiveRegs) => Ok(None),
