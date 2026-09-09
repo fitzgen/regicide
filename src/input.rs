@@ -26,7 +26,7 @@ where
 }
 
 /// Register allocation options.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub struct InputOptions {
     /// Should the register allocator check that the given input is valid?
     ///
@@ -40,6 +40,10 @@ pub struct InputOptions {
     ///
     /// This option is enabled by default when `cfg!(debug_assertions)`.
     pub validate_input: bool,
+
+    /// How much effort should the register allocator put into identifying and
+    /// eliminating redundant moves?
+    pub move_elimination_level: MoveEliminationLevel,
 }
 
 impl Default for InputOptions {
@@ -53,8 +57,24 @@ impl InputOptions {
     pub const fn new() -> Self {
         Self {
             validate_input: cfg!(debug_assertions),
+            move_elimination_level: MoveEliminationLevel::Global,
         }
     }
+}
+
+/// The level of redundant-move elimination to perform.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum MoveEliminationLevel {
+    /// Do not spend time identifying and eliminating redundant moves.
+    None,
+
+    /// Perform a single pass of redundant-move elimination, which can only
+    /// remove redundant moves locally within a basic block.
+    Local,
+
+    /// Remove redundant moves in a global fixed point loop.
+    #[default]
+    Global,
 }
 
 /// The constraints describing where an operand may be located.

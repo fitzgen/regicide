@@ -993,6 +993,10 @@ mod tests {
 
     /// The property check really does see spilled block parameters of merge
     /// blocks, which is the case the placement is easiest to get wrong in.
+    ///
+    /// This samples the same number of inputs as the property check itself: a
+    /// spilled merge-block parameter is rare enough that a tenth of that budget
+    /// can miss it entirely, depending on where the mutator's seed lands.
     #[test]
     fn random_inputs_spill_merge_block_parameters() -> CheckResult<TestInput> {
         static SPILLS: AtomicUsize = AtomicUsize::new(0);
@@ -1000,7 +1004,7 @@ mod tests {
 
         let result =
             Check::new()
-                .iters(1_000)
+                .iters(10_000)
                 .run(|test_input: &TestInput| -> Result<(), String> {
                     let Some(context) = place(test_input)? else {
                         return Ok(());

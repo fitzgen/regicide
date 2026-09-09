@@ -193,7 +193,7 @@ where
     spill_slot_allocation::allocate_spill_slots(context, input, output)?;
     spill_placement::place_spills(context, input, output)?;
     move_generation::generate_moves(context, input, output)?;
-    move_elimination::eliminate_moves(context, input.func)?;
+    move_elimination::eliminate_moves(context, input, output)?;
 
     output.construct(context, input.func)?;
 

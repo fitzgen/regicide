@@ -12,7 +12,10 @@ use crate::{
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
     entity::{Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SccBlockIndex, SecondaryMap},
-    input::{BlockFrequency, DefUse, Input, InputOptions, OperandConstraint, Position, RematCost},
+    input::{
+        BlockFrequency, DefUse, Input, InputOptions, MoveEliminationLevel, OperandConstraint,
+        Position, RematCost,
+    },
     live_ranges::{LiveBundle, LiveSpan, MAX_OPERANDS_PER_INST},
     output::OutputInner,
     spill_slot_allocation::SpillSlot,
@@ -127,6 +130,15 @@ fn gen_operand_constraint(ctx: &mut mutatis::Context) -> mutatis::Result<Operand
             let index = ctx.rng().gen_index(MAX_OPERANDS_PER_INST).unwrap();
             OperandConstraint::Reuse(index)
         }
+    })
+}
+
+/// Generate a level of redundant-move elimination.
+fn gen_move_elimination_level(ctx: &mut mutatis::Context) -> mutatis::Result<MoveEliminationLevel> {
+    Ok(match ctx.rng().gen_index(3).unwrap() {
+        0 => MoveEliminationLevel::None,
+        1 => MoveEliminationLevel::Local,
+        _ => MoveEliminationLevel::Global,
     })
 }
 
@@ -1677,6 +1689,7 @@ impl DefaultMutate for TestMachine {
 /// allocate registers in.
 #[derive(Clone, Debug, Hash)]
 pub struct TestInput {
+    pub options: InputOptions,
     pub machine: TestMachine,
     pub func: TestFunction,
 }
@@ -1684,6 +1697,7 @@ pub struct TestInput {
 impl Default for TestInput {
     fn default() -> Self {
         let mut input = TestInput {
+            options: InputOptions::default(),
             machine: TestMachine::default(),
             func: TestFunction::default(),
         };
@@ -1856,7 +1870,11 @@ impl TestInput {
             )
             .unwrap();
 
-        let mut input = TestInput { machine, func };
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine,
+            func,
+        };
         input.fixup();
         input
     }
@@ -1938,6 +1956,7 @@ impl TestInput {
             .unwrap();
 
         let mut input = TestInput {
+            options: InputOptions::default(),
             machine: TestMachine::two_registers(),
             func,
         };
@@ -2069,6 +2088,7 @@ impl TestInput {
         }
 
         let mut input = TestInput {
+            options: InputOptions::default(),
             machine: TestMachine::two_registers(),
             func,
         };
@@ -2193,6 +2213,7 @@ impl TestInput {
         }
 
         let mut input = TestInput {
+            options: InputOptions::default(),
             machine: TestMachine::two_registers(),
             func,
         };
@@ -2305,6 +2326,7 @@ impl TestInput {
         }
 
         let mut input = TestInput {
+            options: InputOptions::default(),
             machine: TestMachine::two_registers(),
             func,
         };
@@ -2317,13 +2339,64 @@ impl TestInput {
     /// The `Machine` has to be built to be borrowed, hence the callback.
     pub fn with_input<R>(&self, f: impl FnOnce(&Input<'_, TestFunction>) -> R) -> R {
         let machine = self.machine.build();
-        let options = InputOptions::default();
         f(&Input {
-            options: &options,
+            options: &self.options,
             machine: &machine,
             func: &self.func,
         })
     }
+}
+
+/// A mutator for `InputOptions`.
+///
+/// Only the move-elimination level is mutated: `TestInput::fixup` guarantees
+/// that the input is valid, so turning `validate_input` off would only lose
+/// coverage of the validator.
+#[derive(Default)]
+pub struct InputOptionsMutator {}
+
+impl Mutate<InputOptions> for InputOptionsMutator {
+    fn mutate(
+        &mut self,
+        mutations: &mut mutatis::Candidates<'_>,
+        options: &mut InputOptions,
+    ) -> mutatis::Result<()> {
+        mutations.mutation(|ctx| {
+            options.move_elimination_level = if ctx.shrink() {
+                // Doing less move elimination is the simpler test case, so
+                // shrink towards `None`.
+                match options.move_elimination_level {
+                    MoveEliminationLevel::None => {
+                        return Err(mutatis::error::Error::exhausted());
+                    }
+                    MoveEliminationLevel::Local => MoveEliminationLevel::None,
+                    MoveEliminationLevel::Global => {
+                        if ctx.rng().gen_bool() {
+                            MoveEliminationLevel::None
+                        } else {
+                            MoveEliminationLevel::Local
+                        }
+                    }
+                }
+            } else {
+                gen_move_elimination_level(ctx)?
+            };
+            Ok(())
+        })
+    }
+}
+
+impl Generate<InputOptions> for InputOptionsMutator {
+    fn generate(&mut self, ctx: &mut mutatis::Context) -> mutatis::Result<InputOptions> {
+        Ok(InputOptions {
+            move_elimination_level: gen_move_elimination_level(ctx)?,
+            ..InputOptions::default()
+        })
+    }
+}
+
+impl DefaultMutate for InputOptions {
+    type DefaultMutate = InputOptionsMutator;
 }
 
 #[derive(Default)]
@@ -2336,6 +2409,7 @@ impl Mutate<TestInput> for TestInputMutator {
         input: &mut TestInput,
     ) -> mutatis::Result<()> {
         let result = (|| -> mutatis::Result<()> {
+            InputOptionsMutator::default().mutate(mutations, &mut input.options)?;
             TestMachineMutator::default().mutate(mutations, &mut input.machine)?;
             TestFunctionMutator::default().mutate(mutations, &mut input.func)?;
             Ok(())
@@ -2349,6 +2423,7 @@ impl Mutate<TestInput> for TestInputMutator {
 impl Generate<TestInput> for TestInputMutator {
     fn generate(&mut self, context: &mut mutatis::Context) -> mutatis::Result<TestInput> {
         let mut input = TestInput {
+            options: InputOptionsMutator::default().generate(context)?,
             machine: TestMachineMutator::default().generate(context)?,
             func: TestFunctionMutator::default().generate(context)?,
         };
@@ -2464,6 +2539,41 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    /// A `TestInput` asks for a level of move elimination, and `with_input`
+    /// hands whichever one it holds down to the allocator.
+    #[test]
+    fn with_input_reports_the_move_elimination_level() {
+        let mut input = TestInput::default();
+        assert_eq!(
+            input.options.move_elimination_level,
+            InputOptions::default().move_elimination_level,
+        );
+
+        for level in [
+            MoveEliminationLevel::None,
+            MoveEliminationLevel::Local,
+            MoveEliminationLevel::Global,
+        ] {
+            input.options.move_elimination_level = level;
+            input.with_input(|input| assert_eq!(input.options.move_elimination_level, level));
+        }
+    }
+
+    /// `InputOptionsMutator` really does vary the move-elimination level, so
+    /// that the checks which generate `TestInput`s exercise all of them.
+    #[test]
+    fn generates_every_move_elimination_level() {
+        let mut session = mutatis::Session::new().seed(0);
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            let options: InputOptions = session.generate().unwrap();
+            if !seen.contains(&options.move_elimination_level) {
+                seen.push(options.move_elimination_level);
+            }
+        }
+        assert_eq!(seen.len(), 3, "only generated {seen:?}");
     }
 
     /// Every machine that `TestMachine` can describe is one that
