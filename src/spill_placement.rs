@@ -648,11 +648,15 @@ mod tests {
         test::{TestInput, TestMachine},
     };
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{
         collections::{BTreeMap, BTreeSet},
         format,
         string::String,
+        vec,
         vec::Vec,
     };
 
@@ -703,18 +707,51 @@ mod tests {
         Ok(Some(context))
     }
 
+    /// What a run of the property check below saw, so that it can tell whether
+    /// its inputs ever reached the cases it is meant to be about.
+    #[derive(Default)]
+    struct Seen {
+        spills: usize,
+        merge_param_spills: usize,
+    }
+
+    /// The inputs the property check starts from.
+    fn seeds() -> Vec<TestInput> {
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
+        vec![
+            TestInput::default(),
+            // A merge block's parameter that spills: the spill has to land in
+            // the block itself, not on one of the edges into it.
+            TestInput::with_spilled_merge_param(),
+            TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
+            TestInput::with_use_constraints(&[OperandConstraint::Stack]),
+            TestInput::with_use_constraints(&[
+                OperandConstraint::Stack,
+                OperandConstraint::Reg(class),
+            ]),
+            TestInput::with_group_use_constraints(&[
+                OperandConstraint::Stack,
+                OperandConstraint::Reg(group_class),
+            ]),
+            TestInput::with_reuse_def(OperandConstraint::Any),
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
+            TestInput::with_stack_param_and_arg(),
+        ]
+    }
+
     /// Place the spills for `test_input` and check every property the placement
     /// is supposed to have.
     ///
     /// The dominance oracle is the test harness's own dominator tree, and the
     /// definitions are read back out of the operands, so neither is the pass's
     /// own bookkeeping repeated back at itself.
-    fn check_placement(test_input: &TestInput) -> Result<(), String> {
+    fn check_placement(test_input: &TestInput) -> Result<Seen, String> {
         let Some(mut context) = place(test_input)? else {
-            return Ok(());
+            return Ok(Seen::default());
         };
 
-        test_input.with_input(|input| -> Result<(), String> {
+        let seen = test_input.with_input(|input| -> Result<Seen, String> {
             let ctx = &context.context32;
             let func = input.func;
             let live_ranges = &ctx.live_ranges;
@@ -883,7 +920,23 @@ mod tests {
                 }
             }
 
-            Ok(())
+            // Not a property of the pass, but of the inputs: the counts that
+            // let the property check say its inputs were not all trivial.
+            let mut seen = Seen {
+                spills: ctx.spill_placement.spills().len(),
+                merge_param_spills: 0,
+            };
+            for &site in ctx.spill_placement.spills() {
+                let val = site.val(live_ranges);
+                let merge_param = func.blocks().any(|(_, block)| {
+                    block.len_predecessors() > 1 && block.params().any(|param| param == val)
+                });
+                if merge_param {
+                    seen.merge_param_spills += 1;
+                }
+            }
+
+            Ok(seen)
         })?;
 
         // Property 8: the pass leaves nothing behind that a reset does not
@@ -891,7 +944,7 @@ mod tests {
         context.reset();
         assert!(context.is_reset());
 
-        Ok(())
+        Ok(seen)
     }
 
     /// Running the whole pipeline, up to and including this pass, never panics
@@ -906,37 +959,43 @@ mod tests {
             })
     }
 
+    /// The placement has every property it is supposed to have. The counters
+    /// make sure the inputs really reached the cases those properties are
+    /// about, so that a run that checks nothing cannot pass.
+    ///
+    /// The counting happens inside this check rather than in a check of its
+    /// own: a separate check is a separate random walk, and its coverage would
+    /// say nothing about the inputs *this* one saw.
     #[test]
     fn spill_placement_properties() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(10_000)
-            .run(|test_input: &TestInput| -> Result<(), String> { check_placement(test_input) })
-    }
-
-    /// The property check above is not vacuous: random inputs really do reach
-    /// the point where a spill has to be placed.
-    #[test]
-    fn random_inputs_need_spills() -> CheckResult<TestInput> {
         static SPILLS: AtomicUsize = AtomicUsize::new(0);
+        static MERGE_PARAM_SPILLS: AtomicUsize = AtomicUsize::new(0);
         SPILLS.store(0, Ordering::Relaxed);
+        MERGE_PARAM_SPILLS.store(0, Ordering::Relaxed);
 
-        let result =
-            Check::new()
-                .iters(1_000)
-                .run(|test_input: &TestInput| -> Result<(), String> {
-                    if let Some(context) = place(test_input)? {
-                        let placed = context.context32.spill_placement.spills().len();
-                        SPILLS.fetch_add(placed, Ordering::Relaxed);
-                    }
-                    Ok(())
-                });
+        let result = Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            seeds(),
+            |test_input: &TestInput| -> Result<(), String> {
+                let seen = check_placement(test_input)?;
+                SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
+                MERGE_PARAM_SPILLS.fetch_add(seen.merge_param_spills, Ordering::Relaxed);
+                Ok(())
+            },
+        );
 
         if result.is_ok() {
-            assert!(
-                SPILLS.load(Ordering::Relaxed) > 0,
-                "no random input needed a spill, so the placement properties are vacuous",
-            );
+            for (what, counter) in [
+                ("spill", &SPILLS),
+                ("spilled parameter of a merge block", &MERGE_PARAM_SPILLS),
+            ] {
+                assert!(
+                    counter.load(Ordering::Relaxed) > 0,
+                    "no input produced a {what}, so the placement properties are vacuous",
+                );
+            }
         }
+
         result
     }
 
@@ -989,51 +1048,6 @@ mod tests {
                 "the spill belongs at the merge block\'s entry, not on an edge into it",
             );
         });
-    }
-
-    /// The property check really does see spilled block parameters of merge
-    /// blocks, which is the case the placement is easiest to get wrong in.
-    ///
-    /// This samples the same number of inputs as the property check itself: a
-    /// spilled merge-block parameter is rare enough that a tenth of that budget
-    /// can miss it entirely, depending on where the mutator's seed lands.
-    #[test]
-    fn random_inputs_spill_merge_block_parameters() -> CheckResult<TestInput> {
-        static SPILLS: AtomicUsize = AtomicUsize::new(0);
-        SPILLS.store(0, Ordering::Relaxed);
-
-        let result =
-            Check::new()
-                .iters(10_000)
-                .run(|test_input: &TestInput| -> Result<(), String> {
-                    let Some(context) = place(test_input)? else {
-                        return Ok(());
-                    };
-                    test_input.with_input(|input| {
-                        let ctx = &context.context32;
-                        let live_ranges = &ctx.live_ranges;
-                        for &site in ctx.spill_placement.spills() {
-                            let val = site.val(live_ranges);
-                            let merge_param = input.func.blocks().any(|(_, block)| {
-                                block.len_predecessors() > 1
-                                    && block.params().any(|param| param == val)
-                            });
-                            if merge_param {
-                                SPILLS.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    });
-                    Ok(())
-                });
-
-        if result.is_ok() {
-            assert!(
-                SPILLS.load(Ordering::Relaxed) > 0,
-                "no random input spilld a merge block\'s parameter, so the properties say \
-                 nothing about that case",
-            );
-        }
-        result
     }
 
     /// A value whose only use must be on the stack is written straight into its
