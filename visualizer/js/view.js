@@ -222,13 +222,18 @@ function buildFunction(outline) {
   const style = getComputedStyle(pane);
   const lineHeight = parseFloat(style.getPropertyValue("--line-height"));
   const barWidth = parseFloat(style.getPropertyValue("--bar-width"));
-  let columns = 0;
+
+  // Counted up front, because the columns are laid out right to left: the
+  // first column sits against the text it describes, where the eye already
+  // is, and later columns stack away from it.
+  const columns = outline.bars.reduce((n, bar) => Math.max(n, bar.column + 1), 0);
+
   for (const bar of outline.bars) {
     const el = document.createElement("div");
     el.className = "bar";
     el.style.top = bar.startRow * lineHeight + "px";
     el.style.height = (bar.endRow - bar.startRow + 1) * lineHeight + "px";
-    el.style.left = bar.column * barWidth + "px";
+    el.style.left = (columns - 1 - bar.column) * barWidth + "px";
     // A span that never reached a bundle has no color of its own.
     el.style.background = bar.bundle === null ? "var(--fg-dim)" : bundleColor(bar.bundle.index);
     const label = document.createElement("span");
@@ -239,7 +244,6 @@ function buildFunction(outline) {
     spanBundles.set(entityKey(bar.span), bar.bundle);
     barLayer.append(el);
     bars.push({ el, bundle: bar.bundle });
-    columns = Math.max(columns, bar.column + 1);
   }
 
   barLayer.style.width = columns * barWidth + "px";
