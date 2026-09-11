@@ -22,7 +22,7 @@ use crate::{
     live_ranges::{LiveBundle, LivePoint, LiveSpan, Use},
     machine::{Machine, Reg, RegBank, RegClass, RegClassMembers, RegGroup, RegSet},
     move_generation::MovePosition,
-    output::{Edit, RegAllocation},
+    output::{Allocation, Edit, RegAllocation},
     spill_slot_allocation::{SpillSlot, SpillSlotGroup},
 };
 use alloc::vec::Vec;
@@ -400,6 +400,16 @@ where
     /// The bundle it was placed in, or `null` if it never reached one.
     bundle: Option<LiveBundle<E>>,
 
+    /// Where its value lives over it: its bundle's register, or the value's
+    /// stack home when the bundle was spilled. `null` when it reached no
+    /// bundle, which is the only case with nowhere to be.
+    ///
+    /// The function pane draws every value as `v3[r1]`, and this is the only
+    /// place that pairing is decided -- a page that walked from a span to its
+    /// bundle to the spill slots itself would have to duplicate
+    /// `LiveSpan::allocation`.
+    allocation: Option<Allocation<E>>,
+
     /// Its uses, in ascending program order.
     uses: Vec<Use<E>>,
 
@@ -613,15 +623,20 @@ where
             });
         }
 
-        let spans = Vec::from_iter(live_ranges.spans().map(|span| SpanInfo {
-            val: span.val(live_ranges),
-            start: span.start(live_ranges),
-            end: span.end(live_ranges),
-            block: span.block(func, live_ranges),
-            bundle: span.bundle(live_ranges),
-            uses: Vec::from_iter(span.uses(live_ranges)),
-            constraint: span.constraint(live_ranges, input),
-            parent: indexes.span_parent(span),
+        let spans = Vec::from_iter(live_ranges.spans().map(|span| {
+            SpanInfo {
+                val: span.val(live_ranges),
+                start: span.start(live_ranges),
+                end: span.end(live_ranges),
+                block: span.block(func, live_ranges),
+                bundle: span.bundle(live_ranges),
+                allocation: span
+                    .bundle(live_ranges)
+                    .map(|_| span.allocation(live_ranges, spill_slots)),
+                uses: Vec::from_iter(span.uses(live_ranges)),
+                constraint: span.constraint(live_ranges, input),
+                parent: indexes.span_parent(span),
+            }
         }));
 
         let bundles = Vec::from_iter(live_ranges.bundles().map(|bundle| BundleInfo {
@@ -827,6 +842,7 @@ pub(crate) const FUNCTION_SCHEMA: Table = &[
             ("end", None),
             ("block", Some(Descriptor::Entity("Block"))),
             ("bundle", Some(Descriptor::Entity("LiveBundle"))),
+            ("allocation", Some(schema::ALLOCATION)),
             ("uses", Some(Descriptor::List(&Descriptor::Entity("Use")))),
             ("constraint", Some(schema::CONSTRAINT)),
             ("parent", Some(SPAN_PARENT)),

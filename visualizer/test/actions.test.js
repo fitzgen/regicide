@@ -40,12 +40,14 @@ function run(actions, state = initialState()) {
 
 // Every action the page has. Commits 09-12 fill in what they do.
 const ACTIONS = [
+  { type: "loaded" },
   { type: "selectTab", tab: "events" },
   { type: "clickEntity", ref: V3 },
   { type: "clickBreadcrumb", index: 0 },
   { type: "search", query: "Bundle" },
   { type: "queryResult", id: 0, method: "details", result: details(V3) },
   { type: "queryResult", id: 0, method: "searchEvents", result: [1, 2] },
+  { type: "queryResult", id: 0, method: "functionOutline", result: { lines: [], bars: [] } },
   { type: "queryResult", id: 0, method: "details", error: "boom" },
   { type: "hoverSpan", ref: SPAN0 },
   { type: "unhoverSpan" },
@@ -245,4 +247,60 @@ test("an error comes back as state, not as a throw", () => {
   }).state;
   assert.equal(state.error, "boom");
   assert.deepEqual(state.details, {});
+});
+
+test("hovering a span highlights its whole bundle", () => {
+  // The view knows which bar the pointer is over; which bundle that bar
+  // belongs to is the outline's business, so the action carries only the span.
+  const outline = {
+    lines: [],
+    bars: [
+      { span: SPAN0, bundle: BUNDLE4 },
+      { span: { kind: "LiveSpan", index: 1 }, bundle: null },
+    ],
+  };
+  const loaded = { ...initialState(), outline };
+
+  const hovered = run([{ type: "hoverSpan", ref: { ...SPAN0 } }], loaded).state;
+  assert.deepEqual(hovered.hoveredBundle, BUNDLE4, "a fresh ref for the same span missed");
+
+  assert.equal(run([{ type: "unhoverSpan" }], hovered).state.hoveredBundle, null);
+
+  // A span that reached no bundle, and a span with no bar at all, both leave
+  // nothing highlighted rather than throwing.
+  for (const index of [1, 99]) {
+    const ref = { kind: "LiveSpan", index };
+    assert.equal(run([{ type: "hoverSpan", ref }], loaded).state.hoveredBundle, null, "span" + index);
+  }
+  assert.equal(run([{ type: "hoverSpan", ref: SPAN0 }]).state.hoveredBundle, null, "no outline");
+});
+
+test("the outline arrives once the blob has loaded", () => {
+  // The load response is not a query result, so `loaded` is what starts the
+  // page: nothing else would ever ask for the function pane.
+  const first = run([{ type: "loaded" }]);
+  assert.deepEqual(first.queries, [{ id: 0, method: "functionOutline", args: [] }]);
+  assert.equal(first.state.outline, null, "the outline was invented before it arrived");
+
+  const outline = { lines: [], bars: [] };
+  const done = run(
+    [{ type: "queryResult", id: 0, method: "functionOutline", result: outline }],
+    first.state,
+  ).state;
+  assert.equal(done.outline, outline);
+  assert.deepEqual(done.pending, {});
+});
+
+test("clicking an entity in the function pane walks the breadcrumbs", () => {
+  // The function pane's click is commit 08's `clickEntity`, unchanged: a span
+  // bar and a value in a line go through the same handler.
+  const { state, queries } = run([
+    { type: "clickEntity", ref: V3 },
+    { type: "clickEntity", ref: SPAN0 },
+  ]);
+  assert.deepEqual(state.breadcrumbs, [V3, SPAN0]);
+  assert.equal(state.activeBreadcrumb, 1);
+  assert.deepEqual(state.scrollToEntity, SPAN0);
+  assert.equal(state.pendingDetails, entityKey(SPAN0));
+  assert.deepEqual(queries, [{ id: 1, method: "details", args: [SPAN0] }]);
 });

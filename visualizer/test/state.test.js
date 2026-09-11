@@ -14,7 +14,8 @@ test("initialState has the documented shape", () => {
   assert.deepEqual(state.detailsOrder, []);
   assert.equal(state.pendingDetails, null);
   assert.deepEqual(state.search, { query: "", results: [], pending: false });
-  assert.equal(state.hover, null);
+  assert.equal(state.outline, null);
+  assert.equal(state.hoveredBundle, null);
   assert.equal(state.scrollToEntity, null);
   assert.equal(state.scrollToHistogram, null);
   assert.deepEqual(state.pending, {});

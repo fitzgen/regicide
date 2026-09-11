@@ -588,6 +588,17 @@ mod tests {
             ),
             ("critical-edge", TestInput::with_a_critical_edge),
             ("spilled-merge-param", TestInput::with_spilled_merge_param),
+            // The one prefix the other fixtures cannot show: a real allocation
+            // over blocks the embedder called cold, hot, and merely unusual.
+            ("block-kinds", || {
+                let mut test = TestInput::with_spilled_merge_param();
+                use crate::entity::{Block, Entity};
+                let block = |i| Block::try_new(i).expect("a block index");
+                test.set_block_frequency(block(1), crate::input::BlockFrequency::COLD);
+                test.set_block_frequency(block(2), crate::input::BlockFrequency::HOT);
+                test.set_block_frequency(block(3), crate::input::BlockFrequency::new(0.5));
+                test
+            }),
         ];
 
         let bless = std::env::var_os("REGICIDE_BLESS_FIXTURE").is_some();

@@ -70,6 +70,7 @@ function loaded(message) {
     return;
   }
   installEntities(result.entityKinds);
+  dispatch({ type: "loaded" });
   const { blocks, insts, events } = result.summary;
   summary.textContent = blocks + " blocks, " + insts + " insts, " + events + " events";
 }

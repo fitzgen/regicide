@@ -976,6 +976,9 @@
     ],
     "spans": [
       {
+        "allocation": {
+          "reg": 1
+        },
         "block": 0,
         "bundle": 0,
         "constraint": {
@@ -996,6 +999,9 @@
         "val": 0
       },
       {
+        "allocation": {
+          "reg": 4
+        },
         "block": 0,
         "bundle": 1,
         "constraint": {
@@ -1016,6 +1022,9 @@
         "val": 1
       },
       {
+        "allocation": {
+          "slot": 0
+        },
         "block": 0,
         "bundle": 2,
         "constraint": "stack",
@@ -1034,6 +1043,9 @@
         "val": 0
       },
       {
+        "allocation": {
+          "slot": 1
+        },
         "block": 0,
         "bundle": 3,
         "constraint": "stack",
@@ -1052,6 +1064,9 @@
         "val": 1
       },
       {
+        "allocation": {
+          "reg": 1
+        },
         "block": 0,
         "bundle": 4,
         "constraint": {
@@ -1072,6 +1087,9 @@
         "val": 0
       },
       {
+        "allocation": {
+          "reg": 4
+        },
         "block": 0,
         "bundle": 5,
         "constraint": {
@@ -2714,6 +2732,12 @@
         "parent": "Region"
       },
       "spans": {
+        "allocation": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
         "block": "Block",
         "bundle": "LiveBundle",
         "constraint": {

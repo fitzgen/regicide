@@ -46,8 +46,13 @@ export function initialState() {
     // The event log tab.
     search: { query: "", results: [], pending: false },
 
-    // The span the pointer is over, which commit 09 dims the others for.
-    hover: null,
+    // The function pane, as `model.js` rendered it, or `null` until the load
+    // response has come back and the outline query it starts has answered.
+    outline: null,
+
+    // The bundle of the span the pointer is over. A bundle, not a span: the
+    // highlight is bundle-wide, which is also why it cannot be a CSS `:hover`.
+    hoveredBundle: null,
 
     // Queries sent but not yet answered, by id.
     pending: {},

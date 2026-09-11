@@ -693,6 +693,9 @@
     ],
     "spans": [
       {
+        "allocation": {
+          "reg": 1
+        },
         "block": 0,
         "bundle": 0,
         "constraint": {
@@ -714,6 +717,9 @@
         "val": 0
       },
       {
+        "allocation": {
+          "reg": 0
+        },
         "block": 1,
         "bundle": 1,
         "constraint": {
@@ -734,6 +740,9 @@
         "val": 0
       },
       {
+        "allocation": {
+          "reg": 1
+        },
         "block": 1,
         "bundle": 2,
         "constraint": "any",
@@ -752,6 +761,9 @@
         "val": 1
       },
       {
+        "allocation": {
+          "reg": 0
+        },
         "block": 2,
         "bundle": 1,
         "constraint": {
@@ -2222,6 +2234,12 @@
         "parent": "Region"
       },
       "spans": {
+        "allocation": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
         "block": "Block",
         "bundle": "LiveBundle",
         "constraint": {

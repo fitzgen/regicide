@@ -5,7 +5,7 @@
 // mutated. `queries` is what the glue posts to the worker; a response comes
 // back in as another action.
 
-import { entityKey } from "./entities.js";
+import { entityKey, sameEntity } from "./entities.js";
 
 // How many details results to keep. A user walking a long trail accumulates
 // one per distinct entity, and each holds a whole pane's worth of fields.
@@ -19,6 +19,12 @@ const DETAILS_CACHE_SIZE = 50;
 // result would be guesswork.
 export function handleAction(state, action) {
   switch (action.type) {
+    case "loaded":
+      // The blob is readable, so the function pane can be asked for. The load
+      // response itself is not a query result -- it settles whether the page
+      // can show anything at all -- so this is where the page starts.
+      return query(state, "functionOutline", []);
+
     case "selectTab":
       // The tab and nothing else: the other tabs' state survives a round trip
       // away and back, which is what a user expects after checking the event
@@ -54,6 +60,8 @@ export function handleAction(state, action) {
       switch (action.method) {
         case "details":
           return done(cacheDetails(next, action.result));
+        case "functionOutline":
+          return done({ ...next, outline: action.result });
         case "searchEvents":
           return done({
             ...next,
@@ -65,10 +73,12 @@ export function handleAction(state, action) {
     }
 
     case "hoverSpan":
-      return done({ ...state, hover: action.ref });
+      // The view hands over a span; the bundle it belongs to is what the
+      // highlight is keyed by, and the outline already knows which that is.
+      return done({ ...state, hoveredBundle: bundleOf(state.outline, action.ref) });
 
     case "unhoverSpan":
-      return done({ ...state, hover: null });
+      return done({ ...state, hoveredBundle: null });
 
     case "scrollToHistogram":
       return done({ ...state, scrollToHistogram: action.id });
@@ -118,6 +128,12 @@ function cacheDetails(state, result) {
     // Only the query this answers: another is still in flight.
     pendingDetails: state.pendingDetails === key ? null : state.pendingDetails,
   };
+}
+
+// The bundle a span was placed in, or `null` for a span that reached none.
+function bundleOf(outline, span) {
+  const bar = (outline ? outline.bars : []).find((bar) => sameEntity(bar.span, span));
+  return bar === undefined ? null : bar.bundle;
 }
 
 // A state change with nothing to ask the worker.
