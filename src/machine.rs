@@ -305,9 +305,12 @@ impl RegGroup {
 
     /// This register group's associated register bank.
     #[inline]
-    #[expect(
-        dead_code,
-        reason = "the sibling of Reg::bank and RegClass::bank, kept for symmetry"
+    #[cfg_attr(
+        not(feature = "visualizer"),
+        expect(
+            dead_code,
+            reason = "the sibling of Reg::bank and RegClass::bank, kept for symmetry"
+        )
     )]
     pub(crate) fn bank(self, machine: &Machine) -> RegBank {
         machine.groups[self].bank
@@ -413,9 +416,16 @@ impl RegBank {
 
     /// The set of registers that belong to this register bank.
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
+    #[cfg(any(test, feature = "visualizer"))]
     pub(crate) fn registers(self, machine: &Machine) -> &RegSet {
         &machine.banks[self].registers
+    }
+
+    /// The subset of [`RegBank::registers`] that may never be allocated.
+    #[inline]
+    #[cfg(feature = "visualizer")]
+    pub(crate) fn non_allocatable(self, machine: &Machine) -> &RegSet {
+        &machine.banks[self].non_allocatable
     }
 
     /// The subset of `self.registers(machine)` that may be borrowed as a
@@ -552,7 +562,6 @@ pub struct Machine {
     registers: PrimaryMap<Reg, RegDef>,
     groups: PrimaryMap<RegGroup, RegGroupDef>,
     classes: PrimaryMap<RegClass, RegClassDef>,
-    #[allow(dead_code, reason = "will probably need it")]
     banks: PrimaryMap<RegBank, RegBankDef>,
 
     /// For each pair of register classes, the class whose members are the
@@ -585,6 +594,30 @@ impl Machine {
     #[inline]
     pub(crate) fn num_user_classes(&self) -> usize {
         self.num_user_classes
+    }
+}
+
+/// Walking the whole register file, which only the visualizer does.
+#[cfg(feature = "visualizer")]
+impl Machine {
+    /// Every register, in index order.
+    pub(crate) fn regs(&self) -> impl ExactSizeIterator<Item = Reg> {
+        self.registers.keys()
+    }
+
+    /// Every register group, in index order.
+    pub(crate) fn reg_groups(&self) -> impl ExactSizeIterator<Item = RegGroup> {
+        self.groups.keys()
+    }
+
+    /// Every register class, the derived ones included, in index order.
+    pub(crate) fn reg_classes(&self) -> impl ExactSizeIterator<Item = RegClass> {
+        self.classes.keys()
+    }
+
+    /// Every register bank, in index order.
+    pub(crate) fn reg_banks(&self) -> impl ExactSizeIterator<Item = RegBank> {
+        self.banks.keys()
     }
 }
 

@@ -21,7 +21,7 @@ const KINDS = {
   EventIndex: "event",
 };
 
-entities.install(KINDS);
+entities.installEntities(KINDS);
 
 test("entityLabel uses the blob's prefixes", () => {
   assert.equal(entities.entityLabel({ kind: "Val", index: 3 }), "v3");

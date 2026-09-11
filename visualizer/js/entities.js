@@ -20,7 +20,11 @@ let byLongestPrefix = [];
 
 // Install the blob's prefix table. `main.js` and `worker.js` each call this
 // once, with the same table.
-export function install(entityKinds) {
+//
+// The name is qualified because the stitched page concatenates this file with
+// its siblings into one script, where a bare `install` would collide with
+// `view.js`'s.
+export function installEntities(entityKinds) {
   prefixes = { ...entityKinds };
   byLongestPrefix = Object.entries(prefixes)
     // `EventIndex` is an entity type in Rust, but an event is not something to

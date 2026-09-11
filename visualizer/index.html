@@ -8,11 +8,14 @@
 </head>
 <body>
 
-<nav id="tabs" role="tablist" aria-label="Views">
-  <button type="button" role="tab" data-tab="function" aria-selected="true">Function</button>
-  <button type="button" role="tab" data-tab="events" aria-selected="false">Event Log</button>
-  <button type="button" role="tab" data-tab="histograms" aria-selected="false">Histograms</button>
-</nav>
+<header id="topbar">
+  <nav id="tabs" role="tablist" aria-label="Views">
+    <button type="button" role="tab" data-tab="function" aria-selected="true">Function</button>
+    <button type="button" role="tab" data-tab="events" aria-selected="false">Event Log</button>
+    <button type="button" role="tab" data-tab="histograms" aria-selected="false">Histograms</button>
+  </nav>
+  <p id="summary" aria-live="polite">Loading…</p>
+</header>
 
 <main id="panels">
   <section class="panel" data-panel="function" role="tabpanel" aria-label="Function">

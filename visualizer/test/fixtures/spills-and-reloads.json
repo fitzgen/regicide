@@ -1,0 +1,2776 @@
+{
+  "entityKinds": {
+    "Block": "block",
+    "EventIndex": "event",
+    "Inst": "inst",
+    "LiveBundle": "bundle",
+    "LiveSpan": "span",
+    "Reg": "r",
+    "RegBank": "bank",
+    "RegClass": "rc",
+    "RegGroup": "group",
+    "RegUnit": "unit",
+    "Region": "region",
+    "SpillSlot": "stack",
+    "SpillSlotGroup": "stack_group",
+    "Use": "use",
+    "Val": "v"
+  },
+  "events": [
+    {
+      "block": 0,
+      "constraint": {
+        "reg": 4
+      },
+      "end": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "has_fixed_use": false,
+      "kind": "SpanConstructed",
+      "num_uses": 1,
+      "span": 1,
+      "start": {
+        "inst": 1,
+        "pos": "late"
+      },
+      "val": 1
+    },
+    {
+      "at": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "before": 1,
+      "conflicting": "stack",
+      "constraint": {
+        "reg": 4
+      },
+      "kind": "EagerSplit",
+      "val": 1
+    },
+    {
+      "block": 0,
+      "constraint": "stack",
+      "end": {
+        "inst": 3,
+        "pos": "early"
+      },
+      "has_fixed_use": false,
+      "kind": "SpanConstructed",
+      "num_uses": 1,
+      "span": 3,
+      "start": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "val": 1
+    },
+    {
+      "at": {
+        "inst": 3,
+        "pos": "early"
+      },
+      "before": 3,
+      "conflicting": {
+        "reg": 4
+      },
+      "constraint": "stack",
+      "kind": "EagerSplit",
+      "val": 1
+    },
+    {
+      "block": 0,
+      "constraint": {
+        "reg": 4
+      },
+      "end": {
+        "inst": 3,
+        "pos": "late"
+      },
+      "has_fixed_use": false,
+      "kind": "SpanConstructed",
+      "num_uses": 1,
+      "span": 5,
+      "start": {
+        "inst": 3,
+        "pos": "early"
+      },
+      "val": 1
+    },
+    {
+      "block": 0,
+      "constraint": {
+        "reg": 3
+      },
+      "end": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "has_fixed_use": false,
+      "kind": "SpanConstructed",
+      "num_uses": 1,
+      "span": 0,
+      "start": {
+        "inst": 0,
+        "pos": "late"
+      },
+      "val": 0
+    },
+    {
+      "at": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "before": 0,
+      "conflicting": "stack",
+      "constraint": {
+        "reg": 3
+      },
+      "kind": "EagerSplit",
+      "val": 0
+    },
+    {
+      "block": 0,
+      "constraint": "stack",
+      "end": {
+        "inst": 3,
+        "pos": "early"
+      },
+      "has_fixed_use": false,
+      "kind": "SpanConstructed",
+      "num_uses": 1,
+      "span": 2,
+      "start": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "val": 0
+    },
+    {
+      "at": {
+        "inst": 3,
+        "pos": "early"
+      },
+      "before": 2,
+      "conflicting": {
+        "reg": 3
+      },
+      "constraint": "stack",
+      "kind": "EagerSplit",
+      "val": 0
+    },
+    {
+      "block": 0,
+      "constraint": {
+        "reg": 3
+      },
+      "end": {
+        "inst": 3,
+        "pos": "late"
+      },
+      "has_fixed_use": false,
+      "kind": "SpanConstructed",
+      "num_uses": 1,
+      "span": 4,
+      "start": {
+        "inst": 3,
+        "pos": "early"
+      },
+      "val": 0
+    },
+    {
+      "bundle": 0,
+      "constraint": {
+        "reg": 3
+      },
+      "kind": "BundleConstructed",
+      "num_spans": 1,
+      "num_vals": 1,
+      "region": 0
+    },
+    {
+      "bundle": 1,
+      "constraint": {
+        "reg": 4
+      },
+      "kind": "BundleConstructed",
+      "num_spans": 1,
+      "num_vals": 1,
+      "region": 0
+    },
+    {
+      "bundle": 2,
+      "constraint": "stack",
+      "kind": "BundleConstructed",
+      "num_spans": 1,
+      "num_vals": 1,
+      "region": 0
+    },
+    {
+      "bundle": 3,
+      "constraint": "stack",
+      "kind": "BundleConstructed",
+      "num_spans": 1,
+      "num_vals": 1,
+      "region": 0
+    },
+    {
+      "bundle": 4,
+      "constraint": {
+        "reg": 3
+      },
+      "kind": "BundleConstructed",
+      "num_spans": 1,
+      "num_vals": 1,
+      "region": 0
+    },
+    {
+      "bundle": 5,
+      "constraint": {
+        "reg": 4
+      },
+      "kind": "BundleConstructed",
+      "num_spans": 1,
+      "num_vals": 1,
+      "region": 0
+    },
+    {
+      "bundle": 0,
+      "kind": "BundleQueued",
+      "phase": "assignEvict",
+      "priority": 1,
+      "region": 0
+    },
+    {
+      "bundle": 1,
+      "kind": "BundleQueued",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 2,
+      "kind": "BundleQueued",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 3,
+      "kind": "BundleQueued",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 4,
+      "kind": "BundleQueued",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 5,
+      "kind": "BundleQueued",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 5,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "alloc": {
+        "reg": 4
+      },
+      "bundle": 5,
+      "kind": "BundleAssignedNonPreferred",
+      "preference": []
+    },
+    {
+      "bundle": 4,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "alloc": {
+        "reg": 1
+      },
+      "bundle": 4,
+      "kind": "BundleAssignedNonPreferred",
+      "preference": []
+    },
+    {
+      "bundle": 3,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 3,
+      "forced": true,
+      "kind": "BundleSpilledToStack",
+      "region": 0
+    },
+    {
+      "bundle": 2,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "bundle": 2,
+      "forced": true,
+      "kind": "BundleSpilledToStack",
+      "region": 0
+    },
+    {
+      "bundle": 1,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 268435457,
+      "region": 0
+    },
+    {
+      "alloc": {
+        "reg": 4
+      },
+      "bundle": 1,
+      "kind": "BundleAssignedNonPreferred",
+      "preference": []
+    },
+    {
+      "bundle": 0,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 1,
+      "region": 0
+    },
+    {
+      "alloc": {
+        "reg": 1
+      },
+      "bundle": 0,
+      "kind": "BundleAssignedNonPreferred",
+      "preference": []
+    },
+    {
+      "kind": "ValueSpilled",
+      "num_spans": 1,
+      "val": 0
+    },
+    {
+      "kind": "ValueSpilled",
+      "num_spans": 1,
+      "val": 1
+    },
+    {
+      "emergency": false,
+      "kind": "SpillSlotCreated",
+      "size": 8,
+      "slot": 0
+    },
+    {
+      "kind": "SpillSlotAssigned",
+      "slot": {
+        "slot": 0
+      },
+      "val": 0
+    },
+    {
+      "emergency": false,
+      "kind": "SpillSlotCreated",
+      "size": 1,
+      "slot": 1
+    },
+    {
+      "kind": "SpillSlotAssigned",
+      "slot": {
+        "slot": 1
+      },
+      "val": 1
+    },
+    {
+      "at": {
+        "inst": 1,
+        "pos": "early"
+      },
+      "block": 0,
+      "kind": "SpillPlaced",
+      "slot": {
+        "slot": 0
+      },
+      "span": 0,
+      "val": 0
+    },
+    {
+      "at": {
+        "inst": 2,
+        "pos": "early"
+      },
+      "block": 0,
+      "kind": "SpillPlaced",
+      "slot": {
+        "slot": 1
+      },
+      "span": 1,
+      "val": 1
+    },
+    {
+      "alloc": {
+        "reg": 1
+      },
+      "kind": "HalfMoveSource",
+      "pos": {
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        }
+      },
+      "replaced": null,
+      "val": 0
+    },
+    {
+      "alloc": {
+        "slot": 0
+      },
+      "kind": "HalfMoveSource",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "replaced": null,
+      "val": 0
+    },
+    {
+      "alloc": {
+        "reg": 1
+      },
+      "kind": "HalfMoveDest",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "val": 0
+    },
+    {
+      "alloc": {
+        "reg": 4
+      },
+      "kind": "HalfMoveSource",
+      "pos": {
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        }
+      },
+      "replaced": null,
+      "val": 1
+    },
+    {
+      "alloc": {
+        "slot": 1
+      },
+      "kind": "HalfMoveSource",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "replaced": null,
+      "val": 1
+    },
+    {
+      "alloc": {
+        "reg": 4
+      },
+      "kind": "HalfMoveDest",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "val": 1
+    },
+    {
+      "alloc": {
+        "reg": 1
+      },
+      "kind": "HalfMoveSource",
+      "pos": {
+        "point": {
+          "inst": 1,
+          "pos": "early"
+        }
+      },
+      "replaced": null,
+      "val": 0
+    },
+    {
+      "alloc": {
+        "slot": 0
+      },
+      "kind": "HalfMoveDest",
+      "pos": {
+        "point": {
+          "inst": 1,
+          "pos": "early"
+        }
+      },
+      "val": 0
+    },
+    {
+      "alloc": {
+        "slot": 1
+      },
+      "kind": "HalfMoveDest",
+      "pos": {
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        }
+      },
+      "val": 1
+    },
+    {
+      "dst": {
+        "slot": 0
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 1,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "reg": 1
+      },
+      "val": 0
+    },
+    {
+      "dst": {
+        "slot": 1
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "reg": 4
+      },
+      "val": 1
+    },
+    {
+      "dst": {
+        "reg": 1
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "slot": 0
+      },
+      "val": 0
+    },
+    {
+      "dst": {
+        "reg": 4
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "slot": 1
+      },
+      "val": 1
+    },
+    {
+      "kind": "ParallelMoveBatchSolved",
+      "num_input_moves": 1,
+      "num_solved_moves": 1,
+      "pos": {
+        "point": {
+          "inst": 1,
+          "pos": "early"
+        }
+      }
+    },
+    {
+      "index": 0,
+      "kind": "MoveEmitted",
+      "move": {
+        "spill": {
+          "from": 1,
+          "to": 0
+        }
+      },
+      "pos": {
+        "point": {
+          "inst": 1,
+          "pos": "early"
+        }
+      }
+    },
+    {
+      "kind": "ParallelMoveBatchSolved",
+      "num_input_moves": 1,
+      "num_solved_moves": 1,
+      "pos": {
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        }
+      }
+    },
+    {
+      "index": 1,
+      "kind": "MoveEmitted",
+      "move": {
+        "spill": {
+          "from": 4,
+          "to": 1
+        }
+      },
+      "pos": {
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        }
+      }
+    },
+    {
+      "kind": "ParallelMoveBatchSolved",
+      "num_input_moves": 2,
+      "num_solved_moves": 2,
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      }
+    },
+    {
+      "index": 2,
+      "kind": "MoveEmitted",
+      "move": {
+        "reload": {
+          "from": 1,
+          "to": 4
+        }
+      },
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      }
+    },
+    {
+      "index": 3,
+      "kind": "MoveEmitted",
+      "move": {
+        "reload": {
+          "from": 0,
+          "to": 1
+        }
+      },
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      }
+    }
+  ],
+  "function": {
+    "blocks": [
+      {
+        "callArgs": [],
+        "edgeEdits": [],
+        "frequency": 1.0,
+        "insts": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "kind": "entry",
+        "liveIn": [],
+        "liveInSpans": [],
+        "liveOut": [],
+        "liveOutSpans": [],
+        "params": [],
+        "predecessors": [],
+        "successors": []
+      }
+    ],
+    "bundles": [
+      {
+        "allocation": {
+          "reg": 1
+        },
+        "constraint": {
+          "reg": 3
+        },
+        "isMinimal": false,
+        "parent": null,
+        "preference": [],
+        "region": 0,
+        "spans": [
+          0
+        ],
+        "spillWeight": 0.037037037
+      },
+      {
+        "allocation": {
+          "reg": 4
+        },
+        "constraint": {
+          "reg": 4
+        },
+        "isMinimal": true,
+        "parent": null,
+        "preference": [],
+        "region": 0,
+        "spans": [
+          1
+        ],
+        "spillWeight": 0.038461536
+      },
+      {
+        "allocation": null,
+        "constraint": "stack",
+        "isMinimal": true,
+        "parent": null,
+        "preference": [],
+        "region": 0,
+        "spans": [
+          2
+        ],
+        "spillWeight": 0.0
+      },
+      {
+        "allocation": null,
+        "constraint": "stack",
+        "isMinimal": true,
+        "parent": null,
+        "preference": [],
+        "region": 0,
+        "spans": [
+          3
+        ],
+        "spillWeight": 0.0
+      },
+      {
+        "allocation": {
+          "reg": 1
+        },
+        "constraint": {
+          "reg": 3
+        },
+        "isMinimal": true,
+        "parent": null,
+        "preference": [],
+        "region": 0,
+        "spans": [
+          4
+        ],
+        "spillWeight": 0.038461536
+      },
+      {
+        "allocation": {
+          "reg": 4
+        },
+        "constraint": {
+          "reg": 4
+        },
+        "isMinimal": true,
+        "parent": null,
+        "preference": [],
+        "region": 0,
+        "spans": [
+          5
+        ],
+        "spillWeight": 0.038461536
+      }
+    ],
+    "insts": [
+      {
+        "block": 0,
+        "edits": [],
+        "operands": [
+          {
+            "constraint": {
+              "reg": 3
+            },
+            "defUse": "def",
+            "pos": "late",
+            "val": 0
+          }
+        ]
+      },
+      {
+        "block": 0,
+        "edits": [
+          {
+            "at": {
+              "inst": 1,
+              "pos": "early"
+            },
+            "edit": {
+              "move": {
+                "spill": {
+                  "from": 1,
+                  "to": 0
+                }
+              }
+            }
+          }
+        ],
+        "operands": [
+          {
+            "constraint": {
+              "reg": 4
+            },
+            "defUse": "def",
+            "pos": "late",
+            "val": 1
+          }
+        ]
+      },
+      {
+        "block": 0,
+        "edits": [
+          {
+            "at": {
+              "inst": 2,
+              "pos": "early"
+            },
+            "edit": {
+              "move": {
+                "spill": {
+                  "from": 4,
+                  "to": 1
+                }
+              }
+            }
+          }
+        ],
+        "operands": [
+          {
+            "constraint": "stack",
+            "defUse": "use",
+            "pos": "early",
+            "val": 0
+          },
+          {
+            "constraint": "stack",
+            "defUse": "use",
+            "pos": "early",
+            "val": 1
+          }
+        ]
+      },
+      {
+        "block": 0,
+        "edits": [
+          {
+            "at": {
+              "inst": 3,
+              "pos": "early"
+            },
+            "edit": {
+              "move": {
+                "reload": {
+                  "from": 1,
+                  "to": 4
+                }
+              }
+            }
+          },
+          {
+            "at": {
+              "inst": 3,
+              "pos": "early"
+            },
+            "edit": {
+              "move": {
+                "reload": {
+                  "from": 0,
+                  "to": 1
+                }
+              }
+            }
+          }
+        ],
+        "operands": [
+          {
+            "constraint": {
+              "reg": 3
+            },
+            "defUse": "use",
+            "pos": "early",
+            "val": 0
+          },
+          {
+            "constraint": {
+              "reg": 4
+            },
+            "defUse": "use",
+            "pos": "early",
+            "val": 1
+          }
+        ]
+      },
+      {
+        "block": 0,
+        "edits": [],
+        "operands": []
+      }
+    ],
+    "regions": [
+      {
+        "blocks": [
+          0
+        ],
+        "bundles": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5
+        ],
+        "children": [],
+        "depth": 0,
+        "parent": null
+      }
+    ],
+    "spans": [
+      {
+        "block": 0,
+        "bundle": 0,
+        "constraint": {
+          "reg": 3
+        },
+        "end": {
+          "inst": 2,
+          "pos": "early"
+        },
+        "parent": null,
+        "start": {
+          "inst": 0,
+          "pos": "late"
+        },
+        "uses": [
+          3
+        ],
+        "val": 0
+      },
+      {
+        "block": 0,
+        "bundle": 1,
+        "constraint": {
+          "reg": 4
+        },
+        "end": {
+          "inst": 2,
+          "pos": "early"
+        },
+        "parent": null,
+        "start": {
+          "inst": 1,
+          "pos": "late"
+        },
+        "uses": [
+          0
+        ],
+        "val": 1
+      },
+      {
+        "block": 0,
+        "bundle": 2,
+        "constraint": "stack",
+        "end": {
+          "inst": 3,
+          "pos": "early"
+        },
+        "parent": null,
+        "start": {
+          "inst": 2,
+          "pos": "early"
+        },
+        "uses": [
+          4
+        ],
+        "val": 0
+      },
+      {
+        "block": 0,
+        "bundle": 3,
+        "constraint": "stack",
+        "end": {
+          "inst": 3,
+          "pos": "early"
+        },
+        "parent": null,
+        "start": {
+          "inst": 2,
+          "pos": "early"
+        },
+        "uses": [
+          1
+        ],
+        "val": 1
+      },
+      {
+        "block": 0,
+        "bundle": 4,
+        "constraint": {
+          "reg": 3
+        },
+        "end": {
+          "inst": 3,
+          "pos": "late"
+        },
+        "parent": null,
+        "start": {
+          "inst": 3,
+          "pos": "early"
+        },
+        "uses": [
+          5
+        ],
+        "val": 0
+      },
+      {
+        "block": 0,
+        "bundle": 5,
+        "constraint": {
+          "reg": 4
+        },
+        "end": {
+          "inst": 3,
+          "pos": "late"
+        },
+        "parent": null,
+        "start": {
+          "inst": 3,
+          "pos": "early"
+        },
+        "uses": [
+          2
+        ],
+        "val": 1
+      }
+    ],
+    "spillSlots": [
+      {
+        "emergency": false,
+        "group": null,
+        "size": 8
+      },
+      {
+        "emergency": false,
+        "group": null,
+        "size": 1
+      }
+    ],
+    "uses": [
+      {
+        "operand": 0,
+        "point": {
+          "inst": 1,
+          "pos": "late"
+        },
+        "span": 1,
+        "weight": 1.0
+      },
+      {
+        "operand": 1,
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        },
+        "span": 3,
+        "weight": 0.0
+      },
+      {
+        "operand": 1,
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        },
+        "span": 5,
+        "weight": 1.0
+      },
+      {
+        "operand": 0,
+        "point": {
+          "inst": 0,
+          "pos": "late"
+        },
+        "span": 0,
+        "weight": 1.0
+      },
+      {
+        "operand": 0,
+        "point": {
+          "inst": 2,
+          "pos": "early"
+        },
+        "span": 2,
+        "weight": 0.0
+      },
+      {
+        "operand": 0,
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        },
+        "span": 4,
+        "weight": 1.0
+      }
+    ]
+  },
+  "histograms": [
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 1,
+      "id": "blocks-per-region",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Blocks per region"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "region-depth",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Region depth"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "incoming-edges-per-region",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Incoming edges per region"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "outgoing-edges-per-region",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Outgoing edges per region"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 6,
+          "lo": 6
+        }
+      ],
+      "count": 1,
+      "id": "bundles-per-region",
+      "max": 6,
+      "mean": 6.0,
+      "min": 6,
+      "p50": 6,
+      "p90": 6,
+      "p99": 6,
+      "title": "Bundles per region"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "incoming-edges-per-block",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Incoming edges per block"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "outgoing-edges-per-block",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Outgoing edges per block"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "live-in-values-per-block",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Live-in values per block"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "live-out-values-per-block",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Live-out values per block"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "live-in-spans-per-block",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Live-in spans per block"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 1,
+      "id": "live-out-spans-per-block",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Live-out spans per block"
+    },
+    {
+      "buckets": [
+        {
+          "count": 2,
+          "hi": 3,
+          "lo": 3
+        }
+      ],
+      "count": 2,
+      "id": "spans-per-value",
+      "max": 3,
+      "mean": 3.0,
+      "min": 3,
+      "p50": 3,
+      "p90": 3,
+      "p99": 3,
+      "title": "Spans per value"
+    },
+    {
+      "buckets": [
+        {
+          "count": 5,
+          "hi": 1,
+          "lo": 1
+        },
+        {
+          "count": 1,
+          "hi": 2,
+          "lo": 2
+        }
+      ],
+      "count": 6,
+      "id": "instructions-per-span",
+      "max": 2,
+      "mean": 1.1666666666666667,
+      "min": 1,
+      "p50": 1,
+      "p90": 2,
+      "p99": 2,
+      "title": "Instructions per span"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 6,
+      "id": "uses-per-span",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Uses per span"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 6,
+      "id": "spans-per-bundle",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Spans per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 6,
+      "id": "values-per-bundle",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Values per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 5,
+          "hi": 1,
+          "lo": 1
+        },
+        {
+          "count": 1,
+          "hi": 2,
+          "lo": 2
+        }
+      ],
+      "count": 6,
+      "id": "instructions-per-bundle",
+      "max": 2,
+      "mean": 1.1666666666666667,
+      "min": 1,
+      "p50": 1,
+      "p90": 2,
+      "p99": 2,
+      "title": "Instructions per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 6,
+      "id": "uses-per-bundle",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Uses per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 6,
+      "id": "evictions-per-bundle",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Evictions per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 6,
+      "id": "total-splits-per-bundle",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Total splits per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 6,
+      "id": "within-span-splits-per-bundle",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Within-span splits per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 0,
+          "lo": 0
+        }
+      ],
+      "count": 6,
+      "id": "between-span-splits-per-bundle",
+      "max": 0,
+      "mean": 0.0,
+      "min": 0,
+      "p50": 0,
+      "p90": 0,
+      "p99": 0,
+      "title": "Between-span splits per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 6,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 6,
+      "id": "queue-pops-per-bundle",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Priority queue pops per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 1,
+          "hi": 6,
+          "lo": 6
+        }
+      ],
+      "count": 1,
+      "id": "queue-pops-per-region",
+      "max": 6,
+      "mean": 6.0,
+      "min": 6,
+      "p50": 6,
+      "p90": 6,
+      "p99": 6,
+      "title": "Priority queue pops per region"
+    },
+    {
+      "buckets": [
+        {
+          "count": 2,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 2,
+      "id": "spills-per-value",
+      "max": 1,
+      "mean": 1.0,
+      "min": 1,
+      "p50": 1,
+      "p90": 1,
+      "p99": 1,
+      "title": "Spills per value"
+    },
+    {
+      "buckets": [
+        {
+          "count": 4,
+          "hi": 0,
+          "lo": 0
+        },
+        {
+          "count": 2,
+          "hi": 1,
+          "lo": 1
+        }
+      ],
+      "count": 6,
+      "id": "spills-per-bundle",
+      "max": 1,
+      "mean": 0.3333333333333333,
+      "min": 0,
+      "p50": 0,
+      "p90": 1,
+      "p99": 1,
+      "title": "Spills per bundle"
+    },
+    {
+      "buckets": [
+        {
+          "count": 2,
+          "hi": 1,
+          "lo": 1
+        },
+        {
+          "count": 1,
+          "hi": 2,
+          "lo": 2
+        }
+      ],
+      "count": 3,
+      "id": "parallel-moves-per-solve",
+      "max": 2,
+      "mean": 1.3333333333333333,
+      "min": 1,
+      "p50": 1,
+      "p90": 2,
+      "p99": 2,
+      "title": "Parallel moves per solver invocation"
+    }
+  ],
+  "index": {
+    "bundleParents": {
+      "default": null,
+      "values": []
+    },
+    "byEntity": {
+      "Block": {
+        "default": [],
+        "values": [
+          [
+            0,
+            2,
+            4,
+            5,
+            7,
+            9,
+            40,
+            41
+          ]
+        ]
+      },
+      "Inst": {
+        "default": [],
+        "values": [
+          [
+            5
+          ],
+          [
+            0,
+            40,
+            48,
+            49,
+            51,
+            55,
+            56
+          ],
+          [
+            0,
+            1,
+            2,
+            5,
+            6,
+            7,
+            41,
+            42,
+            45,
+            50,
+            52,
+            57,
+            58
+          ],
+          [
+            2,
+            3,
+            4,
+            7,
+            8,
+            9,
+            43,
+            44,
+            46,
+            47,
+            53,
+            54,
+            59,
+            60,
+            61
+          ]
+        ]
+      },
+      "LiveBundle": {
+        "default": [],
+        "values": [
+          [
+            10,
+            16,
+            32,
+            33
+          ],
+          [
+            11,
+            17,
+            30,
+            31
+          ],
+          [
+            12,
+            18,
+            28,
+            29
+          ],
+          [
+            13,
+            19,
+            26,
+            27
+          ],
+          [
+            14,
+            20,
+            24,
+            25
+          ],
+          [
+            15,
+            21,
+            22,
+            23
+          ]
+        ]
+      },
+      "LiveSpan": {
+        "default": [],
+        "values": [
+          [
+            5,
+            6,
+            40
+          ],
+          [
+            0,
+            1,
+            41
+          ],
+          [
+            7,
+            8
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            9
+          ],
+          [
+            4
+          ]
+        ]
+      },
+      "Reg": {
+        "default": [],
+        "values": [
+          [],
+          [
+            25,
+            33,
+            42,
+            44,
+            48,
+            51,
+            53,
+            56,
+            61
+          ],
+          [],
+          [],
+          [
+            23,
+            31,
+            45,
+            47,
+            52,
+            54,
+            58,
+            60
+          ]
+        ]
+      },
+      "RegClass": {
+        "default": [],
+        "values": [
+          [],
+          [],
+          [],
+          [
+            5,
+            6,
+            8,
+            9,
+            10,
+            14
+          ],
+          [
+            0,
+            1,
+            3,
+            4,
+            11,
+            15
+          ]
+        ]
+      },
+      "RegGroup": {
+        "default": [],
+        "values": []
+      },
+      "Region": {
+        "default": [],
+        "values": [
+          [
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            18,
+            19,
+            20,
+            21,
+            22,
+            24,
+            26,
+            27,
+            28,
+            29,
+            30,
+            32
+          ]
+        ]
+      },
+      "SpillSlot": {
+        "default": [],
+        "values": [
+          [
+            36,
+            37,
+            40,
+            43,
+            49,
+            51,
+            53,
+            56,
+            61
+          ],
+          [
+            38,
+            39,
+            41,
+            46,
+            50,
+            52,
+            54,
+            58,
+            60
+          ]
+        ]
+      },
+      "SpillSlotGroup": {
+        "default": [],
+        "values": []
+      },
+      "Use": {
+        "default": [],
+        "values": []
+      },
+      "Val": {
+        "default": [],
+        "values": [
+          [
+            5,
+            6,
+            7,
+            8,
+            9,
+            34,
+            37,
+            40,
+            42,
+            43,
+            44,
+            48,
+            49,
+            51,
+            53
+          ],
+          [
+            0,
+            1,
+            2,
+            3,
+            4,
+            35,
+            39,
+            41,
+            45,
+            46,
+            47,
+            50,
+            52,
+            54
+          ]
+        ]
+      }
+    },
+    "byKind": {
+      "BundleAssignedNonPreferred": [
+        23,
+        25,
+        31,
+        33
+      ],
+      "BundleConstructed": [
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "BundleQueuePopped": [
+        22,
+        24,
+        26,
+        28,
+        30,
+        32
+      ],
+      "BundleQueued": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        21
+      ],
+      "BundleSpilledToStack": [
+        27,
+        29
+      ],
+      "EagerSplit": [
+        1,
+        3,
+        6,
+        8
+      ],
+      "HalfMoveDest": [
+        44,
+        47,
+        49,
+        50
+      ],
+      "HalfMoveSource": [
+        42,
+        43,
+        45,
+        46,
+        48
+      ],
+      "MoveEmitted": [
+        56,
+        58,
+        60,
+        61
+      ],
+      "MoveResolved": [
+        51,
+        52,
+        53,
+        54
+      ],
+      "ParallelMoveBatchSolved": [
+        55,
+        57,
+        59
+      ],
+      "SpanConstructed": [
+        0,
+        2,
+        4,
+        5,
+        7,
+        9
+      ],
+      "SpillPlaced": [
+        40,
+        41
+      ],
+      "SpillSlotAssigned": [
+        37,
+        39
+      ],
+      "SpillSlotCreated": [
+        36,
+        38
+      ],
+      "ValueSpilled": [
+        34,
+        35
+      ]
+    },
+    "spanParents": {
+      "default": null,
+      "values": []
+    }
+  },
+  "machine": {
+    "banks": [
+      {
+        "classes": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "nonAllocatable": [],
+        "regs": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "size": 8
+      },
+      {
+        "classes": [
+          4
+        ],
+        "nonAllocatable": [],
+        "regs": [
+          4,
+          5
+        ],
+        "size": 1
+      }
+    ],
+    "classes": [
+      {
+        "bank": 0,
+        "derived": false,
+        "groups": [
+          0
+        ],
+        "isGroup": true,
+        "regs": [],
+        "spillCost": 1.0
+      },
+      {
+        "bank": 0,
+        "derived": false,
+        "groups": [
+          1
+        ],
+        "isGroup": true,
+        "regs": [],
+        "spillCost": 1.0
+      },
+      {
+        "bank": 0,
+        "derived": false,
+        "groups": [
+          0,
+          1
+        ],
+        "isGroup": true,
+        "regs": [],
+        "spillCost": 1.0
+      },
+      {
+        "bank": 0,
+        "derived": false,
+        "groups": [],
+        "isGroup": false,
+        "regs": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "spillCost": 1.0
+      },
+      {
+        "bank": 1,
+        "derived": false,
+        "groups": [],
+        "isGroup": false,
+        "regs": [
+          4,
+          5
+        ],
+        "spillCost": 1.0
+      }
+    ],
+    "regGroups": [
+      {
+        "bank": 0,
+        "members": [
+          0,
+          1
+        ]
+      },
+      {
+        "bank": 0,
+        "members": [
+          2,
+          3
+        ]
+      }
+    ],
+    "regs": [
+      {
+        "allocatable": true,
+        "bank": 0,
+        "classes": [
+          0,
+          2,
+          3
+        ],
+        "groups": [
+          0
+        ]
+      },
+      {
+        "allocatable": true,
+        "bank": 0,
+        "classes": [
+          0,
+          2,
+          3
+        ],
+        "groups": [
+          0
+        ]
+      },
+      {
+        "allocatable": true,
+        "bank": 0,
+        "classes": [
+          1,
+          2,
+          3
+        ],
+        "groups": [
+          1
+        ]
+      },
+      {
+        "allocatable": true,
+        "bank": 0,
+        "classes": [
+          1,
+          2,
+          3
+        ],
+        "groups": [
+          1
+        ]
+      },
+      {
+        "allocatable": true,
+        "bank": 1,
+        "classes": [
+          4
+        ],
+        "groups": []
+      },
+      {
+        "allocatable": true,
+        "bank": 1,
+        "classes": [
+          4
+        ],
+        "groups": []
+      }
+    ]
+  },
+  "schema": {
+    "events": {
+      "BundleAssignedNonPreferred": {
+        "alloc": {
+          "reg": "Reg",
+          "regGroup": "RegGroup"
+        },
+        "bundle": "LiveBundle",
+        "preference": [
+          "Reg"
+        ]
+      },
+      "BundleAssignedPreferred": {
+        "alloc": {
+          "reg": "Reg",
+          "regGroup": "RegGroup"
+        },
+        "bundle": "LiveBundle"
+      },
+      "BundleAssignedViaEviction": {
+        "alloc": {
+          "reg": "Reg",
+          "regGroup": "RegGroup"
+        },
+        "bundle": "LiveBundle",
+        "evicted": "LiveBundle"
+      },
+      "BundleConstructed": {
+        "bundle": "LiveBundle",
+        "constraint": {
+          "reg": "RegClass"
+        },
+        "region": "Region"
+      },
+      "BundleEvicted": {
+        "alloc": {
+          "reg": "Reg",
+          "regGroup": "RegGroup"
+        },
+        "bundle": "LiveBundle",
+        "by": "LiveBundle"
+      },
+      "BundleHint": {
+        "bundle": "LiveBundle",
+        "from": "LiveBundle",
+        "hint": [
+          "Reg"
+        ]
+      },
+      "BundleQueuePopped": {
+        "bundle": "LiveBundle",
+        "region": "Region"
+      },
+      "BundleQueued": {
+        "bundle": "LiveBundle",
+        "region": "Region"
+      },
+      "BundleSpilledToStack": {
+        "bundle": "LiveBundle",
+        "region": "Region"
+      },
+      "BundleSplit": {
+        "child": "LiveBundle",
+        "parent": "LiveBundle",
+        "region": "Region"
+      },
+      "BundleSplitBetweenSpans": {
+        "bundle": "LiveBundle",
+        "suffix": "LiveBundle"
+      },
+      "BundleSplitFailed": {
+        "bundle": "LiveBundle"
+      },
+      "BundleSplitIntoMinimal": {
+        "bundle": "LiveBundle"
+      },
+      "BundleSplitWithinSpan": {
+        "bundle": "LiveBundle",
+        "span": "LiveSpan",
+        "suffix": "LiveBundle"
+      },
+      "CoalesceRefused": {
+        "a": "LiveSpan",
+        "b": "LiveSpan"
+      },
+      "CriticalEdgeEdit": {
+        "edit": {
+          "move": {
+            "regReg": {
+              "from": "Reg",
+              "to": "Reg"
+            },
+            "reload": {
+              "from": "SpillSlot",
+              "to": "Reg"
+            },
+            "spill": {
+              "from": "Reg",
+              "to": "SpillSlot"
+            }
+          },
+          "remat": {
+            "dest": "Reg",
+            "val": "Val"
+          }
+        },
+        "pred": "Block",
+        "target": "Block"
+      },
+      "CrossRegionAffinity": {
+        "a": "LiveSpan",
+        "b": "LiveSpan"
+      },
+      "EagerSplit": {
+        "before": "LiveSpan",
+        "conflicting": {
+          "reg": "RegClass"
+        },
+        "constraint": {
+          "reg": "RegClass"
+        },
+        "val": "Val"
+      },
+      "HalfMoveDest": {
+        "alloc": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "val": "Val"
+      },
+      "HalfMoveSource": {
+        "alloc": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "replaced": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "val": "Val"
+      },
+      "MoveEmitted": {
+        "move": {
+          "regReg": {
+            "from": "Reg",
+            "to": "Reg"
+          },
+          "reload": {
+            "from": "SpillSlot",
+            "to": "Reg"
+          },
+          "spill": {
+            "from": "Reg",
+            "to": "SpillSlot"
+          }
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        }
+      },
+      "MoveResolved": {
+        "dst": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "src": {
+          "reg": "Reg",
+          "regGroup": "RegGroup",
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "val": "Val"
+      },
+      "ParallelMoveBatchSolved": {
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        }
+      },
+      "RematEmitted": {
+        "dest": "Reg",
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "val": "Val"
+      },
+      "ReuseSplit": {
+        "before": "LiveSpan",
+        "copy": "LiveSpan",
+        "target_use": "Use",
+        "val": "Val"
+      },
+      "ScratchRegChosen": {
+        "mv": {
+          "dst": {
+            "reg": "Reg",
+            "slot": "SpillSlot"
+          },
+          "src": {
+            "reg": "Reg",
+            "slot": "SpillSlot"
+          }
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "scratch": {
+          "reg": "Reg",
+          "slot": "SpillSlot"
+        }
+      },
+      "ScratchRegUnavailable": {
+        "mv": {
+          "dst": {
+            "reg": "Reg",
+            "slot": "SpillSlot"
+          },
+          "src": {
+            "reg": "Reg",
+            "slot": "SpillSlot"
+          }
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        }
+      },
+      "SpanConstructed": {
+        "block": "Block",
+        "constraint": {
+          "reg": "RegClass"
+        },
+        "span": "LiveSpan",
+        "val": "Val"
+      },
+      "SpanSplit": {
+        "first": "LiveSpan",
+        "parent": "LiveSpan",
+        "second": "LiveSpan",
+        "val": "Val"
+      },
+      "SpansCoalesced": {
+        "a": "LiveSpan",
+        "b": "LiveSpan"
+      },
+      "SpillBlockChosen": {
+        "block": "Block",
+        "val": "Val"
+      },
+      "SpillPlaced": {
+        "block": "Block",
+        "slot": {
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "span": "LiveSpan",
+        "val": "Val"
+      },
+      "SpillSlotAssigned": {
+        "slot": {
+          "slot": "SpillSlot",
+          "slotGroup": "SpillSlotGroup"
+        },
+        "val": "Val"
+      },
+      "SpillSlotCreated": {
+        "slot": "SpillSlot"
+      },
+      "SpillSlotGroupCreated": {
+        "group": "SpillSlotGroup",
+        "members": [
+          "SpillSlot"
+        ]
+      },
+      "ValueSpilled": {
+        "val": "Val"
+      }
+    },
+    "function": {
+      "blocks": {
+        "callArgs": [
+          [
+            "Val"
+          ]
+        ],
+        "edgeEdits": [
+          {
+            "edit": {
+              "criticalEdge": {
+                "edit": {
+                  "move": {
+                    "regReg": {
+                      "from": "Reg",
+                      "to": "Reg"
+                    },
+                    "reload": {
+                      "from": "SpillSlot",
+                      "to": "Reg"
+                    },
+                    "spill": {
+                      "from": "Reg",
+                      "to": "SpillSlot"
+                    }
+                  },
+                  "remat": {
+                    "dest": "Reg",
+                    "val": "Val"
+                  }
+                },
+                "target": "Block"
+              },
+              "move": {
+                "regReg": {
+                  "from": "Reg",
+                  "to": "Reg"
+                },
+                "reload": {
+                  "from": "SpillSlot",
+                  "to": "Reg"
+                },
+                "spill": {
+                  "from": "Reg",
+                  "to": "SpillSlot"
+                }
+              },
+              "remat": {
+                "dest": "Reg",
+                "val": "Val"
+              }
+            }
+          }
+        ],
+        "insts": [
+          "Inst"
+        ],
+        "liveIn": [
+          "Val"
+        ],
+        "liveInSpans": [
+          "LiveSpan"
+        ],
+        "liveOut": [
+          "Val"
+        ],
+        "liveOutSpans": [
+          "LiveSpan"
+        ],
+        "params": [
+          "Val"
+        ],
+        "predecessors": [
+          "Block"
+        ],
+        "successors": [
+          "Block"
+        ]
+      },
+      "bundles": {
+        "allocation": {
+          "reg": "Reg",
+          "regGroup": "RegGroup"
+        },
+        "constraint": {
+          "reg": "RegClass"
+        },
+        "parent": "LiveBundle",
+        "preference": [
+          "Reg"
+        ],
+        "region": "Region",
+        "spans": [
+          "LiveSpan"
+        ]
+      },
+      "insts": {
+        "block": "Block",
+        "edits": [
+          {
+            "edit": {
+              "criticalEdge": {
+                "edit": {
+                  "move": {
+                    "regReg": {
+                      "from": "Reg",
+                      "to": "Reg"
+                    },
+                    "reload": {
+                      "from": "SpillSlot",
+                      "to": "Reg"
+                    },
+                    "spill": {
+                      "from": "Reg",
+                      "to": "SpillSlot"
+                    }
+                  },
+                  "remat": {
+                    "dest": "Reg",
+                    "val": "Val"
+                  }
+                },
+                "target": "Block"
+              },
+              "move": {
+                "regReg": {
+                  "from": "Reg",
+                  "to": "Reg"
+                },
+                "reload": {
+                  "from": "SpillSlot",
+                  "to": "Reg"
+                },
+                "spill": {
+                  "from": "Reg",
+                  "to": "SpillSlot"
+                }
+              },
+              "remat": {
+                "dest": "Reg",
+                "val": "Val"
+              }
+            }
+          }
+        ],
+        "operands": [
+          {
+            "constraint": {
+              "reg": "RegClass"
+            },
+            "val": "Val"
+          }
+        ]
+      },
+      "regions": {
+        "blocks": [
+          "Block"
+        ],
+        "bundles": [
+          "LiveBundle"
+        ],
+        "children": [
+          "Region"
+        ],
+        "parent": "Region"
+      },
+      "spans": {
+        "block": "Block",
+        "bundle": "LiveBundle",
+        "constraint": {
+          "reg": "RegClass"
+        },
+        "parent": {
+          "parent": "LiveSpan"
+        },
+        "uses": [
+          "Use"
+        ],
+        "val": "Val"
+      },
+      "spillSlots": {
+        "group": "SpillSlotGroup"
+      },
+      "uses": {
+        "span": "LiveSpan"
+      }
+    },
+    "machine": {
+      "banks": {
+        "classes": [
+          "RegClass"
+        ],
+        "nonAllocatable": [
+          "Reg"
+        ],
+        "regs": [
+          "Reg"
+        ]
+      },
+      "classes": {
+        "bank": "RegBank",
+        "groups": [
+          "RegGroup"
+        ],
+        "regs": [
+          "Reg"
+        ]
+      },
+      "regGroups": {
+        "bank": "RegBank",
+        "members": [
+          "Reg"
+        ]
+      },
+      "regs": {
+        "bank": "RegBank",
+        "classes": [
+          "RegClass"
+        ],
+        "groups": [
+          "RegGroup"
+        ]
+      }
+    }
+  },
+  "version": 1
+}

@@ -69,8 +69,8 @@ pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Inst, Val};
 pub use error::{Error, Result};
 pub use input::{
-    DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand, OperandConstraint,
-    Position, RematCost,
+    BlockFrequency, DefUse, Input, InputBlock, InputFunction, InputInst, InputOptions, InputValue,
+    Operand, OperandConstraint, Position, RematCost,
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{

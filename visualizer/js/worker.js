@@ -11,6 +11,9 @@
 
 import { createModel } from "./model.js";
 
+// The blob format this page understands.
+const VERSION = 1;
+
 let model = null;
 
 // Handle one request. Exported so that `main.js` can call it directly when
@@ -19,11 +22,28 @@ export function dispatch(message) {
   const { id, method, args } = message;
   try {
     if (method === "load") {
+      // Dropped first, so that a blob that turns out to be unparseable or
+      // unsupported does not leave the previous one answering queries.
+      model = null;
       const json = JSON.parse(args[0]);
+      // The version is answered before the model is built, so a blob from a
+      // newer regicide becomes a sentence on the page rather than a failure
+      // deep in the model. This side is where the check lives because this
+      // side is the only one that parses: `main.js` posts the text precisely
+      // so that it never holds a second copy.
+      if (json.version !== VERSION) return { id, result: { version: json.version } };
       model = createModel(json);
       // The prefix table goes back to the main thread, which needs it to
-      // render labels and would otherwise have to parse the blob itself.
-      return { id, result: json.entityKinds || {} };
+      // render labels and would otherwise have to parse the blob itself, and
+      // the summary rides along rather than costing a second round trip.
+      return {
+        id,
+        result: {
+          version: json.version,
+          entityKinds: json.entityKinds || {},
+          summary: model.summary(),
+        },
+      };
     }
     if (model === null) throw new Error("the model has not been loaded");
     if (typeof model[method] !== "function") throw new Error("no such method: " + method);

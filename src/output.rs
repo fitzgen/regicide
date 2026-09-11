@@ -420,6 +420,9 @@ where
 
 /// An edit that goes on an edge the client has to split first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub struct CriticalEdgeEdit<E = u32>
 where
     E: EntityRepr,
@@ -453,6 +456,9 @@ where
 
 /// TODO FITZGEN
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub enum Edit<E = u32>
 where
     E: EntityRepr,

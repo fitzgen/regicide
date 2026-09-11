@@ -4,7 +4,7 @@
 // parsed JSON blob and answers questions about it. This is the layer the node
 // tests exercise hardest, because it needs no environment at all.
 
-import { install } from "./entities.js";
+import { installEntities } from "./entities.js";
 
 // Read a serialized `SecondaryMap`.
 //
@@ -16,8 +16,9 @@ const secondary = (map, index) => (index < map.values.length ? map.values[index]
 
 // Build the model over a parsed blob.
 export function createModel(json) {
-  install(json.entityKinds || {});
+  installEntities(json.entityKinds || {});
 
+  const func = json.function || {};
   const index = json.index || {};
   const byEntity = index.byEntity || {};
 
@@ -29,6 +30,15 @@ export function createModel(json) {
   };
 
   return {
+    // How big the function is. The load response carries it, so the page can
+    // say something true about the blob before any pane exists; commit 09
+    // replaces it with the function itself.
+    summary: () => ({
+      blocks: (func.blocks || []).length,
+      insts: (func.insts || []).length,
+      events: (json.events || []).length,
+    }),
+
     // Raw lookups.
     event: (i) => (json.events || [])[i],
     entity: (ref) => ({ ref, events: entityEvents(ref) }),

@@ -22,6 +22,10 @@ use crate::{
     machine::{RegClass, RegGroup},
     move_generation::MovePosition,
     output::Remat,
+    visualizer::schema::{
+        ALLOCATION, CONSTRAINT, Descriptor, EDGE_EDIT, MOVE, MOVE_POSITION, PARALLEL_MOVE,
+        REG_ALLOCATION, REG_SET, SCALAR_ALLOCATION, STACK_ALLOCATION,
+    },
 };
 
 define_entities! {
@@ -961,6 +965,272 @@ where
                 visit_edge_edit(*edit, f);
             }
         }
+    }
+}
+
+/// The `events` half of the blob's `schema` table: which field of which event
+/// holds which kind of entity.
+///
+/// Every variant lists *every* field, with the ones that name no entity
+/// spelled `_`, and the expansion feeds that list to a match as exhaustive as
+/// [`Event::visit_entities`]'s. A new variant, or a new field on an existing
+/// variant, is therefore a compile error here as well as there, rather than a
+/// field that quietly stops being a link.
+#[cfg(feature = "visualizer")]
+macro_rules! event_schema {
+    ( $(
+        $variant:ident { $( $field:ident $( as $name:literal )? : $desc:tt , )* }
+    )* ) => {
+        /// What each event kind's fields hold.
+        pub(crate) const EVENT_SCHEMA: crate::visualizer::schema::Table = &[ $(
+            (stringify!($variant), &[ $(
+                (event_schema_name!($field $( as $name )?), event_schema_desc!($desc)),
+            )* ]),
+        )* ];
+
+        /// Never called: it exists so that the field lists above have to be
+        /// complete.
+        #[allow(dead_code, reason = "a compile-time exhaustiveness check")]
+        fn schema_lists_every_field<E>(event: &Event<E>)
+        where
+            E: EntityRepr,
+        {
+            match event {
+                $( Event::$variant { $( $field: _, )* } => {} )*
+            }
+        }
+    };
+}
+
+/// The name a schema field serializes under, which is its serde name and not
+/// always its Rust name.
+#[cfg(feature = "visualizer")]
+macro_rules! event_schema_name {
+    ( $field:ident as $name:literal ) => {
+        $name
+    };
+    ( $field:ident ) => {
+        stringify!($field)
+    };
+}
+
+/// One field's descriptor: `_` for a field that names no entity, `[Thing]` for
+/// a list of them, `(EXPR)` for a named composite, and a bare entity type name
+/// otherwise.
+#[cfg(feature = "visualizer")]
+macro_rules! event_schema_desc {
+    ( _ ) => {
+        None
+    };
+    ( [$inner:ident] ) => {
+        Some(Descriptor::List(&Descriptor::Entity(stringify!($inner))))
+    };
+    ( ($descriptor:expr) ) => {
+        Some($descriptor)
+    };
+    ( $kind:ident ) => {
+        Some(Descriptor::Entity(stringify!($kind)))
+    };
+}
+
+#[cfg(feature = "visualizer")]
+event_schema! {
+    SpanConstructed {
+        span: LiveSpan,
+        val: Val,
+        start: _,
+        end: _,
+        block: Block,
+        num_uses: _,
+        constraint: (CONSTRAINT),
+        has_fixed_use: _,
+    }
+    EagerSplit {
+        val: Val,
+        at: _,
+        before: LiveSpan,
+        constraint: (CONSTRAINT),
+        conflicting: (CONSTRAINT),
+    }
+    ReuseSplit {
+        val: Val,
+        at: _,
+        target_use: Use,
+        before: LiveSpan,
+        copy: LiveSpan,
+    }
+    SpansCoalesced {
+        a: LiveSpan,
+        b: LiveSpan,
+        affinity: _,
+    }
+    CoalesceRefused {
+        a: LiveSpan,
+        b: LiveSpan,
+        affinity: _,
+        reason: _,
+    }
+    CrossRegionAffinity {
+        a: LiveSpan,
+        b: LiveSpan,
+    }
+    BundleConstructed {
+        bundle: LiveBundle,
+        region: Region,
+        num_spans: _,
+        num_vals: _,
+        constraint: (CONSTRAINT),
+    }
+    BundleQueued {
+        bundle: LiveBundle,
+        region: Region,
+        priority: _,
+        phase: _,
+    }
+    BundleQueuePopped {
+        bundle: LiveBundle,
+        region: Region,
+        priority: _,
+        phase: _,
+    }
+    BundleAssignedPreferred {
+        bundle: LiveBundle,
+        alloc: (REG_ALLOCATION),
+    }
+    BundleAssignedNonPreferred {
+        bundle: LiveBundle,
+        alloc: (REG_ALLOCATION),
+        preference: (REG_SET),
+    }
+    BundleAssignedViaEviction {
+        bundle: LiveBundle,
+        alloc: (REG_ALLOCATION),
+        evicted: LiveBundle,
+    }
+    BundleEvicted {
+        bundle: LiveBundle,
+        by: LiveBundle,
+        alloc: (REG_ALLOCATION),
+    }
+    BundleSplitBetweenSpans {
+        bundle: LiveBundle,
+        suffix: LiveBundle,
+        at: _,
+        index: _,
+    }
+    BundleSplitWithinSpan {
+        bundle: LiveBundle,
+        suffix: LiveBundle,
+        span: LiveSpan,
+        at: _,
+    }
+    BundleSplitFailed {
+        bundle: LiveBundle,
+        split: _,
+    }
+    BundleSplitIntoMinimal {
+        bundle: LiveBundle,
+        num_pieces: _,
+    }
+    BundleSpilledToStack {
+        bundle: LiveBundle,
+        region: Region,
+        forced: _,
+    }
+    BundleHint {
+        bundle: LiveBundle,
+        hint: (REG_SET),
+        from: LiveBundle,
+    }
+    BundleSplit {
+        parent: LiveBundle,
+        child: LiveBundle,
+        region: Region,
+    }
+    SpillSlotCreated {
+        slot: SpillSlot,
+        size: _,
+        emergency: _,
+    }
+    SpillSlotGroupCreated {
+        group: SpillSlotGroup,
+        members: [SpillSlot],
+        size: _,
+    }
+    SpillSlotAssigned {
+        val: Val,
+        slot: (STACK_ALLOCATION),
+    }
+    ValueSpilled {
+        val: Val,
+        num_spans: _,
+    }
+    SpillPlaced {
+        val: Val,
+        span: LiveSpan,
+        at: _,
+        block: Block,
+        slot: (STACK_ALLOCATION),
+    }
+    SpillBlockChosen {
+        val: Val,
+        block: Block,
+        num_candidates: _,
+    }
+    SpanSplit {
+        parent: LiveSpan,
+        first: LiveSpan,
+        second: LiveSpan,
+        at: _,
+        val: Val,
+    }
+    HalfMoveSource {
+        pos: (MOVE_POSITION),
+        val: Val,
+        alloc: (ALLOCATION),
+        replaced: (ALLOCATION),
+    }
+    HalfMoveDest {
+        pos: (MOVE_POSITION),
+        val: Val,
+        alloc: (ALLOCATION),
+    }
+    MoveResolved {
+        pos: (MOVE_POSITION),
+        val: Val,
+        src: (ALLOCATION),
+        dst: (ALLOCATION),
+    }
+    RematEmitted {
+        pos: (MOVE_POSITION),
+        val: Val,
+        dest: Reg,
+    }
+    ScratchRegChosen {
+        pos: (MOVE_POSITION),
+        mv: (PARALLEL_MOVE),
+        scratch: (SCALAR_ALLOCATION),
+        reason: _,
+    }
+    ScratchRegUnavailable {
+        pos: (MOVE_POSITION),
+        mv: (PARALLEL_MOVE),
+    }
+    ParallelMoveBatchSolved {
+        pos: (MOVE_POSITION),
+        num_input_moves: _,
+        num_solved_moves: _,
+    }
+    MoveEmitted {
+        pos: (MOVE_POSITION),
+        move_ as "move": (MOVE),
+        index: _,
+    }
+    CriticalEdgeEdit {
+        pred: Block,
+        succ: _,
+        target: Block,
+        edit: (EDGE_EDIT),
     }
 }
 

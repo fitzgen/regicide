@@ -8,7 +8,7 @@
 // it belongs in `actions.js`.
 
 // Wire up the listeners. `dispatch` takes an action.
-export function install(root, dispatch) {
+export function installView(root, dispatch) {
   root.addEventListener("click", (e) => {
     const tab = e.target.closest("[data-tab]");
     if (tab) dispatch({ type: "selectTab", tab: tab.dataset.tab });

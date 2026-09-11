@@ -338,6 +338,19 @@ where
         self.slots.len()
     }
 
+    /// Every group of stack slots, in index order.
+    #[cfg(feature = "visualizer")]
+    pub(crate) fn groups(&self) -> impl ExactSizeIterator<Item = SpillSlotGroup<E>> {
+        self.groups.keys()
+    }
+
+    /// Is this slot one of the emergency slots that move generation borrows,
+    /// rather than one a value was assigned?
+    #[cfg(feature = "visualizer")]
+    pub(crate) fn is_emergency(&self, slot: SpillSlot<E>) -> bool {
+        self.emergency.contains(&Some(slot))
+    }
+
     /// The size of every slot we created, indexed by slot.
     ///
     /// The element type does not mention `E`, which is what lets
@@ -870,7 +883,7 @@ where
     E: EntityRepr,
 {
     /// The size of the values this slot holds.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "visualizer"))]
     pub(crate) fn size(self, spill_slots: &SpillSlots<E>) -> SpillSlotSize {
         spill_slots.slots[self]
     }

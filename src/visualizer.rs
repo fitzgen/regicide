@@ -1,16 +1,119 @@
 //! Writing the register allocation visualization HTML.
 
+mod function;
 mod index;
+pub(crate) mod schema;
 
 use crate::{
     context::ContextInner,
     entity::{Block, EntityRepr, Inst, Region, Val, VisualizedEntity},
-    events::EventIndex,
+    events::{EVENT_SCHEMA, EventIndex, EventsLog},
     input::{Input, InputFunction},
     live_ranges::{LiveBundle, LiveSpan, Use},
     machine::{Reg, RegBank, RegClass, RegGroup, RegUnit},
     spill_slot_allocation::{SpillSlot, SpillSlotGroup},
 };
+use alloc::string::String;
+use function::{FUNCTION_SCHEMA, FunctionInfo, MACHINE_SCHEMA, MachineInfo};
+use index::{EventIndexes, Histogram, Index};
+use schema::SerializeTable;
+
+/// The blob format this crate emits, which `main.js` refuses to render if it
+/// does not recognize. Bump it when a change would make an older page
+/// misread a newer blob, rather than merely miss a field.
+const VERSION: u32 = 1;
+
+/// The page's skeleton, and the assets that fill it in.
+///
+/// `include_str!` bakes them into the binary: the page has to be writable from
+/// any working directory, so there is no runtime lookup to get wrong. The cost
+/// is that touching anything under `visualizer/` rebuilds the crate.
+const INDEX_HTML: &str = include_str!("../visualizer/index.html");
+const MAIN_CSS: &str = include_str!("../visualizer/css/main.css");
+const ENTITIES_JS: &str = include_str!("../visualizer/js/entities.js");
+const MODEL_JS: &str = include_str!("../visualizer/js/model.js");
+const WORKER_JS: &str = include_str!("../visualizer/js/worker.js");
+const STATE_JS: &str = include_str!("../visualizer/js/state.js");
+const ACTIONS_JS: &str = include_str!("../visualizer/js/actions.js");
+const VIEW_JS: &str = include_str!("../visualizer/js/view.js");
+const MAIN_JS: &str = include_str!("../visualizer/js/main.js");
+
+/// Where each asset goes. Each of these appears exactly once in
+/// `index.html`, which a test checks, because a renamed marker would
+/// otherwise emit a page that silently does nothing.
+const CSS_MARKER: &str = "/* REGICIDE_CSS */";
+const WORKER_MARKER: &str = "/* REGICIDE_WORKER_JS */";
+const DATA_MARKER: &str = "/* REGICIDE_DATA_JSON */";
+const APP_MARKER: &str = "/* REGICIDE_APP_JS */";
+
+/// The whole visualization, as one JSON object.
+///
+/// The format version is `version` and not `schema`: `schema` is the table
+/// that says which field holds which kind of entity, and one key cannot be
+/// both.
+#[derive(serde::Serialize)]
+#[serde(bound = "")]
+#[serde(rename_all = "camelCase")]
+struct Blob<'a, E>
+where
+    E: EntityRepr,
+{
+    /// The format version.
+    version: u32,
+
+    /// Entity type name -> display prefix, the only place prefixes appear.
+    entity_kinds: EntityKinds,
+
+    /// Which field of which struct holds which kind of entity, the only place
+    /// types appear.
+    schema: Schema,
+
+    /// The register file.
+    machine: MachineInfo,
+
+    /// The IR skeleton.
+    function: FunctionInfo<E>,
+
+    /// The event log, in the order the allocator recorded it.
+    events: &'a EventsLog<E>,
+
+    /// The ways into the event log that are not a position.
+    index: &'a EventIndexes<E>,
+
+    /// The summaries the histograms tab draws.
+    histograms: &'a [Histogram],
+}
+
+/// The blob's `schema` table, one half per kind of thing that holds entities.
+#[derive(serde::Serialize)]
+struct Schema {
+    /// What each event kind's fields hold, generated from the same exhaustive
+    /// match as `Event::visit_entities`.
+    events: SerializeTable,
+
+    /// What the IR skeleton's arrays hold.
+    function: SerializeTable,
+
+    /// What the register file's arrays hold.
+    machine: SerializeTable,
+}
+
+/// [`ENTITY_KINDS`] as a JSON object.
+struct EntityKinds;
+
+impl serde::Serialize for EntityKinds {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(ENTITY_KINDS.len()))?;
+        for (kind, prefix) in ENTITY_KINDS {
+            map.serialize_entry(kind, prefix)?;
+        }
+        map.end()
+    }
+}
 
 /// Write a self-contained HTML visualization of `context`'s results to `path`.
 pub(crate) fn write_html<E, F>(
@@ -22,11 +125,116 @@ where
     E: EntityRepr,
     F: InputFunction,
 {
-    let _ = (context, input, path);
-    todo!("commit 07")
+    std::fs::write(path, page(context, input)?)
 }
 
-#[allow(dead_code, reason = "the table it builds is emitted in commit 07")]
+/// Build the page: serialize the blob, stitch it and the assets into
+/// `index.html`.
+fn page<E, F>(context: &ContextInner<E>, input: &Input<'_, F>) -> std::io::Result<String>
+where
+    E: EntityRepr,
+    F: InputFunction,
+{
+    let data = blob_json(context, input)?;
+
+    // Dependency order, and `model.js` in the worker's bundle only: the main
+    // thread gets labels from `entities.js` and everything else through worker
+    // queries, so that it never holds a second copy of the model.
+    //
+    // The worker's bundle also loses its `export` keywords, because it is
+    // evaluated as a classic script — both as a `Blob` worker and, in the
+    // fallback, as a `new Function` body — and a top-level `export` is a
+    // syntax error in either. The app's bundle keeps them: it is an inline
+    // module.
+    let worker = strip_exports(&bundle(&[ENTITIES_JS, MODEL_JS, WORKER_JS]));
+    let app = bundle(&[ENTITIES_JS, STATE_JS, ACTIONS_JS, VIEW_JS, MAIN_JS]);
+
+    Ok(INDEX_HTML
+        .replace(CSS_MARKER, MAIN_CSS)
+        .replace(WORKER_MARKER, &escape_script(&worker))
+        .replace(DATA_MARKER, &escape_script(&data))
+        .replace(APP_MARKER, &escape_script(&app)))
+}
+
+/// Serialize the blob.
+fn blob_json<E, F>(context: &ContextInner<E>, input: &Input<'_, F>) -> std::io::Result<String>
+where
+    E: EntityRepr,
+    F: InputFunction,
+{
+    let index = Index::build(input, context);
+    let blob = Blob {
+        version: VERSION,
+        entity_kinds: EntityKinds,
+        schema: Schema {
+            events: SerializeTable(EVENT_SCHEMA),
+            function: SerializeTable(FUNCTION_SCHEMA),
+            machine: SerializeTable(MACHINE_SCHEMA),
+        },
+        machine: MachineInfo::new(input.machine),
+        function: FunctionInfo::new(input, context, &index),
+        events: &context.events,
+        index: &index.indexes,
+        histograms: &index.histograms,
+    };
+
+    // `std::io::Result` is the return type, so a float that should have been
+    // clamped has to become an `io::Error` rather than a panic.
+    serde_json::to_string(&blob).map_err(std::io::Error::other)
+}
+
+/// Concatenate `sources` into one script, dropping their sibling imports.
+fn bundle(sources: &[&str]) -> String {
+    let mut out = String::new();
+    for source in sources {
+        out.push_str(&strip_imports(source));
+        out.push('\n');
+    }
+    out
+}
+
+/// Drop every line that imports a sibling module, which the concatenation
+/// above has already brought into scope.
+///
+/// This is a line-oriented hack and should be treated as one: it breaks on a
+/// multi-line import, on a re-export, and on a template literal whose text
+/// starts a line with `import `. None of those fail under `node --test` — they
+/// fail only in the stitched page — so `js_sources_are_stitchable` enforces
+/// the rule they rely on.
+fn strip_imports(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("import ") && trimmed.contains("\"./") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Drop the `export ` keyword from every declaration that has one, leaving a
+/// plain top-level declaration behind.
+fn strip_exports(src: &str) -> String {
+    let mut out = String::with_capacity(src.len());
+    for line in src.lines() {
+        out.push_str(line.strip_prefix("export ").unwrap_or(line));
+        out.push('\n');
+    }
+    out
+}
+
+/// Escape the two sequences the HTML parser reacts to inside a `<script>`
+/// element, either of which would otherwise end the element early.
+///
+/// `\/` is a valid escape in both a JSON string and a JavaScript one, and
+/// neither sequence occurs anywhere else in either language, which a test
+/// checks by looking for them in the emitted page.
+fn escape_script(text: &str) -> String {
+    text.replace("</", "<\\/").replace("<!--", "<\\!--")
+}
+
 const fn kind<T: VisualizedEntity>() -> (&'static str, &'static str) {
     (T::KIND, T::PREFIX)
 }
@@ -35,7 +243,6 @@ const fn kind<T: VisualizedEntity>() -> (&'static str, &'static str) {
 /// declare cursor and storage-index types that nobody will ever search for.
 macro_rules! entity_kinds {
     ( $( $ty:ty ),* $(,)? ) => {
-        #[allow(dead_code, reason = "emitted as `entityKinds` in commit 07")]
         const ENTITY_KINDS: &[(&str, &str)] = &[ $( kind::<$ty>() ),* ];
 
         #[cfg(test)]
@@ -71,6 +278,62 @@ fn debug_matches_prefix<T: VisualizedEntity>() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test::TestInput;
+    use std::{format, println, vec::Vec};
+
+    /// The opening tag of each script the page carries, which is also how a
+    /// test finds the body again.
+    const WORKER_TAG: &str = "<script id=\"regicide-worker\" type=\"text/plain\">";
+    const DATA_TAG: &str = "<script id=\"regicide-data\" type=\"application/json\">";
+    const APP_TAG: &str = "<script type=\"module\">";
+
+    /// Every JS asset, named so that a lint failure says which file.
+    const JS_SOURCES: &[(&str, &str)] = &[
+        ("entities.js", ENTITIES_JS),
+        ("model.js", MODEL_JS),
+        ("worker.js", WORKER_JS),
+        ("state.js", STATE_JS),
+        ("actions.js", ACTIONS_JS),
+        ("view.js", VIEW_JS),
+        ("main.js", MAIN_JS),
+    ];
+
+    /// Run the allocator over `test` and hand the results to `f`.
+    ///
+    /// `run_inner` rather than `run`: the narrow representations would answer
+    /// the same questions, and pinning `u32` keeps a fixture from changing
+    /// when someone turns `entity-repr-8` off.
+    fn allocated<R>(
+        test: &TestInput,
+        f: impl FnOnce(&ContextInner<u32>, &Input<'_, crate::test::TestFunction>) -> R,
+    ) -> R {
+        test.with_input(|input| {
+            let mut context = ContextInner::<u32>::new();
+            crate::run_inner(&mut context, input).expect("the test input allocates");
+            f(&context, input)
+        })
+    }
+
+    /// The stitched page for `test`.
+    fn page_for(test: &TestInput) -> String {
+        allocated(test, |context, input| {
+            page(context, input).expect("the page serializes")
+        })
+    }
+
+    /// One script's body, still escaped.
+    fn script_body<'a>(page: &'a str, open: &str) -> &'a str {
+        let start = page.find(open).expect("the script tag") + open.len();
+        let rest = &page[start..];
+        &rest[..rest.find("</script>").expect("the script's closing tag")]
+    }
+
+    /// The JSON blob back out of a page, undoing [`escape_script`].
+    fn data_json(page: &str) -> String {
+        script_body(page, DATA_TAG)
+            .replace("<\\/", "</")
+            .replace("<\\!--", "<!--")
+    }
 
     /// If a prefix ever drifts from the `Debug` impl the rest of the crate
     /// uses, the visualizer's labels start lying.
@@ -89,5 +352,307 @@ mod tests {
                 "duplicate entity kind {kind}"
             );
         }
+    }
+
+    /// A renamed marker emits a page that quietly does nothing, and every
+    /// other test here would still pass.
+    #[test]
+    fn markers_are_replaced() {
+        let page = page_for(&TestInput::with_a_critical_edge());
+        for marker in [CSS_MARKER, WORKER_MARKER, DATA_MARKER, APP_MARKER] {
+            assert_eq!(
+                INDEX_HTML.matches(marker).count(),
+                1,
+                "`{marker}` should appear exactly once in `index.html`"
+            );
+            assert_eq!(
+                page.matches(marker).count(),
+                0,
+                "`{marker}` survived into the page"
+            );
+        }
+    }
+
+    /// [`strip_imports`] is line-oriented, so the sources have to hold up
+    /// their end: one sibling import per line, and no re-exports. Neither
+    /// rule shows up under `node --test`, where the modules are real modules.
+    #[test]
+    fn js_sources_are_stitchable() {
+        for (name, source) in JS_SOURCES {
+            for (i, line) in source.lines().enumerate() {
+                let at = format!("{name}:{}", i + 1);
+                let trimmed = line.trim();
+                if trimmed.contains("from \"./") {
+                    assert!(
+                        trimmed.starts_with("import "),
+                        "{at}: a sibling import must start its line"
+                    );
+                    assert!(
+                        trimmed.ends_with(';'),
+                        "{at}: a sibling import must end on its own line"
+                    );
+                }
+                assert!(
+                    !(trimmed.starts_with("export ") && trimmed.contains("from \"")),
+                    "{at}: re-exports are not stitchable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_imports_only_drops_sibling_imports() {
+        let stripped = strip_imports(
+            "import { a } from \"./a.js\";\n\
+             export function f() {}\n\
+             const s = \"import { b } from './b.js'\";\n\
+             // import { c } from \"./c.js\"\n",
+        );
+        assert_eq!(
+            stripped,
+            "export function f() {}\n\
+             const s = \"import { b } from './b.js'\";\n\
+             // import { c } from \"./c.js\"\n"
+        );
+    }
+
+    #[test]
+    fn strip_exports_leaves_everything_else() {
+        assert_eq!(
+            strip_exports("export function f() {}\n  export const g = 1;\n"),
+            "function f() {}\n  export const g = 1;\n"
+        );
+    }
+
+    /// Entities serialize as bare indices, so the array they index into has to
+    /// be long enough for all of them. There are no `id` fields to cross-check
+    /// against; the length is the invariant that replaces them.
+    #[test]
+    fn function_arrays_are_indexable() {
+        let test = TestInput::with_values_in_two_banks_spilled_and_reloaded();
+        allocated(&test, |context, input| {
+            let json = blob_json(context, input).expect("the blob serializes");
+            let json: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+            let function = &json["function"];
+            // `regions` is indexed by a strongly-connected component's
+            // representative block, so it is as long as the block array.
+            let expected = [
+                ("blocks", input.func.len_blocks()),
+                ("insts", input.func.len_insts()),
+                ("regions", input.func.len_blocks()),
+                ("spans", context.live_ranges.spans().count()),
+                ("bundles", context.live_ranges.bundles().count()),
+                ("uses", context.live_ranges.len_uses()),
+                ("spillSlots", context.spill_slots.len_slots()),
+            ];
+            for (name, len) in expected {
+                let array = function[name].as_array().expect(name);
+                assert_eq!(array.len(), len, "function.{name}");
+            }
+        });
+    }
+
+    /// The exhaustiveness check that lets [`ENTITY_KINDS`] be a hand-written
+    /// list: a type the schema names but the prefix table does not is a label
+    /// the page cannot render.
+    #[test]
+    fn entity_kinds_cover_the_schema() {
+        for table in [EVENT_SCHEMA, FUNCTION_SCHEMA, MACHINE_SCHEMA] {
+            schema::visit_table_kinds(table, &mut |kind| {
+                assert!(
+                    ENTITY_KINDS.iter().any(|(k, _)| *k == kind),
+                    "the schema names `{kind}`, which `entityKinds` does not"
+                );
+            });
+        }
+    }
+
+    /// The whole path, through an actual file: serialize, stitch, write, read
+    /// back, and find the blob again.
+    #[test]
+    fn round_trip_through_a_file() {
+        let test = TestInput::with_a_critical_edge();
+        let path = std::env::temp_dir().join("regicide-round-trip.html");
+        allocated(&test, |context, input| {
+            write_html(context, input, &path).expect("the page writes");
+        });
+
+        let page = std::fs::read_to_string(&path).expect("the page reads back");
+        std::fs::remove_file(&path).expect("the page is removable");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&data_json(&page)).expect("the blob parses");
+        assert_eq!(json["version"], VERSION);
+        assert_eq!(
+            json["function"]["blocks"].as_array().expect("blocks").len(),
+            test.func.len_blocks()
+        );
+    }
+
+    /// Either sequence ends the `<script>` element early, which turns the rest
+    /// of the page into text.
+    #[test]
+    fn script_bodies_close_no_tags() {
+        let page = page_for(&TestInput::with_spilled_merge_param());
+        for tag in [WORKER_TAG, DATA_TAG, APP_TAG] {
+            let body = script_body(&page, tag);
+            assert!(!body.contains("</"), "`</` inside {tag}");
+            assert!(!body.contains("<!--"), "`<!--` inside {tag}");
+        }
+    }
+
+    /// The blob duplicates a lot -- `function` restates parent links the
+    /// index already has, `byEntity` restates the events -- and the per-event
+    /// cost is what decides whether this is usable on a large function.
+    ///
+    /// The ceiling is a tripwire, not a budget. The largest input in the
+    /// suite came to 48 KB, of which about 30 KB is the assets and so does
+    /// not grow with the function; this leaves room for the panes commits
+    /// 08-12 add and still catches a field quietly added to every event. When
+    /// it trips, the printed sizes are what to re-observe it against.
+    #[test]
+    fn the_blob_stays_small() {
+        const CEILING: usize = 128 * 1024;
+
+        let inputs: &[(&str, fn() -> TestInput)] = &[
+            ("default", TestInput::default),
+            (
+                "two_uses_of_different_values",
+                TestInput::with_two_uses_of_different_values,
+            ),
+            (
+                "values_in_two_banks_spilled_and_reloaded",
+                TestInput::with_values_in_two_banks_spilled_and_reloaded,
+            ),
+            (
+                "reuse_of_a_surviving_value",
+                TestInput::with_reuse_of_a_surviving_value,
+            ),
+            (
+                "two_reads_and_a_reuse_of_a_surviving_value",
+                TestInput::with_two_reads_and_a_reuse_of_a_surviving_value,
+            ),
+            (
+                "a_reuse_of_a_live_in_value",
+                TestInput::with_a_reuse_of_a_live_in_value,
+            ),
+            (
+                "two_reuses_at_one_point",
+                TestInput::with_two_reuses_at_one_point,
+            ),
+            (
+                "two_reuses_of_a_dying_value",
+                TestInput::with_two_reuses_of_a_dying_value,
+            ),
+            ("a_critical_edge", TestInput::with_a_critical_edge),
+            ("spilled_merge_param", TestInput::with_spilled_merge_param),
+            (
+                "a_self_looping_entry_block",
+                TestInput::with_a_self_looping_entry_block,
+            ),
+            ("two_entry_params", TestInput::with_two_entry_params),
+            (
+                "an_entry_param_read_two_ways",
+                TestInput::with_an_entry_param_read_two_ways,
+            ),
+            ("stack_param_and_arg", TestInput::with_stack_param_and_arg),
+        ];
+
+        let mut largest = ("", 0);
+        for (name, build) in inputs {
+            let size = page_for(&build()).len();
+            println!("{name}: {size} bytes");
+            if size > largest.1 {
+                largest = (name, size);
+            }
+        }
+
+        let (name, size) = largest;
+        assert!(
+            size < CEILING,
+            "the page for `{name}` is {size} bytes, over {CEILING}"
+        );
+    }
+
+    /// The blobs the JS suites read.
+    ///
+    /// Without them, commits 09-12 would each hand-write a small blob and a
+    /// change to the Rust shape would leave every JS test passing against a
+    /// format that no longer exists.
+    #[test]
+    fn fixtures_are_up_to_date() {
+        let fixtures: &[(&str, fn() -> TestInput)] = &[
+            (
+                "spills-and-reloads",
+                TestInput::with_values_in_two_banks_spilled_and_reloaded,
+            ),
+            ("critical-edge", TestInput::with_a_critical_edge),
+            ("spilled-merge-param", TestInput::with_spilled_merge_param),
+        ];
+
+        let bless = std::env::var_os("REGICIDE_BLESS_FIXTURE").is_some();
+        for (name, build) in fixtures {
+            let test = build();
+            let got = pretty_blob(&test);
+
+            // A checked-in fixture is only reviewable if the same input always
+            // produces the same bytes, so say so here rather than from a flaky
+            // job later.
+            assert_eq!(
+                got,
+                pretty_blob(&test),
+                "the blob for `{name}` is not deterministic"
+            );
+
+            let path = std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/visualizer/test/fixtures"
+            ))
+            .join(format!("{name}.json"));
+
+            if bless {
+                std::fs::write(&path, &got).expect("the fixture writes");
+                continue;
+            }
+
+            let want = std::fs::read_to_string(&path).unwrap_or_default();
+            assert!(
+                got == want,
+                "`{name}.json` is out of date; re-bless it with \
+                 `REGICIDE_BLESS_FIXTURE=1 cargo test --all-features`\n{}",
+                first_difference(&got, &want)
+            );
+        }
+    }
+
+    /// The blob for `test`, pretty-printed.
+    ///
+    /// Round-tripping through a `Value` also sorts the keys, which costs
+    /// nothing and makes a fixture diff readable.
+    fn pretty_blob(test: &TestInput) -> String {
+        allocated(test, |context, input| {
+            let compact = blob_json(context, input).expect("the blob serializes");
+            let value: serde_json::Value =
+                serde_json::from_str(&compact).expect("the blob is valid JSON");
+            let mut pretty = serde_json::to_string_pretty(&value).expect("a `Value` serializes");
+            pretty.push('\n');
+            pretty
+        })
+    }
+
+    /// Where two fixtures first disagree. `assert_eq!` on a megabyte of JSON
+    /// is not a diff.
+    fn first_difference(got: &str, want: &str) -> String {
+        let got = Vec::from_iter(got.lines());
+        let want = Vec::from_iter(want.lines());
+        for (i, (a, b)) in got.iter().zip(want.iter()).enumerate() {
+            if a != b {
+                return format!(
+                    "first difference at line {}:\n  got:  {a}\n  want: {b}",
+                    i + 1
+                );
+            }
+        }
+        format!("got {} lines, want {}", got.len(), want.len())
     }
 }

@@ -5,11 +5,6 @@
 //! All of it runs once, when the visualization is written, and never during
 //! allocation.
 
-#![allow(
-    dead_code,
-    reason = "the index is serialized by `write_html` in commit 07"
-)]
-
 use crate::{
     context::ContextInner,
     entity::{Block, Entity, EntityRepr, Inst, Region, SecondaryMap, Val},
@@ -67,7 +62,7 @@ where
 /// Where a span came from, for the details pane's "split off of" field.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(bound = "")]
-struct SpanParent<E>
+pub(crate) struct SpanParent<E>
 where
     E: EntityRepr,
 {
@@ -76,6 +71,24 @@ where
 
     /// Where the cut was.
     at: LivePoint<E>,
+}
+
+impl<E> EventIndexes<E>
+where
+    E: EntityRepr,
+{
+    /// Where `span` was cut out of, if it came out of a split.
+    ///
+    /// The IR skeleton repeats this so that the details pane can render a span
+    /// without consulting the index.
+    pub(crate) fn span_parent(&self, span: LiveSpan<E>) -> Option<SpanParent<E>> {
+        self.span_parents[span]
+    }
+
+    /// Which bundle `bundle` was cut out of, if it came out of a split.
+    pub(crate) fn bundle_parent(&self, bundle: LiveBundle<E>) -> Option<LiveBundle<E>> {
+        self.bundle_parents[bundle]
+    }
 }
 
 /// The per-entity indexes.
@@ -133,10 +146,6 @@ macro_rules! by_entity {
                     }
                 )*
             }
-
-            /// The key each map serializes under.
-            #[cfg(test)]
-            const NAMES: &'static [&'static str] = &[ $( $name, )* ];
 
             /// Those keys really are the entity types' own names, which is
             /// what lets the JavaScript look a kind up by the name it parsed

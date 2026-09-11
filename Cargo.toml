@@ -68,3 +68,7 @@ multiple_bound_locations = "warn"
 extra_unused_type_parameters = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
+
+[[example]]
+name = "visualize"
+required-features = ["visualizer"]
