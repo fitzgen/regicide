@@ -283,6 +283,7 @@ const labels = (details) => details.fields.map((field) => field.label);
 const FIELDS = {
   Val: ["Def", "Uses", "Spans", "Bundles"],
   Block: [
+    "Region",
     "Frequency",
     "Instructions",
     "Predecessors",
@@ -359,6 +360,7 @@ test("a block's predecessors carry their arguments and its successors their para
   // successor -- so each list has to be read from the other block.
   const model = modelOf(fixture("critical-edge"));
   assert.deepEqual(shown(model.details({ kind: "Block", index: 2 })), {
+    Region: "region2",
     Frequency: "1",
     Instructions: "inst6, inst7",
     Predecessors: "block0(v0), block1(v0)",
@@ -367,6 +369,20 @@ test("a block's predecessors carry their arguments and its successors their para
     "Live-out spans": "none",
   });
   assert.equal(shown(model.details({ kind: "Block", index: 0 })).Successors, "block1(), block2(v2)");
+});
+
+test("a block names the region that owns it", () => {
+  // The field is the inverse of `region.blocks`, and the region is clickable.
+  const blob = fixture("critical-edge");
+  const field = modelOf(blob)
+    .details({ kind: "Block", index: 1 })
+    .fields.find((f) => f.label === "Region");
+  assert.deepEqual(field.value, [{ text: "region2", entity: { kind: "Region", index: 2 }, cls: "kind-Region" }]);
+
+  // Region allocation can stop before it reaches every block, and a block no
+  // region claims has to say so rather than point at region0.
+  blob.function.regions[2].blocks = [0, 2];
+  assert.equal(shown(modelOf(blob).details({ kind: "Block", index: 1 })).Region, "none");
 });
 
 test("a span reports the span it was split off of, and the point it was cut at", () => {

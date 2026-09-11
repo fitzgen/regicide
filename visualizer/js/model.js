@@ -559,6 +559,12 @@ function buildDetails(json, entityEvents) {
         });
         const succs = block.successors.map((s) => blockWith(s, blocks[s].params));
         return [
+          // First, the way `Region`'s own "Parent" field is: where the block
+          // sits is what the rest of the pane is relative to.
+          {
+            label: "Region",
+            value: regionOf.has(i) ? [entity("Region", regionOf.get(i))] : none(),
+          },
           { label: "Frequency", value: [text(num(block.frequency))] },
           listField("Instructions", "Inst", block.insts),
           list("Predecessors", preds, preds.length),
