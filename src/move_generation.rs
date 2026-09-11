@@ -53,7 +53,7 @@ use crate::{
     counts::Counts,
     entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
     error::{Error, IResult, InternalError},
-    events::EventsLog,
+    events::{EventsLog, ScratchReason},
     hash_map::{Entry, FxHashMap},
     input::{
         DefUse, Input, InputBlock, InputFunction, InputInst as _, InputValue as _, Position,
@@ -124,6 +124,9 @@ define_entities! {
 ///
 /// This is the un-bitpacked version of `PackedMovePosition`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub(crate) enum MovePosition<E>
 where
     E: EntityRepr,
@@ -163,6 +166,21 @@ where
     bits: u64,
 
     _marker: PhantomData<E>,
+}
+
+/// A position serializes as the unpacked form, never as its bits: the bits are
+/// an implementation detail and the visualizer needs the instruction.
+#[cfg(feature = "visualizer")]
+impl<E> serde::Serialize for PackedMovePosition<E>
+where
+    E: EntityRepr,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.unpack().serialize(serializer)
+    }
 }
 
 impl<E> PackedMovePosition<E>
@@ -521,17 +539,26 @@ where
         debug_assert!(self.is_reset());
 
         self.index_function(input, rpo, output)?;
-        self.emit_half_moves(input, counts, liveness, live_ranges, spill_slots, output)?;
+        self.emit_half_moves(
+            input,
+            counts,
+            events,
+            liveness,
+            live_ranges,
+            spill_slots,
+            output,
+        )?;
         self.emit_spills(
             input,
             counts,
+            events,
             liveness,
             live_ranges,
             spill_slots,
             spill_placement,
             output,
         )?;
-        self.resolve(input, counts);
+        self.resolve(input, counts, events);
         self.sequentialize(
             input,
             counts,
@@ -644,6 +671,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         live_ranges: &LiveRanges<E>,
         spill_slots: &SpillSlots<E>,
@@ -666,6 +694,7 @@ where
                 self.emit_value_half_moves(
                     input,
                     counts,
+                    events,
                     liveness,
                     live_ranges,
                     spill_slots,
@@ -685,6 +714,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         live_ranges: &LiveRanges<E>,
         spill_slots: &SpillSlots<E>,
@@ -694,7 +724,15 @@ where
         let func = input.func;
         let val = value_spans[0].val(live_ranges);
 
-        self.emit_entry_param_fills(input, counts, live_ranges, spill_slots, output, value_spans)?;
+        self.emit_entry_param_fills(
+            input,
+            counts,
+            events,
+            live_ranges,
+            spill_slots,
+            output,
+            value_spans,
+        )?;
 
         for (i, span) in value_spans.iter().copied().enumerate() {
             let block = span.block(func, live_ranges);
@@ -726,7 +764,9 @@ where
                     };
 
                     match alloc {
-                        Allocation::Reg(_) => self.emit_dest(counts, pos, incoming_val, alloc),
+                        Allocation::Reg(_) => {
+                            self.emit_dest(counts, events, pos, incoming_val, alloc)
+                        }
                         Allocation::Stack(_) => {
                             if incoming_val == val {
                                 // Nothing to do here because either (1) this is
@@ -738,7 +778,7 @@ where
                                 // move must therefore have the same source and
                                 // destination, and need not be emitted.
                             } else {
-                                self.emit_dest(counts, pos, incoming_val, alloc)
+                                self.emit_dest(counts, events, pos, incoming_val, alloc)
                             }
                         }
                     }
@@ -776,10 +816,10 @@ where
                          move",
                         );
                         let pos = PackedMovePosition::point(start);
-                        self.emit_source(counts, pos, val, prev_alloc);
+                        self.emit_source(counts, events, pos, val, prev_alloc);
 
                         match alloc {
-                            Allocation::Reg(_) => self.emit_dest(counts, pos, val, alloc),
+                            Allocation::Reg(_) => self.emit_dest(counts, events, pos, val, alloc),
                             Allocation::Stack(_) => {
                                 // Handled by spill placement.
                             }
@@ -820,7 +860,7 @@ where
                             index,
                         },
                     )?;
-                    self.emit_source(counts, pos, val, alloc);
+                    self.emit_source(counts, events, pos, val, alloc);
                 }
             }
         }
@@ -840,6 +880,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         live_ranges: &LiveRanges<E>,
         spill_slots: &SpillSlots<E>,
         output: &mut OutputInner<E>,
@@ -883,10 +924,10 @@ where
             // Lazily, so a parameter wanted only where it arrives gets no move.
             if !emitted_source {
                 emitted_source = true;
-                self.emit_source(counts, pos, val, arrival_alloc);
+                self.emit_source(counts, events, pos, val, arrival_alloc);
             }
 
-            self.emit_dest(counts, pos, val, alloc);
+            self.emit_dest(counts, events, pos, val, alloc);
         }
 
         Ok(())
@@ -896,6 +937,7 @@ where
     fn emit_source(
         &mut self,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         pos: PackedMovePosition<E>,
         val: Val<E>,
         alloc: Allocation<E>,
@@ -907,11 +949,29 @@ where
                 // A value can be in several places at once, any of which could
                 // serve as the source of a move. We keep only the best source.
                 if better_source(alloc, *entry.get()) {
-                    entry.insert(alloc);
+                    let replaced = entry.insert(alloc);
+                    event!(
+                        events,
+                        HalfMoveSource {
+                            pos,
+                            val,
+                            alloc,
+                            replaced: Some(replaced)
+                        }
+                    );
                 }
             }
             Entry::Vacant(entry) => {
                 entry.insert(alloc);
+                event!(
+                    events,
+                    HalfMoveSource {
+                        pos,
+                        val,
+                        alloc,
+                        replaced: None
+                    }
+                );
             }
         }
     }
@@ -920,12 +980,14 @@ where
     fn emit_dest(
         &mut self,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         pos: PackedMovePosition<E>,
         val: Val<E>,
         alloc: Allocation<E>,
     ) {
         trace!("move generation: emit dest {val:?} at {pos:?} is {alloc:?}");
         counts.half_move_dests.inc();
+        event!(events, HalfMoveDest { pos, val, alloc });
         self.dests.push((HalfMoveKey::new(pos, val), alloc));
     }
 
@@ -934,6 +996,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         live_ranges: &LiveRanges<E>,
         spill_slots: &SpillSlots<E>,
@@ -953,7 +1016,7 @@ where
             if spill_site.point() != block.end_point(input) {
                 let pos = PackedMovePosition::point(spill_site.point());
                 let key_val = self.val_for_spill_key(input, output, block, val, pos)?;
-                self.emit_spill(counts, pos, key_val, arrives_in, dst);
+                self.emit_spill(counts, events, pos, key_val, arrives_in, dst);
                 continue;
             }
 
@@ -980,7 +1043,7 @@ where
                         index: u16::try_from(index).unwrap(),
                     },
                 )?;
-                self.emit_spill(counts, pos, val, arrives_in, dst);
+                self.emit_spill(counts, events, pos, val, arrives_in, dst);
             }
         }
 
@@ -1017,6 +1080,7 @@ where
     fn emit_spill(
         &mut self,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         pos: PackedMovePosition<E>,
         val: Val<E>,
         arrives_in: Allocation<E>,
@@ -1026,13 +1090,27 @@ where
             trace!("move generation: emit source {val:?} at {pos:?} is {arrives_in:?}");
             counts.half_move_sources.inc();
             entry.insert(arrives_in);
+            event!(
+                events,
+                HalfMoveSource {
+                    pos,
+                    val,
+                    alloc: arrives_in,
+                    replaced: None
+                }
+            );
         }
-        self.emit_dest(counts, pos, val, dst);
+        self.emit_dest(counts, events, pos, val, dst);
     }
 
     /// Join the destination halves against the source halves, turning each pair
     /// into a full move.
-    fn resolve(&mut self, input: &Input<'_, impl InputFunction>, counts: &mut Counts) {
+    fn resolve(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+    ) {
         let mut dests = core::mem::take(&mut self.dests);
 
         // One destination can be asked for multiple times: two spans beginning
@@ -1052,6 +1130,7 @@ where
                 };
                 trace!("move generation: rematerialize {val:?} into {dest:?} at {pos:?}");
                 counts.remats_emitted.inc();
+                event!(events, RematEmitted { pos, val, dest });
                 self.remats.push((pos, Remat { val, dest }));
                 continue;
             }
@@ -1063,6 +1142,7 @@ where
                 );
             };
 
+            event!(events, MoveResolved { pos, val, src, dst });
             self.batch_moves.push((pos, BatchMove { src, dst, val }));
         }
 
@@ -1119,6 +1199,9 @@ where
         spill_slots: &mut SpillSlots<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
+        #[cfg(feature = "visualizer")]
+        let events_start = events.len();
+
         self.batch_moves.sort_unstable_by_key(|&(pos, _)| pos);
 
         // Sequentialize each position's moves.
@@ -1148,7 +1231,8 @@ where
         remats.sort_unstable_by_key(|&(pos, _)| pos);
         let result = (|| -> IResult<()> {
             for &(pos, remat) in remats.iter() {
-                let edit = edit_at_position(input, counts, output, pos, EdgeEdit::Remat(remat))?;
+                let edit =
+                    edit_at_position(input, counts, events, output, pos, EdgeEdit::Remat(remat))?;
                 self.edits.push((pos, edit));
             }
             Ok(())
@@ -1158,6 +1242,13 @@ where
         result?;
 
         self.edits.sort_by_key(|&(pos, _)| pos);
+
+        // The sort just moved every move edit that a rematerialization landed
+        // in front of, so the indices the events recorded as they went are
+        // stale.
+        #[cfg(feature = "visualizer")]
+        remap_move_emitted_events(events, events_start, &self.edits);
+
         Ok(())
     }
 
@@ -1218,10 +1309,13 @@ where
                     (mv.src, mv.dst),
                     (ScalarAllocation::Stack(_), ScalarAllocation::Stack(_))
                 );
-                let counter = if stack_to_stack {
-                    &mut counts.stack_to_stack_moves
+                let (counter, reason) = if stack_to_stack {
+                    (
+                        &mut counts.stack_to_stack_moves,
+                        ScratchReason::StackToStack,
+                    )
                 } else {
-                    &mut counts.move_cycles_broken
+                    (&mut counts.move_cycles_broken, ScratchReason::CycleBreak)
                 };
 
                 // If we have a register available, then use it.
@@ -1239,7 +1333,17 @@ where
                     },
                 ) {
                     counter.inc();
-                    return Some(ScalarAllocation::Reg(reg));
+                    let scratch = ScalarAllocation::Reg(reg);
+                    event!(
+                        events,
+                        ScratchRegChosen {
+                            pos,
+                            mv,
+                            scratch,
+                            reason
+                        }
+                    );
+                    return Some(scratch);
                 }
 
                 // No register is available, so we have to do an emergency spill
@@ -1250,17 +1354,31 @@ where
                     || matches!(mv.dst, ScalarAllocation::Stack(_))
                 {
                     scratch_failed = true;
+                    event!(events, ScratchRegUnavailable { pos, mv });
                     return None;
                 }
 
                 let size = bank.size(machine);
                 let Ok(slot) = spill_slots.emergency_slot(counts, events, size, output) else {
                     scratch_failed = true;
+                    event!(events, ScratchRegUnavailable { pos, mv });
                     return None;
                 };
 
                 counts.move_cycles_broken.inc();
-                Some(ScalarAllocation::Stack(slot))
+                let scratch = ScalarAllocation::Stack(slot);
+                // An emergency slot is only ever reached from a cycle: a
+                // stack-to-stack move returned above.
+                event!(
+                    events,
+                    ScratchRegChosen {
+                        pos,
+                        mv,
+                        scratch,
+                        reason: ScratchReason::CycleBreak
+                    }
+                );
+                Some(scratch)
             };
 
             let moves = expanded.iter().map(|&(mv, _)| mv);
@@ -1275,8 +1393,17 @@ where
                 }
             }
 
+            event!(
+                events,
+                ParallelMoveBatchSolved {
+                    pos,
+                    num_input_moves: expanded.len(),
+                    num_solved_moves: solved.len()
+                }
+            );
+
             for mv in &solved {
-                self.emit_move(input, counts, output, pos, into_move(*mv))?;
+                self.emit_move(input, counts, events, output, pos, into_move(*mv))?;
             }
 
             Ok(())
@@ -1295,16 +1422,60 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         pos: PackedMovePosition<E>,
         move_: Move<E>,
     ) -> IResult<()> {
         trace!("move generation: emit {move_:?} at {pos:?}");
         counts.moves_emitted.inc();
+        event!(
+            events,
+            MoveEmitted {
+                pos,
+                move_,
+                index: self.edits.len()
+            }
+        );
 
-        let edit = edit_at_position(input, counts, output, pos, EdgeEdit::Move(move_))?;
+        let edit = edit_at_position(input, counts, events, output, pos, EdgeEdit::Move(move_))?;
         self.edits.push((pos, edit));
         Ok(())
+    }
+}
+
+/// Renumber each logged `MoveEmitted` to where its edit ended up after the
+/// edits were sorted.
+///
+/// The sort is stable and the moves were already in position order, so the
+/// moves keep their relative order and the nth move edit is the one the nth
+/// `MoveEmitted` describes.
+#[cfg(feature = "visualizer")]
+fn remap_move_emitted_events<E>(
+    events: &mut EventsLog<E>,
+    events_start: usize,
+    edits: &[(PackedMovePosition<E>, Edit<E>)],
+) where
+    E: EntityRepr,
+{
+    let is_move = |edit: &Edit<E>| match edit {
+        Edit::Move(_) => true,
+        Edit::Remat(_) => false,
+        Edit::CriticalEdge(edge) => matches!(edge.edit, EdgeEdit::Move(_)),
+    };
+
+    let mut moves = edits
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, edit))| is_move(edit));
+
+    for event in events.iter_mut_from(events_start) {
+        if let crate::events::Event::MoveEmitted { index, .. } = event {
+            let (i, _) = moves
+                .next()
+                .expect("every `MoveEmitted` event has its own move edit");
+            *index = i;
+        }
     }
 }
 
@@ -1358,6 +1529,7 @@ where
 fn edit_at_position<E>(
     input: &Input<'_, impl InputFunction>,
     counts: &mut Counts,
+    events: &mut EventsLog<E>,
     output: &mut OutputInner<E>,
     pos: PackedMovePosition<E>,
     edit: EdgeEdit<E>,
@@ -1379,6 +1551,15 @@ where
                 .nth(succ)
                 .unwrap();
             let target = output.with_repr::<E, _>(target)?;
+            event!(
+                events,
+                CriticalEdgeEdit {
+                    pred,
+                    succ,
+                    target,
+                    edit
+                }
+            );
             Ok(Edit::CriticalEdge(CriticalEdgeEdit { target, succ, edit }))
         }
     }
@@ -1502,6 +1683,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "visualizer")]
+    use crate::events::Event as LoggedEvent;
     use crate::{
         Inst, RegClass,
         context::Context,
@@ -1516,6 +1699,8 @@ mod tests {
         check::{Check, CheckResult},
         mutators as m,
     };
+    #[cfg(feature = "visualizer")]
+    use std::collections::{BTreeMap, BTreeSet};
     use std::{format, string::String, vec::Vec};
 
     /// Run every phase up through move generation, or `None` when allocation
@@ -2403,5 +2588,254 @@ mod tests {
         }
 
         result
+    }
+    /// Every `MoveEmitted` event's index addresses the edit its move became.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_move_emitted_addresses_its_edit() -> CheckResult<TestInput> {
+        // How many runs had a move edit after a rematerialization, which is
+        // exactly the case where the index a move was emitted with is not the
+        // index it ends up at.
+        static SHIFTED: AtomicUsize = AtomicUsize::new(0);
+
+        let result = Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            seeds(),
+            |test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = generate(test_input)? else {
+                    return Ok(());
+                };
+                let ctx = &context.context32;
+                let edits = ctx.move_generation.edits();
+
+                let is_move = |edit: &Edit<u32>| {
+                    matches!(
+                        edit,
+                        Edit::Move(_)
+                            | Edit::CriticalEdge(CriticalEdgeEdit {
+                                edit: EdgeEdit::Move(_),
+                                ..
+                            })
+                    )
+                };
+
+                let mut num_emitted = 0;
+                for (_, event) in ctx.events.iter() {
+                    let LoggedEvent::MoveEmitted { pos, move_, index } = *event else {
+                        continue;
+                    };
+                    num_emitted += 1;
+
+                    let (edit_pos, edit) = *edits.get(index).ok_or_else(|| {
+                        format!("{move_:?} claims edit {index}, past the end of the edit list")
+                    })?;
+                    if edit_pos != pos {
+                        return Err(format!(
+                            "{move_:?} claims edit {index}, which is at {edit_pos:?}, not {pos:?}",
+                        ));
+                    }
+                    let emitted = match edit {
+                        Edit::Move(mv) => mv,
+                        Edit::CriticalEdge(CriticalEdgeEdit {
+                            edit: EdgeEdit::Move(mv),
+                            ..
+                        }) => mv,
+                        _ => return Err(format!("edit {index} is {edit:?}, not a move")),
+                    };
+                    if emitted != move_ {
+                        return Err(format!("edit {index} is {emitted:?}, not {move_:?}"));
+                    }
+                }
+
+                // And no move edit went unannounced.
+                let num_move_edits = edits.iter().filter(|(_, edit)| is_move(edit)).count();
+                if num_emitted != num_move_edits {
+                    return Err(format!(
+                        "{num_emitted} `MoveEmitted` events for {num_move_edits} move edits",
+                    ));
+                }
+
+                let first_remat = edits.iter().position(|(_, edit)| !is_move(edit));
+                let last_move = edits.iter().rposition(|(_, edit)| is_move(edit));
+                if let (Some(first_remat), Some(last_move)) = (first_remat, last_move)
+                    && first_remat < last_move
+                {
+                    SHIFTED.fetch_add(1, Ordering::Relaxed);
+                }
+
+                Ok(())
+            },
+        );
+
+        if result.is_ok() {
+            assert!(
+                SHIFTED.load(Ordering::Relaxed) > 0,
+                "no random input put a move edit after a rematerialization, so the property \
+                 never sees an index that moved",
+            );
+        }
+
+        result
+    }
+
+    /// Every resolved move has the two halves it was joined from.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_resolved_move_has_both_halves() -> CheckResult<TestInput> {
+        Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            seeds(),
+            |test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = generate(test_input)? else {
+                    return Ok(());
+                };
+                let ctx = &context.context32;
+
+                let mut sources = BTreeMap::new();
+                let mut dests = BTreeMap::new();
+                let mut resolved = Vec::new();
+                for (_, event) in ctx.events.iter() {
+                    match *event {
+                        LoggedEvent::HalfMoveSource {
+                            pos, val, alloc, ..
+                        } => {
+                            // A later source displaces an earlier one, and the
+                            // last one is the one `resolve` reads.
+                            sources.insert((pos, val), alloc);
+                        }
+                        LoggedEvent::HalfMoveDest { pos, val, alloc } => {
+                            dests.entry((pos, val)).or_insert_with(Vec::new).push(alloc);
+                        }
+                        LoggedEvent::MoveResolved { pos, val, src, dst } => {
+                            resolved.push((pos, val, src, dst));
+                        }
+                        _ => continue,
+                    }
+                }
+
+                for (pos, val, src, dst) in resolved {
+                    match sources.get(&(pos, val)) {
+                        Some(&alloc) if alloc == src => {}
+                        Some(&alloc) => {
+                            return Err(format!(
+                                "the move of {val:?} at {pos:?} reads {src:?}, but the last \
+                                 source there was {alloc:?}",
+                            ));
+                        }
+                        None => {
+                            return Err(format!(
+                                "the move of {val:?} at {pos:?} reads {src:?}, which was never \
+                                 logged as a source",
+                            ));
+                        }
+                    }
+                    if !dests.get(&(pos, val)).is_some_and(|ds| ds.contains(&dst)) {
+                        return Err(format!(
+                            "the move of {val:?} at {pos:?} writes {dst:?}, which was never \
+                             logged as a destination",
+                        ));
+                    }
+                }
+
+                Ok(())
+            },
+        )
+    }
+
+    /// Every rematerialization fills a destination that was asked for, in a
+    /// register, with a value that can be rematerialized.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_remat_fills_a_logged_dest() -> CheckResult<TestInput> {
+        Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            seeds(),
+            |test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = generate(test_input)? else {
+                    return Ok(());
+                };
+                let ctx = &context.context32;
+
+                let mut dests = BTreeSet::new();
+                let mut remats = Vec::new();
+                for (_, event) in ctx.events.iter() {
+                    match *event {
+                        LoggedEvent::HalfMoveDest { pos, val, alloc } => {
+                            dests.insert((pos, val, alloc));
+                        }
+                        LoggedEvent::RematEmitted { pos, val, dest } => {
+                            remats.push((pos, val, dest));
+                        }
+                        _ => continue,
+                    }
+                }
+
+                for (pos, val, dest) in remats {
+                    let dst = Allocation::Reg(RegAllocation::Reg(dest));
+                    if !dests.contains(&(pos, val, dst)) {
+                        return Err(format!(
+                            "{val:?} is rematerialized into {dest:?} at {pos:?}, which was never \
+                             logged as a destination",
+                        ));
+                    }
+                    if !ctx.move_generation.rematerializable.contains(val) {
+                        return Err(format!(
+                            "{val:?} is rematerialized but not rematerializable"
+                        ));
+                    }
+                }
+
+                Ok(())
+            },
+        )
+    }
+
+    /// A whole run's event log is valid JSON, whatever it holds.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn the_event_log_serializes() {
+        let mut kinds = BTreeSet::new();
+
+        // The seeds, plus a critical edge, plus the seeds again with every
+        // value rematerializable: between them they reach every corner of move
+        // generation.
+        let mut inputs = seeds();
+        inputs.push(TestInput::with_a_critical_edge());
+        inputs.extend(seeds().into_iter().map(|mut test_input| {
+            test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+            test_input
+        }));
+
+        for test_input in inputs {
+            let Some(context) = generate(&test_input).unwrap() else {
+                continue;
+            };
+            let events = Vec::from_iter(context.context32.events.iter().map(|(_, event)| event));
+            assert!(!events.is_empty());
+
+            let json = serde_json::to_string(&events).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let parsed = parsed.as_array().unwrap();
+            assert_eq!(parsed.len(), events.len());
+
+            for event in parsed {
+                kinds.insert(String::from(event["kind"].as_str().unwrap()));
+            }
+        }
+
+        // Each of move generation's events should have appeared somewhere
+        // above.
+        for kind in [
+            "HalfMoveSource",
+            "HalfMoveDest",
+            "MoveResolved",
+            "RematEmitted",
+            "ScratchRegChosen",
+            "ParallelMoveBatchSolved",
+            "MoveEmitted",
+            "CriticalEdgeEdit",
+        ] {
+            assert!(kinds.contains(kind), "no seed input logged a {kind} event");
+        }
     }
 }

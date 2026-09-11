@@ -34,6 +34,8 @@ impl StateBit {
 
 /// One move in a parallel batch: `dst := src`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub struct ParallelMove<E>
 where
     E: EntityRepr,

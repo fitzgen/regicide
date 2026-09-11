@@ -4,9 +4,13 @@ use crate::{
     entity::{Block, EntityRepr, Region, Val},
     input::OperandConstraint,
     live_ranges::{LiveBundle, LivePoint, LiveSpan, Use},
-    machine::RegSet,
+    machine::{Reg, RegSet},
+    move_generation::PackedMovePosition,
+    output::EdgeEdit,
     output::RegAllocation,
     output::StackAllocation,
+    output::{Allocation, Move, ScalarAllocation},
+    parallel_moves::ParallelMove,
     region_allocation::{Phase, Priority},
     spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize},
 };
@@ -56,6 +60,18 @@ pub enum SplitKind {
 
     /// Cutting a bundle between two uses inside one of its spans.
     WithinSpan,
+}
+
+/// Why a scratch location was needed while sequentializing a batch of moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+pub enum ScratchReason {
+    /// Neither end of the move is a register, and the machine cannot move
+    /// memory to memory directly.
+    StackToStack,
+
+    /// The move is part of a cycle, which has to be broken somewhere.
+    CycleBreak,
 }
 
 /// Something the register allocator did.
@@ -384,6 +400,112 @@ where
         at: LivePoint<E>,
         /// The value both pieces hold.
         val: Val<E>,
+    },
+
+    /// A value was recorded as available somewhere, so that moves at that
+    /// position can read it from there.
+    HalfMoveSource {
+        /// Where it is available.
+        pos: PackedMovePosition<E>,
+        /// The value.
+        val: Val<E>,
+        /// Where it is.
+        alloc: Allocation<E>,
+        /// The source this one displaced, if it is not the first one here.
+        replaced: Option<Allocation<E>>,
+    },
+
+    /// A value was recorded as wanted somewhere.
+    HalfMoveDest {
+        /// Where it is wanted.
+        pos: PackedMovePosition<E>,
+        /// The value.
+        val: Val<E>,
+        /// Where it is wanted.
+        alloc: Allocation<E>,
+    },
+
+    /// A wanted destination was joined with a source, making a whole move.
+    MoveResolved {
+        /// Where the move goes.
+        pos: PackedMovePosition<E>,
+        /// The value it moves.
+        val: Val<E>,
+        /// Where it reads from.
+        src: Allocation<E>,
+        /// Where it writes to.
+        dst: Allocation<E>,
+    },
+
+    /// A value was rematerialized instead of moved.
+    RematEmitted {
+        /// Where it is rematerialized.
+        pos: PackedMovePosition<E>,
+        /// The value.
+        val: Val<E>,
+        /// The register it is rematerialized into.
+        dest: Reg<E>,
+    },
+
+    /// A scratch location was found for a move that could not be done directly.
+    ScratchRegChosen {
+        /// Where the batch is.
+        pos: PackedMovePosition<E>,
+        /// The move that needed the scratch.
+        mv: ParallelMove<E>,
+        /// The scratch location, which is a stack slot when no register was
+        /// free.
+        scratch: ScalarAllocation<E>,
+        /// Why it was needed.
+        reason: ScratchReason,
+    },
+
+    /// No scratch location could be found, which fails the whole allocation.
+    ScratchRegUnavailable {
+        /// Where the batch is.
+        pos: PackedMovePosition<E>,
+        /// The move that needed the scratch.
+        mv: ParallelMove<E>,
+    },
+
+    /// A position's parallel moves were sequentialized.
+    ParallelMoveBatchSolved {
+        /// Where the batch is.
+        pos: PackedMovePosition<E>,
+        /// How many parallel moves went in.
+        num_input_moves: usize,
+        /// How many sequential moves came out.
+        num_solved_moves: usize,
+    },
+
+    /// A sequentialized move became an edit.
+    MoveEmitted {
+        /// Where the move goes.
+        pos: PackedMovePosition<E>,
+        /// The move.
+        #[cfg_attr(feature = "visualizer", serde(rename = "move"))]
+        move_: Move<E>,
+        /// Its index in the finished edit list, so that the visualizer can
+        /// map an edit it renders back to the event that made it.
+        //
+        // Recorded as the position in `self.edits` at the time of emission,
+        // then renumbered once the edits are sorted. Stable only because move
+        // elimination never removes an edit; if it ever does, add a
+        // `MoveEliminated { index }` event and fold it in the visualizer
+        // rather than renumbering again here.
+        index: usize,
+    },
+
+    /// An edit was placed on a critical edge, which the client has to split.
+    CriticalEdgeEdit {
+        /// The predecessor the edge leaves.
+        pred: Block<E>,
+        /// Which of the predecessor's successors it is.
+        succ: usize,
+        /// The successor the edge enters.
+        target: Block<E>,
+        /// What goes on the edge.
+        edit: EdgeEdit<E>,
     },
 }
 

@@ -27,6 +27,25 @@ where
     Stack(StackAllocation<E>),
 }
 
+/// An allocation serializes as whichever of its two halves it holds, whose
+/// four variant names are already distinct, so the visualizer sees one flat
+/// vocabulary of places a value can be.
+#[cfg(feature = "visualizer")]
+impl<E> serde::Serialize for Allocation<E>
+where
+    E: EntityRepr,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Reg(reg) => reg.serialize(serializer),
+            Self::Stack(stack) => stack.serialize(serializer),
+        }
+    }
+}
+
 /// Where a value lives in registers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RegAllocation<E = u32>
@@ -113,6 +132,28 @@ where
 
     /// A single spill slot.
     Stack(SpillSlot<E>),
+}
+
+/// A scalar allocation serializes in the same vocabulary as [`Allocation`],
+/// restricted to the two variants that name exactly one location.
+#[cfg(feature = "visualizer")]
+impl<E> serde::Serialize for ScalarAllocation<E>
+where
+    E: EntityRepr,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Reg(reg) => {
+                serializer.serialize_newtype_variant("ScalarAllocation", 0, "reg", reg)
+            }
+            Self::Stack(slot) => {
+                serializer.serialize_newtype_variant("ScalarAllocation", 1, "slot", slot)
+            }
+        }
+    }
 }
 
 impl<E> From<Reg<E>> for ScalarAllocation<E>
@@ -330,6 +371,9 @@ where
 
 /// TODO FITZGEN
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub enum Move<E = u32>
 where
     E: EntityRepr,
@@ -361,6 +405,8 @@ where
 
 /// TODO FITZGEN
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub struct Remat<E = u32>
 where
     E: EntityRepr,
@@ -391,6 +437,9 @@ where
 
 /// What a [`CriticalEdgeEdit`] does once the edge is split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "visualizer", serde(bound = ""))]
 pub enum EdgeEdit<E = u32>
 where
     E: EntityRepr,
