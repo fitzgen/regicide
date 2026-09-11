@@ -587,14 +587,18 @@ mod tests {
     /// index already has, `byEntity` restates the events -- and the per-event
     /// cost is what decides whether this is usable on a large function.
     ///
+    /// So the blob is what is measured, not the page around it. Weighing the
+    /// whole page instead put the assets on the scale too: they are about
+    /// 110 KB and climbing, they do not grow with the function, and a pane
+    /// added to `model.js` would trip a tripwire aimed at the event log.
+    ///
     /// The ceiling is a tripwire, not a budget. The largest input in the
-    /// suite came to 48 KB, of which about 30 KB is the assets and so does
-    /// not grow with the function; this leaves room for the panes commits
-    /// 08-12 add and still catches a field quietly added to every event. When
-    /// it trips, the printed sizes are what to re-observe it against.
+    /// suite comes to 23 KB, so this leaves room to grow and still catches a
+    /// field quietly added to every event. When it trips, the printed sizes
+    /// are what to re-observe it against.
     #[test]
     fn the_blob_stays_small() {
-        const CEILING: usize = 128 * 1024;
+        const CEILING: usize = 32 * 1024;
 
         let inputs: &[(&str, fn() -> TestInput)] = &[
             ("default", TestInput::default),
@@ -642,7 +646,7 @@ mod tests {
 
         let mut largest = ("", 0);
         for (name, build) in inputs {
-            let size = page_for(&build()).len();
+            let size = data_json(&page_for(&build())).len();
             println!("{name}: {size} bytes");
             if size > largest.1 {
                 largest = (name, size);
