@@ -63,6 +63,7 @@ use crate::{
     counts::Counts,
     entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
     error::IResult,
+    events::EventsLog,
     input::{DefUse, Input, InputBlock as _, InputFunction, Position},
     live_ranges::{LivePoint, LiveRanges, LiveSpan},
     liveness::{Liveness, for_each_operand_rev},
@@ -93,6 +94,18 @@ define_entities! {
 /// The size of a spill slot: a power-of-two number of bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpillSlotSize(u8);
+
+/// A slot size serializes as its byte count, which is what a stack frame is
+/// measured in.
+#[cfg(feature = "visualizer")]
+impl serde::Serialize for SpillSlotSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u16(self.size())
+    }
+}
 
 impl SpillSlotSize {
     /// Create a `SpillSlotSize` of `size` bytes.
@@ -149,6 +162,7 @@ where
 
     let ContextInner {
         counts,
+        events,
         rpo,
         liveness,
         live_ranges,
@@ -161,6 +175,7 @@ where
     spill_slots.allocate(
         input,
         counts,
+        events,
         rpo,
         liveness,
         live_ranges,
@@ -348,6 +363,7 @@ where
     pub(crate) fn emergency_slot(
         &mut self,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         size: SpillSlotSize,
         output: &mut OutputInner<E>,
     ) -> IResult<SpillSlot<E>> {
@@ -359,6 +375,14 @@ where
         self.emergency[size.index()] = Some(slot);
         counts.emergency_spill_slots.inc();
         counts.spill_slots.inc();
+        event!(
+            events,
+            SpillSlotCreated {
+                slot,
+                size,
+                emergency: true,
+            }
+        );
         trace!(
             "spill slots: created emergency {slot:?} ({} bytes)",
             size.size()
@@ -371,6 +395,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
         live_ranges: &LiveRanges<E>,
@@ -378,8 +403,8 @@ where
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         debug_assert!(self.is_reset());
-        self.collect_spilled_values(counts, live_ranges, region_allocation);
-        self.color(input, counts, rpo, liveness, output)
+        self.collect_spilled_values(counts, events, live_ranges, region_allocation);
+        self.color(input, counts, events, rpo, liveness, output)
     }
 
     /// Gather the values that need a stack slot: everything covered by a bundle
@@ -387,14 +412,40 @@ where
     fn collect_spilled_values(
         &mut self,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
     ) {
+        // How many stack spans each value has. Only counted when we are
+        // logging, which is the only thing that reads it.
+        let logging = cfg!(any(
+            feature = "trace-log",
+            debug_assertions,
+            feature = "visualizer",
+        ));
+        let mut num_spans = SecondaryMap::<Val<E>, usize>::new(0);
+
         for bundle in region_allocation.stack_bundles().iter().copied() {
             for span in bundle.spans(live_ranges) {
-                if self.spilled.insert(span.val(live_ranges)) {
+                let val = span.val(live_ranges);
+                if self.spilled.insert(val) {
                     counts.spilled_values.inc();
                 }
+                if logging {
+                    num_spans[val] += 1;
+                }
+            }
+        }
+
+        if logging {
+            for val in self.spilled.iter() {
+                event!(
+                    events,
+                    ValueSpilled {
+                        val,
+                        num_spans: num_spans[val],
+                    }
+                );
             }
         }
         trace!(
@@ -410,6 +461,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
         output: &mut OutputInner<E>,
@@ -419,7 +471,7 @@ where
         }
 
         for block in rpo.iter() {
-            self.allocate_block(input, counts, liveness, block, output)?;
+            self.allocate_block(input, counts, events, liveness, block, output)?;
         }
 
         self.check_every_spilled_value_has_a_slot();
@@ -434,6 +486,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         block: Block<E>,
         output: &mut OutputInner<E>,
@@ -445,21 +498,21 @@ where
         debug_assert!(self.events.is_empty());
         debug_assert!(self.live.is_empty());
 
-        self.enter_block(input, counts, liveness, block, output)?;
+        self.enter_block(input, counts, events, liveness, block, output)?;
         self.collect_events(input, liveness, block, output)?;
 
         self.events.sort_unstable();
-        let mut events = core::mem::take(&mut self.events);
-        for (point, event, val) in events.drain(..) {
+        let mut block_events = core::mem::take(&mut self.events);
+        for (point, event, val) in block_events.drain(..) {
             match event {
                 Event::Kill => self.free(input, val),
                 Event::Def => {
                     let _ = point;
-                    self.assign(input, counts, val, output)?;
+                    self.assign(input, counts, events, val, output)?;
                 }
             }
         }
-        self.events = events;
+        self.events = block_events;
 
         self.in_use.reset();
         for free in &mut self.free_slots {
@@ -481,6 +534,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         block: Block<E>,
         output: &mut OutputInner<E>,
@@ -518,7 +572,7 @@ where
                 "{val:?} is live on entry to {block:?} without a slot, so it must be one of \
                  {block:?}'s parameters",
             );
-            self.assign(input, counts, val, output)?;
+            self.assign(input, counts, events, val, output)?;
         }
 
         Ok(())
@@ -601,6 +655,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         val: Val<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
@@ -614,15 +669,25 @@ where
         let num_regs = val.num_regs(input);
 
         let home = if num_regs == 1 {
-            StackAllocation::SpillSlot(self.alloc_slot(size, output)?)
+            StackAllocation::SpillSlot(self.alloc_slot(events, size, output)?)
         } else {
             let start = self.group_members.next_key(output)?;
             for _ in 0..num_regs {
-                let slot = self.alloc_slot(size, output)?;
+                let slot = self.alloc_slot(events, size, output)?;
                 self.group_members.push(output, slot)?;
             }
             let end = self.group_members.next_key(output)?;
             let group = self.groups.push(output, EntityRange { start, end })?;
+            // After its members' events, so that the log never names a slot
+            // before creating it.
+            event!(
+                events,
+                SpillSlotGroupCreated {
+                    group,
+                    members: group.members(self).to_vec(),
+                    size,
+                }
+            );
             StackAllocation::SpillSlotGroup(group)
         };
 
@@ -630,6 +695,7 @@ where
         self.occupy_val_slots(input, val);
 
         counts.spill_slot_assignments.inc();
+        event!(events, SpillSlotAssigned { val, slot: home });
         trace!(
             "spill slots: assigned {val:?} to {home:?}: {num_regs} slot(s) of {} bytes",
             size.size(),
@@ -641,12 +707,24 @@ where
     /// existing slot of that size is occupied.
     fn alloc_slot(
         &mut self,
+        events: &mut EventsLog<E>,
         size: SpillSlotSize,
         output: &mut OutputInner<E>,
     ) -> IResult<SpillSlot<E>> {
         match self.free_slots[size.index()].pop() {
             Some(slot) => Ok(slot),
-            None => self.slots.push(output, size),
+            None => {
+                let slot = self.slots.push(output, size)?;
+                event!(
+                    events,
+                    SpillSlotCreated {
+                        slot,
+                        size,
+                        emergency: false,
+                    }
+                );
+                Ok(slot)
+            }
         }
     }
 
@@ -815,6 +893,9 @@ mod tests {
         vec::Vec,
     };
 
+    #[cfg(feature = "visualizer")]
+    use crate::events::Event as LoggedEvent;
+
     /// Run every phase up through spill slot allocation.
     ///
     /// Returns `None` when register allocation itself gave up on this input,
@@ -944,6 +1025,7 @@ mod tests {
             {
                 let ContextInner {
                     counts,
+                    events,
                     rpo,
                     liveness,
                     spill_slots,
@@ -951,7 +1033,7 @@ mod tests {
                     ..
                 } = &mut *context;
                 spill_slots
-                    .color(input, counts, rpo, liveness, output)
+                    .color(input, counts, events, rpo, liveness, output)
                     .map_err(|()| format!("coloring failed: {:?}", output.take_error()))?;
             }
 
@@ -1093,6 +1175,158 @@ mod tests {
 
             Ok(())
         })
+    }
+
+    /// Run the whole allocator, which is the only way to reach the emergency
+    /// slot path: move generation is what borrows an emergency slot.
+    #[cfg(feature = "visualizer")]
+    fn run_everything(test_input: &TestInput) -> Result<Option<Context>, String> {
+        let mut context = Context::new();
+        assert!(context.is_reset());
+
+        let result = test_input
+            .with_input(|input| -> IResult<()> { crate::run_inner(&mut context.context32, input) });
+
+        if result.is_err() {
+            return match context.context32.output.take_error() {
+                crate::error::InternalError::Error(crate::Error::TooManyLiveRegs) => Ok(None),
+                error => Err(format!("allocation failed: {error:?}")),
+            };
+        }
+
+        Ok(Some(context))
+    }
+
+    /// Every slot in the stack frame was announced exactly once, with the
+    /// right size, and flagged as an emergency slot exactly when it is one.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_slot_is_announced_once() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(1_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = run_everything(test_input)? else {
+                    return Ok(());
+                };
+                let inner = &context.context32;
+                let spill_slots = &inner.spill_slots;
+
+                let mut created: BTreeMap<SpillSlot<u32>, (SpillSlotSize, bool)> = BTreeMap::new();
+                for (_, event) in inner.events.iter() {
+                    let LoggedEvent::SpillSlotCreated {
+                        slot,
+                        size,
+                        emergency,
+                    } = *event
+                    else {
+                        continue;
+                    };
+                    if created.insert(slot, (size, emergency)).is_some() {
+                        return Err(format!("{slot:?} was created twice"));
+                    }
+                }
+
+                let emergency: BTreeSet<SpillSlot<u32>> =
+                    spill_slots.emergency.iter().flatten().copied().collect();
+
+                for (index, &size) in spill_slots.sizes().iter().enumerate() {
+                    let slot = SpillSlot::<u32>::try_new(index).unwrap();
+                    let want = (size, emergency.contains(&slot));
+                    match created.remove(&slot) {
+                        Some(got) if got == want => {}
+                        Some(got) => {
+                            return Err(format!(
+                                "{slot:?} was announced as {got:?}, but it is {want:?}"
+                            ));
+                        }
+                        None => return Err(format!("{slot:?} was never announced")),
+                    }
+                }
+
+                if let Some((slot, _)) = created.pop_first() {
+                    return Err(format!("{slot:?} was announced but does not exist"));
+                }
+
+                Ok(())
+            })
+    }
+
+    /// Every spilled value was announced, and given a home made of slots that
+    /// were announced before it.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_value_gets_an_announced_home() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(1_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = allocate(test_input)? else {
+                    return Ok(());
+                };
+                let inner = &context.context32;
+                let spill_slots = &inner.spill_slots;
+
+                let mut slots_so_far: BTreeSet<SpillSlot<u32>> = BTreeSet::new();
+                let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
+                let mut homes: BTreeMap<Val<u32>, StackAllocation<u32>> = BTreeMap::new();
+
+                for (_, event) in inner.events.iter() {
+                    match *event {
+                        LoggedEvent::SpillSlotCreated { slot, .. } => {
+                            slots_so_far.insert(slot);
+                        }
+                        LoggedEvent::SpillSlotGroupCreated {
+                            group, ref members, ..
+                        } => {
+                            if members != group.members(spill_slots) {
+                                return Err(format!(
+                                    "{group:?} was announced with {members:?}, but holds {:?}",
+                                    group.members(spill_slots),
+                                ));
+                            }
+                            for &slot in members {
+                                if !slots_so_far.contains(&slot) {
+                                    return Err(format!(
+                                        "{group:?} names {slot:?}, which was not created yet"
+                                    ));
+                                }
+                            }
+                        }
+                        LoggedEvent::ValueSpilled { val, num_spans } => {
+                            if num_spans == 0 {
+                                return Err(format!("{val:?} was spilled with no spans"));
+                            }
+                            if !spilled.insert(val) {
+                                return Err(format!("{val:?} was spilled twice"));
+                            }
+                        }
+                        LoggedEvent::SpillSlotAssigned { val, slot } => {
+                            if homes.insert(val, slot).is_some() {
+                                return Err(format!("{val:?} was given two homes"));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                let want_spilled: BTreeSet<Val<u32>> = spill_slots.spilled().iter().collect();
+                if spilled != want_spilled {
+                    return Err(format!(
+                        "the log spilled {spilled:?}, but the pass spilled {want_spilled:?}"
+                    ));
+                }
+
+                for val in want_spilled {
+                    let home = val.stack_home(spill_slots);
+                    if homes.get(&val).copied() != home {
+                        return Err(format!(
+                            "{val:?} was announced at {:?}, but lives at {home:?}",
+                            homes.get(&val),
+                        ));
+                    }
+                }
+
+                Ok(())
+            })
     }
 
     /// Running the whole pipeline, up to and including this pass, never panics

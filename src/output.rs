@@ -75,6 +75,29 @@ where
     SpillSlotGroup(SpillSlotGroup<E>),
 }
 
+/// A stack allocation serializes as its variant name wrapping a bare index,
+/// which is what tells the visualizer whether that index is a slot or a group
+/// of slots.
+#[cfg(feature = "visualizer")]
+impl<E> serde::Serialize for StackAllocation<E>
+where
+    E: EntityRepr,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::SpillSlot(slot) => {
+                serializer.serialize_newtype_variant("StackAllocation", 0, "slot", slot)
+            }
+            Self::SpillSlotGroup(group) => {
+                serializer.serialize_newtype_variant("StackAllocation", 1, "slotGroup", group)
+            }
+        }
+    }
+}
+
 /// A single machine location: what one move reads or writes.
 ///
 /// This is what parallel move solving deals in, because two locations must

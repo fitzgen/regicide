@@ -53,6 +53,7 @@ use crate::{
     counts::Counts,
     entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
     error::{Error, IResult, InternalError},
+    events::EventsLog,
     hash_map::{Entry, FxHashMap},
     input::{
         DefUse, Input, InputBlock, InputFunction, InputInst as _, InputValue as _, Position,
@@ -87,6 +88,7 @@ where
 
     let ContextInner {
         counts,
+        events,
         rpo,
         liveness,
         live_ranges,
@@ -101,6 +103,7 @@ where
     move_generation.generate(
         input,
         counts,
+        events,
         rpo,
         liveness,
         live_ranges,
@@ -506,6 +509,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
         live_ranges: &LiveRanges<E>,
@@ -528,7 +532,14 @@ where
             output,
         )?;
         self.resolve(input, counts);
-        self.sequentialize(input, counts, region_allocation, spill_slots, output)
+        self.sequentialize(
+            input,
+            counts,
+            events,
+            region_allocation,
+            spill_slots,
+            output,
+        )
     }
 
     /// Build the index of what we need in order to generate moves.
@@ -1103,6 +1114,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
         output: &mut OutputInner<E>,
@@ -1116,6 +1128,7 @@ where
                 self.sequentialize_batch(
                     input,
                     counts,
+                    events,
                     region_allocation,
                     spill_slots,
                     output,
@@ -1153,6 +1166,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
         output: &mut OutputInner<E>,
@@ -1240,7 +1254,7 @@ where
                 }
 
                 let size = bank.size(machine);
-                let Ok(slot) = spill_slots.emergency_slot(counts, size, output) else {
+                let Ok(slot) = spill_slots.emergency_slot(counts, events, size, output) else {
                     scratch_failed = true;
                     return None;
                 };

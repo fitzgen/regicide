@@ -57,6 +57,7 @@ use crate::{
     counts::Counts,
     entity::{EntityRepr, EntitySet, SecondaryMap},
     error::IResult,
+    events::EventsLog,
     input::{DefUse, Input, InputBlock as _, InputFunction, InputInst as _, Position},
     live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, Use},
     liveness::block_first_inst,
@@ -81,6 +82,7 @@ where
 
     let ContextInner {
         counts,
+        events,
         rpo,
         live_ranges,
         region_allocation,
@@ -93,6 +95,7 @@ where
     spill_placement.place(
         input,
         counts,
+        events,
         rpo,
         live_ranges,
         region_allocation,
@@ -333,6 +336,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
@@ -352,7 +356,7 @@ where
         let spans = core::mem::take(&mut self.spans);
 
         for val_spans in spans.chunk_by(|a, b| a.val(live_ranges) == b.val(live_ranges)) {
-            self.place_spills_for_value(input, counts, live_ranges, val_spans);
+            self.place_spills_for_value(input, counts, events, live_ranges, spill_slots, val_spans);
         }
 
         self.spans = spans;
@@ -434,7 +438,9 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
         val_spans: &[LiveSpan<E>],
     ) {
         let val = val_spans[0].val(live_ranges);
@@ -464,7 +470,7 @@ where
             return;
         }
 
-        self.find_legal_spill_blocks(input, live_ranges, val_spans);
+        self.find_legal_spill_blocks(input, events, live_ranges, val_spans);
 
         // Place the spill for each on-stack span.
         for &span in val_spans {
@@ -486,6 +492,18 @@ where
             trace!("spill placement: spill {val:?} in {block:?} at {point:?}");
             self.spills.push(SpillSite { point, span });
             counts.spills_placed.inc();
+            event!(
+                events,
+                SpillPlaced {
+                    val,
+                    span,
+                    at: point,
+                    block,
+                    slot: val
+                        .stack_home(spill_slots)
+                        .expect("a value we are spilling has a stack home"),
+                }
+            );
         }
 
         self.legal.reset();
@@ -501,9 +519,11 @@ where
     fn find_legal_spill_blocks(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         live_ranges: &LiveRanges<E>,
         val_spans: &[LiveSpan<E>],
     ) {
+        let mut num_candidates = 0;
         let mut prev_block = None;
         for &span in val_spans {
             let block = span.block(input.func, live_ranges);
@@ -516,6 +536,36 @@ where
                 && span.start(live_ranges) == block.start_point(input)
             {
                 self.legal[block] = Some(span);
+                num_candidates += 1;
+            }
+        }
+
+        // A second walk, so that every event can say how many candidates there
+        // were in the end. Compiled away when nothing is listening.
+        if cfg!(any(
+            feature = "trace-log",
+            debug_assertions,
+            feature = "visualizer",
+        )) {
+            let val = val_spans[0].val(live_ranges);
+            let mut prev_block = None;
+            for &span in val_spans {
+                let block = span.block(input.func, live_ranges);
+                if prev_block == Some(block) {
+                    continue;
+                }
+                prev_block = Some(block);
+
+                if self.legal[block].is_some() {
+                    event!(
+                        events,
+                        SpillBlockChosen {
+                            val,
+                            block,
+                            num_candidates,
+                        }
+                    );
+                }
             }
         }
     }
@@ -656,6 +706,9 @@ mod tests {
         vec::Vec,
     };
 
+    #[cfg(feature = "visualizer")]
+    use crate::events::Event as LoggedEvent;
+
     /// Run every phase up through spill placement.
     ///
     /// Returns `None` when register allocation itself gave up on this input,
@@ -701,6 +754,110 @@ mod tests {
         }
 
         Ok(Some(context))
+    }
+
+    /// Every placed spill was logged, against a value the log already said
+    /// was going to the stack and a span that is still in a register there.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_spill_is_logged() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(1_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = place(test_input)? else {
+                    return Ok(());
+                };
+                // A second build of the same input, only so that the checks
+                // below can ask which block a point is in.
+                test_input.with_input(|input| -> Result<(), String> {
+                    let inner = &context.context32;
+                    let live_ranges = &inner.live_ranges;
+                    let spill_slots = &inner.spill_slots;
+
+                    let mut on_stack: BTreeSet<LiveBundle<u32>> = BTreeSet::new();
+                    let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
+                    let mut placed: Vec<(LivePoint<u32>, LiveSpan<u32>)> = Vec::new();
+
+                    for (_, event) in inner.events.iter() {
+                        match *event {
+                            LoggedEvent::BundleSpilledToStack { bundle, .. } => {
+                                on_stack.insert(bundle);
+                            }
+                            LoggedEvent::ValueSpilled { val, .. } => {
+                                spilled.insert(val);
+                            }
+                            LoggedEvent::SpillPlaced {
+                                val,
+                                span,
+                                at,
+                                block,
+                                slot,
+                            } => {
+                                if span.val(live_ranges) != val {
+                                    return Err(format!("{span:?} does not hold {val:?}"));
+                                }
+                                if Some(slot) != val.stack_home(spill_slots) {
+                                    return Err(format!(
+                                        "{val:?} was spilled to {slot:?}, but lives at {:?}",
+                                        val.stack_home(spill_slots),
+                                    ));
+                                }
+                                if block != span.block(input.func, live_ranges) {
+                                    return Err(format!(
+                                        "{span:?} is in {:?}, not {block:?}",
+                                        span.block(input.func, live_ranges),
+                                    ));
+                                }
+                                if !spilled.contains(&val) {
+                                    return Err(format!(
+                                        "{val:?} is spilled at {at:?}, but was never logged as \
+                                         going to the stack"
+                                    ));
+                                }
+                                placed.push((at, span));
+                            }
+                            LoggedEvent::SpillBlockChosen { num_candidates, .. } => {
+                                if num_candidates == 0 {
+                                    return Err(String::from(
+                                        "a legal spill block was logged with no candidates",
+                                    ));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // Every spill the pass recorded was logged, and nothing else
+                    // was.
+                    let mut want: Vec<(LivePoint<u32>, LiveSpan<u32>)> = inner
+                        .spill_placement
+                        .spills()
+                        .iter()
+                        .map(|site| (site.point, site.span))
+                        .collect();
+                    want.sort_unstable();
+                    placed.sort_unstable();
+                    if placed != want {
+                        return Err(format!("logged spills {placed:?}, but placed {want:?}"));
+                    }
+
+                    // And each one names the span that still holds the value
+                    // in a register there, which is what the store reads from.
+                    for &(_, span) in &placed {
+                        let bundle = span
+                            .bundle(live_ranges)
+                            .expect("a live span belongs to a bundle");
+                        if on_stack.contains(&bundle) {
+                            return Err(format!(
+                                "{span:?} is already on the stack in {bundle:?}, so there is \
+                                 nothing to store from"
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                })
+            })
     }
 
     /// What a run of the property check below saw, so that it can tell whether

@@ -6,8 +6,11 @@ use crate::{
     live_ranges::{LiveBundle, LivePoint, LiveSpan, Use},
     machine::RegSet,
     output::RegAllocation,
+    output::StackAllocation,
     region_allocation::{Phase, Priority},
+    spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize},
 };
+use alloc::vec::Vec;
 
 define_entities! {
     /// An event in the event log.
@@ -300,6 +303,70 @@ where
         child: LiveBundle<E>,
         /// The region both are allocated within.
         region: Region<E>,
+    },
+
+    /// A stack slot was created.
+    SpillSlotCreated {
+        /// The new slot.
+        slot: SpillSlot<E>,
+        /// How many bytes it holds.
+        size: SpillSlotSize,
+        /// Was it created for move generation to borrow, rather than to be a
+        /// spilled value's home?
+        emergency: bool,
+    },
+
+    /// A group of stack slots was created to hold one value of a register
+    /// group class.
+    SpillSlotGroupCreated {
+        /// The new group.
+        group: SpillSlotGroup<E>,
+        /// Its slots, in group-member order.
+        members: Vec<SpillSlot<E>>,
+        /// How many bytes each of them holds.
+        size: SpillSlotSize,
+    },
+
+    /// A spilled value was given its home on the stack.
+    SpillSlotAssigned {
+        /// The value.
+        val: Val<E>,
+        /// Where it lives.
+        slot: StackAllocation<E>,
+    },
+
+    /// A value will live in memory, because every bundle covering it is on the
+    /// stack.
+    ValueSpilled {
+        /// The value.
+        val: Val<E>,
+        /// How many of its spans put it there.
+        num_spans: usize,
+    },
+
+    /// A store of a value into its stack slot was placed.
+    SpillPlaced {
+        /// The value being stored.
+        val: Val<E>,
+        /// The span that is live in a register at the store, which is also
+        /// what names the bundle the spill is charged to.
+        span: LiveSpan<E>,
+        /// Where the store goes.
+        at: LivePoint<E>,
+        /// The block it goes in.
+        block: Block<E>,
+        /// Where it stores to.
+        slot: StackAllocation<E>,
+    },
+
+    /// A block where a value may legally be spilled.
+    SpillBlockChosen {
+        /// The value.
+        val: Val<E>,
+        /// A block it is live and in a register at the start of.
+        block: Block<E>,
+        /// How many such blocks it has in total.
+        num_candidates: usize,
     },
 
     /// A span was cut in two by a bundle split.
