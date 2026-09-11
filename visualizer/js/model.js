@@ -359,15 +359,56 @@ function buildOutline(func) {
   return { lines, bars: buildBars(spans, instRows) };
 }
 
-// One bar per span, spanning the rows its instructions occupy.
+// The row a program point sits on: an instruction is drawn as two lines, and
+// its `early` point is the first of them and its `late` point the second.
+// `null` when no block claimed the instruction, so it was never drawn.
+function rowOfPoint(point, instRows) {
+  const rows = instRows.get(point.inst);
+  if (rows === undefined) return null;
+  return point.pos === "early" ? rows.first : rows.last;
+}
+
+// The largest member of `sorted` below `bound`, or `null` if it has none.
+function latestBelow(sorted, bound) {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] < bound) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo === 0 ? null : sorted[lo - 1];
+}
+
+// The row of the last point a span covers, given its *exclusive* end.
+//
+// One point back from `end`, which for an `early` end is the previous
+// instruction's `late` point -- and the previous instruction, not `end.inst`,
+// is the one that has rows: a span reaching the end of the function ends one
+// past the last instruction there is. `emitted` is why the step back is a
+// search and not a subtraction: instruction indices are only contiguous when
+// every one of them is in a block.
+function lastRowOfSpan(end, instRows, emitted) {
+  if (end.pos === "late") return rowOfPoint({ inst: end.inst, pos: "early" }, instRows);
+  const before = latestBelow(emitted, end.inst);
+  return before === null ? null : rowOfPoint({ inst: before, pos: "late" }, instRows);
+}
+
+// One bar per span, spanning the rows the span's points occupy.
 function buildBars(spans, instRows) {
+  // In index order, which is the order points run in; `instRows` is keyed in
+  // the order the blocks were drawn.
+  const emitted = [...instRows.keys()].sort((a, b) => a - b);
+
   const bars = [];
   spans.forEach((span, index) => {
-    const start = instRows.get(span.start.inst);
-    const end = instRows.get(span.end.inst);
+    const startRow = rowOfPoint(span.start, instRows);
+    const endRow = lastRowOfSpan(span.end, instRows, emitted);
     // A span over an instruction no block claims is not drawable; it would
-    // have no rows to sit beside.
-    if (start === undefined || end === undefined) return;
+    // have no rows to sit beside. Nor is one whose end comes out above its
+    // start: an empty span, or a span across blocks the layout put out of
+    // index order, neither of which is a run of rows.
+    if (startRow === null || endRow === null || endRow < startRow) return;
     const ref = allocationRef(span.allocation);
     bars.push({
       span: { kind: "LiveSpan", index },
@@ -380,8 +421,8 @@ function buildBars(spans, instRows) {
         entityLabel({ kind: "Val", index: span.val }) +
         (ref ? "[" + entityLabel(ref) + "]" : "") +
         ")",
-      startRow: start.first,
-      endRow: end.last,
+      startRow,
+      endRow,
       column: 0,
     });
   });

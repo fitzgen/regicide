@@ -265,6 +265,75 @@ test("bars share a column only when they do not overlap", () => {
   assert.ok(columns.size < bars.length, "no column was reused");
 });
 
+test("a bar covers exactly the rows the span's points sit on", () => {
+  // A span is `[start, end)`, and a point is a row: an instruction's `early`
+  // point is its first line and its `late` point its second. The rule is
+  // stated here from the blob rather than borrowed from `model.js`, because
+  // the bar being one row too tall at either end is exactly the bug that a
+  // test written the other way round would agree with.
+  for (const name of ["spills-and-reloads", "critical-edge", "block-kinds"]) {
+    const blob = fixture(name);
+    const outline = outlineOf(blob);
+    const rows = instRowsOf(outline);
+    // Every span in these fixtures is over drawn instructions, so every one
+    // of them has a bar.
+    assert.equal(outline.bars.length, blob.function.spans.length, name);
+
+    for (const bar of outline.bars) {
+      const span = blob.function.spans[bar.span.index];
+      const start = rows.get(span.start.inst);
+      const where = name + " " + bar.label;
+      assert.equal(bar.startRow, span.start.pos === "early" ? start.first : start.last, where);
+      // One point back from the exclusive end: `late` is the same
+      // instruction's `early`, `early` is the previous instruction's `late`.
+      const end =
+        span.end.pos === "late"
+          ? rows.get(span.end.inst).first
+          : rows.get(span.end.inst - 1).last;
+      assert.equal(bar.endRow, end, where);
+    }
+  }
+});
+
+test("a span that runs to the end of the function still gets a bar", () => {
+  // Perturbed rather than fixtured: a span's end is exclusive, so a value
+  // read at the last instruction's `late` point ends one instruction past the
+  // end of the function -- which is what a page built by
+  // `examples/visualize.rs` is full of, and what no hand-written test input
+  // here happens to produce.
+  const blob = fixture("spills-and-reloads");
+  const last = blob.function.insts.length - 1;
+  const span = blob.function.spans.length;
+  blob.function.spans = [
+    ...blob.function.spans,
+    {
+      ...blob.function.spans[0],
+      start: { inst: last, pos: "early" },
+      end: { inst: last + 1, pos: "early" },
+    },
+  ];
+
+  const outline = outlineOf(blob);
+  const bar = outline.bars.find((bar) => bar.span.index === span);
+  assert.ok(bar, "the span past the last instruction has no bar");
+  const rows = instRowsOf(outline);
+  assert.equal(bar.startRow, rows.get(last).first);
+  assert.equal(bar.endRow, rows.get(last).last);
+});
+
+// Instruction index -> the two rows it is drawn on, read back off the outline.
+function instRowsOf(outline) {
+  const rows = new Map();
+  outline.lines.forEach((line, row) => {
+    if (line.kind !== "inst") return;
+    const ref = line.parts.map((part) => part.entity).find((ref) => ref && ref.kind === "Inst");
+    // The `late` line carries no reference of its own; it is the row after
+    // the `early` line that does.
+    if (ref) rows.set(ref.index, { first: row, last: row + 1 });
+  });
+  return rows;
+}
+
 test("every entity a line names is a real one, labeled by `entities.js`", () => {
   for (const name of ["spills-and-reloads", "critical-edge", "spilled-merge-param"]) {
     const blob = fixture(name);
