@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>regicide</title>
+<style>/* REGICIDE_CSS */</style>
+</head>
+<body>
+
+<nav id="tabs" role="tablist" aria-label="Views">
+  <button type="button" role="tab" data-tab="function" aria-selected="true">Function</button>
+  <button type="button" role="tab" data-tab="events" aria-selected="false">Event Log</button>
+  <button type="button" role="tab" data-tab="histograms" aria-selected="false">Histograms</button>
+</nav>
+
+<main id="panels">
+  <section class="panel" data-panel="function" role="tabpanel" aria-label="Function">
+    <nav id="breadcrumbs" aria-label="Selection history"></nav>
+    <div class="split">
+      <div id="function-pane" tabindex="0"></div>
+      <aside id="details-pane"></aside>
+    </div>
+  </section>
+
+  <section class="panel" data-panel="events" role="tabpanel" aria-label="Event log" hidden>
+    <div id="event-search">
+      <label for="event-query">Search</label>
+      <input id="event-query" type="search" autocomplete="off">
+    </div>
+    <div id="event-list" tabindex="0"></div>
+  </section>
+
+  <section class="panel" data-panel="histograms" role="tabpanel" aria-label="Histograms" hidden>
+    <div class="split">
+      <nav id="histogram-toc" aria-label="Histograms"></nav>
+      <div id="histogram-pane" tabindex="0"></div>
+    </div>
+  </section>
+</main>
+
+<script id="regicide-worker" type="text/plain">/* REGICIDE_WORKER_JS */</script>
+<script id="regicide-data" type="application/json">/* REGICIDE_DATA_JSON */</script>
+<script type="module">/* REGICIDE_APP_JS */</script>
+
+</body>
+</html>

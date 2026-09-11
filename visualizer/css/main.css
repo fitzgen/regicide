@@ -1,0 +1,206 @@
+/* The palette, in one place. Later commits pick from these rather than
+   inventing colors. */
+:root {
+  color-scheme: light dark;
+
+  --bg: #fdfdfc;
+  --bg-raised: #f3f2ef;
+  --bg-sunken: #e8e6e1;
+  --fg: #1c1b19;
+  --fg-dim: #6b6862;
+  --border: #d6d3cc;
+  --accent: #1a5fb4;
+  --accent-fg: #ffffff;
+  --focus: #1a5fb4;
+
+  /* Syntax highlighting for the function pane. */
+  --syntax-keyword: #8f3f71;
+  --syntax-entity: #1a5fb4;
+  --syntax-reg: #0b6a5b;
+  --syntax-stack: #a15c00;
+  --syntax-comment: #6b6862;
+
+  /* The bundle ramp. `entities.js` maps a bundle index onto it. */
+  --bundle-0: #4c78a8;
+  --bundle-1: #f58518;
+  --bundle-2: #54a24b;
+  --bundle-3: #b279a2;
+  --bundle-4: #e45756;
+  --bundle-5: #72b7b2;
+  --bundle-6: #eeca3b;
+  --bundle-7: #9d755d;
+
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* A ramp tuned for a white background goes muddy on a dark one, so the dark
+   theme redefines the properties rather than filtering them. */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16171a;
+    --bg-raised: #1f2126;
+    --bg-sunken: #101114;
+    --fg: #e6e4e0;
+    --fg-dim: #9a968e;
+    --border: #33363d;
+    --accent: #78aeed;
+    --accent-fg: #101114;
+    --focus: #78aeed;
+
+    --syntax-keyword: #d391c6;
+    --syntax-entity: #78aeed;
+    --syntax-reg: #6fd0bd;
+    --syntax-stack: #e8b366;
+    --syntax-comment: #9a968e;
+
+    --bundle-0: #7aa6d6;
+    --bundle-1: #f2a65a;
+    --bundle-2: #7cc46f;
+    --bundle-3: #c99bc0;
+    --bundle-4: #ea7d7c;
+    --bundle-5: #8ed0cb;
+    --bundle-6: #e3cf6c;
+    --bundle-7: #bb9581;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 system-ui, sans-serif;
+}
+
+/* The panes are dense grids of clickable text, so focus has to be visible from
+   the start; retrofitting it never happens. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 1px;
+}
+
+#tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 8px 0;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--border);
+}
+
+#tabs button {
+  font: inherit;
+  color: inherit;
+  padding: 6px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 5px 5px 0 0;
+  background: none;
+  cursor: pointer;
+}
+
+#tabs button[aria-selected="true"] {
+  background: var(--bg);
+  border-color: var(--border);
+}
+
+#panels {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.panel {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel[hidden] { display: none; }
+
+/* The function and histogram tabs are both a scrolling main pane beside a
+   fixed-width side pane. */
+.split {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+#breadcrumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  min-height: 33px;
+}
+
+#function-pane,
+#histogram-pane {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 10px 12px;
+}
+
+/* Column alignment is what makes the textual rendering readable. */
+#function-pane {
+  font-family: var(--mono);
+  white-space: pre;
+}
+
+#details-pane,
+#histogram-toc {
+  width: 320px;
+  flex: none;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--bg-raised);
+  border-left: 1px solid var(--border);
+}
+
+#histogram-toc {
+  border-left: none;
+  border-right: 1px solid var(--border);
+  order: -1;
+}
+
+#event-search {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+#event-search input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  padding: 3px 6px;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+#event-list {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 6px 10px;
+  font-family: var(--mono);
+}
+
+/* Commit 09's hover behavior dims everything that is not the hovered span. */
+.dimmed {
+  opacity: 0.3;
+}

@@ -97,13 +97,23 @@ jobs:
       - name: Test
         run: cargo test --locked ${{ matrix.flags }}
 
+  js:
+    name: JS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: cd visualizer && npm test
+
   # A single job that depends on everything else, so that branch protection only
   # needs to require this one status check rather than every matrix entry.
   ci:
     name: CI
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, build]
+    needs: [fmt, build, js]
     steps:
       - name: Check that all jobs succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
