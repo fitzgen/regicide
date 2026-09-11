@@ -1,11 +1,13 @@
 //! Coalescing live spans into bundles.
 //!
-//! There are three ways two spans can have *affinity*, meaning that a move
+//! There are four ways two spans can have *affinity*, meaning that a move
 //! between them is implied if they are not allocated to the same location:
 //!
 //! 1. a value flowing along a control-flow edge,
-//! 2. a block argument feeding the parameter it is passed to, and
-//! 3. a def that must reuse the register of one of its own operands.
+//! 2. a block argument feeding the parameter it is passed to,
+//! 3. a def that must reuse the register of one of its own operands, and
+//! 4. the pieces on either side of a reuse split, which hold the same value
+//!    across the definition that overwrites the copy between them.
 //!
 //! When a span in one bundle has affinity with a span in another bundle, we say
 //! that the bundles have affinity.
@@ -314,12 +316,9 @@ where
             return true;
         }
 
-        let Some(constraint) = self.set_constraint[a].merge(
-            &self.set_constraint[b],
-            machine,
-            |_| unreachable!("already resolved"),
-            |_| unreachable!("already resolved"),
-        ) else {
+        let Some(constraint) =
+            self.set_constraint[a].merge_resolved(&self.set_constraint[b], machine)
+        else {
             return false;
         };
 
@@ -515,19 +514,13 @@ where
             for span in succ_repr.live_in_spans(live_ranges) {
                 debug_assert_eq!(span.start(live_ranges), succ_start);
                 let val = span.val(live_ranges);
-                // We might already have an entry in `val_entry_span` because a
-                // value can be associated with multiple spans: for example, when a
-                // value is used in multiple operands of the same instruction, but
-                // those operands have conflicting constraints, we create a span for
-                // each conflicting use, all of which are associated with the same
-                // value. In this scenario, which span we put in the map (and
-                // therefore attempt to coalesce with) is an arbitrary choice; we
-                // take the first span we encounter and ignore others.
-                //
-                // TODO: investigate taking the least-constrained span, so as to
-                // maximize likelihood of successful coalescing?
-                if self.val_entry_span[val].is_none() {
-                    self.val_entry_span[val] = Some(span);
+                // A value can be live-in in several places at once, e.g. due to
+                // conflicting uses at the first instruction, or a tie there, so
+                // take the entry span that reaches furthest, which gives us the
+                // most bang for our buck.
+                match self.val_entry_span[val] {
+                    Some(prev) if prev.end(live_ranges) >= span.end(live_ranges) => {}
+                    _ => self.val_entry_span[val] = Some(span),
                 }
             }
 
@@ -596,7 +589,8 @@ where
         }
     }
 
-    /// Merge the sets of the operands tied together by a `Reuse` constraint.
+    /// Merge the sets of the operands tied together by a `Reuse` constraint,
+    /// and those of the pieces on either side of the reuse split.
     fn coalesce_reuse_operands<'a>(
         &mut self,
         live_ranges: &LiveRanges<E>,
@@ -614,6 +608,8 @@ where
                     input.func.value(input_inst.operand(j).val()).reg_class(),
                     input.func.value(input_inst.operand(i).val()).reg_class()
                 );
+                let target = input_inst.operand(i);
+                let target_val = output.with_repr(target.val())?;
                 let inst = output.with_repr(inst)?;
                 let (Some(a), Some(b)) = (
                     inst.operand_span(live_ranges, block, j),
@@ -623,9 +619,61 @@ where
                 };
                 // Always within one block, so always within one region.
                 self.try_merge(input.machine, live_ranges, a, b);
+
+                debug_assert_eq!(target.pos(), Position::Early);
+                self.coalesce_across_reuse_split(
+                    live_ranges,
+                    input,
+                    block,
+                    target_val,
+                    LivePoint::new(inst, Position::Early),
+                );
             }
         }
         Ok(())
+    }
+
+    /// Merge the pieces on either side of a `Reuse` split at `at`.
+    ///
+    /// Of the three pieces `push_span_and_split_conflicts` makes, only the
+    /// middle one (the doomed copy that the definition overwrites)
+    /// fundamentally requires a copy, so coalescing the other two parts into
+    /// one bundle can avoid an additional, unnecessary copy.
+    ///
+    /// Always within one block, so always within one region.
+    fn coalesce_across_reuse_split(
+        &mut self,
+        live_ranges: &LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+        block: Block<E>,
+        val: Val<E>,
+        at: LivePoint<E>,
+    ) {
+        // `head` ends where the tied instruction begins. There is none here
+        // when `val` arrives live-in and the tie is at the first instruction:
+        // that piece is empty, and construction pushes nothing for it. Joining
+        // `head` to `tail` across the edge is then `coalesce_block`'s job.
+        let Some(head) = block
+            .spans(live_ranges)
+            .into_iter()
+            .find(|span| span.val(live_ranges) == val && span.end(live_ranges) == at)
+        else {
+            return;
+        };
+
+        // A surviving piece begins at the tie and continues past the
+        // instruction. There can be several, since conflicting uses split the
+        // survivor into overlapping alternatives; each takes its value from
+        // `head`, so keep the first whose constraints allow the merge.
+        let after_inst = at.next_point();
+        for tail in block.spans(live_ranges) {
+            let survives = tail.val(live_ranges) == val
+                && tail.start(live_ranges) == at
+                && tail.end(live_ranges) > after_inst;
+            if survives && self.try_merge(input.machine, live_ranges, head, tail) {
+                break;
+            }
+        }
     }
 }
 
@@ -881,7 +929,7 @@ mod tests {
     use crate::test::{TestFunction, TestInput};
     use mutatis::check::{Check, CheckResult};
     use std::{
-        collections::HashMap,
+        collections::{HashMap, hash_map},
         format,
         string::{String, ToString},
         vec::Vec,
@@ -972,6 +1020,9 @@ mod tests {
     }
 
     /// The span of each value that is live at `block`'s entry.
+    ///
+    /// A value can begin the block in several places at once; like
+    /// `coalesce_block`, this takes the span that reaches furthest.
     fn entry_spans(
         live_ranges: &LiveRanges<u32>,
         func: &TestFunction,
@@ -981,7 +1032,17 @@ mod tests {
         let mut map = HashMap::new();
         for span in block.spans(live_ranges) {
             if span.start(live_ranges) == start {
-                map.entry(span.val(live_ranges)).or_insert(span);
+                match map.entry(span.val(live_ranges)) {
+                    hash_map::Entry::Vacant(entry) => {
+                        entry.insert(span);
+                    }
+                    hash_map::Entry::Occupied(mut entry) => {
+                        let prev: LiveSpan = *entry.get();
+                        if span.end(live_ranges) > prev.end(live_ranges) {
+                            entry.insert(span);
+                        }
+                    }
+                }
             }
         }
         map
@@ -1023,6 +1084,26 @@ mod tests {
                         operand_span(live_ranges, block, inst, i),
                     ) {
                         affinities.push((a, b, true));
+                    }
+
+                    // And the pieces on either side of the reuse split. See
+                    // `Coalescing::coalesce_across_reuse_split`.
+                    let val = input_inst.operand(i).val();
+                    let at = LivePoint::new(inst, Position::Early);
+                    let Some(span1) = block
+                        .spans(live_ranges)
+                        .into_iter()
+                        .find(|span| span.val(live_ranges) == val && span.end(live_ranges) == at)
+                    else {
+                        continue;
+                    };
+                    for span3 in block.spans(live_ranges) {
+                        if span3.val(live_ranges) == val
+                            && span3.start(live_ranges) == at
+                            && span3.end(live_ranges) > at.next_point()
+                        {
+                            affinities.push((span1, span3, true));
+                        }
                     }
                 }
             }
@@ -1143,11 +1224,12 @@ mod tests {
                         let mut expected = OperandConstraint::Any;
                         for span in bundle.spans(live_ranges) {
                             let span = span.constraint(live_ranges, input);
-                            expected = expected
-                                .merge(&span, input.machine, |_| unreachable!(), |_| unreachable!())
-                                .ok_or_else(|| {
-                                    format!("{bundle:?}'s spans have conflicting constraints")
-                                })?;
+                            expected =
+                                expected
+                                    .merge_resolved(&span, input.machine)
+                                    .ok_or_else(|| {
+                                        format!("{bundle:?}'s spans have conflicting constraints")
+                                    })?;
                         }
                         if expected != bundle.constraint(live_ranges) {
                             return Err(format!(
@@ -1232,12 +1314,7 @@ mod tests {
                         }
                         if ba
                             .constraint(live_ranges)
-                            .merge(
-                                &bb.constraint(live_ranges),
-                                input.machine,
-                                |_| unreachable!(),
-                                |_| unreachable!(),
-                            )
+                            .merge_resolved(&bb.constraint(live_ranges), input.machine)
                             .is_none()
                         {
                             continue;
@@ -1572,6 +1649,49 @@ mod tests {
             spans[0].bundle(live_ranges),
             spans[1].bundle(live_ranges),
             "the tied def and the operand it reuses should still share a bundle",
+        );
+    }
+
+    /// Of the three pieces a reuse split leaves, the middle one goes to the
+    /// definition and the outer two go together, so the value stays put.
+    #[test]
+    fn the_pieces_on_either_side_of_a_reuse_split_are_coalesced() {
+        let input = TestInput::with_reuse_of_a_surviving_value();
+
+        // The tie is on `inst1`: operand 1 defines over operand 0's place.
+        let (survivor, defined) = input.with_input(|input| {
+            let inst = input.func.inst(Inst::try_new(1).unwrap());
+            (inst.operand(0).val(), inst.operand(1).val())
+        });
+
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+        let block = Block::try_new(0).unwrap();
+
+        let mut pieces: Vec<LiveSpan> = block
+            .spans(live_ranges)
+            .into_iter()
+            .filter(|&span| span.val(live_ranges) == survivor)
+            .collect();
+        pieces.sort_by_key(|span| (span.start(live_ranges), span.end(live_ranges)));
+        assert_eq!(pieces.len(), 3, "{pieces:#?}");
+        let (span1, span2, span3) = (pieces[0], pieces[1], pieces[2]);
+
+        assert_eq!(
+            span1.bundle(live_ranges),
+            span3.bundle(live_ranges),
+            "the pieces on either side of the tie should share a bundle",
+        );
+        assert_eq!(
+            span2.bundle(live_ranges),
+            only_span(live_ranges, 0, defined.index()).bundle(live_ranges),
+            "the piece the definition overwrites should share the definition's bundle",
+        );
+        assert_ne!(
+            span1.bundle(live_ranges),
+            span2.bundle(live_ranges),
+            "the surviving value and the definition that overwrites one copy of \
+             it may not share a location",
         );
     }
 

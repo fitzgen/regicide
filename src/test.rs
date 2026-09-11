@@ -283,6 +283,15 @@ impl InstData {
             InstData::Branch { targets, .. } => targets,
         }
     }
+
+    /// This instruction's operand list itself, mutably, so that operands can
+    /// be added and removed.
+    #[cfg(test)]
+    fn operand_list_mut(&mut self) -> &mut Vec<Operand> {
+        match self {
+            InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
+        }
+    }
 }
 
 /// The most register classes any `TestMachine` can define, and so the range a
@@ -461,6 +470,33 @@ impl TestFunction {
     /// up to date.
     pub(crate) fn dominators(&self) -> &DominatorTree {
         &self.dominators
+    }
+
+    /// One of an instruction's operands, mutably, without repairing the
+    /// function afterwards.
+    #[cfg(test)]
+    pub(crate) fn operand_mut(&mut self, inst: Inst, operand: usize) -> &mut Operand {
+        &mut self.insts[inst].operands_mut()[operand]
+    }
+
+    /// An instruction's whole operand list, mutably, so that a test can change
+    /// its length without repairing the function.
+    #[cfg(test)]
+    pub(crate) fn operands_mut(&mut self, inst: Inst) -> &mut Vec<Operand> {
+        self.insts[inst].operand_list_mut()
+    }
+
+    /// Move `val` into the machine's `reg_class`th class, the numbering
+    /// [`TestMachine::BOTH_REGS_CLASS`] uses, without repairing the function.
+    #[cfg(test)]
+    pub(crate) fn set_reg_class(&mut self, val: Val, reg_class: u8) {
+        self.values[val].reg_class = reg_class;
+    }
+
+    /// Point one of a branch's edges at a different block, without repair.
+    #[cfg(test)]
+    pub(crate) fn set_block_call_target(&mut self, inst: Inst, call: usize, target: Block) {
+        self.insts[inst].block_calls_mut()[call].target = target;
     }
 
     /// Repair this function until it is well formed: a terminated,
@@ -830,47 +866,53 @@ impl TestFunction {
         }
     }
 
-    /// Make every `Reuse` constraint name an operand that it is allowed to
-    /// name: one that exists, and whose own constraint is not a `Reuse`.
+    /// Put every `Reuse` into the only shape the allocator accepts: on a late
+    /// definition, naming an early use of the same instruction alone.
+    ///
+    /// A definition carrying one moves to [`Position::Late`]; a use carrying
+    /// one loses it, since making it a definition would give its value two.
     fn ensure_operand_constraints(&mut self) {
-        for (_inst, inst_data) in self.insts.iter_mut() {
+        let Self { insts, .. } = self;
+        let mut reusable = Vec::new();
+
+        for (_inst, inst_data) in insts.iter_mut() {
             let operands = inst_data.operands_mut();
-            let num_operands = operands.len();
 
-            // Where each operand's reuse points after wrapping, so that the
-            // walk below can chase it without borrowing `operands` again.
-            let targets: Vec<Option<usize>> = operands
-                .iter()
-                .map(|op| match op.constraint() {
-                    OperandConstraint::Reuse(i) => Some(i % num_operands),
-                    _ => None,
-                })
-                .collect();
+            reusable.clear();
+            reusable.extend(operands.iter().enumerate().filter_map(|(i, op)| {
+                let ok = op.kind() == DefUse::Use
+                    && op.pos() == Position::Early
+                    && op.constraint() != OperandConstraint::Stack;
+                ok.then_some(i)
+            }));
 
-            for i in 0..num_operands {
-                let Some(mut target) = targets[i] else {
+            for i in 0..operands.len() {
+                let op = operands[i];
+                let OperandConstraint::Reuse(target) = op.constraint() else {
                     continue;
                 };
 
-                let mut steps = 0;
-                while let Some(next) = targets[target] {
-                    steps += 1;
-                    if steps > num_operands {
-                        // Every operand reuses another one, so there is no
-                        // operand left for this one to legally name.
-                        target = i;
-                        break;
-                    }
-                    target = next;
-                }
-
-                let constraint = if target == i {
-                    OperandConstraint::Any
+                let claim = if op.kind() != DefUse::Def {
+                    None
+                } else if let Some(j) = reusable.iter().position(|&r| r == target) {
+                    Some(reusable.remove(j))
+                } else if reusable.is_empty() {
+                    None
                 } else {
-                    OperandConstraint::Reuse(target)
+                    Some(reusable.remove(target % reusable.len()))
                 };
-                let op = &mut operands[i];
-                *op = Operand::new(op.pos(), op.kind(), constraint, op.val());
+
+                let constraint = match claim {
+                    Some(target) => OperandConstraint::Reuse(target),
+                    None => OperandConstraint::Any,
+                };
+
+                let pos = match constraint {
+                    OperandConstraint::Reuse(_) => Position::Late,
+                    _ => op.pos(),
+                };
+
+                operands[i] = Operand::new(pos, op.kind(), constraint, op.val());
             }
         }
     }
@@ -1329,10 +1371,6 @@ impl<'a> InputInst<'a> for TestInst<'a> {
         self.func.insts[self.inst].operands()[i]
     }
 
-    fn clobbers(&self) -> crate::RegSet {
-        todo!()
-    }
-
     fn block(&self) -> Block {
         self.func.inst_blocks[self.inst]
             .expect("should have been inserted by `ensure_unique_insts_in_layout`")
@@ -1436,6 +1474,14 @@ impl TestMachine {
     /// still meeting either an `rc0` or an `rc1` operand constraint.
     pub const BOTH_REGS_CLASS: u8 = 2;
 
+    /// The class holding [`TestMachine::two_registers`]' first register alone,
+    /// and so the way to pin an operand there.
+    pub const FIRST_REG_CLASS: u8 = 0;
+
+    /// The class holding [`TestMachine::two_registers`]' second register alone,
+    /// which nothing pinned to [`TestMachine::FIRST_REG_CLASS`] can satisfy.
+    pub const SECOND_REG_CLASS: u8 = 1;
+
     /// A machine of one bank with two registers and three classes: `rc0` holds
     /// the first register, `rc1` the second, and `rc2` both.
     ///
@@ -1489,6 +1535,78 @@ impl TestMachine {
                     spill_cost: 0,
                 }],
             }],
+        };
+        machine.fixup();
+        machine
+    }
+
+    /// [`TestMachine::groups_and_registers`]' `rc0`: its first register group.
+    pub const FIRST_GROUP_CLASS: u8 = 0;
+
+    /// [`TestMachine::groups_and_registers`]' `rc1`: its second register
+    /// group, and so nothing `rc0` holds.
+    pub const SECOND_GROUP_CLASS: u8 = 1;
+
+    /// [`TestMachine::groups_and_registers`]' `rc2`: both register groups.
+    pub const EITHER_GROUP_CLASS: u8 = 2;
+
+    /// [`TestMachine::groups_and_registers`]' `rc3`: its first bank's four
+    /// registers, one at a time rather than in groups.
+    pub const WIDE_REGS_CLASS: u8 = 3;
+
+    /// [`TestMachine::groups_and_registers`]' `rc4`: its second bank, an
+    /// eighth the width of the first.
+    pub const NARROW_REGS_CLASS: u8 = 4;
+
+    /// A machine with confusable allocations: bank 0's four eight-byte
+    /// registers pair into two groups, with classes for each group, both
+    /// groups, and the four alone; bank 1 has two one-byte registers. So a
+    /// group, a single register, and two slot sizes can all be told apart.
+    pub fn groups_and_registers() -> Self {
+        let mut machine = TestMachine {
+            banks: vec![
+                TestBank {
+                    log2_size: 3,
+                    regs: vec![1, 1, 1, 1],
+                    non_allocatable: 0,
+                    groups: vec![
+                        TestGroup {
+                            members: vec![0, 1],
+                        },
+                        TestGroup {
+                            members: vec![2, 3],
+                        },
+                    ],
+                    classes: vec![
+                        TestClass {
+                            members: TestClassMembers::Groups(vec![0]),
+                            spill_cost: 0,
+                        },
+                        TestClass {
+                            members: TestClassMembers::Groups(vec![1]),
+                            spill_cost: 0,
+                        },
+                        TestClass {
+                            members: TestClassMembers::Groups(vec![0, 1]),
+                            spill_cost: 0,
+                        },
+                        TestClass {
+                            members: TestClassMembers::Regs(vec![0, 1, 2, 3]),
+                            spill_cost: 0,
+                        },
+                    ],
+                },
+                TestBank {
+                    log2_size: 0,
+                    regs: vec![1, 1],
+                    non_allocatable: 0,
+                    groups: Vec::new(),
+                    classes: vec![TestClass {
+                        members: TestClassMembers::Regs(vec![0, 1]),
+                        spill_cost: 0,
+                    }],
+                },
+            ],
         };
         machine.fixup();
         machine
@@ -1795,7 +1913,7 @@ impl TestInput {
 
     /// [`TestInput::with_use_constraints`] on any machine, with the value in
     /// `reg_class` and defined under `def_constraint`.
-    fn with_use_constraints_in(
+    pub fn with_use_constraints_in(
         machine: TestMachine,
         reg_class: u8,
         def_constraint: OperandConstraint,
@@ -1880,6 +1998,201 @@ impl TestInput {
         input
     }
 
+    /// A single-block input whose third instruction reads two different
+    /// values, one pinned to each of [`TestMachine::two_registers`]' two
+    /// registers.
+    ///
+    /// This is the smallest function with one instruction whose operands are
+    /// in known, *different* places, which is what it takes to say that an
+    /// operand went somewhere another operand of the same instruction did not.
+    pub fn with_two_uses_of_different_values() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let r0 = RegClass::try_new(0).unwrap();
+        let r1 = RegClass::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in 0..2 {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let def = |val| InstData::Op {
+            operands: vec![Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                val,
+            )],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            def(first),
+            def(second),
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(r0),
+                        first,
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(r1),
+                        second,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A single-block input on [`TestMachine::groups_and_registers`] whose two
+    /// values live in different banks, and each of which is defined in a
+    /// register, then read on the stack, then read in a register again.
+    ///
+    /// The stack reads force one spill per value, into slots of different
+    /// sizes, and the register reads force one reload per value, into
+    /// registers of different banks. That makes this the fixture on which
+    /// swapping a pair of moves' destinations is a well-defined perturbation:
+    /// there is exactly one wrong slot and exactly one wrong bank to swap in,
+    /// and neither has to be guessed at by index.
+    pub fn with_values_in_two_banks_spilled_and_reloaded() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let wide = Val::try_new(0).unwrap();
+        let narrow = Val::try_new(1).unwrap();
+        let wide_regs = RegClass::try_new(TestMachine::WIDE_REGS_CLASS.into()).unwrap();
+        let narrow_regs = RegClass::try_new(TestMachine::NARROW_REGS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for (i, reg_class) in [TestMachine::WIDE_REGS_CLASS, TestMachine::NARROW_REGS_CLASS]
+            .into_iter()
+            .enumerate()
+        {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let def = |val, class| InstData::Op {
+            operands: vec![Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Reg(class),
+                val,
+            )],
+            side_effects: true,
+        };
+        let reads = |constraint: fn(RegClass) -> OperandConstraint| InstData::Op {
+            operands: vec![
+                Operand::new(Position::Early, DefUse::Use, constraint(wide_regs), wide),
+                Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    constraint(narrow_regs),
+                    narrow,
+                ),
+            ],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            def(wide, wide_regs),
+            def(narrow, narrow_regs),
+            reads(|_| OperandConstraint::Stack),
+            reads(OperandConstraint::Reg),
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::groups_and_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input with one instruction that ties a def to a use: the
     /// def carries a `Reuse` naming the use operand, whose own constraint is
     /// `use_constraint`.
@@ -1933,8 +2246,8 @@ impl TestInput {
                 ],
                 side_effects: true,
             },
-            // `ensure_terminators` rewrites a block's last instruction, so give
-            // it one of its own rather than letting it take the tied one.
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the tied instruction.
             InstData::Op {
                 operands: vec![],
                 side_effects: true,
@@ -1965,10 +2278,619 @@ impl TestInput {
         input
     }
 
-    /// Report `frequency` for every block in this function.
+    /// A single-block input whose reuse target outlives the tie: the value is
+    /// read at the tied use and again later. The smallest function that needs
+    /// construction's reuse split.
+    pub fn with_reuse_of_a_surviving_value() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let tied = Val::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in 0..2 {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        tied,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // The read that makes the tied use's value a survivor.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the later read.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// Like `with_reuse_of_a_surviving_value`, but the tied instruction reads
+    /// the survivor *twice*. Both reads are at one point, so construction must
+    /// put both in the overwritten span or the value needs a third register.
+    pub fn with_two_reads_and_a_reuse_of_a_surviving_value() -> Self {
+        Self::two_reads_and_a_reuse_of_a_surviving_value(OperandConstraint::Any)
+    }
+
+    /// Like `with_two_reads_and_a_reuse_of_a_surviving_value`, but the plain
+    /// read is pinned to one register while the tie resolves to the value's
+    /// two-register class.
     ///
-    /// `frequency` must be one of `BLOCK_FREQUENCIES`, which is every value a
-    /// `TestFunction` can report.
+    /// The overwritten span inherits its fixedness from that read rather than
+    /// from the tie: the tie is not fixed, but the read joins it, and the
+    /// span they share can only live in `r0`.
+    pub fn with_a_fixed_read_beside_a_reuse_of_a_surviving_value() -> Self {
+        let class = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        Self::two_reads_and_a_reuse_of_a_surviving_value(OperandConstraint::Reg(class))
+    }
+
+    /// The body of `with_two_reads_and_a_reuse_of_a_surviving_value` and
+    /// `with_a_fixed_read_beside_a_reuse_of_a_surviving_value`, which differ
+    /// only in what the plain read demands.
+    fn two_reads_and_a_reuse_of_a_surviving_value(plain_read: OperandConstraint) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let tied = Val::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in 0..2 {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    // The plain read, at the same point as the tied one.
+                    Operand::new(Position::Early, DefUse::Use, plain_read, defined),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(1),
+                        tied,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // The read that makes the tied use's value a survivor.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the later read.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// Like `with_two_reads_and_a_reuse_of_a_surviving_value`, but with an
+    /// *earlier* read pinned to `r0` and the tie pinned to `r1`.
+    ///
+    /// The two plain reads share the tie's point and demand nothing, so they
+    /// can join the overwritten piece --- the pinned read is at an earlier
+    /// point and stays behind, so its `r0` has no say. Letting it speak splits
+    /// the value into two registers across the tie's instruction where one
+    /// would do.
+    pub fn with_a_pinned_read_before_a_reuse_that_reads_twice() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let tied = Val::try_new(1).unwrap();
+
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let second_reg = RegClass::try_new(TestMachine::SECOND_REG_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for inst in [0, 2] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(inst).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            // The pinned read, on an instruction of its own so that it is not
+            // part of the tie's run.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(first_reg),
+                    defined,
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    // Two plain reads at the tie's point, so that the run has
+                    // more than one use and accumulates a constraint at all.
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    // The tie's target, which the pinned read cannot share a
+                    // register with.
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(second_reg),
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(2),
+                        tied,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // The read that makes the tied use's value a survivor.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the later read.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// Like `with_reuse_of_a_surviving_value`, but the tie is at a *second*
+    /// block's first instruction, so the reused value arrives live-in and the
+    /// piece up to the tie is empty. Pushing one anyway would hold a third
+    /// location that nothing reads, and this machine has two registers.
+    pub fn with_a_reuse_of_a_live_in_value() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let tied = Val::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for inst in [0, 2] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(inst).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`: define the value; `block1` does all the reading.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target: Block::try_new(1).unwrap(),
+                    args: vec![],
+                }],
+            },
+            // `block1`'s first instruction: the tie, on a live-in value that
+            // the read below keeps alive past it.
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        tied,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // A read to make the tied value a survivor, and one of the
+            // definition so that it needs a register of its own.
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, tied),
+                ],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(2), inst(3), inst(4)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A single-block input whose second instruction reads one surviving value
+    /// twice and ties a definition to each read. Validation forbids two reuses
+    /// of the *same* operand, not of different ones, so two ties sit at one
+    /// point, and the piece before the second is empty and never pushed.
+    pub fn with_two_reuses_at_one_point() -> Self {
+        Self::two_reuses_at_one_point(true)
+    }
+
+    /// Like `with_two_reuses_at_one_point`, but nothing reads the value after
+    /// the ties. The definitions overwriting the two reads cannot share a
+    /// register, so nor can the reads, dying value or not.
+    pub fn with_two_reuses_of_a_dying_value() -> Self {
+        Self::two_reuses_at_one_point(false)
+    }
+
+    /// The body of `with_two_reuses_at_one_point` and
+    /// `with_two_reuses_of_a_dying_value`, which differ only in `survives`.
+    fn two_reuses_at_one_point(survives: bool) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let first_tied = Val::try_new(1).unwrap();
+        let second_tied = Val::try_new(2).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(1).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(1).unwrap(),
+                i: 1,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        // One location per tie, plus one for the tail if there
+                        // is a later read; three of them need the wide class.
+                        reg_class: if survives {
+                            TestMachine::WIDE_REGS_CLASS
+                        } else {
+                            TestMachine::BOTH_REGS_CLASS
+                        },
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    defined,
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        first_tied,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(1),
+                        second_tied,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // The read that makes the tied value a survivor, if it has one.
+            InstData::Op {
+                operands: if survives {
+                    vec![Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        defined,
+                    )]
+                } else {
+                    vec![]
+                },
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the read.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: if survives {
+                TestMachine::groups_and_registers()
+            } else {
+                TestMachine::two_registers()
+            },
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// Report `frequency`, one of `BLOCK_FREQUENCIES`, for every block in this
+    /// function.
     pub fn set_block_frequencies(&mut self, frequency: BlockFrequency) {
         let index = BLOCK_FREQUENCIES
             .iter()
@@ -1980,9 +2902,7 @@ impl TestInput {
         }
     }
 
-    /// Report `frequency` for `block`, leaving every other block alone.
-    ///
-    /// `frequency` must be one of `BLOCK_FREQUENCIES`.
+    /// Report `frequency`, one of `BLOCK_FREQUENCIES`, for `block` alone.
     pub fn set_block_frequency(&mut self, block: Block, frequency: BlockFrequency) {
         let index = BLOCK_FREQUENCIES
             .iter()
@@ -2003,15 +2923,10 @@ impl TestInput {
         }
     }
 
-    /// A two-block input that passes one value along an edge as a block
-    /// argument, with a use of the argument constrained by `arg` and a use of
-    /// the parameter it feeds constrained by `param`.
-    ///
-    /// This is the smallest function that has a block argument-to-parameter
-    /// affinity for coalescing to find, and the constraints are the knob for
-    /// deciding whether it may take it. The machine is
-    /// [`TestMachine::two_registers`], so `Reg(rc0)` and `Reg(rc1)` are the
-    /// pair that conflict.
+    /// A two-block input passing one value along an edge as a block argument,
+    /// the argument's use constrained by `arg` and the parameter's by `param`:
+    /// the smallest function with an argument-to-parameter affinity to find. On
+    /// [`TestMachine::two_registers`], `Reg(rc0)` and `Reg(rc1)` conflict.
     pub fn with_block_arg_constraints(arg: OperandConstraint, param: OperandConstraint) -> Self {
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
@@ -2048,8 +2963,8 @@ impl TestInput {
 
         func.insts = PrimaryMap::new();
         for inst in [
-            // The definition, then a use that gives the argument's span its
-            // constraint, then the branch that passes it along.
+            // The definition, a use to constrain the argument's span, then the
+            // branch that passes it along.
             op(Position::Late, DefUse::Def, OperandConstraint::Any, arg_val),
             op(Position::Early, DefUse::Use, arg, arg_val),
             InstData::Branch {
@@ -2059,9 +2974,8 @@ impl TestInput {
                     args: vec![arg_val],
                 }],
             },
-            // A use that gives the parameter's span its constraint, then a
-            // terminator of the target block's own, so that
-            // `ensure_terminators` does not take that use away.
+            // A use to constrain the parameter's span, then a terminator of the
+            // block's own so `ensure_terminators` does not take the use away.
             op(Position::Early, DefUse::Use, param, param_val),
             InstData::Op {
                 operands: vec![],
@@ -2097,17 +3011,150 @@ impl TestInput {
         input
     }
 
-    /// A diamond whose merge block takes a parameter that has to spend part of
-    /// its live range on the stack.
-    ///
-    /// `block0` defines a value and branches to `block1` and `block2`, which
-    /// each pass it to `block3` as a block argument. The parameter is used
-    /// first in a register and then on the stack, so it starts `block3` in a
-    /// register and ends up in its slot.
-    ///
-    /// A block parameter is logically defined on the control-flow edges that
-    /// reach its block, so this is the shape that would expose a store placed
-    /// on one of those edges but not the others.
+    /// [`TestInput::with_block_arg_constraints`] with the argument read on the
+    /// stack, the parameter read in a register, and every value cheap enough to
+    /// recompute: the edge fills the parameter by rematerializing the argument,
+    /// atop the block, which the checker must rename after rather than before.
+    pub fn with_a_rematerialized_block_arg() -> Self {
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let mut input = Self::with_block_arg_constraints(
+            OperandConstraint::Stack,
+            OperandConstraint::Reg(class),
+        );
+        input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        input
+    }
+
+    /// An input with a critical edge that really needs an edit: `block0`
+    /// branches to `block1` or `block2` and `block1` falls through to `block2`,
+    /// so `block0`'s edge joins two successors to two predecessors. Its two
+    /// predecessors pass different values in different registers and the
+    /// parameter is read where `block1`'s already is, so only `block0`'s edge
+    /// needs a move, and only an edge block can hold it.
+    pub fn with_a_critical_edge() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first = Val::try_new(0).unwrap();
+        let param = Val::try_new(1).unwrap();
+        let second = Val::try_new(2).unwrap();
+        let merge = Block::try_new(2).unwrap();
+        let r0 = RegClass::try_new(0).unwrap();
+        let r1 = RegClass::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::BlockParam { block: merge, i: 0 },
+            ValDef::InstResult {
+                inst: Inst::try_new(3).unwrap(),
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+        let call = |target, args: &[Val]| BlockCall {
+            target,
+            args: args.to_vec(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // `block0`: define a value in `r1` and branch two ways, passing it
+            // along the edge straight to the merge.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, first),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(r1),
+                first,
+            ),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![call(Block::try_new(1).unwrap(), &[]), call(merge, &[first])],
+            },
+            // `block1`: pass a value of its own in `r0` instead, giving the
+            // merge its second predecessor.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, second),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(r0),
+                second,
+            ),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![call(merge, &[second])],
+            },
+            // `block2`: read the parameter from `r0`, where `block1`'s value
+            // already is.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(r0),
+                param,
+            ),
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(3), inst(4), inst(5)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param],
+                insts: vec![inst(6), inst(7)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A diamond whose merge block takes a parameter that spends part of its
+    /// live range on the stack: `block1` and `block2` each pass `block0`'s
+    /// value to `block3`, which reads it first in a register and then on the
+    /// stack. A parameter is logically defined on its incoming edges, so this
+    /// exposes a store placed on one of them but not the others.
     pub fn with_spilled_merge_param() -> Self {
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
@@ -2167,10 +3214,9 @@ impl TestInput {
             // block1 and block2: pass the value to the merge block.
             branch(merge, vec![arg_val]),
             branch(merge, vec![arg_val]),
-            // block3: the parameter arrives in a register and then has to be
-            // read off the stack, so its live range gets split. The last
-            // instruction is a terminator of the block's own, so that
-            // `ensure_terminators` does not take the stack use away.
+            // `block3`: the parameter arrives in a register and is then read
+            // off the stack, splitting its live range. The terminator is the
+            // block's own so that `ensure_terminators` spares the stack use.
             op(Position::Early, DefUse::Use, reg, param_val),
             op(
                 Position::Early,
@@ -2216,6 +3262,351 @@ impl TestInput {
         let mut input = TestInput {
             options: InputOptions::default(),
             machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// An input whose entry block branches back to itself, passing a value of
+    /// its own for its own parameter: the one shape where the checker's entry
+    /// state is met against something rather than believed. `block0` reads its
+    /// parameter, defines a value, and branches to itself or on to `block1`.
+    pub fn with_a_self_looping_entry_block() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let param = Val::try_new(0).unwrap();
+        let next = Val::try_new(1).unwrap();
+        let entry = Block::try_new(0).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::BlockParam { block: entry, i: 0 },
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // `block0`: read the parameter and define its replacement on the
+            // back edge.
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(class),
+                        param,
+                    ),
+                    Operand::new(Position::Late, DefUse::Def, OperandConstraint::Any, next),
+                ],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: entry,
+                        args: vec![next],
+                    },
+                    BlockCall {
+                        target: Block::try_new(1).unwrap(),
+                        args: vec![],
+                    },
+                ],
+            },
+            // `block1`: one more read, so the parameter is live out of the
+            // entry block along both edges.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Stack,
+                    param,
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![param],
+                insts: vec![inst(0), inst(1)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(2), inst(3)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A single-block input whose entry block takes two parameters, each read
+    /// once. One place for both would be a contract no caller could meet, and
+    /// no other fixture has a block with two parameters to say so with.
+    pub fn with_two_entry_params() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let entry = Block::try_new(0).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in [0, 1] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::BlockParam { block: entry, i },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            InstData::Op {
+                operands: vec![
+                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, first),
+                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, second),
+                ],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![first, second],
+                    insts: vec![inst(0), inst(1)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A single-block input whose entry block takes three parameters of
+    /// different shapes: a register group, a wide single register, and a
+    /// narrow one from the other bank.
+    ///
+    /// Each is read off the stack, so the allocation ends up holding a slot
+    /// group and slots of both of the machine's sizes at once. That is what
+    /// lets a test claim a parameter arrives in a slot of the wrong size, or
+    /// in a group where a single register belongs, without inventing a
+    /// location the results never mention.
+    pub fn with_entry_params_in_two_banks() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let entry = Block::try_new(0).unwrap();
+        let classes = [
+            TestMachine::FIRST_GROUP_CLASS,
+            TestMachine::WIDE_REGS_CLASS,
+            TestMachine::NARROW_REGS_CLASS,
+        ];
+
+        func.values = PrimaryMap::new();
+        for (i, reg_class) in classes.into_iter().enumerate() {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class,
+                        def: ValDef::BlockParam { block: entry, i },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            InstData::Op {
+                operands: (0..classes.len())
+                    .map(|i| {
+                        Operand::new(
+                            Position::Early,
+                            DefUse::Use,
+                            OperandConstraint::Stack,
+                            Val::try_new(i).unwrap(),
+                        )
+                    })
+                    .collect(),
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: (0..classes.len())
+                        .map(|i| Val::try_new(i).unwrap())
+                        .collect(),
+                    insts: vec![inst(0), inst(1)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::groups_and_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A single-block input whose entry block takes a parameter read twice at
+    /// one point, once in a register and once on the stack, so several of its
+    /// live-in pieces start at the function's first program point. The caller
+    /// fills the one [`crate::Output::block_param_allocs`] reports; with no
+    /// incoming edge to carry moves, the allocator must fill the rest.
+    pub fn with_an_entry_param_read_two_ways() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let param = Val::try_new(0).unwrap();
+        let entry = Block::try_new(0).unwrap();
+        let narrow = RegClass::try_new(TestMachine::NARROW_REGS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::NARROW_REGS_CLASS,
+                    def: ValDef::BlockParam { block: entry, i: 0 },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(narrow),
+                        param,
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Stack,
+                        param,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Use,
+                        OperandConstraint::Reg(narrow),
+                        param,
+                    ),
+                ],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Stack,
+                    param,
+                )],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![param],
+                    insts: vec![inst(0), inst(1), inst(2)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::groups_and_registers(),
             func,
         };
         input.fixup();
@@ -2966,6 +4357,20 @@ mod tests {
         );
     }
 
+    /// Where `func_with_a_reuse`'s one `Reuse` is.
+    fn the_reuse(func: &TestFunction) -> (Inst, usize) {
+        func.insts
+            .iter()
+            .find_map(|(inst, inst_data)| {
+                let j = inst_data
+                    .operands()
+                    .iter()
+                    .position(|op| matches!(op.constraint(), OperandConstraint::Reuse(_)))?;
+                Some((inst, j))
+            })
+            .expect("`func_with_a_reuse` has a reuse operand")
+    }
+
     /// A single-block function whose second instruction defines a value that
     /// must reuse the register of one of its own operands, tying the two values
     /// together.
@@ -3034,6 +4439,226 @@ mod tests {
 
         func.fixup();
         func
+    }
+
+    /// A `Reuse` may only name a use: reusing a definition would give one
+    /// location to two values the same instruction writes.
+    #[test]
+    fn reject_a_reuse_of_a_def() {
+        let mut func = func_with_a_reuse();
+
+        let (inst, j, target) = func
+            .insts
+            .iter()
+            .find_map(|(inst, inst_data)| {
+                let operands = inst_data.operands();
+                let j = operands
+                    .iter()
+                    .position(|op| matches!(op.constraint(), OperandConstraint::Reuse(_)))?;
+                let OperandConstraint::Reuse(target) = operands[j].constraint() else {
+                    unreachable!("just found this operand by its `Reuse` constraint")
+                };
+                Some((inst, j, target))
+            })
+            .expect("`func_with_a_reuse` has a reuse operand");
+
+        // Make the named operand a def, leaving the reuse on it. `fixup` does
+        // not run, so nothing repairs this behind our back.
+        let operands = func.insts[inst].operands_mut();
+        let op = &mut operands[target];
+        assert_eq!(op.kind(), DefUse::Use);
+        *op = Operand::new(op.pos(), DefUse::Def, op.constraint(), op.val());
+
+        let actual = expect_invalid_with(&TestMachine::two_registers().build(), &func);
+        assert!(
+            matches!(
+                actual,
+                Error::InvalidReuse { inst: i, operand } if i == inst && operand == j
+            ),
+            "expected an `InvalidReuse`, got {actual:?}",
+        );
+    }
+
+    /// A `Reuse` on an early def is rejected: it is written while the use it
+    /// reuses is still being read.
+    #[test]
+    fn reject_a_reuse_on_an_early_def() {
+        let mut func = func_with_a_reuse();
+        let (inst, j) = the_reuse(&func);
+
+        let op = &mut func.insts[inst].operands_mut()[j];
+        *op = Operand::new(Position::Early, op.kind(), op.constraint(), op.val());
+
+        let actual = expect_invalid_with(&TestMachine::two_registers().build(), &func);
+        assert!(
+            matches!(
+                actual,
+                Error::InvalidReuse { inst: i, operand } if i == inst && operand == j
+            ),
+            "expected an `InvalidReuse`, got {actual:?}",
+        );
+    }
+
+    /// A `Reuse` naming a late use is rejected: the use would be read after
+    /// the definition overwrote it.
+    #[test]
+    fn reject_a_reuse_of_a_late_use() {
+        let mut func = func_with_a_reuse();
+        let (inst, j) = the_reuse(&func);
+        let OperandConstraint::Reuse(target) = func.insts[inst].operands()[j].constraint() else {
+            unreachable!("just found this operand by its `Reuse` constraint")
+        };
+
+        let op = &mut func.insts[inst].operands_mut()[target];
+        *op = Operand::new(Position::Late, op.kind(), op.constraint(), op.val());
+
+        let actual = expect_invalid_with(&TestMachine::two_registers().build(), &func);
+        assert!(
+            matches!(
+                actual,
+                Error::InvalidReuse { inst: i, operand } if i == inst && operand == j
+            ),
+            "expected an `InvalidReuse`, got {actual:?}",
+        );
+    }
+
+    /// A `Reuse` naming a stack-constrained use is rejected: two values can
+    /// only share a register.
+    #[test]
+    fn reject_a_reuse_of_a_stack_constrained_use() {
+        let mut func = func_with_a_reuse();
+        let (inst, j) = the_reuse(&func);
+        let OperandConstraint::Reuse(target) = func.insts[inst].operands()[j].constraint() else {
+            unreachable!("just found this operand by its `Reuse` constraint")
+        };
+
+        let op = &mut func.insts[inst].operands_mut()[target];
+        *op = Operand::new(op.pos(), op.kind(), OperandConstraint::Stack, op.val());
+
+        let actual = expect_invalid_with(&TestMachine::two_registers().build(), &func);
+        assert!(
+            matches!(
+                actual,
+                Error::InvalidReuse { inst: i, operand } if i == inst && operand == j
+            ),
+            "expected an `InvalidReuse`, got {actual:?}",
+        );
+    }
+
+    /// A second `Reuse` naming a claimed operand is rejected: both definitions
+    /// would want the one location.
+    #[test]
+    fn reject_a_reuse_of_a_claimed_target() {
+        let mut func = func_with_a_reuse();
+        let (inst, j) = the_reuse(&func);
+        let reuse = func.insts[inst].operands()[j].constraint();
+
+        // Copy the reuse onto a second definition, so two name one target.
+        let val = Val::try_new(func.values.len()).unwrap();
+        func.values
+            .push(
+                &mut OutputInner::<u32>::new(),
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult { inst, i: 1 },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+        let operands = match &mut func.insts[inst] {
+            InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
+        };
+        operands.push(Operand::new(Position::Late, DefUse::Def, reuse, val));
+        let second = operands.len() - 1;
+
+        let actual = expect_invalid_with(&TestMachine::two_registers().build(), &func);
+        assert!(
+            matches!(
+                actual,
+                Error::InvalidReuse { inst: i, operand } if i == inst && operand == second
+            ),
+            "expected an `InvalidReuse`, got {actual:?}",
+        );
+    }
+
+    /// `fixup` is happy to tie a definition to a use whose value outlives the
+    /// instruction: the allocator splits the survivor around the copy.
+    #[test]
+    fn fixup_keeps_a_reuse_of_a_surviving_value() {
+        let mut input = TestInput::with_reuse_def(OperandConstraint::Any);
+        let (inst, j) = the_reuse(&input.func);
+        let target = match input.func.insts[inst].operands()[j].constraint() {
+            OperandConstraint::Reuse(target) => target,
+            c => panic!("`the_reuse` found a reuse, got {c:?}"),
+        };
+        let reused = input.func.insts[inst].operands()[target].val();
+
+        // Read the reused value once more, from the terminator, so that it
+        // outlives the instruction that wanted to overwrite it.
+        let last = *input.func.blocks[Block::try_new(0).unwrap()]
+            .insts
+            .last()
+            .unwrap();
+        match &mut input.func.insts[last] {
+            InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
+        }
+        .push(Operand::new(
+            Position::Early,
+            DefUse::Use,
+            OperandConstraint::Any,
+            reused,
+        ));
+        input.fixup();
+
+        let kept = input
+            .func
+            .insts
+            .iter()
+            .flat_map(|(_inst, inst_data)| inst_data.operands())
+            .any(|op| matches!(op.constraint(), OperandConstraint::Reuse(_)));
+        assert!(
+            kept,
+            "`fixup` dropped a reuse of a value that outlives the instruction",
+        );
+    }
+
+    /// Whatever the generator produced, `fixup` never leaves a `Reuse` in a
+    /// shape the validator rejects.
+    #[test]
+    fn fixup_repairs_an_illegal_reuse() {
+        for kind in [DefUse::Def, DefUse::Use] {
+            for pos in [Position::Early, Position::Late] {
+                let mut func = func_with_a_reuse();
+                for (_inst, inst_data) in func.insts.iter_mut() {
+                    for op in inst_data.operands_mut() {
+                        *op = Operand::new(pos, kind, op.constraint(), op.val());
+                    }
+                }
+
+                func.fixup();
+
+                for (_inst, inst_data) in func.insts.iter() {
+                    let operands = inst_data.operands();
+                    for op in operands {
+                        let OperandConstraint::Reuse(target) = op.constraint() else {
+                            continue;
+                        };
+                        assert_eq!(op.kind(), DefUse::Def, "`fixup` left a reuse on a use");
+                        assert_eq!(op.pos(), Position::Late, "`fixup` left an early reuse");
+                        assert_eq!(
+                            operands[target].kind(),
+                            DefUse::Use,
+                            "`fixup` left a reuse naming a def",
+                        );
+                        assert_eq!(
+                            operands[target].pos(),
+                            Position::Early,
+                            "`fixup` left a reuse naming a late use",
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

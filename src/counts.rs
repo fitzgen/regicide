@@ -67,6 +67,7 @@ pub struct Counts {
     pub live_spans: Count,
     pub uses: Count,
     pub eager_splits: Count,
+    pub reuse_splits: Count,
     pub bundles: Count,
     pub queue_pops: Count,
     pub preferred_assignments: Count,
@@ -103,6 +104,7 @@ impl Counts {
             live_spans: Count::new(),
             uses: Count::new(),
             eager_splits: Count::new(),
+            reuse_splits: Count::new(),
             bundles: Count::new(),
             queue_pops: Count::new(),
             preferred_assignments: Count::new(),
@@ -143,6 +145,7 @@ impl Counts {
             live_spans,
             uses,
             eager_splits,
+            reuse_splits,
             bundles,
             queue_pops,
             preferred_assignments,
@@ -175,6 +178,7 @@ impl Counts {
             && live_spans.is_reset()
             && uses.is_reset()
             && eager_splits.is_reset()
+            && reuse_splits.is_reset()
             && bundles.is_reset()
             && queue_pops.is_reset()
             && preferred_assignments.is_reset()

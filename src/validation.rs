@@ -17,7 +17,8 @@ use crate::{
     entity::{Block, Entity, EntityRepr, Inst, SecondaryMap, Val},
     error::{Error, IResult, Result},
     input::{
-        DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand, OperandConstraint,
+        DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand,
+        OperandConstraint, Position,
     },
     live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST},
     machine::Machine,
@@ -189,15 +190,33 @@ fn check_block_references<'a>(
 
         for (i, operand) in input_inst.operands().enumerate() {
             match operand.constraint() {
-                // A `Reuse` must name a real operand of this instruction, and
-                // one that is not itself a `Reuse`.
+                // A `Reuse` ties a late definition to an early use of the same
+                // instruction: anywhere else it names two things live at once.
+                // The target, being a use, never carries a `Reuse` itself.
                 OperandConstraint::Reuse(target) => {
-                    let reuses_a_reuse = target < num_operands
-                        && matches!(
-                            input_inst.operand(target).constraint(),
-                            OperandConstraint::Reuse(_)
-                        );
-                    if target >= num_operands || reuses_a_reuse {
+                    let reusing_is_late_def =
+                        operand.kind() == DefUse::Def && operand.pos() == Position::Late;
+                    if !reusing_is_late_def || target >= num_operands {
+                        return Err(Error::InvalidReuse { inst, operand: i });
+                    }
+                    let target_operand = input_inst.operand(target);
+                    let target_is_early_use = target_operand.kind() == DefUse::Use
+                        && target_operand.pos() == Position::Early;
+                    if !target_is_early_use {
+                        return Err(Error::InvalidReuse { inst, operand: i });
+                    }
+                    // The pair share a location, and only a register can be
+                    // shared: each value has its own stack home.
+                    if target_operand.constraint() == OperandConstraint::Stack {
+                        return Err(Error::InvalidReuse { inst, operand: i });
+                    }
+                    // One target, one reuse: two definitions sharing the
+                    // use's location would overwrite one another.
+                    let claimed = input_inst
+                        .operands()
+                        .take(i)
+                        .any(|other| other.constraint() == OperandConstraint::Reuse(target));
+                    if claimed {
                         return Err(Error::InvalidReuse { inst, operand: i });
                     }
                 }

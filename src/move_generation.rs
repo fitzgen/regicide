@@ -472,6 +472,13 @@ where
         &self.edits
     }
 
+    /// Those edits, mutably, so that a test can break a correct allocation and
+    /// watch the checker notice.
+    #[cfg(test)]
+    pub(crate) fn edits_mut(&mut self) -> &mut Vec<(PackedMovePosition<E>, Edit<E>)> {
+        &mut self.edits
+    }
+
     /// The edits at program points inside the block whose instructions run from
     /// `first` to `last`, in program order.
     pub(crate) fn block_point_edits(
@@ -676,6 +683,8 @@ where
         let func = input.func;
         let val = value_spans[0].val(live_ranges);
 
+        self.emit_entry_param_fills(input, counts, live_ranges, spill_slots, output, value_spans)?;
+
         for (i, span) in value_spans.iter().copied().enumerate() {
             let block = span.block(func, live_ranges);
             let start = span.start(live_ranges);
@@ -803,6 +812,70 @@ where
                     self.emit_source(counts, pos, val, alloc);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Fill the entry block's extra live-in pieces of a parameter from the one
+    /// place it arrives in.
+    ///
+    /// Other blocks' parameters are filled by their incoming edges' moves; the
+    /// entry block's edge from the caller is implicit, and has no incoming
+    /// edge. The caller is responsible for placing its arguments in the
+    /// parameter location `Output::block_param_allocs` reports. Every other
+    /// span starting at the block's start point must read that location.
+    fn emit_entry_param_fills(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+        output: &mut OutputInner<E>,
+        value_spans: &[LiveSpan<E>],
+    ) -> IResult<()> {
+        let val = value_spans[0].val(live_ranges);
+        let entry = output.with_repr::<E, _>(input.func.entry_block())?;
+
+        // Only the entry block's own parameters arrive from outside; anything
+        // else beginning at the start point is defined there.
+        if self.param_of[val].filter(|&(b, _)| b == entry).is_none() {
+            return Ok(());
+        }
+
+        let start = entry.start_point(input);
+        let entry_start_spans = || {
+            value_spans
+                .iter()
+                .copied()
+                .filter(|span| span.start(live_ranges) == start)
+        };
+
+        // The furthest-reaching span, ties broken by the span itself. This must
+        // agree with `Output::block_param_allocs`, which tells the caller where
+        // to place its arguments.
+        let Some(arrival_span) =
+            entry_start_spans().max_by_key(|span| (span.end(live_ranges), *span))
+        else {
+            return Ok(());
+        };
+        let arrival_alloc = arrival_span.allocation(live_ranges, spill_slots);
+
+        let pos = PackedMovePosition::point(start);
+        let mut emitted_source = false;
+        for span in entry_start_spans() {
+            let alloc = span.allocation(live_ranges, spill_slots);
+            if alloc == arrival_alloc {
+                continue;
+            }
+
+            // Lazily, so a parameter wanted only where it arrives gets no move.
+            if !emitted_source {
+                emitted_source = true;
+                self.emit_source(counts, pos, val, arrival_alloc);
+            }
+
+            self.emit_dest(counts, pos, val, alloc);
         }
 
         Ok(())
@@ -1307,9 +1380,11 @@ where
 {
     // Can we place the move at the start of the successor? This requires that
     // successor only has one incoming edge (or else our move might clobber
-    // other edges' values).
-    let succ_block = input.func.block(edge.succ.with_repr32());
-    if succ_block.len_predecessors() == 1 {
+    // other edges' values) and that it is not the entry block, whose implicit
+    // edge from outside the function delivers the function's parameters.
+    let succ = edge.succ.with_repr32();
+    let succ_block = input.func.block(succ);
+    if succ_block.len_predecessors() == 1 && succ != input.func.entry_block() {
         return Ok(PackedMovePosition::point(edge.succ.start_point(input)));
     }
 
@@ -1423,7 +1498,10 @@ mod tests {
         test::{TestFunction, TestInput, TestMachine},
     };
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{format, string::String, vec::Vec};
 
     /// Run every phase up through move generation, or `None` when allocation
@@ -1524,6 +1602,12 @@ mod tests {
         /// which spill placement cannot do: it only ever stores a value into
         /// its own home.
         stack_params: usize,
+
+        /// Edits atop the entry block, which is where the fills that spread a
+        /// function parameter from its arrival to its other pieces go, and
+        /// where nothing else can: an edge into the entry block has to put its
+        /// moves elsewhere, since the function's own arrival shares the spot.
+        entry_param_fills: usize,
 
         /// Spills and reloads of one member of a value that lives in a
         /// register group, which are the moves that group support adds.
@@ -1886,6 +1970,63 @@ mod tests {
                 }
             }
 
+            // The gap atop the entry block, which no edge covers: the loop
+            // below walks real predecessor edges, and an edge into the entry
+            // block never places its moves here anyway, since the function's
+            // own arrival shares the position. So this is the only check the
+            // entry parameters' fills ever face.
+            {
+                let entry = func.entry_block();
+                let entry_start = entry.start_point(input);
+                let pos = PackedMovePosition::point(entry_start);
+                let params = func.block(entry).params().collect::<Vec<_>>();
+
+                // The furthest-reaching piece of a parameter starting here is
+                // where the caller left it, the rule `emit_entry_param_fills`
+                // and `Output::block_param_allocs` both follow.
+                let arrival = |param: Val<u32>| {
+                    live_ranges
+                        .spans()
+                        .filter(|span| {
+                            span.val(live_ranges) == param && span.start(live_ranges) == entry_start
+                        })
+                        .max_by_key(|span| (span.end(live_ranges), *span))
+                        .map(|span| span.allocation(live_ranges, spill_slots))
+                };
+
+                // The parameters are left out of the slot seeding, not just
+                // the values `filling` names: a parameter's stack piece is
+                // written by the very batch under test, so seeding it would
+                // be assuming what the fills are supposed to do.
+                let mut unseeded = filling(&[pos]);
+                unseeded.extend(params.iter().copied());
+                let mut state = slots_at(entry_start, &unseeded);
+                for &param in &params {
+                    if let Some(alloc) = arrival(param) {
+                        for (alloc, part) in parts_of(param, alloc) {
+                            state.write(machine, alloc, Some(part));
+                        }
+                    }
+                }
+
+                let fills = batch(pos);
+                seen.entry_param_fills += fills.len();
+                apply(&mut state, input, &fills, &mut seen);
+
+                // One piece held the parameter going in; all of them must hold
+                // it coming out. That is what makes this no tautology: the
+                // arrival is one span, the requirement is every span.
+                let mut needed = Vec::new();
+                for &(val, span_start, _, alloc, block) in &spans {
+                    if block != entry || span_start != entry_start || !params.contains(&val) {
+                        continue;
+                    }
+                    needed.extend(parts_of(val, alloc));
+                }
+                check(&state, &needed, &(entry, "arrival"))?;
+                check(&state, &stored_at(pos, &|val| val), &(entry, "arrival"))?;
+            }
+
             // Every edge on its own: both a parameter's value and the moves a
             // value needs can differ between edges into one block.
             for (pred, input_pred) in func.blocks() {
@@ -1908,10 +2049,15 @@ mod tests {
                     let arrival_pos = PackedMovePosition::point(entry);
 
                     // A move on the edge itself is legal only when the edge
-                    // really is critical.
+                    // really is critical: neither block will take the move.
+                    // The successor will not when another edge reaches it, and
+                    // the entry block never will, since the function's own
+                    // entry reaches it too.
                     let on_edge = batch(edge_pos);
                     if !on_edge.is_empty() {
-                        let critical = input_succ.len_predecessors() > 1
+                        let succ_takes_it =
+                            input_succ.len_predecessors() == 1 && succ != func.entry_block();
+                        let critical = !succ_takes_it
                             && (input_pred.len_successors() > 1
                                 || func.inst(last).operands_len() > 0);
                         if !critical {
@@ -2148,9 +2294,44 @@ mod tests {
         });
     }
 
+    /// The inputs the property check starts its random walk from.
+    fn seeds() -> Vec<TestInput> {
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
+        std::vec![
+            TestInput::default(),
+            TestInput::with_spilled_merge_param(),
+            TestInput::with_stack_param_and_arg(),
+            TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
+            TestInput::with_use_constraints(&[
+                OperandConstraint::Stack,
+                OperandConstraint::Reg(class),
+            ]),
+            // A value in a register group that has to be on the stack for one
+            // use and in its group for another: the spills and reloads of a
+            // single group member that this pass had to learn to do.
+            TestInput::with_group_use_constraints(&[
+                OperandConstraint::Stack,
+                OperandConstraint::Reg(group_class),
+            ]),
+            TestInput::with_group_use_constraints(&[
+                OperandConstraint::Reg(group_class),
+                OperandConstraint::Stack,
+                OperandConstraint::Reg(group_class),
+            ]),
+            TestInput::with_reuse_def(OperandConstraint::Any),
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
+            // Parameters of the *entry* block, the only ones no edge fills.
+            TestInput::with_two_entry_params(),
+            TestInput::with_an_entry_param_read_two_ways(),
+            TestInput::with_entry_params_in_two_banks(),
+            TestInput::with_a_self_looping_entry_block(),
+        ]
+    }
+
     /// The moves put every value where the allocation says it belongs, at
-    /// every boundary and along every edge. The counters make sure random
-    /// inputs really reach every kind of move.
+    /// every boundary and along every edge. The counters make sure the inputs
+    /// really reach every kind of move.
     #[test]
     fn move_generation_properties() -> CheckResult<TestInput> {
         static REG_REGS: AtomicUsize = AtomicUsize::new(0);
@@ -2160,25 +2341,28 @@ mod tests {
         static CRITICAL_EDGE_MOVES: AtomicUsize = AtomicUsize::new(0);
         static PARAM_EDGES: AtomicUsize = AtomicUsize::new(0);
         static STACK_PARAMS: AtomicUsize = AtomicUsize::new(0);
+        static ENTRY_PARAM_FILLS: AtomicUsize = AtomicUsize::new(0);
         static GROUP_SPILLS: AtomicUsize = AtomicUsize::new(0);
         static GROUP_RELOADS: AtomicUsize = AtomicUsize::new(0);
 
-        let result =
-            Check::new()
-                .iters(10_000)
-                .run(|test_input: &TestInput| -> Result<(), String> {
-                    let seen = check_moves(test_input)?;
-                    REG_REGS.fetch_add(seen.reg_regs, Ordering::Relaxed);
-                    SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
-                    RELOADS.fetch_add(seen.reloads, Ordering::Relaxed);
-                    REMATS.fetch_add(seen.remats, Ordering::Relaxed);
-                    CRITICAL_EDGE_MOVES.fetch_add(seen.critical_edge_moves, Ordering::Relaxed);
-                    PARAM_EDGES.fetch_add(seen.param_edges, Ordering::Relaxed);
-                    STACK_PARAMS.fetch_add(seen.stack_params, Ordering::Relaxed);
-                    GROUP_SPILLS.fetch_add(seen.group_spills, Ordering::Relaxed);
-                    GROUP_RELOADS.fetch_add(seen.group_reloads, Ordering::Relaxed);
-                    Ok(())
-                });
+        let result = Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            seeds(),
+            |test_input: &TestInput| -> Result<(), String> {
+                let seen = check_moves(test_input)?;
+                REG_REGS.fetch_add(seen.reg_regs, Ordering::Relaxed);
+                SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
+                RELOADS.fetch_add(seen.reloads, Ordering::Relaxed);
+                REMATS.fetch_add(seen.remats, Ordering::Relaxed);
+                CRITICAL_EDGE_MOVES.fetch_add(seen.critical_edge_moves, Ordering::Relaxed);
+                PARAM_EDGES.fetch_add(seen.param_edges, Ordering::Relaxed);
+                STACK_PARAMS.fetch_add(seen.stack_params, Ordering::Relaxed);
+                ENTRY_PARAM_FILLS.fetch_add(seen.entry_param_fills, Ordering::Relaxed);
+                GROUP_SPILLS.fetch_add(seen.group_spills, Ordering::Relaxed);
+                GROUP_RELOADS.fetch_add(seen.group_reloads, Ordering::Relaxed);
+                Ok(())
+            },
+        );
 
         if result.is_ok() {
             for (what, counter) in [
@@ -2192,6 +2376,7 @@ mod tests {
                     "parameter filled in its slot from an argument",
                     &STACK_PARAMS,
                 ),
+                ("fill atop the entry block", &ENTRY_PARAM_FILLS),
                 ("spill of a register group's member", &GROUP_SPILLS),
                 ("reload of a register group's member", &GROUP_RELOADS),
             ] {

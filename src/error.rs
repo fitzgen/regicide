@@ -315,9 +315,8 @@ pub enum Error {
     /// An operand's `Reuse` constraint does not name an operand that it can
     /// reuse.
     ///
-    /// A `Reuse` must name another operand of the same instruction, and one
-    /// whose own constraint is not a `Reuse`, so that a chain of reuses is never
-    /// more than one link long.
+    /// A `Reuse` must be a late definition naming an early, non-stack use of
+    /// the same instruction, and no two may name the same target.
     InvalidReuse {
         /// The instruction with the offending operand.
         inst: Inst,

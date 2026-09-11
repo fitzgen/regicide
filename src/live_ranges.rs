@@ -6,7 +6,8 @@ use crate::entity::{
 };
 use crate::error::IResult;
 use crate::input::{
-    Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position, RematCost,
+    DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
+    RematCost,
 };
 use crate::liveness::{Liveness, block_first_inst, block_last_inst};
 use crate::machine::{Machine, RegClassMembers};
@@ -1130,19 +1131,13 @@ where
     ) -> OperandConstraint {
         let mut constraint = OperandConstraint::Any;
         for u in self.uses(live_ranges) {
-            let input_inst = input.func.inst(u.point(live_ranges).inst().with_repr32());
-            let sibling = |j| input_inst.operand(j).constraint();
-            let use_constraint = input_inst
-                .operand(u.operand(live_ranges))
-                .constraint()
-                .resolved(sibling);
+            let use_constraint = reuse_aware_constraint(
+                input,
+                u.point(live_ranges).inst().with_repr32(),
+                u.operand(live_ranges),
+            );
             constraint = constraint
-                .merge(
-                    &use_constraint,
-                    input.machine,
-                    |_| unreachable!("the accumulated constraint is always resolved"),
-                    |_| unreachable!("the use's constraint is already resolved"),
-                )
+                .merge_resolved(&use_constraint, input.machine)
                 .expect("uses within the same span never conflict");
         }
         constraint
@@ -1701,18 +1696,13 @@ where
 
         let data = &mut live_ranges.bundles[self];
 
-        let already_resolved = |_| unreachable!("constraints should already be resolved");
-        let class =
-            match data
-                .constraint
-                .merge(&constraint, machine, &already_resolved, &already_resolved)
-            {
-                Some(OperandConstraint::Reg(intersection)) => intersection,
-                Some(OperandConstraint::Any) | Some(OperandConstraint::Stack) | None => return,
-                Some(OperandConstraint::Reuse(_)) => {
-                    unreachable!("constraints should already be resolved")
-                }
-            };
+        let class = match data.constraint.merge_resolved(&constraint, machine) {
+            Some(OperandConstraint::Reg(intersection)) => intersection,
+            Some(OperandConstraint::Any) | Some(OperandConstraint::Stack) | None => return,
+            Some(OperandConstraint::Reuse(_)) => {
+                unreachable!("constraints should already be resolved")
+            }
+        };
 
         // We only hint for registers (the common case) and not register groups.
         let RegClassMembers::Regs(_) = class.members(machine) else {
@@ -1741,12 +1731,7 @@ where
         for span in self.spans(live_ranges) {
             let span_constraint = span.constraint(live_ranges, input);
             constraint = constraint
-                .merge(
-                    &span_constraint,
-                    input.machine,
-                    |_| unreachable!("the accumulated constraint is always resolved"),
-                    |_| unreachable!("a span's constraint is already resolved"),
-                )
+                .merge_resolved(&span_constraint, input.machine)
                 .expect("the spans of a bundle never conflict, so neither do any subset of them");
         }
         live_ranges.bundles[self].constraint = constraint;
@@ -1848,8 +1833,301 @@ where
     }
 }
 
-/// Push the given span, eagerly splitting at every point where its uses'
-/// constraints conflict.
+/// Get the constraint that an instruction's `operand` places on its span.
+///
+/// Resolves a `Reuse` to its target's constraint, then strengthens both halves
+/// of a tie to demand a register: a stack home belongs to one value alone and
+/// so cannot be reused for two different values.
+fn reuse_aware_constraint(
+    input: &Input<'_, impl InputFunction>,
+    inst: Inst,
+    operand: usize,
+) -> OperandConstraint {
+    let input_inst = input.func.inst(inst);
+    let constraint = input_inst.operand(operand).constraint();
+    let resolved = constraint.resolved(|j| input_inst.operand(j).constraint());
+
+    let is_tied = matches!(constraint, OperandConstraint::Reuse(_))
+        || input_inst
+            .operands()
+            .any(|op| op.constraint() == OperandConstraint::Reuse(operand));
+    match resolved {
+        OperandConstraint::Any if is_tied => {
+            let val = input_inst.operand(operand).val();
+            OperandConstraint::Reg(input.func.value(val).reg_class())
+        }
+        resolved => resolved,
+    }
+}
+
+/// Push a span covering `start..end` of `val`, holding the uses in
+/// `uses_start..uses_end`.
+fn push_span<E>(
+    spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
+    output: &mut OutputInner<E>,
+    val: Val<E>,
+    (start, end): (LivePoint<E>, LivePoint<E>),
+    (uses_start, uses_end): (Use<E>, Use<E>),
+    has_fixed_use: bool,
+) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    spans.push(
+        output,
+        LiveSpanData::new(
+            start,
+            end,
+            val,
+            EntityRange {
+                start: uses_start,
+                end: uses_end,
+            },
+            has_fixed_use,
+        ),
+    )?;
+    Ok(())
+}
+
+/// One use of a value, with its constraint resolved.
+struct ResolvedUse<E>
+where
+    E: EntityRepr,
+{
+    /// The use itself.
+    use_: Use<E>,
+
+    /// Its program point.
+    point: LivePoint<E>,
+
+    /// Which operand of `point`'s instruction it is.
+    operand: usize,
+
+    /// Its resolved constraint.
+    constraint: OperandConstraint,
+
+    /// And whether the constraint is a single, fixed register.
+    is_fixed: bool,
+}
+
+impl<E> ResolvedUse<E>
+where
+    E: EntityRepr,
+{
+    /// Look `use_` up and resolve its constraint.
+    fn new(
+        input: &Input<'_, impl InputFunction>,
+        uses: &PrimaryMap<Use<E>, UseData<E>>,
+        use_: Use<E>,
+    ) -> Self {
+        let use_data = &uses[use_];
+        let point = use_data.point;
+        let operand = usize::from(use_data.operand);
+        let constraint = reuse_aware_constraint(input, point.inst().with_repr32(), operand);
+        let is_fixed = constraint.is_fixed(input.machine);
+        ResolvedUse {
+            use_,
+            point,
+            operand,
+            constraint,
+            is_fixed,
+        }
+    }
+
+    /// Does a definition at this use's instruction reuse this operand's place
+    /// and does this use's value outlive this instruction? If so, this use
+    /// needs its own span.
+    fn needs_a_span_of_its_own(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        end: LivePoint<E>,
+    ) -> bool {
+        let input_inst = input.func.inst(self.point.inst().with_repr32());
+        input_inst.operand(self.operand).kind() == DefUse::Use
+            && is_reuse_target(&input_inst, self.operand)
+            && (end > self.point.next_point() || another_tie_follows(&input_inst, self.operand))
+    }
+}
+
+/// A piece of a span being accumulated, and the run of uses at its end.
+///
+/// A run is the group of uses at one program point. When a definition ties
+/// itself to the last of several reads at one point, the whole run must move
+/// into the reuse's span together, since a span's uses are contiguous.
+struct Piece<E>
+where
+    E: EntityRepr,
+{
+    /// Where the piece starts.
+    start: LivePoint<E>,
+
+    /// Where its uses start.
+    uses_start: Use<E>,
+
+    /// The merged constraint of everything folded in so far.
+    constraint: OperandConstraint,
+
+    /// Whether the merged constraint demands one particular register.
+    has_fixed_use: bool,
+
+    /// The piece's last point, thus far.
+    point: LivePoint<E>,
+
+    /// Where its run on uses starts.
+    run_start: Use<E>,
+
+    /// The merged constraint of just the run of uses.
+    run_constraint: OperandConstraint,
+
+    /// Whether the run's merged constraint demands one particular register.
+    run_has_fixed_use: bool,
+
+    /// Whether the piece demanded a fixed register before this run began.
+    before_run_has_fixed_use: bool,
+}
+
+impl<E> Piece<E>
+where
+    E: EntityRepr,
+{
+    /// A piece beginning at `start` with nothing folded into it yet.
+    fn empty(start: LivePoint<E>, uses_start: Use<E>) -> Self {
+        Piece {
+            start,
+            uses_start,
+            constraint: OperandConstraint::Any,
+            has_fixed_use: false,
+            point: start,
+            run_start: uses_start,
+            run_constraint: OperandConstraint::Any,
+            run_has_fixed_use: false,
+            before_run_has_fixed_use: false,
+        }
+    }
+
+    /// A piece beginning at `start` that holds `u`, and nothing before it.
+    fn restarting_at(start: LivePoint<E>, u: &ResolvedUse<E>) -> Self {
+        Piece {
+            start,
+            uses_start: u.use_,
+            constraint: u.constraint,
+            has_fixed_use: u.is_fixed,
+            point: u.point,
+            run_start: u.use_,
+            run_constraint: u.constraint,
+            run_has_fixed_use: u.is_fixed,
+            before_run_has_fixed_use: false,
+        }
+    }
+
+    /// Fold the given use into this piece.
+    ///
+    /// `merged` is the merge of `u`'s constraint with the piece's.
+    fn fold(&mut self, u: &ResolvedUse<E>, merged: OperandConstraint, machine: &Machine) {
+        if u.point != self.point {
+            // A new run begins: remember the fixedness predating it.
+            self.before_run_has_fixed_use = self.has_fixed_use;
+            self.run_start = u.use_;
+            self.run_constraint = u.constraint;
+            self.run_has_fixed_use = u.is_fixed;
+        } else {
+            // The run accumulates only its own uses, not the piece's: whether
+            // it can join a tie is only about the uses that would move into the
+            // tie's span; the rest of the piece would stay behind.
+            self.run_constraint = self
+                .run_constraint
+                .merge_resolved(&u.constraint, machine)
+                .expect("the run admits everything the piece does, which merged with `u`");
+            self.run_has_fixed_use |= u.is_fixed;
+        }
+        self.constraint = merged;
+        self.has_fixed_use |= u.is_fixed;
+        self.point = u.point;
+    }
+
+    /// Split this piece around the reuse-tie at `u`.
+    ///
+    /// A `Reuse` is a definition, so it overwrites the location it shares with its
+    /// target. A target that outlives the instruction needs a second copy for its
+    /// later uses, so it is split like this:
+    ///
+    /// ```ignore
+    ///        def               reuse                     use
+    /// span1: [d================)
+    /// span2:                   [r==)
+    /// span3:                   [==========================u)
+    /// ```
+    ///
+    /// `span2` holds only the tied use, and coalescing bundles it with the span
+    /// containing the other tied half. `span3` starts at the same point rather than
+    /// after it, since it exists to keep the value alive across the reuse
+    /// instruction for subsequent uses. Coalescing will also try bundling `span1`
+    /// with `span3`, when possible.
+    ///
+    /// This method pushes `span1` and `span2`, and returns `span3` so more uses
+    /// can be accumulated into it.
+    fn split_at_reuse(
+        &self,
+        spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
+        output: &mut OutputInner<E>,
+        machine: &Machine,
+        val: Val<E>,
+        u: &ResolvedUse<E>,
+    ) -> IResult<Self> {
+        // Earlier uses at this same point belong to the reuse's span rather
+        // than the piece, if they can share a location with the tie.
+        let run_at_this_point = self.point == u.point && self.run_start != u.use_;
+        let run_joins_the_tie = run_at_this_point
+            && self
+                .run_constraint
+                .merge_resolved(&u.constraint, machine)
+                .is_some();
+
+        // Where the piece ends, where its uses end, and whose fixedness.
+        let (end, uses_end, has_fixed_use) = if run_joins_the_tie {
+            // The run belongs to the tie: the piece stops short of it.
+            (u.point, self.run_start, self.before_run_has_fixed_use)
+        } else if run_at_this_point {
+            // The run conflicts with the tie, so it stays in the piece, which
+            // must reach past the early half to contain it.
+            (u.point.next_point(), u.use_, self.has_fixed_use)
+        } else {
+            // Nothing here is in the piece, so it ends where the instruction
+            // begins.
+            (u.point, u.use_, self.has_fixed_use)
+        };
+
+        // The piece so far, `span1`. May be empty, and then not pushed at all.
+        if self.start < end || self.uses_start != uses_end {
+            push_span(
+                spans,
+                output,
+                val,
+                (self.start, end),
+                (self.uses_start, uses_end),
+                has_fixed_use,
+            )?;
+        }
+
+        // `span2`: the reads at this point and the early half of their
+        // instruction, existing only to be overwritten by the reuse def.
+        let after = output.entity::<Use<E>>(u.use_.index() + 1)?;
+        push_span(
+            spans,
+            output,
+            val,
+            (u.point, u.point.next_point()),
+            (uses_end, after),
+            u.is_fixed || (run_joins_the_tie && self.run_has_fixed_use),
+        )?;
+
+        // The surviving tail, `span3`.
+        Ok(Piece::empty(u.point, after))
+    }
+}
+
+/// Push the given span, eagerly splitting where its uses' constraints conflict
+/// and at every `Reuse` target that outlives its instruction.
 fn push_span_and_split_conflicts<E>(
     input: &Input<'_, impl InputFunction>,
     uses: &PrimaryMap<Use<E>, UseData<E>>,
@@ -1862,66 +2140,43 @@ fn push_span_and_split_conflicts<E>(
 where
     E: EntityRepr,
 {
-    // The piece we are accumulating: where it starts, where its uses start, the
-    // merged constraint of everything folded into it so far, and whether any of
-    // that demands one particular register.
-    let mut piece_start = start;
-    let mut piece_uses_start = span_uses.start;
-    let mut piece_constraint = OperandConstraint::Any;
-    let mut piece_has_fixed_use = false;
-
-    let mut last_point = start;
+    let mut piece = Piece::empty(start, span_uses.start);
     for use_ in span_uses {
-        let use_data = &uses[use_];
-        let point = use_data.point;
+        let u = ResolvedUse::new(input, uses, use_);
 
-        let input_inst = input.func.inst(point.inst().with_repr32());
-        let sibling = |j| input_inst.operand(j).constraint();
-        let use_constraint = input_inst
-            .operand(usize::from(use_data.operand))
-            .constraint();
+        if u.needs_a_span_of_its_own(input, end) {
+            debug_assert_eq!(u.point.pos(), Position::Early);
+            piece = piece.split_at_reuse(spans, output, input.machine, val, &u)?;
+            counts.reuse_splits.inc();
+            continue;
+        }
 
-        let resolved = use_constraint.resolved(&sibling);
-        let is_fixed = resolved.is_fixed(input.machine);
-
-        match piece_constraint.merge(
-            &use_constraint,
-            input.machine,
-            |_| unreachable!("the accumulated constraint is always resolved"),
-            &sibling,
-        ) {
+        match piece
+            .constraint
+            .merge_resolved(&u.constraint, input.machine)
+        {
             // No conflict: we can fold `use_` into this piece.
-            Some(merged) => {
-                piece_constraint = merged.resolved(&sibling);
-                piece_has_fixed_use |= is_fixed;
-                last_point = point;
-            }
+            Some(merged) => piece.fold(&u, merged, input.machine),
 
             // Conflict: `use_` cannot fold into this piece, so split the span.
             None => {
-                spans.push(
+                push_span(
+                    spans,
                     output,
-                    LiveSpanData::new(
-                        piece_start,
-                        core::cmp::max(point, last_point.next_point()),
-                        val,
-                        EntityRange {
-                            start: piece_uses_start,
-                            end: use_,
-                        },
-                        piece_has_fixed_use,
+                    val,
+                    (
+                        piece.start,
+                        core::cmp::max(u.point, piece.point.next_point()),
                     ),
+                    (piece.uses_start, u.use_),
+                    piece.has_fixed_use,
                 )?;
                 counts.eager_splits.inc();
 
                 // The new piece starts at the last instruction boundary, not at
                 // the conflicting use, because a move between the two pieces
                 // cannot happen in the middle of an instruction.
-                piece_start = point.inst_boundary_at_or_before();
-                piece_uses_start = use_;
-                piece_constraint = resolved;
-                piece_has_fixed_use = is_fixed;
-                last_point = point;
+                piece = Piece::restarting_at(u.point.inst_boundary_at_or_before(), &u);
             }
         }
     }
@@ -1930,22 +2185,39 @@ where
     //
     // This piece either has uses or spans to the end of the block (because the
     // associated value is live-out of the block).
-    debug_assert!(piece_uses_start != span_uses.end || end == block_end);
-    spans.push(
+    debug_assert!(piece.uses_start != span_uses.end || end == block_end);
+    push_span(
+        spans,
         output,
-        LiveSpanData::new(
-            piece_start,
-            end,
-            val,
-            EntityRange {
-                start: piece_uses_start,
-                end: span_uses.end,
-            },
-            piece_has_fixed_use,
-        ),
+        val,
+        (piece.start, end),
+        (piece.uses_start, span_uses.end),
+        piece.has_fixed_use,
     )?;
-
     Ok(())
+}
+
+/// Does a later operand tie a definition to another read of `index`'s value?
+///
+/// Two definitions cannot share a register, so neither can the reads they
+/// overwrite, even when the value dies at this instruction.
+fn another_tie_follows<'a>(input_inst: &impl InputInst<'a>, index: usize) -> bool {
+    let val = input_inst.operand(index).val();
+    input_inst
+        .operands()
+        .enumerate()
+        .skip(index + 1)
+        .any(|(j, op)| {
+            op.kind() == DefUse::Use && op.val() == val && is_reuse_target(input_inst, j)
+        })
+}
+
+/// Does some definition of this instruction tie itself to its `index`th
+/// operand?
+fn is_reuse_target<'a>(input_inst: &impl InputInst<'a>, index: usize) -> bool {
+    input_inst
+        .operands()
+        .any(|op| op.constraint() == OperandConstraint::Reuse(index))
 }
 
 #[cfg(test)]
@@ -1960,7 +2232,11 @@ mod tests {
     use crate::region_tree::RegionTree;
     use crate::rpo::Rpo;
     use crate::test::{TestFunction, TestInput};
-    use mutatis::check::{Check, CheckResult};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{
         collections::{BTreeSet as Set, HashMap},
         format,
@@ -2296,6 +2572,25 @@ mod tests {
         map
     }
 
+    /// The inputs `live_span_properties` starts its random walk from.
+    fn seeds() -> Vec<TestInput> {
+        vec![
+            TestInput::default(),
+            TestInput::with_reuse_of_a_surviving_value(),
+            TestInput::with_two_reads_and_a_reuse_of_a_surviving_value(),
+            TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
+            TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
+            TestInput::with_a_reuse_of_a_live_in_value(),
+            TestInput::with_two_reuses_at_one_point(),
+            TestInput::with_two_reuses_of_a_dying_value(),
+            TestInput::with_a_critical_edge(),
+            TestInput::with_two_entry_params(),
+            TestInput::with_an_entry_param_read_two_ways(),
+            TestInput::with_entry_params_in_two_banks(),
+            TestInput::with_values_in_two_banks_spilled_and_reloaded(),
+        ]
+    }
+
     /// The point of eager splitting, stated directly: a value whose uses want
     /// disjoint register classes gets one span per class, cut just before the
     /// use that conflicts.
@@ -2344,6 +2639,379 @@ mod tests {
         let test_input = TestInput::with_use_constraints(&[rc(0), rc(2)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         assert_eq!(live_ranges.spans().count(), 1);
+    }
+
+    /// A `Reuse` whose target outlives the instruction gets the three-piece
+    /// shape `split_at_reuse` draws. The properties above say only that the
+    /// pieces tile the value's range; this says where the cuts land and who
+    /// owns the tied use.
+    #[test]
+    fn split_a_span_around_a_reuse_of_a_surviving_value() {
+        let test_input = TestInput::with_reuse_of_a_surviving_value();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The reuse names operand 0 of `inst1`, the value that outlives it.
+        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let tie = LivePoint::new(inst(1), Position::Early);
+        let overwritten = LivePoint::new(inst(1), Position::Late);
+        let later_use = LivePoint::new(inst(2), Position::Early);
+
+        // The run up to the tie ...
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            tie,
+            "the first piece stops at the instruction that overwrites its place",
+        );
+
+        // ... the copy the definition overwrites, the instruction's early half ...
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(
+            spans[1].end(&live_ranges),
+            overwritten,
+            "the doomed piece covers just the tied instruction",
+        );
+
+        // ... and the survivor, starting alongside it so both share a source.
+        assert_eq!(spans[2].start(&live_ranges), tie);
+        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
+
+        // The tied use belongs to the overwritten piece, which is therefore
+        // what `Inst::operand_span` resolves to for coalescing.
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def]);
+        assert_eq!(points(spans[1]), vec![tie]);
+        assert_eq!(points(spans[2]), vec![later_use]);
+
+        // The control: with no later read the value dies at the tie.
+        let test_input = TestInput::with_reuse_def(OperandConstraint::Any);
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        assert_eq!(
+            live_ranges
+                .spans()
+                .filter(|span| span.val(&live_ranges) == survivor)
+                .count(),
+            1,
+        );
+    }
+
+    /// Reading one value twice under a tie still cuts it into three pieces.
+    ///
+    /// Both reads are at one point, so the piece before the tie ends there and
+    /// hands *both* to the overwritten piece; ending it later would leave three
+    /// pieces live across that point.
+    #[test]
+    fn split_a_span_around_a_reuse_that_reads_its_value_twice() {
+        let test_input = TestInput::with_two_reads_and_a_reuse_of_a_surviving_value();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The reuse names operand 1 of `inst1`; operand 0 reads it too.
+        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val());
+        assert_eq!(
+            survivor,
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val()),
+            "the fixture reads one value twice",
+        );
+
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let tie = LivePoint::new(inst(1), Position::Early);
+        let overwritten = LivePoint::new(inst(1), Position::Late);
+        let later_use = LivePoint::new(inst(2), Position::Early);
+
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            tie,
+            "the first piece stops at the tie even though it just read the value there",
+        );
+
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(spans[1].end(&live_ranges), overwritten);
+
+        assert_eq!(spans[2].start(&live_ranges), tie);
+        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
+
+        // Both reads belong to the overwritten piece: they read one place, and
+        // a span's uses are contiguous.
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def]);
+        assert_eq!(points(spans[1]), vec![tie, tie]);
+        assert_eq!(points(spans[2]), vec![later_use]);
+    }
+
+    /// The same three pieces, but with the plain read pinned to `r0` while the
+    /// tie resolves to the value's two-register class.
+    ///
+    /// The overwritten piece holds both reads, so it can only live in `r0` ---
+    /// which `is_fixed` alone cannot see, since the tie itself is not fixed.
+    /// Losing that flag costs no correctness: `LiveBundle::recompute` would
+    /// leave `BUNDLE_HAS_FIXED_USES` clear and `Priority::new` would hand a
+    /// bundle with exactly one home to the low-priority tier.
+    #[test]
+    fn a_fixed_read_beside_a_reuse_fixes_the_overwritten_piece() {
+        let test_input = TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let tie = LivePoint::new(inst(1), Position::Early);
+        let overwritten = LivePoint::new(inst(1), Position::Late);
+        let later_use = LivePoint::new(inst(2), Position::Early);
+
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), tie);
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(spans[1].end(&live_ranges), overwritten);
+        assert_eq!(spans[2].start(&live_ranges), tie);
+        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
+
+        // The tie is not fixed, so the flag can only have come from the run
+        // of reads that joined it.
+        test_input.with_input(|input| {
+            let resolved = reuse_aware_constraint(input, inst(1), 1);
+            assert!(
+                !resolved.is_fixed(input.machine),
+                "the tie itself should not be fixed, or the flag proves nothing: {resolved:?}",
+            );
+        });
+        assert!(
+            spans[1].has_fixed_use(&live_ranges),
+            "the overwritten piece holds a read pinned to one register: {:#?}",
+            spans[1],
+        );
+    }
+
+    /// A read pinned elsewhere, at an *earlier* point, does not keep the run at
+    /// the tie's point out of the overwritten piece.
+    ///
+    /// The run is what moves into that piece, so only the run's own constraint
+    /// decides whether it can join the tie. Folding the rest of the piece in
+    /// too --- the pinned read here --- makes the merge fail, and the value
+    /// then needs two registers across the tie's instruction instead of one.
+    #[test]
+    fn a_pinned_read_does_not_veto_a_later_run_joining_a_tie() {
+        let test_input = TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The reuse names operand 2 of `inst2`; operands 0 and 1 read it too,
+        // at the same point, and `inst1` reads it at an earlier one.
+        let survivor = test_input.with_input(|input| input.func.inst(inst(2)).operand(2).val());
+        test_input.with_input(|input| {
+            let inst2 = input.func.inst(inst(2));
+            for i in [0, 1] {
+                assert_eq!(inst2.operand(i).val(), survivor, "operand {i} reads it too");
+            }
+            assert_eq!(input.func.inst(inst(1)).operand(0).val(), survivor);
+
+            // The pinned read and the tie want disjoint classes, so the piece
+            // before the tie cannot satisfy both --- which is the whole point.
+            let pinned = reuse_aware_constraint(input, inst(1), 0);
+            let tie = reuse_aware_constraint(input, inst(2), 2);
+            assert!(
+                pinned.merge_resolved(&tie, input.machine).is_none(),
+                "{pinned:?} and {tie:?} should conflict",
+            );
+        });
+
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let pinned_read = LivePoint::new(inst(1), Position::Early);
+        let tie = LivePoint::new(inst(2), Position::Early);
+        let overwritten = LivePoint::new(inst(2), Position::Late);
+        let later_use = LivePoint::new(inst(3), Position::Early);
+
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            tie,
+            "the piece holding the pinned read stops at the tie, rather than \
+             reaching past the early half to keep the run it has no claim on",
+        );
+
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(spans[1].end(&live_ranges), overwritten);
+
+        assert_eq!(spans[2].start(&live_ranges), tie);
+        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
+
+        // All three reads at the tie's point belong to the overwritten piece.
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def, pinned_read]);
+        assert_eq!(points(spans[1]), vec![tie, tie, tie]);
+        assert_eq!(points(spans[2]), vec![later_use]);
+    }
+
+    /// A tie at a block's first instruction, on a live-in value, splits it in
+    /// two, not three: the piece up to the tie is empty --- arrival and tie
+    /// share the start point --- so it is never pushed, and pushed anyway it
+    /// would hold a register across the early half with no uses at all.
+    #[test]
+    fn split_a_span_around_a_reuse_of_a_live_in_value() {
+        let test_input = TestInput::with_a_reuse_of_a_live_in_value();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The reuse names operand 0 of `inst2`, the block's first instruction.
+        let survivor = test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let tie = LivePoint::new(inst(2), Position::Early);
+        let overwritten = LivePoint::new(inst(2), Position::Late);
+        let later_use = LivePoint::new(inst(3), Position::Early);
+
+        // The whole of `block0`, which the value flows out of ...
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            tie,
+            "the defining block's piece ends where the tied block begins",
+        );
+
+        // ... then `block1`'s two pieces: the doomed copy and the survivor.
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(spans[1].end(&live_ranges), overwritten);
+        assert_eq!(spans[2].start(&live_ranges), tie);
+        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
+
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def]);
+        assert_eq!(points(spans[1]), vec![tie]);
+        assert_eq!(points(spans[2]), vec![later_use]);
+    }
+
+    /// Two ties at one point cut their value into one doomed piece each plus
+    /// one survivor: the first tie takes everything up to the instruction, so
+    /// the piece before the *second* is empty and never pushed.
+    #[test]
+    fn split_a_span_around_two_reuses_at_one_point() {
+        let test_input = TestInput::with_two_reuses_at_one_point();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // Both ties name reads of the same value, at the same point.
+        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        assert_eq!(
+            survivor,
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val()),
+        );
+
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 4, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let tie = LivePoint::new(inst(1), Position::Early);
+        let overwritten = LivePoint::new(inst(1), Position::Late);
+        let later_use = LivePoint::new(inst(2), Position::Early);
+
+        // The run up to the first tie, a doomed piece per tie, and the survivor.
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), tie);
+        for span in &spans[1..3] {
+            assert_eq!(span.start(&live_ranges), tie);
+            assert_eq!(span.end(&live_ranges), overwritten);
+        }
+        assert_eq!(spans[3].start(&live_ranges), tie);
+        assert_eq!(spans[3].end(&live_ranges), later_use.next_point());
+
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def]);
+        assert_eq!(points(spans[1]), vec![tie]);
+        assert_eq!(points(spans[2]), vec![tie]);
+        assert_eq!(points(spans[3]), vec![later_use]);
+    }
+
+    /// Two ties at one point on a dying value still cut it into one piece per
+    /// tie: one location would carry both reads, but the definitions that
+    /// overwrite them cannot share a register, so neither can the reads. The
+    /// last tie keeps the tail, there being nothing after it to carry.
+    #[test]
+    fn split_a_span_around_two_reuses_of_a_dying_value() {
+        let test_input = TestInput::with_two_reuses_of_a_dying_value();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let tie = LivePoint::new(inst(1), Position::Early);
+        let overwritten = LivePoint::new(inst(1), Position::Late);
+
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), tie);
+        for span in &spans[1..] {
+            assert_eq!(span.start(&live_ranges), tie);
+            assert_eq!(span.end(&live_ranges), overwritten);
+        }
+
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def]);
+        assert_eq!(points(spans[1]), vec![tie]);
+        assert_eq!(points(spans[2]), vec![tie]);
     }
 
     /// Splitting a bundle rearranges who owns which slots of the shared span
@@ -3136,9 +3804,22 @@ mod tests {
 
     #[test]
     fn live_span_properties() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(10_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        // How many reads are split out into a doomed piece *only* because a
+        // later tie names another read of the same value, rather than because
+        // the value outlives the instruction. The walk below reached that case
+        // zero times before the seeds were added, so every property here was
+        // blind to how such a value is cut up.
+        //
+        // Derived from the input rather than counted in `analyze_spans`: its
+        // `Counts` is local to it, and a `Count` stores nothing at all without
+        // `feature = "trace-log"`.
+        static TIE_ONLY_SPLITS: AtomicUsize = AtomicUsize::new(0);
+        TIE_ONLY_SPLITS.store(0, Ordering::Relaxed);
+
+        let result = Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            seeds(),
+            |test_input: &TestInput| -> Result<(), String> {
                 let func = &test_input.func;
                 let (mut liveness, live_ranges) = analyze_spans(test_input)?;
 
@@ -3289,18 +3970,13 @@ mod tests {
                             // came from, so that this is a check on where the
                             // spans were cut and not on a second reading of the
                             // same operands.
-                            let input_inst = input.func.inst(use_data.point(&live_ranges).inst());
-                            let sibling = |j| input_inst.operand(j).constraint();
-                            let this = input_inst
-                                .operand(use_data.operand(&live_ranges))
-                                .constraint();
-                            match constraint.merge(
-                                &this,
-                                input.machine,
-                                |_| unreachable!("the folded constraint is always resolved"),
-                                &sibling,
-                            ) {
-                                Some(merged) => constraint = merged.resolved(&sibling),
+                            let this = reuse_aware_constraint(
+                                input,
+                                use_data.point(&live_ranges).inst(),
+                                use_data.operand(&live_ranges),
+                            );
+                            match constraint.merge_resolved(&this, input.machine) {
+                                Some(merged) => constraint = merged,
                                 None => {
                                     return Err(format!(
                                         "{span:?} has a use at {:?} constrained to {this:?}, \
@@ -3570,9 +4246,29 @@ mod tests {
                             ));
                         }
                     }
+
+                    // 8. A span with no uses begins and ends at an
+                    // instruction boundary.
+                    //
+                    // Such a piece only carries its value from one boundary to
+                    // another, and a boundary is the only place a move into or
+                    // out of it can go. One ending mid-instruction holds a
+                    // register that nothing reads.
+                    for &span in &spans_in[&block] {
+                        if !span.uses(&live_ranges).is_empty() {
+                            continue;
+                        }
+                        let (start, end) = (span.start(&live_ranges), span.end(&live_ranges));
+                        if start.pos() != Position::Early || end.pos() != Position::Early {
+                            return Err(format!(
+                                "{span:?} covers {start:?}..{end:?} of {block:?} and has no \
+                                 uses, so it holds a location that nothing reads",
+                            ));
+                        }
+                    }
                 }
 
-                // 8. Every operand is accounted for: a def starts its value's
+                // 9. Every operand is accounted for: a def starts its value's
                 // span exactly at its own program point, a use is strictly
                 // inside one, and either way the span records it.
                 for &(block, point, i, kind, val) in &operands {
@@ -3621,7 +4317,7 @@ mod tests {
                     }
                 }
 
-                // 9. Each use's weight is the cost model applied to that
+                // 10. Each use's weight is the cost model applied to that
                 // use's own operand, in that use's own block, and a span flags
                 // a fixed use exactly when one of its uses names a class that
                 // holds a single register.
@@ -3662,7 +4358,10 @@ mod tests {
                                 ));
                             }
 
-                            any_fixed |= match resolved {
+                            // A tie strengthens `Any` into the value's class,
+                            // which may hold one register, as construction saw.
+                            any_fixed |= match reuse_aware_constraint(input, point.inst(), operand)
+                            {
                                 OperandConstraint::Reg(class) => class.is_singleton(input.machine),
                                 _ => false,
                             };
@@ -3680,7 +4379,31 @@ mod tests {
                     Ok(())
                 })?;
 
-                // 10. Constructing twice gives exactly the same spans and uses.
+                // Count the reads the tie disjunct alone splits out, for the
+                // non-vacuity assertion below. `end` is the value's live range
+                // end in the block, which is what construction compares the
+                // tie's point against, and so the last piece's end.
+                test_input.with_input(|input| {
+                    for &(block, point, i, kind, val) in &operands {
+                        if kind != DefUse::Use {
+                            continue;
+                        }
+                        let input_inst = input.func.inst(point.inst());
+                        let end = spans_of[&(val, block)]
+                            .iter()
+                            .map(|span| span.end(&live_ranges))
+                            .max()
+                            .expect("property 9 found a span for every operand's value");
+                        if is_reuse_target(&input_inst, i)
+                            && end <= point.next_point()
+                            && another_tie_follows(&input_inst, i)
+                        {
+                            TIE_ONLY_SPLITS.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+
+                // 11. Constructing twice gives exactly the same spans and uses.
                 let (_, again) = analyze_spans(test_input)?;
                 let first: Vec<_> = live_ranges.spans.as_slice().to_vec();
                 let second: Vec<_> = again.spans.as_slice().to_vec();
@@ -3697,7 +4420,7 @@ mod tests {
                     }
                 }
 
-                // 11. Both halves reset cleanly, including the scratch that
+                // 12. Both halves reset cleanly, including the scratch that
                 // span construction borrows from `Liveness`.
                 let mut live_ranges = live_ranges;
                 live_ranges.reset();
@@ -3710,6 +4433,17 @@ mod tests {
                 }
 
                 Ok(())
-            })
+            },
+        );
+
+        if result.is_ok() {
+            assert!(
+                TIE_ONLY_SPLITS.load(Ordering::Relaxed) > 0,
+                "no input reached a read that only a later tie splits out, so no property \
+                 here saw one",
+            );
+        }
+
+        result
     }
 }

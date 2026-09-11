@@ -1,7 +1,7 @@
 use core::{cell::RefCell, fmt, marker::PhantomData};
 
 use crate::{
-    Machine, RegClass, RegSet,
+    Machine, RegClass,
     context::ContextInner,
     entity::{Block, Entity as _, EntityRepr, Inst, Val},
     error::IResult,
@@ -98,8 +98,11 @@ pub enum OperandConstraint {
     /// This operand must be in the same location as the `i`th operand of this
     /// operand's associated instruction.
     ///
-    /// The operand named by a `Reuse` must not itself have a `Reuse`
-    /// constraint.
+    /// A `Reuse` may only appear on a [`Position::Late`] definition, and must
+    /// name a [`Position::Early`] use, constrained to [`Self::Any`] or
+    /// [`Self::Reg`], that no other `Reuse` names. The two are then live over
+    /// disjoint halves of the instruction, which is what lets them share a
+    /// location, and the target never carries a `Reuse` itself.
     Reuse(usize),
 }
 
@@ -217,6 +220,19 @@ impl OperandConstraint {
                 }
             }
         }
+    }
+
+    /// `OperandConstraint::merge` for two constraints that are already
+    /// resolved.
+    pub(crate) fn merge_resolved(&self, other: &Self, machine: &Machine) -> Option<Self> {
+        debug_assert!(!matches!(self, Self::Reuse(_)), "must already be resolved");
+        debug_assert!(!matches!(other, Self::Reuse(_)), "must already be resolved");
+        self.merge(
+            other,
+            machine,
+            |_| unreachable!("`self` is already resolved"),
+            |_| unreachable!("`other` is already resolved"),
+        )
     }
 }
 
@@ -707,9 +723,6 @@ pub trait InputInst<'a> {
 
     /// TODO FITZGEN
     fn operand(&self, i: usize) -> Operand;
-
-    /// TODO FITZGEN
-    fn clobbers(&self) -> RegSet;
 
     /// Get the block that this instruction lies within.
     fn block(&self) -> Block;

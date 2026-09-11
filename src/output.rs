@@ -1,8 +1,10 @@
+use alloc::vec::Vec;
+
 use crate::context::{Context, WhichContext};
 use crate::entity::{Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, SecondaryMap, Val};
 use crate::error::{IResult, InternalError};
 use crate::input::{InputBlock, InputFunction, InputInst as _, Position};
-use crate::live_ranges::{LivePoint, LiveRanges};
+use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan};
 use crate::liveness::block_inst_bounds;
 use crate::machine::{Interfere, Machine, Reg, RegGroup};
 use crate::move_generation::{MoveGeneration, PackedMovePosition};
@@ -544,6 +546,17 @@ impl<'a> Output<'a> {
         with_inner!(self, |inner| inner.output.inst_allocs(inst))
     }
 
+    /// Where `block`'s parameters live when the block is entered, in parameter
+    /// order.
+    ///
+    /// Exactly as long as the block's parameter list; `None` for a parameter
+    /// that is not live. For the entry block this is where callers must place
+    /// the function's arguments; for any other block it merely documents moves
+    /// that [`Output::block_insts_and_edits`] already accounts for.
+    pub fn block_param_allocs(&self, block: Block) -> &[Option<Allocation>] {
+        with_inner!(self, |inner| inner.output.block_param_allocs(block))
+    }
+
     /// Iterate over `block`'s instructions and the edits to insert around them,
     /// in the order the rewritten block should have them.
     ///
@@ -748,6 +761,11 @@ define_entities! {
     struct OperandAllocation = "operand_allocation";
 }
 
+define_entities! {
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct BlockParamAllocation = "block_param_allocation";
+}
+
 /// What an operand's allocation slot holds until the scatter fills it in.
 const UNALLOCATED: Allocation =
     Allocation::Reg(RegAllocation::Reg(<Reg as Entity>::MAX_REPRESENTABLE));
@@ -768,6 +786,17 @@ where
     /// Where each instruction's operands' allocations live within
     /// `operand_allocs`.
     inst_allocs: SecondaryMap<Inst<E>, EntityRange<OperandAllocation<E>>>,
+
+    /// Contiguous storage for where every block's parameters arrive; `None` for
+    /// a parameter that no span covers. Stored under the public `u32`
+    /// representation, like `operand_allocs`.
+    param_allocs: PrimaryMap<BlockParamAllocation<E>, Option<Allocation>>,
+
+    /// Where each block's parameters' allocations live within `param_allocs`.
+    block_params: SecondaryMap<Block<E>, EntityRange<BlockParamAllocation<E>>>,
+
+    /// Scratch space for the spans of a block's parameters reported thus far.
+    incumbents: Vec<Option<LiveSpan<E>>>,
 }
 
 impl<E: EntityRepr> OutputInner<E> {
@@ -776,6 +805,9 @@ impl<E: EntityRepr> OutputInner<E> {
             error: None,
             operand_allocs: PrimaryMap::new(),
             inst_allocs: SecondaryMap::new(EntityRange::empty()),
+            param_allocs: PrimaryMap::new(),
+            block_params: SecondaryMap::new(EntityRange::empty()),
+            incumbents: Vec::new(),
         }
     }
 
@@ -784,10 +816,16 @@ impl<E: EntityRepr> OutputInner<E> {
             error,
             operand_allocs: inst_allocation_storage,
             inst_allocs,
+            param_allocs,
+            block_params,
+            incumbents,
         } = self;
         *error = None;
         inst_allocation_storage.reset();
         inst_allocs.reset();
+        param_allocs.reset();
+        block_params.reset();
+        incumbents.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -795,8 +833,16 @@ impl<E: EntityRepr> OutputInner<E> {
             error,
             operand_allocs: inst_allocation_storage,
             inst_allocs,
+            param_allocs,
+            block_params,
+            incumbents,
         } = self;
-        error.is_none() && inst_allocation_storage.is_reset() && inst_allocs.is_reset()
+        error.is_none()
+            && inst_allocation_storage.is_reset()
+            && inst_allocs.is_reset()
+            && param_allocs.is_reset()
+            && block_params.is_reset()
+            && incumbents.is_empty()
     }
 
     pub fn construct(
@@ -810,8 +856,9 @@ impl<E: EntityRepr> OutputInner<E> {
         let _timing = Timing::new("output");
 
         self.operand_allocs.reserve(func.len_insts());
-        for (_, input_block) in func.blocks() {
+        for (block, input_block) in func.blocks() {
             self.reserve_block_inst_allocs(&input_block)?;
+            self.reserve_block_param_allocs(block, &input_block)?;
         }
 
         for block in rpo.iter() {
@@ -827,6 +874,8 @@ impl<E: EntityRepr> OutputInner<E> {
             }
         }
 
+        self.scatter_block_param_allocs(func, live_ranges, spill_slots);
+
         if cfg!(debug_assertions) {
             for block in rpo.iter() {
                 self.debug_assert_block_allocated(&func.block(block.with_repr32()));
@@ -834,6 +883,97 @@ impl<E: EntityRepr> OutputInner<E> {
         }
 
         Ok(())
+    }
+
+    /// Record where each of a block's parameters arrives.
+    fn scatter_block_param_allocs(
+        &mut self,
+        func: &impl InputFunction,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+    ) {
+        let mut incumbents = core::mem::take(&mut self.incumbents);
+        debug_assert!(incumbents.is_empty());
+        incumbents.resize(self.param_allocs.len(), None);
+
+        // `block_spans` and `live_in_spans` are invalid at this point, since
+        // region allocation already split spans, so we have to walk everything.
+        for span in live_ranges.spans() {
+            let block = span.block(func, live_ranges);
+            let input_block = func.block(block.with_repr32());
+
+            let (first_inst, _) = block_inst_bounds(&input_block);
+            let Some(first_inst) = first_inst.with_repr::<E>() else {
+                continue;
+            };
+            if span.start(live_ranges) != LivePoint::new(first_inst, Position::Early) {
+                continue;
+            }
+
+            let val = span.val(live_ranges).with_repr32();
+            let Some(k) = input_block.params().position(|param| param == val) else {
+                continue;
+            };
+
+            let range = self.block_params[block];
+            let index = range.start.index() + k;
+            debug_assert!(index < range.end.index());
+
+            // Keep the span that reaches furthest, breaking ties on the span
+            // itself.
+            let key = (span.end(live_ranges), span);
+            match incumbents[index] {
+                Some(prev) if (prev.end(live_ranges), prev) >= key => continue,
+                _ => incumbents[index] = Some(span),
+            }
+
+            let alloc = span.allocation(live_ranges, spill_slots);
+            self.param_allocs.as_mut_slice()[index] = Some(alloc.with_repr32());
+        }
+
+        incumbents.clear();
+        self.incumbents = incumbents;
+    }
+
+    /// Give each of `block`'s parameters a slot in the flat storage, and record
+    /// the block's range within it.
+    fn reserve_block_param_allocs<'a>(
+        &mut self,
+        block: Block,
+        input_block: &impl InputBlock<'a>,
+    ) -> IResult<()> {
+        let block = self.with_repr::<E, _>(block)?;
+
+        let start_index = self.param_allocs.len();
+        let end_index = start_index + input_block.params().count();
+        let start = self.entity::<BlockParamAllocation<E>>(start_index)?;
+        let end = self.entity::<BlockParamAllocation<E>>(end_index)?;
+
+        for _ in start_index..end_index {
+            self.param_allocs.push_unwrap(None);
+        }
+        self.block_params[block] = EntityRange { start, end };
+        Ok(())
+    }
+
+    /// Where `block`'s parameters arrive, in parameter order.
+    pub fn block_param_allocs(&self, block: Block) -> &[Option<Allocation>] {
+        let Some(block) = block.with_repr::<E>() else {
+            return &[];
+        };
+        let range = self.block_params[block];
+        &self.param_allocs.as_slice()[range.indices()]
+    }
+
+    /// Where `block`'s parameters arrive, mutably, so that a test can break a
+    /// correct allocation and watch the checker notice.
+    #[cfg(test)]
+    pub(crate) fn block_param_allocs_mut(&mut self, block: Block) -> &mut [Option<Allocation>] {
+        let Some(block) = block.with_repr::<E>() else {
+            return &mut [];
+        };
+        let range = self.block_params[block];
+        &mut self.param_allocs.as_mut_slice()[range.indices()]
     }
 
     /// Give each of `input_block`'s instructions' operands a placeholder slot

@@ -356,6 +356,11 @@ where
         self.inner.elems.get_mut(index)
     }
 
+    /// Returns an iterator over the keys in the map.
+    pub fn keys(&self) -> PrimaryMapKeys<K> {
+        self.inner.keys()
+    }
+
     pub fn iter(&self) -> PrimaryMapIter<'_, K, V> {
         self.inner.iter()
     }
