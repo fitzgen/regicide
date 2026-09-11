@@ -47,9 +47,14 @@ export function handleAction(state, action) {
       return done({ ...state, tab: action.tab });
 
     case "clickEntity": {
-      // Clear everything after the active breadcrumb, then push. Clicking the
-      // already-active entity pushes a duplicate, which is honest about what
-      // the user did.
+      // Clicking the already-active entity re-selects it rather than pushing:
+      // a `[v3, v3]` trail says nothing the single crumb did not, and the
+      // re-select still scrolls the pane back to it.
+      if (sameEntity(state.breadcrumbs[state.activeBreadcrumb], action.ref)) {
+        return select(state, state.breadcrumbs, state.activeBreadcrumb);
+      }
+
+      // Otherwise clear everything after the active breadcrumb, then push.
       const kept = state.breadcrumbs.slice(0, state.activeBreadcrumb + 1);
       const breadcrumbs = [...kept, action.ref];
       return select(state, breadcrumbs, breadcrumbs.length - 1);

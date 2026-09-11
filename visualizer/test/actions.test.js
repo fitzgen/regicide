@@ -109,15 +109,37 @@ test("clicking a breadcrumb moves the active index without truncating", () => {
   assert.deepEqual(state.scrollToEntity, SPAN0);
 });
 
-test("clicking the active entity pushes a duplicate", () => {
-  // The rule says push, and a `[v3, v3]` trail is honest about what the user
-  // did. `sameEntity`, because two structurally equal refs are never `===`.
-  const { state } = run([
+test("clicking the active entity does not push a duplicate", () => {
+  // A fresh ref rather than `V3` itself, because the guard is structural:
+  // two refs for the same entity are never `===`.
+  const { state, queries } = run([
     { type: "clickEntity", ref: V3 },
     { type: "clickEntity", ref: { ...V3 } },
   ]);
-  assert.equal(state.breadcrumbs.length, 2);
-  assert.ok(sameEntity(state.breadcrumbs[0], state.breadcrumbs[1]));
+  assert.deepEqual(state.breadcrumbs, [V3]);
+  assert.equal(state.activeBreadcrumb, 0);
+  assert.ok(sameEntity(state.selected, V3));
+  // Still a re-select, so the pane is still asked to scroll back to it.
+  assert.deepEqual(state.scrollToEntity, V3);
+  assert.deepEqual(
+    queries.map((q) => q.method),
+    ["details"],
+  );
+});
+
+test("clicking a non-active earlier breadcrumb still truncates and pushes", () => {
+  // Only the *active* crumb is deduplicated: walking back to `span0` and
+  // clicking it again is a click on something that is already selected, but
+  // clicking `v3` from there is a new step and drops `bundle4`.
+  const { state } = run([
+    { type: "clickEntity", ref: SPAN0 },
+    { type: "clickEntity", ref: V3 },
+    { type: "clickEntity", ref: BUNDLE4 },
+    { type: "clickBreadcrumb", index: 0 },
+    { type: "clickEntity", ref: { ...V3 } },
+  ]);
+  assert.deepEqual(state.breadcrumbs, [SPAN0, V3]);
+  assert.equal(state.activeBreadcrumb, 1);
 });
 
 test("an out-of-range breadcrumb index is a no-op", () => {
