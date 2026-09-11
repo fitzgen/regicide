@@ -279,6 +279,7 @@ fn debug_matches_prefix<T: VisualizedEntity>() {
 mod tests {
     use super::*;
     use crate::test::TestInput;
+    use alloc::collections::BTreeMap;
     use std::{format, println, vec::Vec};
 
     /// The opening tag of each script the page carries, which is also how a
@@ -398,6 +399,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The name a top-level declaration binds, if the line declares one.
+    ///
+    /// Column 0 is the whole test: a declaration indented by even one space is
+    /// inside something and cannot collide with anything.
+    fn top_level_binding(line: &str) -> Option<&str> {
+        let rest = line.strip_prefix("export ").unwrap_or(line);
+        let rest = rest.strip_prefix("async ").unwrap_or(rest);
+        let rest = ["function ", "class ", "const ", "let ", "var "]
+            .iter()
+            .find_map(|keyword| rest.strip_prefix(keyword))?;
+        // `const {a, b} = ...` would need real parsing; the sources do not use
+        // it, and a destructuring line simply binds nothing here.
+        let name = rest
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+            .next()?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    /// Two modules may each have a top-level `dispatch`; one script may not.
+    ///
+    /// This is the failure mode the stitching creates and no other check sees:
+    /// `node --test` runs the files as separate modules, where the collision
+    /// does not exist, and the page only reports it as a syntax error that
+    /// blanks the whole app.
+    #[test]
+    fn bundled_sources_do_not_shadow_each_other() {
+        let bundles: &[(&str, &[(&str, &str)])] = &[
+            (
+                "worker",
+                &[
+                    ("entities.js", ENTITIES_JS),
+                    ("model.js", MODEL_JS),
+                    ("worker.js", WORKER_JS),
+                ],
+            ),
+            (
+                "app",
+                &[
+                    ("entities.js", ENTITIES_JS),
+                    ("state.js", STATE_JS),
+                    ("actions.js", ACTIONS_JS),
+                    ("view.js", VIEW_JS),
+                    ("main.js", MAIN_JS),
+                ],
+            ),
+        ];
+
+        for (bundle, sources) in bundles {
+            let mut seen = BTreeMap::new();
+            for (file, source) in *sources {
+                for line in source.lines() {
+                    let Some(name) = top_level_binding(line) else {
+                        continue;
+                    };
+                    if let Some(first) = seen.insert(name, file) {
+                        assert_eq!(
+                            first, file,
+                            "the {bundle} bundle binds `{name}` in both {first} and {file}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn top_level_binding_reads_declarations_and_nothing_else() {
+        assert_eq!(
+            top_level_binding("export function installView(root) {"),
+            Some("installView")
+        );
+        assert_eq!(
+            top_level_binding("let viewDispatch = () => {};"),
+            Some("viewDispatch")
+        );
+        assert_eq!(top_level_binding("const INDENT = 4;"), Some("INDENT"));
+        assert_eq!(top_level_binding("  const inner = 1;"), None);
+        assert_eq!(top_level_binding("// const commented = 1;"), None);
+        assert_eq!(top_level_binding("  return const;"), None);
     }
 
     #[test]

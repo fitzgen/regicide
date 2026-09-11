@@ -14,7 +14,11 @@ const INDENT = 4;
 
 // The action dispatcher, kept so that the scroll handshake can be closed from
 // here: the view scrolls, then says it has.
-let dispatch = () => {};
+//
+// Qualified, like `installView`: the stitched page concatenates this file with
+// `main.js`, whose own `dispatch` is a top-level function, and two top-level
+// bindings of one name is a syntax error there and nowhere else.
+let viewDispatch = () => {};
 
 // The outline the function pane's DOM was built from. Building it is the
 // expensive step -- thousands of lines -- so it happens once and every later
@@ -36,18 +40,18 @@ let bars = [];
 let shownSelection = null;
 let shownHover = null;
 
-// Wire up the listeners. `dispatch` takes an action.
+// Wire up the listeners. `dispatcher` takes an action.
 export function installView(root, dispatcher) {
-  dispatch = dispatcher;
+  viewDispatch = dispatcher;
 
   root.querySelector("#tabs").addEventListener("click", (e) => {
     const tab = e.target.closest("[data-tab]");
-    if (tab) dispatch({ type: "selectTab", tab: tab.dataset.tab });
+    if (tab) viewDispatch({ type: "selectTab", tab: tab.dataset.tab });
   });
 
   root.querySelector("#breadcrumbs").addEventListener("click", (e) => {
     const crumb = e.target.closest("[data-index]");
-    if (crumb) dispatch({ type: "clickBreadcrumb", index: Number(crumb.dataset.index) });
+    if (crumb) viewDispatch({ type: "clickBreadcrumb", index: Number(crumb.dataset.index) });
   });
 
   // One handler for the whole pane, on the pane itself: the lines and bars are
@@ -57,14 +61,14 @@ export function installView(root, dispatcher) {
   pane.addEventListener("click", (e) => {
     const el = e.target.closest("[data-entity]");
     const ref = el && refs.get(el.dataset.entity);
-    if (ref) dispatch({ type: "clickEntity", ref });
+    if (ref) viewDispatch({ type: "clickEntity", ref });
   });
   pane.addEventListener("mouseover", (e) => {
     const bar = e.target.closest(".bar");
-    if (bar) dispatch({ type: "hoverSpan", ref: refs.get(bar.dataset.entity) });
+    if (bar) viewDispatch({ type: "hoverSpan", ref: refs.get(bar.dataset.entity) });
   });
   pane.addEventListener("mouseout", (e) => {
-    if (e.target.closest(".bar")) dispatch({ type: "unhoverSpan" });
+    if (e.target.closest(".bar")) viewDispatch({ type: "unhoverSpan" });
   });
 }
 
@@ -222,5 +226,5 @@ function scrollToEntity(state) {
   const found = elements.get(entityKey(state.scrollToEntity));
   if (found) found[0].scrollIntoView({ block: "center" });
   // Out of band: dispatching from inside a render would re-enter it.
-  queueMicrotask(() => dispatch({ type: "scrolled", what: "entity" }));
+  queueMicrotask(() => viewDispatch({ type: "scrolled", what: "entity" }));
 }
