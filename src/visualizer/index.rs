@@ -208,8 +208,11 @@ where
 
         let histograms = histograms(input, context);
 
-        // Commit 12's table of contents is keyed by these ids, and a duplicate
-        // would silently drop a chart.
+        // The visualizer's table of contents is keyed by these ids: a duplicate
+        // would silently drop a chart, and an id the table of contents has
+        // never heard of would land in its trailing "Other" group. The set is
+        // pinned here, and `model.js` asserts that every id its grouping names
+        // is one of these, which is the pair that keeps the two from drifting.
         let mut ids = BTreeSet::new();
         for histogram in &histograms {
             assert!(
@@ -218,6 +221,11 @@ where
                 histogram.id,
             );
         }
+        assert!(
+            ids.iter().copied().eq(HISTOGRAM_IDS.iter().copied()),
+            "the histograms are no longer {HISTOGRAM_IDS:?} but {ids:?}; \
+             update `HISTOGRAM_IDS` here and the grouping in `visualizer/js/model.js`",
+        );
 
         Self {
             indexes: EventIndexes {
@@ -230,6 +238,41 @@ where
         }
     }
 }
+
+/// Every histogram id, in sorted order.
+///
+/// Pinned so that adding, removing, or renaming one is a deliberate act that
+/// also visits the visualizer's grouping rather than a silent change nobody
+/// notices until a chart is missing from the page.
+const HISTOGRAM_IDS: &[&str] = &[
+    "between-span-splits-per-bundle",
+    "blocks-per-region",
+    "bundles-per-region",
+    "evictions-per-bundle",
+    "incoming-edges-per-block",
+    "incoming-edges-per-region",
+    "instructions-per-bundle",
+    "instructions-per-span",
+    "live-in-spans-per-block",
+    "live-in-values-per-block",
+    "live-out-spans-per-block",
+    "live-out-values-per-block",
+    "outgoing-edges-per-block",
+    "outgoing-edges-per-region",
+    "parallel-moves-per-solve",
+    "queue-pops-per-bundle",
+    "queue-pops-per-region",
+    "region-depth",
+    "spans-per-bundle",
+    "spans-per-value",
+    "spills-per-bundle",
+    "spills-per-value",
+    "total-splits-per-bundle",
+    "uses-per-bundle",
+    "uses-per-span",
+    "values-per-bundle",
+    "within-span-splits-per-bundle",
+];
 
 /// How many buckets a histogram that does not get one per distinct value has.
 const NUM_BUCKETS: u64 = 16;

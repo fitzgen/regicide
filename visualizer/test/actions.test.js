@@ -55,6 +55,8 @@ const ACTIONS = [
   { type: "hoverSpan", ref: SPAN0 },
   { type: "unhoverSpan" },
   { type: "scrollToHistogram", id: "spans-per-bundle" },
+  { type: "queryResult", id: 0, method: "histograms", result: [] },
+  { type: "queryResult", id: 0, method: "histogramGroups", result: [] },
   { type: "scrolled", what: "entity" },
   { type: "scrolled", what: "histogram" },
 ];
@@ -284,10 +286,12 @@ test("the outline arrives once the blob has loaded", () => {
   // page: nothing else would ever ask for the function pane.
   const first = run([{ type: "loaded" }]);
   // The empty search rides along: it is the whole log, and it is what the
-  // event tab opens on.
+  // event tab opens on. So do the histograms, which are already computed.
   assert.deepEqual(first.queries, [
     { id: 0, method: "functionOutline", args: [] },
     { id: 1, method: "searchEvents", args: [""] },
+    { id: 2, method: "histograms", args: [] },
+    { id: 3, method: "histogramGroups", args: [] },
   ]);
   assert.equal(first.state.outline, null, "the outline was invented before it arrived");
 
@@ -297,8 +301,12 @@ test("the outline arrives once the blob has loaded", () => {
     first.state,
   ).state;
   assert.equal(done.outline, outline);
-  // The search it went out with is still in flight.
-  assert.deepEqual(done.pending, { 1: "searchEvents" });
+  // Everything it went out with is still in flight.
+  assert.deepEqual(done.pending, {
+    1: "searchEvents",
+    2: "histograms",
+    3: "histogramGroups",
+  });
 });
 
 test("clicking an entity in the function pane walks the breadcrumbs", () => {
@@ -429,4 +437,48 @@ test("clicking an entity in an event row is a function-pane click with a tab swi
   assert.equal(viaPane.state.tab, "events", "a plain click moved the tab");
   assert.deepEqual({ ...viaEvent.state, tab: null }, { ...viaPane.state, tab: null });
   assert.deepEqual(viaEvent.queries, viaPane.queries);
+});
+
+test("the histograms arrive as two separate answers", () => {
+  const histograms = [{ id: "spans-per-value", title: "Spans per value", count: 2, buckets: [] }];
+  const groups = [{ group: "Liveness", items: [{ id: "spans-per-value", title: "x", count: 2 }] }];
+  let { state } = run([{ type: "loaded" }]);
+  assert.equal(state.histograms, null);
+  assert.equal(state.histogramGroups, null);
+
+  state = run(
+    [
+      { type: "queryResult", id: 2, method: "histograms", result: histograms },
+      { type: "queryResult", id: 3, method: "histogramGroups", result: groups },
+    ],
+    state,
+  ).state;
+  assert.equal(state.histograms, histograms);
+  assert.equal(state.histogramGroups, groups);
+  assert.deepEqual(state.pending, { 0: "functionOutline", 1: "searchEvents" });
+});
+
+test("a histogram scroll survives a tab switch", () => {
+  // The field belongs to the histograms tab, and the gesture that asks for the
+  // scroll is often the same one that selects the tab: clearing it on a switch
+  // would drop the request that the switch was made for.
+  let { state } = run([
+    { type: "scrollToHistogram", id: "spills-per-value" },
+    { type: "selectTab", tab: "histograms" },
+  ]);
+  assert.equal(state.scrollToHistogram, "spills-per-value");
+
+  state = run([{ type: "selectTab", tab: "function" }], state).state;
+  assert.equal(state.scrollToHistogram, "spills-per-value");
+});
+
+test("a later histogram scroll replaces the pending one", () => {
+  // Two clicks in the table of contents before the first has been served: the
+  // second is where the user wants to be, and serving both would scroll past
+  // it to get there.
+  const { state } = run([
+    { type: "scrollToHistogram", id: "spills-per-value" },
+    { type: "scrollToHistogram", id: "uses-per-span" },
+  ]);
+  assert.equal(state.scrollToHistogram, "uses-per-span");
 });

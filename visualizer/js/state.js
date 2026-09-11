@@ -55,6 +55,13 @@ export function initialState() {
     // here is bounded by what the user scrolled past.
     eventRows: {},
 
+    // The histograms and their grouping for the table of contents, or `null`
+    // until the queries the load response starts have answered. Two fields,
+    // because they are two answers: the grouping is a list of ids and counts
+    // for the contents, and the histograms themselves are what the pane draws.
+    histograms: null,
+    histogramGroups: null,
+
     // The function pane, as `model.js` rendered it, or `null` until the load
     // response has come back and the outline query it starts has answered.
     outline: null,

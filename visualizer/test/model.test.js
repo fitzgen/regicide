@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
-import { createModel } from "../js/model.js";
+import { createModel, histogramGroupIds } from "../js/model.js";
 import { entityClass, entityLabel, installEntities } from "../js/entities.js";
 
 test("createModel answers the documented queries", () => {
@@ -11,6 +11,7 @@ test("createModel answers the documented queries", () => {
     "searchEvents",
     "functionOutline",
     "histograms",
+    "histogramGroups",
     "event",
     "entity",
   ]) {
@@ -781,4 +782,87 @@ test("the search answers with indices and the rows come separately", () => {
   // computed from a scroll position and can outrun a result by a frame.
   assert.deepEqual(model.eventRows([blob.events.length, -1]), []);
   assert.deepEqual(model.eventRows(undefined), []);
+});
+
+// ---------------------------------------------------------------------------
+// The histograms.
+
+test("the histograms come back exactly as the blob carries them", () => {
+  // Commit 05 computed every statistic. Recomputing one here would be a second
+  // answer to a question that already has one.
+  const blob = fixture("spills-and-reloads");
+  assert.equal(modelOf(blob).histograms(), blob.histograms);
+});
+
+test("the grouping covers every histogram exactly once", () => {
+  const blob = fixture("spills-and-reloads");
+  const groups = modelOf(blob).histogramGroups();
+  const grouped = groups.flatMap((group) => group.items.map((item) => item.id));
+  assert.equal(new Set(grouped).size, grouped.length, "a histogram is in two groups");
+  assert.deepEqual(
+    [...grouped].sort(),
+    blob.histograms.map((histogram) => histogram.id).sort(),
+  );
+});
+
+test("a table of contents entry is an id, a title, and a count", () => {
+  const blob = fixture("spills-and-reloads");
+  const byId = new Map(blob.histograms.map((histogram) => [histogram.id, histogram]));
+  for (const group of modelOf(blob).histogramGroups()) {
+    assert.equal(typeof group.group, "string");
+    for (const item of group.items) {
+      const histogram = byId.get(item.id);
+      assert.deepEqual(item, {
+        id: histogram.id,
+        title: histogram.title,
+        count: histogram.count,
+      });
+    }
+  }
+});
+
+test("every id in the hard-coded grouping is one the Rust side produces", () => {
+  // The test that catches a typo. "Other" makes a *new* Rust histogram
+  // visible, but a misspelled id here moves a real one into it silently and
+  // leaves a dead entry behind: nothing on screen says which of the two
+  // happened, and the grouping is the only place that can tell.
+  const blob = fixture("spills-and-reloads");
+  const ids = histogramGroupIds();
+  assert.equal(new Set(ids).size, ids.length, "an id is listed twice in the grouping");
+  const real = new Set(blob.histograms.map((histogram) => histogram.id));
+  for (const id of ids) assert.ok(real.has(id), "no such histogram: " + id);
+});
+
+test("a histogram the grouping does not name lands in a trailing Other", () => {
+  // Perturbed rather than fixtured: the point is what happens when the Rust
+  // side grows a histogram this file has never heard of, and by construction
+  // no fixture contains one.
+  const blob = fixture("spills-and-reloads");
+  const surprise = { ...blob.histograms[0], id: "frobs-per-widget", title: "Frobs per widget" };
+  blob.histograms = [...blob.histograms, surprise];
+  const groups = modelOf(blob).histogramGroups();
+  const last = groups[groups.length - 1];
+  assert.equal(last.group, "Other");
+  assert.deepEqual(last.items, [
+    { id: surprise.id, title: surprise.title, count: surprise.count },
+  ]);
+});
+
+test("the group order is the one the table of contents shows", () => {
+  const blob = fixture("spills-and-reloads");
+  assert.deepEqual(
+    modelOf(blob).histogramGroups().map((group) => group.group),
+    ["Control flow", "Liveness", "Allocation", "Spills and moves"],
+  );
+});
+
+test("a group the blob has no histograms for is not an empty heading", () => {
+  const blob = fixture("spills-and-reloads");
+  blob.histograms = blob.histograms.filter((histogram) => histogram.id === "spans-per-value");
+  assert.deepEqual(modelOf(blob).histogramGroups(), [
+    {
+      group: "Liveness",
+      items: [{ id: "spans-per-value", title: "Spans per value", count: 2 }],
+    },
+  ]);
 });

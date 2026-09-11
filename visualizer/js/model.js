@@ -74,8 +74,13 @@ export function createModel(json) {
     // thing the model computes and the pane asks for it exactly once.
     functionOutline: () => (outline ||= buildOutline(func)),
 
-    // The histograms tab. Commit 12.
+    // The histograms tab. The blob's own array, unchanged: commit 05
+    // computed every statistic, and recomputing any of them here would be a
+    // second answer to a question that already has one.
     histograms: () => json.histograms || [],
+
+    // The same histograms, grouped for the table of contents.
+    histogramGroups: () => groupHistograms(json.histograms || []),
   };
 }
 
@@ -938,3 +943,85 @@ function searchEvents(json, byKind, entityEvents, query) {
   // order is not a log.
   return found.sort((a, b) => a - b);
 }
+
+// ---------------------------------------------------------------------------
+// The histograms tab.
+
+// The table of contents' groups, in the order it shows them.
+//
+// Hard-coded, because the grouping is an editorial judgement about what a
+// reader wants to see beside what, and nothing in the data expresses it. The
+// Rust side asserts the id set it produces (`histogram_ids_are_the_expected_set`
+// in `index.rs`) and the tests below assert that every id named here is in it,
+// which is the pair that keeps the two from drifting.
+const HISTOGRAM_GROUPS = [
+  [
+    "Control flow",
+    [
+      "blocks-per-region",
+      "region-depth",
+      "incoming-edges-per-region",
+      "outgoing-edges-per-region",
+      "incoming-edges-per-block",
+      "outgoing-edges-per-block",
+    ],
+  ],
+  [
+    "Liveness",
+    [
+      "spans-per-value",
+      "spans-per-bundle",
+      "values-per-bundle",
+      "instructions-per-span",
+      "instructions-per-bundle",
+      "uses-per-span",
+      "uses-per-bundle",
+      "live-in-values-per-block",
+      "live-out-values-per-block",
+      "live-in-spans-per-block",
+      "live-out-spans-per-block",
+    ],
+  ],
+  [
+    "Allocation",
+    [
+      "bundles-per-region",
+      "queue-pops-per-bundle",
+      "queue-pops-per-region",
+      "evictions-per-bundle",
+      "total-splits-per-bundle",
+      "within-span-splits-per-bundle",
+      "between-span-splits-per-bundle",
+    ],
+  ],
+  ["Spills and moves", ["spills-per-value", "spills-per-bundle", "parallel-moves-per-solve"]],
+];
+
+// Group the histograms for the table of contents.
+function groupHistograms(histograms) {
+  const byId = new Map(histograms.map((histogram) => [histogram.id, histogram]));
+  const item = ({ id, title, count }) => ({ id, title, count });
+  const groups = [];
+  const placed = new Set();
+  for (const [group, ids] of HISTOGRAM_GROUPS) {
+    const items = [];
+    for (const id of ids) {
+      const histogram = byId.get(id);
+      // A named histogram the blob does not carry is simply absent, not an
+      // empty entry pointing at nothing.
+      if (histogram === undefined) continue;
+      items.push(item(histogram));
+      placed.add(id);
+    }
+    if (items.length > 0) groups.push({ group, items });
+  }
+  // Whatever the grouping does not name is still shown. A histogram added on
+  // the Rust side must not be invisible here just because nobody thought to
+  // file it, and a trailing group is how that failure announces itself.
+  const rest = histograms.filter((histogram) => !placed.has(histogram.id));
+  if (rest.length > 0) groups.push({ group: "Other", items: rest.map(item) });
+  return groups;
+}
+
+// The grouping's ids, in order, for the tests that keep it honest.
+export const histogramGroupIds = () => HISTOGRAM_GROUPS.flatMap(([, ids]) => ids);

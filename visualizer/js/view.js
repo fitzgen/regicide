@@ -60,6 +60,13 @@ let eventScroll = 0;
 let shownResults = null;
 const askedRows = new Set();
 
+// The histograms the pane and the table of contents were built from. Both
+// are static once they arrive, so each is built once and then left alone.
+let builtHistograms = null;
+let builtGroups = null;
+
+// A histogram id -> its heading, for the table of contents' scroll.
+let histogramHeadings = new Map();
 // The state the last render drew, so that a scroll can redraw the window
 // without one being passed in.
 let lastState = null;
@@ -113,6 +120,10 @@ export function installView(root, dispatcher) {
     if (ref) viewDispatch({ type: "clickEntityFromEvent", entity: ref });
   });
 
+  root.querySelector("#histogram-toc").addEventListener("click", (e) => {
+    const entry = e.target.closest("[data-histogram-id]");
+    if (entry) viewDispatch({ type: "scrollToHistogram", id: entry.dataset.histogramId });
+  });
   // Straight to the renderer, per the note on `eventScroll`.
   list.addEventListener("scroll", () => {
     eventScroll = list.scrollTop;
@@ -128,6 +139,7 @@ export function render(state) {
   renderFunction(state);
   renderDetails(state);
   renderEvents(state);
+  renderHistograms(state);
 }
 
 function renderTabs(state) {
@@ -507,4 +519,162 @@ function renderEventRows(state) {
     for (const index of wanted) askedRows.add(index);
     queueMicrotask(() => viewDispatch({ type: "needEventRows", indices: wanted }));
   }
+}
+
+// ---------------------------------------------------------------------------
+// The histograms tab.
+
+// Built once each, then only the scroll handshake runs. The histograms are
+// pre-computed and never change, which is what makes a cache here correct
+// rather than merely fast.
+function renderHistograms(state) {
+  if (state.histogramGroups !== builtGroups) buildHistogramToc(state.histogramGroups);
+  if (state.histograms !== builtHistograms) buildHistogramPane(state.histograms);
+  scrollToHistogram(state);
+}
+
+// The table of contents: a heading per group, a button per histogram.
+function buildHistogramToc(groups) {
+  const toc = document.getElementById("histogram-toc");
+  toc.textContent = "";
+  builtGroups = groups;
+  if (!groups) return;
+
+  for (const { group, items } of groups) {
+    const heading = document.createElement("h2");
+    heading.className = "toc-group";
+    heading.textContent = group;
+    toc.append(heading);
+
+    const list = document.createElement("ul");
+    list.className = "toc-items";
+    for (const item of items) {
+      const entry = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "toc-item";
+      // Greyed rather than hidden or disabled: a function with no spills
+      // should read as "nothing to see here", and the entry is still worth
+      // scrolling to in order to see that it says so.
+      if (item.count === 0) button.classList.add("toc-empty");
+      button.dataset.histogramId = item.id;
+      const title = document.createElement("span");
+      title.textContent = item.title;
+      const count = document.createElement("span");
+      count.className = "toc-count";
+      count.textContent = String(item.count);
+      button.append(title, count);
+      entry.append(button);
+      list.append(entry);
+    }
+    toc.append(list);
+  }
+}
+
+// The pane: a section per histogram.
+function buildHistogramPane(histograms) {
+  const pane = document.getElementById("histogram-pane");
+  pane.textContent = "";
+  builtHistograms = histograms;
+  histogramHeadings = new Map();
+  if (!histograms) return;
+
+  for (const histogram of histograms) {
+    const section = document.createElement("section");
+    section.className = "histogram";
+
+    const heading = document.createElement("h2");
+    heading.className = "histogram-title";
+    // The id goes on the heading rather than the section, so that scrolling
+    // to it puts the title at the top of the pane rather than above it.
+    heading.id = "histogram-" + histogram.id;
+    heading.textContent = histogram.title;
+    histogramHeadings.set(histogram.id, heading);
+    section.append(heading);
+
+    section.append(histogramStats(histogram));
+    if (histogram.count > 0) section.append(histogramBars(histogram));
+    pane.append(section);
+  }
+}
+
+// The stats line.
+function histogramStats(histogram) {
+  const stats = document.createElement("p");
+  stats.className = "histogram-stats";
+  if (histogram.count === 0) {
+    stats.textContent = "no samples";
+    return stats;
+  }
+  // A mean over no samples is not zero, and printing `0.00` there would claim
+  // a measurement nobody took. Commit 05 keeps it finite so that nothing here
+  // has to guard against `NaN`, but "no samples" is still the honest reading.
+  const parts = [
+    ["count", histogram.count],
+    ["min", histogram.min],
+    ["max", histogram.max],
+    ["mean", histogram.mean.toFixed(2)],
+    ["p50", histogram.p50],
+    ["p90", histogram.p90],
+    ["p99", histogram.p99],
+  ];
+  for (const [label, value] of parts) {
+    const stat = document.createElement("span");
+    stat.className = "histogram-stat";
+    const name = document.createElement("span");
+    name.className = "histogram-stat-name";
+    name.textContent = label;
+    stat.append(name, " " + value);
+    stats.append(stat);
+  }
+  return stats;
+}
+
+// The bars. Flexbox rows over the bucket list: a label, a bar scaled to the
+// fullest bucket, and the count. No canvas and no library -- the page is one
+// self-contained file, and a bar chart is a div whose width is a percentage.
+function histogramBars(histogram) {
+  const buckets = histogram.buckets || [];
+  const widest = Math.max(1, ...buckets.map((bucket) => bucket.count));
+
+  const table = document.createElement("div");
+  table.className = "histogram-bars";
+  for (const bucket of buckets) {
+    const row = document.createElement("div");
+    row.className = "histogram-bucket";
+
+    const label = document.createElement("span");
+    label.className = "bucket-label";
+    // An en dash range only when the bucket spans more than one value: `3-3`
+    // is noise, and most of the interesting buckets are one value wide.
+    label.textContent = bucket.lo === bucket.hi ? String(bucket.lo) : bucket.lo + "–" + bucket.hi;
+
+    const track = document.createElement("span");
+    track.className = "bucket-track";
+    const bar = document.createElement("span");
+    bar.className = "bucket-bar";
+    // Empty buckets are drawn at zero width rather than skipped: a gap in the
+    // middle of a distribution is a fact about it, and dropping the row would
+    // make the axis lie.
+    bar.style.width = (bucket.count / widest) * 100 + "%";
+    track.append(bar);
+
+    const count = document.createElement("span");
+    count.className = "bucket-count";
+    count.textContent = String(bucket.count);
+
+    row.append(label, track, count);
+    table.append(row);
+  }
+  return table;
+}
+
+// Commit 08's one-shot, for the other pane. Cleared even when no histogram
+// matches -- an id that is in the state but not in the DOM would otherwise
+// have every later render retrying it forever.
+function scrollToHistogram(state) {
+  if (state.scrollToHistogram === null) return;
+  const heading = histogramHeadings.get(state.scrollToHistogram);
+  if (heading) heading.scrollIntoView({ block: "start" });
+  queueMicrotask(() => viewDispatch({ type: "scrolled", what: "histogram" }));
 }

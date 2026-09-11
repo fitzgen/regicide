@@ -425,3 +425,126 @@ body {
   border-radius: 2px;
   vertical-align: baseline;
 }
+
+/* The histograms tab. */
+#histogram-toc {
+  font-size: 12px;
+}
+
+.toc-group {
+  margin: 12px 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.toc-group:first-child {
+  margin-top: 0;
+}
+
+.toc-items {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Full-width, so that the count sits against the right edge and the whole row
+   is the click target. */
+.toc-item {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  padding: 2px 4px;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.toc-item:hover {
+  background: var(--bg-sunken);
+}
+
+/* A histogram with no samples is not broken, just empty. */
+.toc-empty {
+  color: var(--fg-dim);
+}
+
+.toc-count {
+  margin-left: auto;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.histogram {
+  margin-bottom: 22px;
+}
+
+.histogram-title {
+  margin: 0 0 2px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.histogram-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.histogram-stat-name {
+  color: var(--fg-dim);
+}
+
+.histogram-bars {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  max-width: 640px;
+}
+
+.histogram-bucket {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* Fixed columns on both ends, so the bars share one baseline down the chart
+   rather than each starting wherever its label ended. */
+.bucket-label {
+  width: 84px;
+  flex: none;
+  text-align: right;
+  color: var(--fg-dim);
+}
+
+.bucket-count {
+  width: 48px;
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+.bucket-track {
+  flex: 1;
+  min-width: 0;
+  height: 11px;
+  background: var(--bg-sunken);
+  border-radius: 2px;
+}
+
+.bucket-bar {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+}

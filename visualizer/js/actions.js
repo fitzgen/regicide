@@ -27,10 +27,16 @@ export function handleAction(state, action) {
       // The empty search goes out now rather than when the event tab is first
       // shown: it is the whole log, it is what the tab opens on, and asking
       // for it here means the tab is populated the moment it appears.
+      //
+      // The histograms go out with them rather than when their tab is first
+      // shown: they are already computed, they never change, and asking for
+      // them here means every tab is drawn before the user reaches it.
       const search = { ...state.search, query: "", pending: true };
       return queries({ ...state, search }, [
         { method: "functionOutline", args: [] },
         { method: "searchEvents", args: [""] },
+        { method: "histograms", args: [] },
+        { method: "histogramGroups", args: [] },
       ]);
     }
 
@@ -91,6 +97,10 @@ export function handleAction(state, action) {
           return done(cacheDetails(next, action.result));
         case "functionOutline":
           return done({ ...next, outline: action.result });
+        case "histograms":
+          return done({ ...next, histograms: action.result });
+        case "histogramGroups":
+          return done({ ...next, histogramGroups: action.result });
         case "searchEvents": {
           // The one place a stale result is dropped rather than cached. A
           // debounced search guarantees out-of-order responses, the query text
