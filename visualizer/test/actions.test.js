@@ -17,6 +17,7 @@ const V3 = { kind: "Val", index: 3 };
 const SPAN0 = { kind: "LiveSpan", index: 0 };
 const BLOCK2 = { kind: "Block", index: 2 };
 const BUNDLE4 = { kind: "LiveBundle", index: 4 };
+const EVENT7 = { kind: "EventIndex", index: 7 };
 
 // The details result for `ref`, in the model's shape.
 const details = (ref) => ({ ref, fields: [], eventCount: 0, events: [] });
@@ -59,6 +60,9 @@ const ACTIONS = [
   { type: "queryResult", id: 0, method: "histogramGroups", result: [] },
   { type: "scrolled", what: "entity" },
   { type: "scrolled", what: "histogram" },
+  { type: "clickEntity", ref: EVENT7 },
+  { type: "scrolled", what: "event" },
+  { type: "queryResult", id: 0, method: "details", args: [EVENT7], result: null },
 ];
 
 test("handleAction returns {state, queries} and mutates neither input", () => {
@@ -543,4 +547,88 @@ test("a later histogram scroll replaces the pending one", () => {
     { type: "scrollToHistogram", id: "uses-per-span" },
   ]);
   assert.equal(state.scrollToHistogram, "uses-per-span");
+});
+
+test("clicking an event goes to the log and keeps a filter that shows it", () => {
+  // The user searched for something, found an event in a details pane's list,
+  // and clicked it. The filter they typed is the context they are reading in,
+  // so it stays; the scroll happens within it.
+  let { state } = run([
+    { type: "search", query: "Bundle" },
+    { type: "queryResult", id: 1, method: "searchEvents", args: ["Bundle"], result: [4, 7, 9] },
+    { type: "clickEntity", ref: V3 },
+  ]);
+  const before = state;
+
+  const { state: after, queries } = run([{ type: "clickEntity", ref: EVENT7 }], state);
+  assert.equal(after.tab, "events");
+  assert.equal(after.scrollToEvent, 7);
+  assert.deepEqual(queries, []);
+  assert.equal(after.search.query, "Bundle");
+  assert.deepEqual(after.search.results, [4, 7, 9]);
+
+  // An event is not an entity: none of the selection state moves.
+  assert.deepEqual(after.breadcrumbs, before.breadcrumbs);
+  assert.equal(after.activeBreadcrumb, before.activeBreadcrumb);
+  assert.deepEqual(after.selected, before.selected);
+  assert.deepEqual(after.scrollToEntity, before.scrollToEntity);
+});
+
+test("clicking an event the filter hides clears the query", () => {
+  // Otherwise the click is a no-op: the list draws the results and nothing
+  // else, so an event outside them has nowhere to be scrolled to.
+  let { state } = run([
+    { type: "search", query: "Spill" },
+    { type: "queryResult", id: 1, method: "searchEvents", args: ["Spill"], result: [4, 9] },
+  ]);
+
+  const { state: after, queries } = run([{ type: "clickEntity", ref: EVENT7 }], state);
+  assert.equal(after.tab, "events");
+  assert.equal(after.scrollToEvent, 7);
+  assert.equal(after.search.query, "");
+  assert.equal(after.search.pending, true);
+  assert.equal(queries.length, 1);
+  assert.equal(queries[0].method, "searchEvents");
+  assert.deepEqual(queries[0].args, [""]);
+});
+
+test("an event scroll is one-shot", () => {
+  let { state } = run([
+    { type: "queryResult", id: 1, method: "searchEvents", args: [""], result: [7] },
+    { type: "clickEntity", ref: EVENT7 },
+  ]);
+  assert.equal(state.scrollToEvent, 7);
+
+  // And the other two requests are not the one being cleared.
+  state = run([{ type: "scrolled", what: "entity" }], state).state;
+  assert.equal(state.scrollToEvent, 7);
+  state = run([{ type: "scrolled", what: "event" }], state).state;
+  assert.equal(state.scrollToEvent, null);
+});
+
+test("a details result of null clears its pending key", () => {
+  // What the crash was: a ref the model has no pane for answers `null`, and
+  // reading `.ref` off it threw. The pane has to stop saying "Loading..."
+  // either way.
+  let { state } = run([{ type: "hoverEntity", ref: SPAN0 }]);
+  assert.equal(state.pendingDetails, entityKey(SPAN0));
+
+  state = run(
+    [{ type: "queryResult", id: 1, method: "details", args: [SPAN0], result: null }],
+    state,
+  ).state;
+  assert.equal(state.pendingDetails, null);
+  assert.deepEqual(state.details, {});
+  assert.equal(state.error, null);
+});
+
+test("a null details result for another entity leaves the pending key alone", () => {
+  // Two queries in flight and the uninteresting one comes back empty: the
+  // pane is still waiting on the one the user is looking at.
+  let { state } = run([{ type: "hoverEntity", ref: SPAN0 }]);
+  state = run(
+    [{ type: "queryResult", id: 9, method: "details", args: [BUNDLE4], result: null }],
+    state,
+  ).state;
+  assert.equal(state.pendingDetails, entityKey(SPAN0));
 });

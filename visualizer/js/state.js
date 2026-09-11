@@ -32,6 +32,12 @@ export function initialState() {
     // that neither scroll can cancel the other's pending request.
     scrollToHistogram: null,
 
+    // The event index the event log owes a scroll to, as a third field for the
+    // same reason. Also one-shot, but cleared a beat later than the other two:
+    // the request can outlive a render, because the log may have to be
+    // re-searched before the event it names is on screen to scroll to.
+    scrollToEvent: null,
+
     // Details results, keyed by `entityKey(ref)`. A cache, never invalidated.
     details: {},
 

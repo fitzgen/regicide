@@ -23,6 +23,7 @@ test("initialState has the documented shape", () => {
   assert.equal(state.hoveredBundle, null);
   assert.equal(state.scrollToEntity, null);
   assert.equal(state.scrollToHistogram, null);
+  assert.equal(state.scrollToEvent, null);
   assert.deepEqual(state.pending, {});
   assert.equal(state.nextQueryId, 0);
   assert.equal(state.error, null);

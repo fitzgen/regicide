@@ -494,6 +494,37 @@ function renderEvents(state) {
     document.getElementById("event-list").scrollTop = 0;
   }
   renderEventRows(state);
+  scrollToEvent(state);
+}
+
+// The same one-shot as the other two panes', with one difference: it is not
+// cleared when the event is nowhere to be found.
+//
+// The other two clear regardless, because an entity absent from the DOM is an
+// entity that will never be there. An event absent from the results may be one
+// the request itself is fetching -- `showEvent` clears a filter that hides the
+// event -- so clearing here would drop the scroll a frame before the results
+// it needs arrive. An unsettled search is left pending instead, and the next
+// render serves it.
+function scrollToEvent(state) {
+  if (state.scrollToEvent === null) return;
+  const results = state.search.results;
+  if (results === null || state.search.pending) return;
+
+  const at = results.indexOf(state.scrollToEvent);
+  if (at >= 0) {
+    // No element to `scrollIntoView`: the list is virtualized, so the offset
+    // is arithmetic on `--event-row`, as in `renderEventRows`. Half a row of
+    // slack centres the row itself rather than its top edge.
+    const list = document.getElementById("event-list");
+    const rowHeight = parseFloat(getComputedStyle(list).getPropertyValue("--event-row"));
+    list.scrollTop = Math.max(0, (at + 0.5) * rowHeight - list.clientHeight / 2);
+    // Read back, because the browser clamps the bottom end, and then redraw:
+    // the window this lands on is not the one just drawn.
+    eventScroll = list.scrollTop;
+    renderEventRows(state);
+  }
+  queueMicrotask(() => viewDispatch({ type: "scrolled", what: "event" }));
 }
 
 // The rows, drawn on every scroll as well as every render.

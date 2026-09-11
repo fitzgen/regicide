@@ -47,6 +47,11 @@ export function handleAction(state, action) {
       return done({ ...state, tab: action.tab });
 
     case "clickEntity": {
+      // An event is a position in the log, not an entity with a pane -- the
+      // model answers `null` for one -- so the click means "show me it in the
+      // log" and never touches the breadcrumb trail.
+      if (action.ref.kind === "EventIndex") return showEvent(state, action.ref.index);
+
       // Clicking the already-active entity re-selects it rather than pushing:
       // a `[v3, v3]` trail says nothing the single crumb did not, and the
       // re-select still scrolls the pane back to it.
@@ -99,6 +104,11 @@ export function handleAction(state, action) {
       if (action.error) return done(next);
       switch (action.method) {
         case "details":
+          // `null` when the model has nothing to say about the ref. There is
+          // nothing to cache, but the pending key still has to clear or the
+          // pane reads "Loading..." for good. The key comes from the echoed
+          // args, because a `null` carries no ref to derive it from.
+          if (action.result === null) return done(clearPendingDetails(next, action.args));
           return done(cacheDetails(next, action.result));
         case "functionOutline":
           return done({ ...next, outline: action.result });
@@ -159,9 +169,10 @@ export function handleAction(state, action) {
 
     case "scrolled":
       // An unknown `what` is a no-op. The view is the only thing that
-      // dispatches this, but a typo there should clear neither request.
+      // dispatches this, but a typo there should clear none of the requests.
       if (action.what === "entity") return done({ ...state, scrollToEntity: null });
       if (action.what === "histogram") return done({ ...state, scrollToHistogram: null });
+      if (action.what === "event") return done({ ...state, scrollToEvent: null });
       return done(state);
 
     default:
@@ -184,6 +195,21 @@ function select(state, breadcrumbs, active) {
   return query(next, "details", [ref]);
 }
 
+// Show the event log, scrolled to one event.
+//
+// No breadcrumb and no selection: the trail is a record of the entities a user
+// chose to look at, and an event is a place rather than a thing.
+function showEvent(state, index) {
+  const next = { ...state, tab: "events", scrollToEvent: index };
+  // The list draws the current results and nothing else, so an event the
+  // filter is hiding has nowhere to be scrolled to and the query has to go.
+  // A filter that already shows it is left alone -- the user put it there, and
+  // the scroll works within it.
+  if ((state.search.results || []).includes(index)) return done(next);
+  const search = { ...next.search, query: "", pending: true };
+  return query({ ...next, search }, "searchEvents", [""]);
+}
+
 // Store a details result. Always: by the time one arrives, nothing in it says
 // which click it answered, and a result for an entity the user has clicked
 // away from is not stale but a warm cache entry for a breadcrumb they are one
@@ -202,6 +228,18 @@ function cacheDetails(state, result) {
     // Only the query this answers: another is still in flight.
     pendingDetails: state.pendingDetails === key ? null : state.pendingDetails,
   };
+}
+
+// Clear the pending details key, given the args of the query that answered.
+//
+// Only that query's key: another may still be in flight, and clearing the
+// field outright would make its pane say "this entity has no details" the
+// moment a different one came back empty.
+function clearPendingDetails(state, args) {
+  const ref = (args || [])[0];
+  if (!ref) return state;
+  const key = entityKey(ref);
+  return state.pendingDetails === key ? { ...state, pendingDetails: null } : state;
 }
 
 // The bundle a span was placed in, or `null` for a span that reached none.
