@@ -2,45 +2,171 @@
 //!
 //! ```text
 //! cargo run --example visualize --all-features -- /tmp/regicide.html
+//! cargo run --example visualize --all-features -- -s 42 -i 200 /tmp/other.html
 //! ```
 //!
-//! The function is hand-written rather than borrowed from `regicide::test`,
-//! which is compiled only under `cfg(test)`. It is small, but not the smallest
-//! possible: six values are live at once on a six-register machine, one
-//! operand has to be read off the stack, and a block parameter carries a value
-//! along an edge. So the page has spans, bundles, a spill slot, and edits to
-//! show rather than a straight line of trivially satisfied constraints.
+//! With no `--seed`, the function is the hand-written one below. It is small,
+//! but not the smallest possible: six values are live at once on a
+//! six-register machine, one operand has to be read off the stack, and a
+//! block parameter carries a value along an edge. So the page has spans,
+//! bundles, a spill slot, and edits to show rather than a straight line of
+//! trivially satisfied constraints.
+//!
+//! With one, the function is a `regicide::test::TestInput` mutated `--iters`
+//! times, which is how to go looking at allocations nobody wrote by hand.
+//! `regicide::test` is not public API; the `visualizer` feature this example
+//! requires is what exposes it.
 
 use regicide::{
-    Block, BlockFrequency, Context, DefUse, Entity, Input, InputBlock, InputFunction, InputInst,
-    InputOptions, InputValue, Inst, Machine, MachineBuilder, Operand, OperandConstraint, Position,
-    RegClass, RegUnit, RematCost, SpillSlotSize, Val,
+    Block, BlockFrequency, Context, DefUse, Entity, Error, Input, InputBlock, InputFunction,
+    InputInst, InputOptions, InputValue, Inst, Machine, MachineBuilder, Operand, OperandConstraint,
+    Position, RegClass, RegUnit, RematCost, SpillSlotSize, Val,
 };
 use std::{env, process};
 
+const USAGE: &str = "\
+usage: visualize [-s SEED] [-i ITERS] <path.html>
+
+  -s, --seed SEED    seed a `mutatis::Session` and visualize a mutated
+                     `TestInput` instead of the hand-written function
+  -i, --iters ITERS  mutate it this many times (default 100)
+  -h, --help         print this message";
+
+/// How many times a mutated input is mutated when only `--seed` was given.
+const DEFAULT_ITERS: u64 = 100;
+
 fn main() {
-    let mut args = env::args().skip(1);
-    let (Some(path), None) = (args.next(), args.next()) else {
-        eprintln!("usage: visualize <path.html>");
-        process::exit(2);
+    let args = match Args::parse(env::args().skip(1)) {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("{message}\n\n{USAGE}");
+            process::exit(2);
+        }
     };
 
-    let (machine, rc) = machine();
-    let func = function(rc);
-    let options = InputOptions::default();
-    let input = Input {
-        options: &options,
-        machine: &machine,
-        func: &func,
-    };
+    // Either flag means a mutated input; the two functions never meet, so the
+    // page is written by one generic sink.
+    if args.seed.is_none() && args.iters.is_none() {
+        let (machine, rc) = machine();
+        let func = function(rc);
+        let options = InputOptions::default();
+        emit(
+            &Input {
+                options: &options,
+                machine: &machine,
+                func: &func,
+            },
+            &args.path,
+        );
+        return;
+    }
 
+    // Always seeded explicitly: `Session::new()` otherwise draws from a
+    // process-global counter, and a page worth keeping has to be one that can
+    // be asked for again.
+    let seed = args.seed.unwrap_or(0);
+    let iters = args.iters.unwrap_or(DEFAULT_ITERS);
+    eprintln!("mutating the default TestInput: seed {seed}, {iters} iterations");
+
+    let mut input = regicide::test::TestInput::default();
+    let mut session = mutatis::Session::new().seed(seed);
+    for i in 0..iters {
+        if let Err(e) = session.mutate(&mut input) {
+            eprintln!("mutation {i} failed: {e}");
+            process::exit(1);
+        }
+    }
+    input.with_input(|input| emit(input, &args.path));
+}
+
+/// Allocate registers for `input` and write the page.
+///
+/// Generic, because `InputFunction` has GATs and is not object-safe; the
+/// signature mirrors `regicide::run`'s own.
+fn emit(input: &Input<'_, impl InputFunction>, path: &str) {
     let mut context = Context::new();
-    let output = regicide::run(&mut context, &input).expect("the example function is valid");
-    output
-        .write_visualization_html(&input, &path)
-        .expect("could not write the visualization");
+    let output = match regicide::run(&mut context, input) {
+        Ok(output) => output,
+        // The one failure a mutated input reaches often: `TestMachine` has at
+        // most two banks of four registers, and nothing keeps a mutation from
+        // asking for more at one point.
+        Err(Error::TooManyLiveRegs) => {
+            eprintln!(
+                "this input needs more registers at one point than its machine has; \
+                 try another --seed"
+            );
+            process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("register allocation failed: {e}");
+            process::exit(1);
+        }
+    };
 
+    if let Err(e) = output.write_visualization_html(input, path) {
+        eprintln!("could not write {path}: {e}");
+        process::exit(1);
+    }
     println!("wrote {path}");
+}
+
+/// The command line.
+struct Args {
+    path: String,
+    seed: Option<u64>,
+    iters: Option<u64>,
+}
+
+impl Args {
+    /// Parse it, by hand rather than by adding a crate for three flags.
+    fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
+        let mut path = None;
+        let mut seed = None;
+        let mut iters = None;
+        let mut args = args.peekable();
+
+        while let Some(arg) = args.next() {
+            // Split on `=` only for a flag: a path may contain one.
+            let (name, inline) = match arg.starts_with('-') {
+                true => match arg.split_once('=') {
+                    Some((name, value)) => (name.to_string(), Some(value.to_string())),
+                    None => (arg, None),
+                },
+                false => (arg, None),
+            };
+
+            // A flag's value is the inline half if it had one, and otherwise
+            // the next argument.
+            let mut value = |name: &str| match inline.clone() {
+                Some(value) => Ok(value),
+                None => args.next().ok_or(format!("{name} needs a value")),
+            };
+
+            match name.as_str() {
+                "-h" | "--help" => {
+                    println!("{USAGE}");
+                    process::exit(0);
+                }
+                "-s" | "--seed" => seed = Some(number(&name, &value(&name)?)?),
+                "-i" | "--iters" => iters = Some(number(&name, &value(&name)?)?),
+                _ if name.starts_with('-') => return Err(format!("unknown flag {name}")),
+                _ if path.is_some() => return Err(format!("more than one path: {name}")),
+                _ => path = Some(name),
+            }
+        }
+
+        match path {
+            Some(path) => Ok(Args { path, seed, iters }),
+            None => Err("no output path".to_string()),
+        }
+    }
+}
+
+/// One flag's value as an integer.
+fn number(flag: &str, value: &str) -> Result<u64, String> {
+    value
+        .parse()
+        .map_err(|_| format!("{flag} wants a non-negative integer, not `{value}`"))
 }
 
 /// A machine with one bank of six allocatable registers, plus one the

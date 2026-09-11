@@ -11,7 +11,7 @@ use core::{
 };
 
 #[derive(Clone, Hash)]
-#[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
+#[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
 pub struct PrimaryMap<K, V> {
     elems: Vec<V>,
     _phantom: PhantomData<K>,

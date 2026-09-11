@@ -170,6 +170,7 @@ impl TestParallelMoves {
     }
 
     /// The moves in this batch.
+    #[cfg(test)]
     pub(crate) fn moves(&self) -> &[TestMove] {
         &self.moves
     }

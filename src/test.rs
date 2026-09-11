@@ -24,7 +24,6 @@ use crate::{
 use alloc::{vec, vec::Vec};
 use core::{
     fmt::{self, Display},
-    hash::Hasher,
     marker::PhantomData,
     mem, slice,
 };
@@ -39,7 +38,6 @@ impl<E> Default for EntityMutator<E> {
     }
 }
 
-#[cfg(any(test, fuzz))]
 impl<E> Mutate<E> for EntityMutator<E>
 where
     E: Entity,
@@ -429,10 +427,12 @@ impl Mutate<TestFunction> for TestFunctionMutator {
     }
 }
 
+#[cfg(test)]
 fn hash<T>(value: &T) -> u64
 where
     T: core::hash::Hash,
 {
+    use core::hash::Hasher;
     let mut hasher = std::hash::DefaultHasher::new();
     <T as core::hash::Hash>::hash(value, &mut hasher);
     hasher.finish()
@@ -478,6 +478,7 @@ impl fmt::Debug for TestFunction {
 impl TestFunction {
     /// Get this function's dominator tree, which [`TestFunction::fixup`] keeps
     /// up to date.
+    #[cfg(test)]
     pub(crate) fn dominators(&self) -> &DominatorTree {
         &self.dominators
     }

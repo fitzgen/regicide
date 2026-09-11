@@ -366,7 +366,7 @@ where
         Val::try_new(index).unwrap()
     }
 
-    #[cfg(any(test, fuzz))]
+    #[cfg(any(test, fuzz, feature = "visualizer"))]
     pub(crate) fn set_val(&mut self, val: Val<E>) {
         *self = Self::new(self.pos(), self.kind(), self.constraint(), val);
     }
@@ -409,7 +409,7 @@ where
 
 /// The position of an operand's definition or use of its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
+#[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
 #[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
 #[cfg_attr(feature = "visualizer", serde(rename_all = "lowercase"))]
 #[repr(u8)]
@@ -434,7 +434,7 @@ impl Position {
 
 /// A definition or use of an associated value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(test, fuzz), derive(mutatis::Mutate))]
+#[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
 #[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
 #[cfg_attr(feature = "visualizer", serde(rename_all = "lowercase"))]
 #[repr(u8)]

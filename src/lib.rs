@@ -62,7 +62,7 @@ mod visualizer;
 
 #[cfg(any(test, feature = "checker"))]
 pub mod checker;
-#[cfg(any(test, fuzz))]
+#[cfg(any(test, fuzz, feature = "visualizer"))]
 pub mod test;
 
 pub use context::Context;
