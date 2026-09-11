@@ -103,6 +103,14 @@ function entity(kind, index) {
   return { text: entityLabel(ref), entity: ref, cls: entityClass(ref) };
 }
 
+// The same, for a part whose text is not the entity's own label: `def` and
+// `use` are the words the user is looking at, and clicking one should still
+// open the operand's use.
+function entityAs(label, kind, index) {
+  const ref = { kind, index };
+  return { text: label, entity: ref, cls: entityClass(ref) };
+}
+
 // An allocation is one of four shapes, each a bare index under a key that says
 // what it indexes.
 const ALLOCATION_KINDS = {
@@ -185,7 +193,7 @@ function buildOutline(func) {
   // searching by point is not: two spans of one value abut at the point a
   // reload splits them, and both contain it.
   const useByOperand = new Map();
-  for (const use of uses) useByOperand.set(use.point.inst + ":" + use.operand, use);
+  uses.forEach((use, i) => useByOperand.set(use.point.inst + ":" + use.operand, i));
 
   // Where `val` lives at `point`, or `null` if nothing covers it. Used for the
   // places that have no operand of their own: block parameters and edge
@@ -331,9 +339,12 @@ function buildOutline(func) {
     inst.operands.forEach((operand, i) => {
       if (operand.pos !== pos) return;
       const use = useByOperand.get(index + ":" + i);
-      const allocation = use === undefined ? null : spans[use.span].allocation;
+      const allocation = use === undefined ? null : spans[uses[use].span].allocation;
       parts.push(text(parts.length === 0 ? " " : ", "));
-      parts.push(text(operand.defUse + " "), ...valueParts(operand.val, allocation));
+      // The word itself is the link: an operand is where a use is, and there
+      // is nothing else on the line to hang it off.
+      parts.push(use === undefined ? text(operand.defUse) : entityAs(operand.defUse, "Use", use));
+      parts.push(text(" "), ...valueParts(operand.val, allocation));
     });
     return parts;
   }
@@ -462,6 +473,11 @@ function buildDetails(json, entityEvents) {
       defOf.set(operand.val, [entity("Inst", i), text(" " + operand.pos)]);
     });
   });
+
+  // "<inst>:<operand>" -> the use recorded for it. Every operand has one, def
+  // and use alike, which is what lets the word itself be the link to it.
+  const useOfOperand = new Map();
+  uses.forEach((use, i) => useOfOperand.set(use.point.inst + ":" + use.operand, i));
 
   // block -> the region that owns it, which is what makes an edge "incoming".
   const regionOf = new Map();
@@ -702,12 +718,17 @@ function buildDetails(json, entityEvents) {
         const inst = insts[i];
         if (inst === undefined) return null;
         const live = spansAt.get(i) || [];
-        const operands = inst.operands.map((operand, n) => [
-          text(n + ": " + operand.defUse + " " + operand.pos + " "),
-          entity("Val", operand.val),
-          text(" "),
-          ...constraintParts(operand.constraint),
-        ]);
+        const operands = inst.operands.map((operand, n) => {
+          const use = useOfOperand.get(i + ":" + n);
+          return [
+            text(n + ": "),
+            use === undefined ? text(operand.defUse) : entityAs(operand.defUse, "Use", use),
+            text(" " + operand.pos + " "),
+            entity("Val", operand.val),
+            text(" "),
+            ...constraintParts(operand.constraint),
+          ];
+        });
         return [
           list("Live spans", live.map(spanParts), live.length),
           { label: "Block", value: [entity("Block", inst.block)] },

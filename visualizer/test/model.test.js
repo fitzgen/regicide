@@ -209,6 +209,45 @@ test("both halves of an instruction are drawn, empty or not", () => {
   assert.ok(insts.some((line) => text(line).endsWith(" early:")));
 });
 
+test("every `def` and `use` in the outline links to its own use", () => {
+  // An operand is where a use is, and the word is the only thing on the line
+  // to hang the link off -- so the word carries the ref while still reading as
+  // `def` rather than as `use3`.
+  const blob = fixture("spills-and-reloads");
+  const outline = outlineOf(blob);
+  const words = outline.lines
+    .flatMap((line) => line.parts)
+    .filter((part) => part.text === "def" || part.text === "use");
+  assert.ok(words.length > 0, "no operands in the outline");
+
+  const operands = blob.function.insts.flatMap((inst) => inst.operands);
+  assert.equal(words.length, operands.length, "an operand whose word is not rendered");
+
+  for (const word of words) {
+    assert.equal(word.entity.kind, "Use");
+    assert.equal(word.cls, "kind-Use");
+    const use = blob.function.uses[word.entity.index];
+    const operand = blob.function.insts[use.point.inst].operands[use.operand];
+    assert.equal(operand.defUse, word.text, "a word pointing at another operand's use");
+  }
+});
+
+test("an instruction's operands link their `def` and `use` to the use", () => {
+  // The same link in the pane, and the line reads exactly as it did before.
+  const blob = fixture("spills-and-reloads");
+  const operands = modelOf(blob).details({ kind: "Inst", index: 3 }).fields.find((f) => f.label === "Operands");
+  const reads = "0: use early v0 reg rc3 { r0, r1, r2, r3 }, 1: use early v1 reg rc4 { r4, r5 }";
+  assert.equal(flat(operands.value), reads);
+
+  const words = operands.value.filter((part) => part.text === "def" || part.text === "use");
+  assert.equal(words.length, 2);
+  for (const word of words) assert.equal(word.entity.kind, "Use");
+  assert.deepEqual(
+    words.map((word) => blob.function.uses[word.entity.index].operand),
+    [0, 1],
+  );
+});
+
 test("bars share a column only when they do not overlap", () => {
   const { bars } = outlineOf(fixture("spills-and-reloads"));
   for (const a of bars) {
@@ -255,9 +294,7 @@ test("every entity a line names is a real one, labeled by `entities.js`", () => 
         assert.ok(Number.isInteger(ref.index) && ref.index >= 0, name + ": bad index");
         const array = arrays[ref.kind];
         if (array) assert.ok(ref.index < array.length, name + ": " + entityLabel(ref) + " is past");
-        // Never hand-built: one function decides how an entity reads.
-        assert.equal(part.text, entityLabel(ref), name + ": a hand-built label");
-        assert.equal(part.cls, entityClass(ref), name + ": a hand-built class");
+        assertReads(part, name);
       }
     }
     assert.ok(seen > 0, name + ": no entities at all");
@@ -276,6 +313,16 @@ const shown = (details) =>
   Object.fromEntries(details.fields.map((field) => [field.label, flat(field.value)]));
 
 const labels = (details) => details.fields.map((field) => field.label);
+
+// One function decides how an entity reads, with one deliberate exception: an
+// operand's `def`/`use` word links to that operand's own use, so the word is
+// the part's text and `use7` is not.
+function assertReads(part, where) {
+  const ref = part.entity;
+  const word = ref.kind === "Use" && (part.text === "def" || part.text === "use");
+  if (!word) assert.equal(part.text, entityLabel(ref), where + ": a hand-built label");
+  assert.equal(part.cls, entityClass(ref), where + ": a hand-built class");
+}
 
 // The spec's checklist, encoded: every entity kind's fields, in the order the
 // pane must show them. Someone reading a pane twice should find the same field
@@ -689,9 +736,7 @@ test("every entity every pane names is a real one, labeled by `entities.js`", ()
             links += 1;
             const ref = part.entity;
             const where = name + " " + entityLabel(details.ref) + "." + field.label;
-            // Never hand-built: one function decides how an entity reads.
-            assert.equal(part.text, entityLabel(ref), where + ": a hand-built label");
-            assert.equal(part.cls, entityClass(ref), where + ": a hand-built class");
+            assertReads(part, where);
             assert.ok(Number.isInteger(ref.index) && ref.index >= 0, where + ": bad index");
             assert.ok(model.details(ref) !== null, where + ": " + entityLabel(ref) + " has no pane");
           }
