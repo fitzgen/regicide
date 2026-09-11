@@ -48,6 +48,13 @@ export function entityLabel(ref) {
   return prefix === undefined ? entityKey(ref) : prefix + ref.index;
 }
 
+// The CSS class an entity of this kind is drawn with. One convention, so that
+// an entity looks the same in the breadcrumb bar, the function pane, and the
+// details pane; `main.css` maps the kinds onto the palette.
+export function entityClass(ref) {
+  return "kind-" + ref.kind;
+}
+
 // Structural equality. Refs are copied across the worker boundary, so two refs
 // for the same entity are never the same object.
 export function sameEntity(a, b) {

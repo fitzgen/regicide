@@ -5,7 +5,11 @@
 // mutated. `queries` is what the glue posts to the worker; a response comes
 // back in as another action.
 
-import { sameEntity } from "./entities.js";
+import { entityKey } from "./entities.js";
+
+// How many details results to keep. A user walking a long trail accumulates
+// one per distinct entity, and each holds a whole pane's worth of fields.
+const DETAILS_CACHE_SIZE = 50;
 
 // Apply `action` to `state`.
 //
@@ -16,25 +20,25 @@ import { sameEntity } from "./entities.js";
 export function handleAction(state, action) {
   switch (action.type) {
     case "selectTab":
+      // The tab and nothing else: the other tabs' state survives a round trip
+      // away and back, which is what a user expects after checking the event
+      // log and returning to where they were in the function.
       return done({ ...state, tab: action.tab });
 
     case "clickEntity": {
-      const breadcrumbs = sameEntity(last(state.breadcrumbs), action.ref)
-        ? state.breadcrumbs
-        : [...state.breadcrumbs, action.ref];
-      return query({ ...state, breadcrumbs, details: null }, "details", [action.ref]);
+      // Clear everything after the active breadcrumb, then push. Clicking the
+      // already-active entity pushes a duplicate, which is honest about what
+      // the user did.
+      const kept = state.breadcrumbs.slice(0, state.activeBreadcrumb + 1);
+      const breadcrumbs = [...kept, action.ref];
+      return select(state, breadcrumbs, breadcrumbs.length - 1);
     }
 
     case "clickBreadcrumb": {
-      const breadcrumbs = state.breadcrumbs.slice(0, action.index + 1);
-      const ref = last(breadcrumbs);
-      const next = {
-        ...state,
-        breadcrumbs,
-        details: null,
-        scrollTo: { ...state.scrollTo, entity: ref },
-      };
-      return ref === null ? done(next) : query(next, "details", [ref]);
+      // No truncation, unlike `clickEntity`. That asymmetry is the whole point
+      // of the bar: it is how a user goes back up the trail and forward again.
+      if (action.index < 0 || action.index >= state.breadcrumbs.length) return done(state);
+      return select(state, state.breadcrumbs, action.index);
     }
 
     case "search": {
@@ -49,7 +53,7 @@ export function handleAction(state, action) {
       if (action.error) return done(next);
       switch (action.method) {
         case "details":
-          return done({ ...next, details: action.result });
+          return done(cacheDetails(next, action.result));
         case "searchEvents":
           return done({
             ...next,
@@ -67,14 +71,53 @@ export function handleAction(state, action) {
       return done({ ...state, hover: null });
 
     case "scrollToHistogram":
-      return done({ ...state, scrollTo: { ...state.scrollTo, histogram: action.id } });
+      return done({ ...state, scrollToHistogram: action.id });
 
     case "scrolled":
-      return done({ ...state, scrollTo: { ...state.scrollTo, [action.what]: null } });
+      // An unknown `what` is a no-op. The view is the only thing that
+      // dispatches this, but a typo there should clear neither request.
+      if (action.what === "entity") return done({ ...state, scrollToEntity: null });
+      if (action.what === "histogram") return done({ ...state, scrollToHistogram: null });
+      return done(state);
 
     default:
       return done(state);
   }
+}
+
+// Make `breadcrumbs[active]` the selection, scroll to it, and ask for its
+// details.
+function select(state, breadcrumbs, active) {
+  const ref = breadcrumbs[active];
+  const next = {
+    ...state,
+    breadcrumbs,
+    activeBreadcrumb: active,
+    selected: ref,
+    scrollToEntity: ref,
+    pendingDetails: entityKey(ref),
+  };
+  return query(next, "details", [ref]);
+}
+
+// Store a details result. Always: by the time one arrives, nothing in it says
+// which click it answered, and a result for an entity the user has clicked
+// away from is not stale but a warm cache entry for a breadcrumb they are one
+// click from returning to. Freshness is then a rendering question -- the pane
+// reads the cache at the *selected* key -- and an out-of-order arrival cannot
+// show the wrong entity.
+function cacheDetails(state, result) {
+  const key = entityKey(result.ref);
+  const details = { ...state.details, [key]: result };
+  const detailsOrder = [...state.detailsOrder.filter((k) => k !== key), key];
+  while (detailsOrder.length > DETAILS_CACHE_SIZE) delete details[detailsOrder.shift()];
+  return {
+    ...state,
+    details,
+    detailsOrder,
+    // Only the query this answers: another is still in flight.
+    pendingDetails: state.pendingDetails === key ? null : state.pendingDetails,
+  };
 }
 
 // A state change with nothing to ask the worker.
@@ -93,9 +136,4 @@ function query(state, method, args) {
     },
     queries: [{ id, method, args }],
   };
-}
-
-// The current selection, or `null` when nothing is selected.
-function last(list) {
-  return list.length === 0 ? null : list[list.length - 1];
 }

@@ -16,6 +16,13 @@ test("createModel answers the documented queries", () => {
   }
 });
 
+test("a details result carries its own ref back", () => {
+  // The main thread caches a result by `entityKey(result.ref)`, so the result
+  // has to say which entity it is for; nothing else in it does.
+  const ref = { kind: "Val", index: 3 };
+  assert.deepEqual(createModel({}).details(ref).ref, ref);
+});
+
 test("a SecondaryMap read past the end of `values` is the default", () => {
   // `values` stops at the highest key ever written, so the tail of the entity
   // space is only covered by `default`.

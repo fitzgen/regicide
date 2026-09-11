@@ -217,3 +217,42 @@ body {
 .dimmed {
   opacity: 0.3;
 }
+
+/* One color per entity kind, keyed by `entities.js`'s `kind-<Kind>` class, so
+   that the breadcrumb bar, the function pane, and the details pane agree.
+   Grouped onto the syntax palette rather than given fifteen colors nobody
+   could tell apart. */
+.kind-Val,
+.kind-Block,
+.kind-Inst,
+.kind-Region { color: var(--syntax-entity); }
+
+.kind-Reg,
+.kind-RegUnit,
+.kind-RegGroup,
+.kind-RegClass,
+.kind-RegBank { color: var(--syntax-reg); }
+
+.kind-SpillSlot,
+.kind-SpillSlotGroup { color: var(--syntax-stack); }
+
+.kind-LiveSpan,
+.kind-LiveBundle,
+.kind-Use,
+.kind-EventIndex { color: var(--syntax-keyword); }
+
+.crumb {
+  font: inherit;
+  font-family: var(--mono);
+  color: inherit;
+  padding: 1px 7px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.crumb.active {
+  background: var(--bg-sunken);
+  border-color: var(--fg-dim);
+}

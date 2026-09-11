@@ -43,8 +43,10 @@ export function createModel(json) {
     event: (i) => (json.events || [])[i],
     entity: (ref) => ({ ref, events: entityEvents(ref) }),
 
-    // The details pane. Commit 10.
-    details: (_ref) => ({ fields: [], related: [] }),
+    // The details pane. Commit 10. The result carries its own `ref` back, so
+    // that the main thread can cache it without tracking which request it
+    // answered.
+    details: (ref) => ({ ref, fields: [], events: [] }),
 
     // The event log tab's search. Commit 11.
     searchEvents: (_query) => [],

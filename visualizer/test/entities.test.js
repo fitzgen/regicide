@@ -70,6 +70,12 @@ test("sameEntity compares structurally", () => {
   assert.ok(!entities.sameEntity(null, null));
 });
 
+test("entityClass is the kind, prefixed", () => {
+  // `main.css` has a rule per kind, so the two have to agree on the spelling.
+  assert.equal(entities.entityClass({ kind: "LiveBundle", index: 4 }), "kind-LiveBundle");
+  assert.equal(entities.entityClass({ kind: "Val", index: 0 }), "kind-Val");
+});
+
 test("bundleColor stays inside the ramp", () => {
   for (let i = 0; i < 3 * entities.BUNDLE_RAMP_LENGTH; i++) {
     const color = entities.bundleColor(i);

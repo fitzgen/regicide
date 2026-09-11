@@ -6,10 +6,17 @@ test("initialState has the documented shape", () => {
   const state = initialState();
   assert.equal(state.tab, "function");
   assert.deepEqual(state.breadcrumbs, []);
-  assert.equal(state.details, null);
+  // -1, not 0: `slice(0, 0)` on the first click is what makes the first push
+  // work.
+  assert.equal(state.activeBreadcrumb, -1);
+  assert.equal(state.selected, null);
+  assert.deepEqual(state.details, {});
+  assert.deepEqual(state.detailsOrder, []);
+  assert.equal(state.pendingDetails, null);
   assert.deepEqual(state.search, { query: "", results: [], pending: false });
   assert.equal(state.hover, null);
-  assert.deepEqual(state.scrollTo, { entity: null, histogram: null });
+  assert.equal(state.scrollToEntity, null);
+  assert.equal(state.scrollToHistogram, null);
   assert.deepEqual(state.pending, {});
   assert.equal(state.nextQueryId, 0);
   assert.equal(state.error, null);
