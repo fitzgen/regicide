@@ -189,10 +189,37 @@ body {
   border-left: 1px solid var(--border);
 }
 
+/* The resizer draws this pane's left edge instead. A drag sets an inline
+   width, which wins over the 320px starting value above. */
+#details-pane {
+  border-left: none;
+}
+
 #histogram-toc {
   border-left: none;
   border-right: 1px solid var(--border);
   order: -1;
+}
+
+/* The handle between the two, which is also the details pane's left edge:
+   the pane's own border would sit right beside it and read as a second
+   line. */
+#details-resizer {
+  flex: none;
+  width: 5px;
+  cursor: col-resize;
+  background: var(--border);
+  touch-action: none;
+}
+
+#details-resizer:hover,
+body.resizing #details-resizer {
+  background: var(--accent);
+}
+
+/* A drag that starts on the handle would otherwise select the pane's text. */
+body.resizing {
+  user-select: none;
 }
 
 #event-search {

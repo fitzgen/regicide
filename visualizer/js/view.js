@@ -60,6 +60,12 @@ let eventScroll = 0;
 let shownResults = null;
 const askedRows = new Set();
 
+// How far the details pane can be dragged. Narrower than this and a field's
+// label and value no longer fit on one line; wider and the function pane it
+// exists to annotate is gone.
+const MIN_DETAILS_WIDTH = 180;
+const MAX_DETAILS_WIDTH = 900;
+
 // The histograms the pane and the table of contents were built from. Both
 // are static once they arrive, so each is built once and then left alone.
 let builtHistograms = null;
@@ -128,6 +134,41 @@ export function installView(root, dispatcher) {
   list.addEventListener("scroll", () => {
     eventScroll = list.scrollTop;
     if (lastState !== null) renderEventRows(lastState);
+  });
+
+  installResizer(root);
+}
+
+// Dragging the handle sets the details pane's width, in the view and not in
+// the state, for the reason given on `eventScroll`: a drag is a stream of
+// events at frame rate and nothing else reads the width. It survives a render
+// because `#details-pane` itself is never rebuilt, only its children.
+function installResizer(root) {
+  const resizer = root.querySelector("#details-resizer");
+  const details = root.querySelector("#details-pane");
+
+  resizer.addEventListener("pointerdown", (e) => {
+    // The pane is on the right, so dragging left widens it.
+    const startX = e.clientX;
+    const startWidth = details.getBoundingClientRect().width;
+    const move = (e) => {
+      const width = startWidth - (e.clientX - startX);
+      details.style.width = Math.min(MAX_DETAILS_WIDTH, Math.max(MIN_DETAILS_WIDTH, width)) + "px";
+    };
+    const up = () => {
+      resizer.removeEventListener("pointermove", move);
+      resizer.removeEventListener("pointerup", up);
+      root.classList.remove("resizing");
+    };
+
+    root.classList.add("resizing");
+    resizer.addEventListener("pointermove", move);
+    resizer.addEventListener("pointerup", up);
+    // Capture last, and on the handle the listeners are on: a pointer that
+    // outruns the 5px strip keeps driving the drag rather than dropping it on
+    // the first fast flick.
+    resizer.setPointerCapture(e.pointerId);
+    e.preventDefault();
   });
 }
 
