@@ -104,12 +104,21 @@ export function installView(root, dispatcher) {
   const pane = root.querySelector("#function-pane");
   pane.addEventListener("click", clickEntity);
   root.querySelector("#details-pane").addEventListener("click", clickEntity);
+  // Any entity, not just a bar: hovering one previews it in the details pane,
+  // and a bar still drives the bundle-wide dim as well.
   pane.addEventListener("mouseover", (e) => {
-    const bar = e.target.closest(".bar");
-    if (bar) viewDispatch({ type: "hoverSpan", ref: refs.get(bar.dataset.entity) });
+    const el = e.target.closest("[data-entity]");
+    const ref = el && refs.get(el.dataset.entity);
+    if (ref) viewDispatch({ type: "hoverEntity", ref });
   });
   pane.addEventListener("mouseout", (e) => {
-    if (e.target.closest(".bar")) viewDispatch({ type: "unhoverSpan" });
+    if (e.target.closest("[data-entity]") === null) return;
+    // Moving from a bar to its own label, or straight from one entity to the
+    // next, is not leaving: the `mouseover` that follows would only have to
+    // undo this, and the pane would flicker in between.
+    const into = e.relatedTarget;
+    if (into && into.closest && into.closest("[data-entity]")) return;
+    viewDispatch({ type: "unhoverEntity" });
   });
 
   root.querySelector("#event-query").addEventListener("input", (e) => {
@@ -391,11 +400,13 @@ function scrollToEntity(state) {
 function renderDetails(state) {
   const pane = document.getElementById("details-pane");
   pane.textContent = "";
-  if (state.selected === null) return;
+  // The hover wins while there is one, and dropping it restores the selection.
+  const shown = state.hovered !== null ? state.hovered : state.selected;
+  if (shown === null) return;
 
-  // Always read the cache at the *selected* key, so that a result arriving for
-  // an entity the user has already clicked away from cannot appear.
-  const key = entityKey(state.selected);
+  // Always read the cache at the *shown* key, so that a result arriving for an
+  // entity the pointer has already left cannot appear.
+  const key = entityKey(shown);
   const details = state.details[key];
   if (!details) {
     // No result and no request means the query failed. An empty pane is honest

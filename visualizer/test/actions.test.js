@@ -52,8 +52,8 @@ const ACTIONS = [
   { type: "clickEntityFromEvent", entity: V3 },
   { type: "queryResult", id: 0, method: "functionOutline", result: { lines: [], bars: [] } },
   { type: "queryResult", id: 0, method: "details", error: "boom" },
-  { type: "hoverSpan", ref: SPAN0 },
-  { type: "unhoverSpan" },
+  { type: "hoverEntity", ref: SPAN0 },
+  { type: "unhoverEntity" },
   { type: "scrollToHistogram", id: "spans-per-bundle" },
   { type: "queryResult", id: 0, method: "histograms", result: [] },
   { type: "queryResult", id: 0, method: "histogramGroups", result: [] },
@@ -289,18 +289,58 @@ test("hovering a span highlights its whole bundle", () => {
   };
   const loaded = { ...initialState(), outline };
 
-  const hovered = run([{ type: "hoverSpan", ref: { ...SPAN0 } }], loaded).state;
+  const hovered = run([{ type: "hoverEntity", ref: { ...SPAN0 } }], loaded).state;
   assert.deepEqual(hovered.hoveredBundle, BUNDLE4, "a fresh ref for the same span missed");
 
-  assert.equal(run([{ type: "unhoverSpan" }], hovered).state.hoveredBundle, null);
+  assert.equal(run([{ type: "unhoverEntity" }], hovered).state.hoveredBundle, null);
 
   // A span that reached no bundle, and a span with no bar at all, both leave
-  // nothing highlighted rather than throwing.
-  for (const index of [1, 99]) {
-    const ref = { kind: "LiveSpan", index };
-    assert.equal(run([{ type: "hoverSpan", ref }], loaded).state.hoveredBundle, null, "span" + index);
+  // nothing highlighted rather than throwing. So does an entity that is not a
+  // span, which is now hoverable too.
+  for (const ref of [{ kind: "LiveSpan", index: 1 }, { kind: "LiveSpan", index: 99 }, BLOCK2]) {
+    const state = run([{ type: "hoverEntity", ref }], loaded).state;
+    assert.equal(state.hoveredBundle, null, entityKey(ref));
   }
-  assert.equal(run([{ type: "hoverSpan", ref: SPAN0 }]).state.hoveredBundle, null, "no outline");
+  assert.equal(run([{ type: "hoverEntity", ref: SPAN0 }]).state.hoveredBundle, null, "no outline");
+});
+
+test("hovering an entity previews it without touching the trail", () => {
+  // Hovering is looking; the trail is a record of where the user chose to go.
+  const before = run([{ type: "clickEntity", ref: V3 }]).state;
+  const { state, queries } = run([{ type: "hoverEntity", ref: BLOCK2 }], before);
+
+  assert.deepEqual(state.hovered, BLOCK2);
+  assert.deepEqual(state.breadcrumbs, before.breadcrumbs);
+  assert.equal(state.activeBreadcrumb, before.activeBreadcrumb);
+  assert.equal(state.scrollToEntity, before.scrollToEntity);
+
+  // The pane needs the fields, and says so while they are on their way.
+  assert.deepEqual(
+    queries.map((q) => [q.method, q.args]),
+    [["details", [BLOCK2]]],
+  );
+  assert.equal(state.pendingDetails, entityKey(BLOCK2));
+
+  // Dropping the hover is what puts the selection back in the pane.
+  const after = run([{ type: "unhoverEntity" }], state).state;
+  assert.equal(after.hovered, null);
+  assert.deepEqual(after.selected, V3);
+});
+
+test("hovering something already cached asks for nothing", () => {
+  // The pointer crosses a lot of entities on its way somewhere.
+  const cached = run([
+    { type: "clickEntity", ref: BLOCK2 },
+    { type: "queryResult", id: 0, method: "details", result: details(BLOCK2) },
+    { type: "clickEntity", ref: V3 },
+    { type: "queryResult", id: 1, method: "details", result: details(V3) },
+  ]).state;
+
+  const { state, queries } = run([{ type: "hoverEntity", ref: { ...BLOCK2 } }], cached);
+  assert.deepEqual(queries, []);
+  assert.deepEqual(state.hovered, BLOCK2);
+  // And nothing is left pending, which is what the pane's "Loading…" reads.
+  assert.equal(state.pendingDetails, null);
 });
 
 test("the outline arrives once the blob has loaded", () => {

@@ -66,6 +66,10 @@ export function initialState() {
     // response has come back and the outline query it starts has answered.
     outline: null,
 
+    // The entity the pointer is over, which the details pane prefers over the
+    // selection: looking at something should not cost a breadcrumb.
+    hovered: null,
+
     // The bundle of the span the pointer is over. A bundle, not a span: the
     // highlight is bundle-wide, which is also why it cannot be a CSS `:hover`.
     hoveredBundle: null,

@@ -129,13 +129,30 @@ export function handleAction(state, action) {
       }
     }
 
-    case "hoverSpan":
-      // The view hands over a span; the bundle it belongs to is what the
-      // highlight is keyed by, and the outline already knows which that is.
-      return done({ ...state, hoveredBundle: bundleOf(state.outline, action.ref) });
+    case "hoverEntity": {
+      // Two things at once, from the one gesture: the bundle-wide dim, keyed
+      // by the bundle the outline placed the span in -- a ref that is not a
+      // span reaches no bar and so dims nothing, exactly as before -- and the
+      // details preview.
+      //
+      // No breadcrumb, no selection, no scroll: hovering is looking, and the
+      // trail is a record of where the user chose to go.
+      const key = entityKey(action.ref);
+      const next = {
+        ...state,
+        hovered: action.ref,
+        hoveredBundle: bundleOf(state.outline, action.ref),
+      };
+      // The pointer crosses a lot of entities on its way somewhere, so only a
+      // cache miss is worth a query.
+      if (state.details[key] !== undefined) return done(next);
+      return query({ ...next, pendingDetails: key }, "details", [action.ref]);
+    }
 
-    case "unhoverSpan":
-      return done({ ...state, hoveredBundle: null });
+    case "unhoverEntity":
+      // Which restores the active breadcrumb's details, because that is what
+      // the pane falls back to.
+      return done({ ...state, hovered: null, hoveredBundle: null });
 
     case "scrollToHistogram":
       return done({ ...state, scrollToHistogram: action.id });
