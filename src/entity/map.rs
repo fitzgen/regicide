@@ -294,6 +294,21 @@ where
     }
 }
 
+/// A `PrimaryMap` is dense by construction, so position is the entity's index
+/// and it needs no keys in the JSON.
+#[cfg(feature = "visualizer")]
+impl<K, V> serde::Serialize for PrimaryMap<K, V>
+where
+    V: serde::Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_seq(self.elems.iter())
+    }
+}
+
 #[derive(Clone, Hash)]
 pub(crate) struct SecondaryMap<K, V> {
     inner: PrimaryMap<K, V>,
@@ -376,6 +391,25 @@ where
     #[allow(dead_code, reason = "will probably need it")]
     pub fn into_iter(self) -> PrimaryMapIntoIter<K, V> {
         self.inner.into_iter()
+    }
+}
+
+/// A `SecondaryMap` is *not* dense: `elems` only grows to the highest key ever
+/// written, so the default has to travel with the values.
+#[cfg(feature = "visualizer")]
+impl<K, V> serde::Serialize for SecondaryMap<K, V>
+where
+    V: serde::Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("SecondaryMap", 2)?;
+        s.serialize_field("default", &self.default_value)?;
+        s.serialize_field("values", &self.inner.elems)?;
+        s.end()
     }
 }
 

@@ -197,6 +197,17 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Has
     }
 }
 
+/// An entity type the visualizer knows how to name.
+#[cfg(feature = "visualizer")]
+#[allow(dead_code, reason = "read through `ENTITY_KINDS` in commit 07")]
+pub(crate) trait VisualizedEntity: Entity {
+    /// The type's own name, e.g. `"LiveSpan"`.
+    const KIND: &'static str;
+
+    /// The `Debug` prefix, e.g. `"span"`.
+    const PREFIX: &'static str;
+}
+
 macro_rules! define_entities {
     ( $(
         $( #[$attr:meta] )*
@@ -253,6 +264,23 @@ macro_rules! define_entities {
                 fn to_bits(self) -> <Self::Repr as crate::entity::NonZeroInt>::NonZero {
                     self.0
                 }
+            }
+
+            #[cfg(feature = "visualizer")]
+            impl<T: crate::entity::EntityRepr> serde::Serialize for $name<T> {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    use crate::entity::Entity;
+                    serializer.serialize_u64(self.index() as u64)
+                }
+            }
+
+            #[cfg(feature = "visualizer")]
+            impl<T: crate::entity::EntityRepr> crate::entity::VisualizedEntity for $name<T> {
+                const KIND: &'static str = stringify!($name);
+                const PREFIX: &'static str = $fmt;
             }
         )*
     };
@@ -325,6 +353,23 @@ macro_rules! define_fixed_size_entities {
                 fn to_bits(self) -> <Self::Repr as crate::entity::NonZeroInt>::NonZero {
                     self.0
                 }
+            }
+
+            #[cfg(feature = "visualizer")]
+            impl serde::Serialize for $name {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: serde::Serializer,
+                {
+                    use crate::entity::Entity;
+                    serializer.serialize_u64(self.index() as u64)
+                }
+            }
+
+            #[cfg(feature = "visualizer")]
+            impl crate::entity::VisualizedEntity for $name {
+                const KIND: &'static str = stringify!($name);
+                const PREFIX: &'static str = $fmt;
             }
         )*
     };
@@ -476,6 +521,33 @@ where
 mod tests {
     use crate::{RegClass, RegUnit, entity::Entity};
     use core::mem;
+
+    /// An entity is its index in the JSON and nothing more; the type is
+    /// recovered from the `schema` table, not from the encoding.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn entities_serialize_as_bare_indices() {
+        use crate::entity::{Block, Val};
+        use crate::{Reg, RegBank};
+
+        macro_rules! assert_bare {
+            ( $( $ty:ty ),* ) => {
+                $(
+                    assert_eq!(
+                        serde_json::to_value(<$ty>::try_new(3).unwrap()).unwrap(),
+                        serde_json::json!(3),
+                    );
+                )*
+            };
+        }
+
+        // Two from `define_entities!`...
+        assert_bare!(Val<u32>, Block<u8>);
+        // ...and two from `define_fixed_size_entities!`.
+        assert_bare!(RegClass, RegBank);
+        // `Reg` is generic despite living next to the fixed-size ones.
+        assert_bare!(Reg<u16>);
+    }
 
     /// The point of a fixed-repr entity is that it does not pay for indices it
     /// can never hold.

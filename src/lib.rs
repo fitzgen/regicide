@@ -27,6 +27,8 @@ macro_rules! trace {
 
 #[macro_use]
 mod entity;
+#[macro_use]
+mod events;
 
 mod btree;
 mod coalescing;
@@ -35,6 +37,8 @@ mod counts;
 mod dfs;
 mod dominators;
 mod error;
+#[cfg(not(feature = "visualizer"))]
+mod events_disabled;
 mod input;
 mod live_ranges;
 mod liveness;
@@ -53,6 +57,8 @@ mod spill_slot_allocation;
 mod timing;
 mod union_find;
 mod validation;
+#[cfg(feature = "visualizer")]
+mod visualizer;
 
 #[cfg(any(test, feature = "checker"))]
 pub mod checker;

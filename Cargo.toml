@@ -7,11 +7,16 @@ edition = "2024"
 log = "0.4.33"
 rustc-hash = { version = "2.1.3", default-features = false }
 hashbrown = { version = "0.17.1", default-features = false, optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.145", optional = true }
 
 [dev-dependencies]
 regicide = {
   version = "0.1.0", path = ".",
-  features = ["std", "checker", "timing", "trace-log", "entity-repr-8", "entity-repr-16"],
+  features = [
+    "std", "checker", "timing", "trace-log", "entity-repr-8", "entity-repr-16",
+    "visualizer",
+  ],
 }
 mutatis = { version = "0.5.2", features = ["check", "derive"] }
 
@@ -22,6 +27,7 @@ timing = ["std"]
 trace-log = []
 entity-repr-8 = []
 entity-repr-16 = []
+visualizer = ["std", "dep:serde", "dep:serde_json"]
 
 [lints]
 workspace = true

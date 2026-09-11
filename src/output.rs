@@ -3,6 +3,8 @@ use alloc::vec::Vec;
 use crate::context::{Context, WhichContext};
 use crate::entity::{Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, SecondaryMap, Val};
 use crate::error::{IResult, InternalError};
+#[cfg(feature = "visualizer")]
+use crate::input::Input;
 use crate::input::{InputBlock, InputFunction, InputInst as _, Position};
 use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan};
 use crate::liveness::block_inst_bounds;
@@ -625,6 +627,26 @@ pub enum InstOrEdit {
 
     /// An edit to insert at this point in the block.
     Edit(Edit),
+}
+
+#[cfg(feature = "visualizer")]
+impl Output<'_> {
+    /// Write a self-contained HTML visualization of these results to `path`.
+    ///
+    /// The HTML embeds everything it needs: no network access, no local files.
+    pub fn write_visualization_html(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<()> {
+        let path = path.as_ref();
+        // Only the context that actually ran has a populated event log; a
+        // narrower repr that bailed with `EntityReprTooSmall` left a partial
+        // log behind that `with_inner!` correctly skips. Do not concatenate.
+        with_inner!(self, |inner| crate::visualizer::write_html(
+            inner, input, path
+        ))
+    }
 }
 
 /// An iterator over a block's instructions and edits, as returned by

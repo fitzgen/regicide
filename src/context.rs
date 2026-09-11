@@ -1,7 +1,7 @@
 use crate::{
-    coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, live_ranges::LiveRanges,
-    liveness::Liveness, move_generation::MoveGeneration, output::OutputInner,
-    region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
+    coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, events::EventsLog,
+    live_ranges::LiveRanges, liveness::Liveness, move_generation::MoveGeneration,
+    output::OutputInner, region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
     spill_placement::SpillPlacement, spill_slot_allocation::SpillSlots,
 };
 
@@ -88,6 +88,7 @@ pub(crate) enum WhichContext {
 
 pub(crate) struct ContextInner<E: EntityRepr> {
     pub counts: Counts,
+    pub events: EventsLog,
     pub rpo: Rpo<E>,
     pub region_tree: RegionTree<E>,
     pub liveness: Liveness<E>,
@@ -105,6 +106,7 @@ impl<E: EntityRepr> ContextInner<E> {
     pub(crate) const fn new() -> Self {
         Self {
             counts: Counts::new(),
+            events: EventsLog::new(),
             rpo: Rpo::new(),
             region_tree: RegionTree::new(),
             liveness: Liveness::new(),
@@ -122,6 +124,7 @@ impl<E: EntityRepr> ContextInner<E> {
     pub fn reset(&mut self) {
         let Self {
             counts,
+            events,
             rpo,
             region_tree,
             liveness,
@@ -135,6 +138,7 @@ impl<E: EntityRepr> ContextInner<E> {
             output,
         } = self;
         counts.reset();
+        events.reset();
         rpo.reset();
         region_tree.reset();
         liveness.reset();
@@ -151,6 +155,7 @@ impl<E: EntityRepr> ContextInner<E> {
     pub fn is_reset(&self) -> bool {
         let Self {
             counts,
+            events,
             rpo,
             region_tree,
             liveness,
@@ -164,6 +169,7 @@ impl<E: EntityRepr> ContextInner<E> {
             output,
         } = self;
         counts.is_reset()
+            && events.is_reset()
             && rpo.is_reset()
             && region_tree.is_reset()
             && liveness.is_reset()

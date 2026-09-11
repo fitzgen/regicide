@@ -61,6 +61,10 @@ jobs:
             flags: --no-default-features --features hashbrown,entity-repr-8,entity-repr-16
           - name: std+checker
             flags: --no-default-features --features std,checker
+          - name: visualizer
+            flags: --no-default-features --features visualizer
+          - name: visualizer+trace-log
+            flags: --no-default-features --features visualizer,trace-log
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
