@@ -28,6 +28,13 @@ export function createModel(json) {
   const byKind = index.byKind || {};
   const eventSchema = (json.schema || {}).events || {};
 
+  // phase -> the events carrying it, ascending. The blob has no phase index of
+  // its own -- `phase` is a plain string on two event kinds, with no schema
+  // descriptor -- and one pass over the log is cheap beside the search that
+  // wants it, so it is built on first use and then kept.
+  let byPhase = null;
+  const phaseIndex = () => (byPhase ||= buildPhaseIndex(json.events || []));
+
   // The events an entity is named by. Kinds with no index of their own (a
   // register unit, say) have no list rather than an empty one.
   const entityEvents = (ref) => {
@@ -57,7 +64,7 @@ export function createModel(json) {
     // The event log tab's search: which events match, in log order. Indices
     // only -- the log is the one list that can be hundreds of thousands long,
     // and `eventRows` is what turns a window of it into something renderable.
-    searchEvents: (query) => searchEvents(json, byKind, entityEvents, query),
+    searchEvents: (query) => searchEvents(json, byKind, phaseIndex, entityEvents, query),
 
     // Those events, rendered. Split from the search so that a query matching
     // the whole log answers with an array of numbers rather than an array of
@@ -960,12 +967,25 @@ const eventRow = (events, eventSchema, index) => ({
   summary: summarizeEvent(events[index], eventSchema),
 });
 
+// The phases the log mentions, each with its events in log order.
+function buildPhaseIndex(events) {
+  const byPhase = new Map();
+  events.forEach((event, i) => {
+    const phase = event.phase;
+    if (typeof phase !== "string") return;
+    const found = byPhase.get(phase);
+    if (found === undefined) byPhase.set(phase, [i]);
+    else found.push(i);
+  });
+  return byPhase;
+}
+
 // Which events match a search.
 //
-// Two query forms and nothing else: a whole entity label, or a
-// case-insensitive substring of an event kind. The spec asks for one term, so
-// there is no query language here to invent.
-function searchEvents(json, byKind, entityEvents, query) {
+// Three query forms and nothing else: a whole entity label, or a
+// case-insensitive substring of either an event kind or a queue phase. The
+// spec asks for one term, so there is no query language here to invent.
+function searchEvents(json, byKind, phaseIndex, entityEvents, query) {
   const events = json.events || [];
   // Trimmed, because a trailing space is a typo and not a query, and an
   // entity label with one around it parses as nothing at all.
@@ -991,16 +1011,21 @@ function searchEvents(json, byKind, entityEvents, query) {
   const ref = parseEntityLabel(text);
   if (ref !== null) return entityEvents(ref).slice();
 
-  // Matched once per kind rather than once per event, which is what `byKind`
-  // is for.
+  // Matched once per kind and once per phase rather than once per event, which
+  // is what the two indexes are for. A `Set`, because `assignEvict` is both a
+  // phase and a substring of no kind but `evict` matches both ways on some
+  // other log, and an event listed twice would be drawn twice.
   const needle = text.toLowerCase();
-  const found = [];
+  const found = new Set();
   for (const [kind, indices] of Object.entries(byKind)) {
-    if (kind.toLowerCase().includes(needle)) found.push(...indices);
+    if (kind.toLowerCase().includes(needle)) for (const i of indices) found.add(i);
   }
-  // Each kind's list is ascending, but their union is not, and a log out of
-  // order is not a log.
-  return found.sort((a, b) => a - b);
+  for (const [phase, indices] of phaseIndex()) {
+    if (phase.toLowerCase().includes(needle)) for (const i of indices) found.add(i);
+  }
+  // Each list is ascending, but their union is not, and a log out of order is
+  // not a log.
+  return [...found].sort((a, b) => a - b);
 }
 
 // ---------------------------------------------------------------------------

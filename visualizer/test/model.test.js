@@ -807,6 +807,44 @@ test("a kind query is a case-insensitive substring, over every matching kind", (
   assert.deepEqual(model.searchEvents("SP"), found);
 });
 
+test("a phase query finds the queue events of that phase", () => {
+  // The reason to want this: `assignEvict` is the phase, not the kind, so a
+  // kind search cannot reach the queue events that belong to a phase.
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  const queued = blob.events
+    .map((event, i) => (event.phase === "assignEvict" ? i : -1))
+    .filter((i) => i >= 0);
+  assert.equal(queued.length, 12, "this fixture's phase events moved");
+
+  // A partial phase, the whole phase, and a different case all find them.
+  for (const query of ["evic", "assignEvict", "ASSIGNEVICT"]) {
+    assert.deepEqual(model.searchEvents(query), queued, query);
+  }
+  for (const i of queued) {
+    assert.ok(["BundleQueued", "BundleQueuePopped"].includes(blob.events[i].kind));
+  }
+
+  // A phase nothing was queued in is not a fall-through to anything else.
+  assert.deepEqual(model.searchEvents("assignNoSuchPhase"), []);
+});
+
+test("a query matching both a kind and a phase lists each event once", () => {
+  const blob = fixture("spills-and-reloads");
+  // `BundleQueued` is a kind and `queueSomething` a phase on events that
+  // already match it, which is the overlap a plain concatenation duplicates.
+  for (const event of blob.events) {
+    if (event.kind === "BundleQueued") event.phase = "queueSomething";
+  }
+  const found = modelOf(blob).searchEvents("queue");
+  assert.deepEqual(new Set(found).size, found.length, "an event came back twice");
+  assert.deepEqual([...found].sort((a, b) => a - b), found, "out of log order");
+  assert.ok(
+    found.some((i) => blob.events[i].kind === "BundleQueuePopped"),
+    "the kind half of the match was lost",
+  );
+});
+
 test("an entity label wins over a kind that contains it", () => {
   const blob = fixture("spills-and-reloads");
   const model = modelOf(blob);
