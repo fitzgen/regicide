@@ -88,7 +88,7 @@ pub(crate) enum WhichContext {
 
 pub(crate) struct ContextInner<E: EntityRepr> {
     pub counts: Counts,
-    pub events: EventsLog,
+    pub events: EventsLog<E>,
     pub rpo: Rpo<E>,
     pub region_tree: RegionTree<E>,
     pub liveness: Liveness<E>,

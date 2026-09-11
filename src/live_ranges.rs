@@ -5,6 +5,7 @@ use crate::entity::{
     Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, Region, SecondaryMap, Val, WideInt,
 };
 use crate::error::IResult;
+use crate::events::EventsLog;
 use crate::input::{
     DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
     RematCost,
@@ -60,6 +61,25 @@ where
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{:?}:{:?}", self.inst(), self.pos())
+    }
+}
+
+/// A point serializes as the instruction and half it names, never as the packed
+/// bits.
+#[cfg(feature = "visualizer")]
+impl<E> serde::Serialize for LivePoint<E>
+where
+    E: EntityRepr,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("LivePoint", 2)?;
+        s.serialize_field("inst", &self.inst())?;
+        s.serialize_field("pos", &self.pos())?;
+        s.end()
     }
 }
 
@@ -180,6 +200,19 @@ where
 /// `SpillWeight`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SpillWeight(PackedSpillWeight);
+
+/// JSON has no `NaN` and no infinities, and `serde_json` errors on both, so a
+/// weight that is not finite is reported as zero rather than failing the write.
+#[cfg(feature = "visualizer")]
+impl serde::Serialize for SpillWeight {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let weight = self.as_f32();
+        serializer.serialize_f32(if weight.is_finite() { weight } else { 0.0 })
+    }
+}
 
 const SPILL_WEIGHT_BITS: u32 = 16;
 type PackedSpillWeight = PackedPositiveFloat<u16, SPILL_WEIGHT_BITS>;
@@ -775,6 +808,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         liveness: &mut Liveness<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
@@ -806,8 +840,12 @@ where
             let block = output.with_repr(block)?;
             let spans_start = spans.next_key(output)?;
             let uses_start = uses.next_key(output)?;
+            #[cfg(feature = "visualizer")]
+            let events_start = events.len();
             for span in liveness.block_spans(input.func, block, uses, output)? {
-                push_span_and_split_conflicts(input, uses, spans, counts, span, block_end, output)?;
+                push_span_and_split_conflicts(
+                    input, uses, spans, counts, events, span, block, block_end, output,
+                )?;
             }
             let uses_end = uses.next_key(output)?;
             let spans_end = spans.next_key(output)?;
@@ -816,20 +854,47 @@ where
             // spans are both in a contiguous run.
             //
             // See `live_in_spans` and `live_out_spans`.
-            spans.as_mut_slice()[spans_start.index()..spans_end.index()].sort_unstable_by_key(
-                |data| {
-                    let bucket = match (data.start == block_start, data.end == block_end) {
-                        // Live-in only.
-                        (true, false) => 0u8,
-                        // Live-in and live-out.
-                        (true, true) => 1,
-                        // Live-out only.
-                        (false, true) => 2,
-                        // Neither: born and dead within this block.
-                        (false, false) => 3,
-                    };
-                    (bucket, data.start, data.end)
-                },
+            //
+            // The key is total --- no two of a block's spans share a value, a
+            // range, and a first use --- so the order does not depend on how
+            // the sort breaks ties, which is what lets the fix-up below find
+            // where each span moved to.
+            let sort_key = |data: &LiveSpanData<E>| {
+                let bucket = match (data.start == block_start, data.end == block_end) {
+                    // Live-in only.
+                    (true, false) => 0u8,
+                    // Live-in and live-out.
+                    (true, true) => 1,
+                    // Live-out only.
+                    (false, true) => 2,
+                    // Neither: born and dead within this block.
+                    (false, false) => 3,
+                };
+                (bucket, data.start, data.end, data.val, data.uses.start)
+            };
+
+            let block_span_range = spans_start.index()..spans_end.index();
+
+            // The events above name span keys that the sort is about to
+            // invalidate, so remember the order they were pushed in.
+            #[cfg(feature = "visualizer")]
+            let keys_before = alloc::vec::Vec::from_iter(
+                spans.as_slice()[block_span_range.clone()]
+                    .iter()
+                    .map(sort_key),
+            );
+
+            spans.as_mut_slice()[block_span_range.clone()].sort_unstable_by_key(sort_key);
+
+            #[cfg(feature = "visualizer")]
+            remap_block_span_events(
+                events,
+                events_start,
+                spans_start,
+                &keys_before,
+                &alloc::vec::Vec::from_iter(
+                    spans.as_slice()[block_span_range].iter().map(sort_key),
+                ),
             );
 
             let mut live_in_end = spans_start;
@@ -1274,6 +1339,22 @@ where
         live_ranges: &LiveRanges<E>,
     ) -> EntityRange<BundleSpansStorageIndex<E>> {
         live_ranges.bundles[self].spans
+    }
+
+    /// How many distinct `Val`s this bundle's spans belong to.
+    ///
+    /// Quadratic, but bundles are small and this only runs when events are
+    /// being recorded.
+    pub(crate) fn num_vals(self, live_ranges: &LiveRanges<E>) -> usize {
+        let spans = self.spans(live_ranges);
+        spans
+            .clone()
+            .enumerate()
+            .filter(|(i, span)| {
+                let val = span.val(live_ranges);
+                !spans.clone().take(*i).any(|s| s.val(live_ranges) == val)
+            })
+            .count()
     }
 
     /// Split this bundle in two between spans.
@@ -1860,33 +1941,87 @@ fn reuse_aware_constraint(
     }
 }
 
+/// Rewrite the provisional span keys in the events a block's span construction
+/// logged, after the sort has moved those spans.
+///
+/// `keys_before` and `keys_after` are the block's sort keys in push order and in
+/// sorted order; the key is total, so a key identifies a span in both.
+#[cfg(feature = "visualizer")]
+fn remap_block_span_events<E, K>(
+    events: &mut EventsLog<E>,
+    events_start: usize,
+    spans_start: LiveSpan<E>,
+    keys_before: &[K],
+    keys_after: &[K],
+) where
+    E: EntityRepr,
+    K: Ord,
+{
+    let remap = |span: LiveSpan<E>| -> LiveSpan<E> {
+        let old = span.index() - spans_start.index();
+        let new = keys_after
+            .binary_search(&keys_before[old])
+            .expect("the sort key is total, so every span kept its key");
+        LiveSpan::try_new(spans_start.index() + new).expect("a key that already existed")
+    };
+
+    for event in events.iter_mut_from(events_start) {
+        match event {
+            crate::events::Event::SpanConstructed { span, .. } => *span = remap(*span),
+            crate::events::Event::EagerSplit { before, .. } => *before = remap(*before),
+            crate::events::Event::ReuseSplit { before, copy, .. } => {
+                *before = before.map(remap);
+                *copy = remap(*copy);
+            }
+            // Span construction runs before every other phase, so nothing else
+            // can be in the log yet.
+            _ => unreachable!("only span construction has run"),
+        }
+    }
+}
+
 /// Push a span covering `start..end` of `val`, holding the uses in
-/// `uses_start..uses_end`.
+/// `uses_start..uses_end`, and log its construction.
+///
+/// `constraint` is the merged constraint of those uses and `block` the block
+/// they lie in; neither is part of the span, and both are only what the event
+/// reports.
 fn push_span<E>(
     spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
     output: &mut OutputInner<E>,
+    events: &mut EventsLog<E>,
     val: Val<E>,
     (start, end): (LivePoint<E>, LivePoint<E>),
     (uses_start, uses_end): (Use<E>, Use<E>),
+    constraint: OperandConstraint,
     has_fixed_use: bool,
-) -> IResult<()>
+    block: Block<E>,
+) -> IResult<LiveSpan<E>>
 where
     E: EntityRepr,
 {
-    spans.push(
+    let uses = EntityRange {
+        start: uses_start,
+        end: uses_end,
+    };
+    let span = spans.push(
         output,
-        LiveSpanData::new(
+        LiveSpanData::new(start, end, val, uses, has_fixed_use),
+    )?;
+    event!(
+        events,
+        SpanConstructed {
+            span,
+            val,
             start,
             end,
-            val,
-            EntityRange {
-                start: uses_start,
-                end: uses_end,
-            },
+            block,
+            num_uses: uses.len(),
+            constraint,
             has_fixed_use,
-        ),
-    )?;
-    Ok(())
+        }
+    );
+    Ok(span)
 }
 
 /// One use of a value, with its constraint resolved.
@@ -2070,8 +2205,10 @@ where
         &self,
         spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
         output: &mut OutputInner<E>,
+        events: &mut EventsLog<E>,
         machine: &Machine,
         val: Val<E>,
+        block: Block<E>,
         u: &ResolvedUse<E>,
     ) -> IResult<Self> {
         // Earlier uses at this same point belong to the reuse's span rather
@@ -2098,28 +2235,46 @@ where
         };
 
         // The piece so far, `span1`. May be empty, and then not pushed at all.
-        if self.start < end || self.uses_start != uses_end {
-            push_span(
+        let before = if self.start < end || self.uses_start != uses_end {
+            Some(push_span(
                 spans,
                 output,
+                events,
                 val,
                 (self.start, end),
                 (self.uses_start, uses_end),
+                self.constraint,
                 has_fixed_use,
-            )?;
-        }
+                block,
+            )?)
+        } else {
+            None
+        };
 
         // `span2`: the reads at this point and the early half of their
         // instruction, existing only to be overwritten by the reuse def.
         let after = output.entity::<Use<E>>(u.use_.index() + 1)?;
-        push_span(
+        let copy = push_span(
             spans,
             output,
+            events,
             val,
             (u.point, u.point.next_point()),
             (uses_end, after),
+            u.constraint,
             u.is_fixed || (run_joins_the_tie && self.run_has_fixed_use),
+            block,
         )?;
+        event!(
+            events,
+            ReuseSplit {
+                val,
+                at: u.point,
+                target_use: u.use_,
+                before,
+                copy,
+            }
+        );
 
         // The surviving tail, `span3`.
         Ok(Piece::empty(u.point, after))
@@ -2133,7 +2288,9 @@ fn push_span_and_split_conflicts<E>(
     uses: &PrimaryMap<Use<E>, UseData<E>>,
     spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
     counts: &mut Counts,
+    events: &mut EventsLog<E>,
     (start, end, val, span_uses): (LivePoint<E>, LivePoint<E>, Val<E>, EntityRange<Use<E>>),
+    block: Block<E>,
     block_end: LivePoint<E>,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
@@ -2146,7 +2303,7 @@ where
 
         if u.needs_a_span_of_its_own(input, end) {
             debug_assert_eq!(u.point.pos(), Position::Early);
-            piece = piece.split_at_reuse(spans, output, input.machine, val, &u)?;
+            piece = piece.split_at_reuse(spans, output, events, input.machine, val, block, &u)?;
             counts.reuse_splits.inc();
             continue;
         }
@@ -2160,17 +2317,30 @@ where
 
             // Conflict: `use_` cannot fold into this piece, so split the span.
             None => {
-                push_span(
+                let before = push_span(
                     spans,
                     output,
+                    events,
                     val,
                     (
                         piece.start,
                         core::cmp::max(u.point, piece.point.next_point()),
                     ),
                     (piece.uses_start, u.use_),
+                    piece.constraint,
                     piece.has_fixed_use,
+                    block,
                 )?;
+                event!(
+                    events,
+                    EagerSplit {
+                        val,
+                        at: u.point,
+                        before,
+                        constraint: piece.constraint,
+                        conflicting: u.constraint,
+                    }
+                );
                 counts.eager_splits.inc();
 
                 // The new piece starts at the last instruction boundary, not at
@@ -2189,10 +2359,13 @@ where
     push_span(
         spans,
         output,
+        events,
         val,
         (piece.start, end),
         (piece.uses_start, span_uses.end),
+        piece.constraint,
         piece.has_fixed_use,
+        block,
     )?;
     Ok(())
 }
@@ -2497,7 +2670,17 @@ mod tests {
 
     /// Compute the liveness and live spans of `test_input`'s function.
     fn analyze_spans(test_input: &TestInput) -> Result<(Liveness<u32>, LiveRanges<u32>), String> {
+        analyze_spans_and_events(test_input)
+            .map(|(liveness, live_ranges, _)| (liveness, live_ranges))
+    }
+
+    /// Like `analyze_spans`, but also hands back the events that construction
+    /// logged.
+    fn analyze_spans_and_events(
+        test_input: &TestInput,
+    ) -> Result<(Liveness<u32>, LiveRanges<u32>, EventsLog<u32>), String> {
         let mut counts = Counts::new();
+        let mut events = EventsLog::<u32>::new();
         let mut dfs = Dfs::<u32>::new();
         let mut rpo = Rpo::<u32>::new();
         let mut region_tree = RegionTree::<u32>::new();
@@ -2513,14 +2696,20 @@ mod tests {
                 .and_then(|()| region_tree.construct(func, &mut counts, &mut dfs, &mut output))
                 .and_then(|()| liveness.construct(func, &mut counts, &rpo, &mut output))
                 .and_then(|()| {
-                    live_ranges.construct(input, &mut counts, &mut liveness, &mut output)
+                    live_ranges.construct(
+                        input,
+                        &mut counts,
+                        &mut events,
+                        &mut liveness,
+                        &mut output,
+                    )
                 })
         });
         if result.is_err() {
             return Err(format!("construction failed: {:?}", output.take_error()));
         }
 
-        Ok((liveness, live_ranges))
+        Ok((liveness, live_ranges, events))
     }
 
     /// The half-open program point bounds of `block`: `[start, end)`.
@@ -2639,6 +2828,109 @@ mod tests {
         let test_input = TestInput::with_use_constraints(&[rc(0), rc(2)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         assert_eq!(live_ranges.spans().count(), 1);
+    }
+
+    /// Every span construction is logged, and so is the eager split that made
+    /// two of them.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn span_construction_and_eager_splits_are_logged() {
+        use crate::events::Event;
+
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let test_input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
+        let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
+
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+
+        let constructed: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::SpanConstructed {
+                    span,
+                    val,
+                    start,
+                    end,
+                    ..
+                } => Some((*span, *val, *start, *end)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(constructed.len(), 2, "{constructed:#?}");
+        for (span, val, start, end) in constructed {
+            assert_eq!(val, span.val(&live_ranges));
+            assert_eq!(start, span.start(&live_ranges));
+            assert_eq!(end, span.end(&live_ranges));
+        }
+
+        let splits: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::EagerSplit {
+                    val,
+                    at,
+                    before,
+                    constraint,
+                    conflicting,
+                } => Some((*val, *at, *before, *constraint, *conflicting)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(splits.len(), 1, "{splits:#?}");
+        let (val, at, before, constraint, conflicting) = splits[0];
+        assert_eq!(before, spans[0]);
+        assert_eq!(val, spans[0].val(&live_ranges));
+        assert_eq!(at, LivePoint::new(inst(2), Position::Early));
+        assert_eq!(constraint, rc(0));
+        assert_eq!(conflicting, rc(1));
+    }
+
+    /// A reuse split names the use it was made for and the one-point span the
+    /// definition overwrites.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn reuse_splits_are_logged() {
+        use crate::events::Event;
+
+        let test_input = TestInput::with_reuse_of_a_surviving_value();
+        let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
+
+        let splits: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::ReuseSplit {
+                    val,
+                    at,
+                    target_use,
+                    before,
+                    copy,
+                } => Some((*val, *at, *target_use, *before, *copy)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(splits.len(), 1, "{splits:#?}");
+        let (val, at, target_use, before, copy) = splits[0];
+
+        assert_eq!(val, copy.val(&live_ranges));
+        assert_eq!(at, target_use.point(&live_ranges));
+        assert_eq!(copy.start(&live_ranges), at);
+        assert_eq!(copy.end(&live_ranges), at.next_point());
+        let before = before.expect("the value is live before the tie");
+        assert_eq!(before.end(&live_ranges), at);
+
+        // The pieces were logged as they were pushed, before the split that
+        // explains them.
+        let kinds: Vec<_> = events
+            .iter()
+            .map(|(_, e)| match e {
+                Event::SpanConstructed { .. } => "span",
+                Event::ReuseSplit { .. } => "reuse",
+                _ => "other",
+            })
+            .collect();
+        let reuse = kinds.iter().position(|k| *k == "reuse").unwrap();
+        assert_eq!(kinds[reuse - 1], "span");
     }
 
     /// A `Reuse` whose target outlives the instruction gets the three-piece

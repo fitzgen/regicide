@@ -64,6 +64,7 @@
 use crate::context::ContextInner;
 use crate::entity::{Block, Entity, EntityRange, EntityRepr, Region, SecondaryMap, Val};
 use crate::error::IResult;
+use crate::events::{Affinity, EventsLog, RefusedReason};
 use crate::input::{
     Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
 };
@@ -303,15 +304,17 @@ where
         &mut self,
         machine: &Machine,
         live_ranges: &LiveRanges<E>,
-        a: LiveSpan<E>,
-        b: LiveSpan<E>,
+        events: &mut EventsLog<E>,
+        affinity: Affinity,
+        span_a: LiveSpan<E>,
+        span_b: LiveSpan<E>,
     ) -> bool {
         // NB: this method must not mutate any state until after it is sure that
         // merging will succeed. We cannot leave half-merged state behind after
         // refusing to merge the sets!
 
-        let a = self.span_sets.find(a);
-        let b = self.span_sets.find(b);
+        let a = self.span_sets.find(span_a);
+        let b = self.span_sets.find(span_b);
         if a == b {
             return true;
         }
@@ -319,10 +322,28 @@ where
         let Some(constraint) =
             self.set_constraint[a].merge_resolved(&self.set_constraint[b], machine)
         else {
+            event!(
+                events,
+                CoalesceRefused {
+                    a: span_a,
+                    b: span_b,
+                    affinity,
+                    reason: RefusedReason::ConstraintConflict,
+                }
+            );
             return false;
         };
 
         if !self.sets_are_disjoint(live_ranges, a, b) {
+            event!(
+                events,
+                CoalesceRefused {
+                    a: span_a,
+                    b: span_b,
+                    affinity,
+                    reason: RefusedReason::Overlap,
+                }
+            );
             return false;
         }
 
@@ -392,6 +413,14 @@ where
         self.set_head[root] = head;
         self.set_tail[root] = tail;
         self.set_constraint[root] = constraint;
+        event!(
+            events,
+            SpansCoalesced {
+                a: span_a,
+                b: span_b,
+                affinity,
+            }
+        );
         true
     }
 }
@@ -408,6 +437,7 @@ where
 
     let ContextInner {
         counts,
+        events,
         region_tree,
         live_ranges,
         coalescing,
@@ -419,11 +449,19 @@ where
 
     // Merge spans into sets within each region.
     for region in region_tree.pre_order_iter() {
-        coalescing.coalesce_region(region_tree, live_ranges, input, output, region)?;
+        coalescing.coalesce_region(region_tree, live_ranges, input, events, output, region)?;
     }
 
     // Then build our bundles from the merged span sets.
-    build_bundles(coalescing, region_tree, live_ranges, counts, input, output)?;
+    build_bundles(
+        coalescing,
+        region_tree,
+        live_ranges,
+        counts,
+        events,
+        input,
+        output,
+    )?;
 
     // And finally propagate hints across regions.
     hint_across_regions(coalescing, region_tree, live_ranges, input.machine);
@@ -443,6 +481,7 @@ where
         region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         region: Region<E>,
     ) -> IResult<()> {
@@ -461,7 +500,15 @@ where
         // details).
         region_blocks_by_priority(input, region_tree, region, &mut region_blocks);
         for block in region_blocks.iter() {
-            self.coalesce_block(region_tree, live_ranges, input, output, region, *block)?;
+            self.coalesce_block(
+                region_tree,
+                live_ranges,
+                input,
+                events,
+                output,
+                region,
+                *block,
+            )?;
         }
 
         region_blocks.clear();
@@ -477,6 +524,7 @@ where
         region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         region: Region<E>,
         block: Block<E>,
@@ -486,6 +534,7 @@ where
         self.coalesce_reuse_operands(
             live_ranges,
             input,
+            events,
             output,
             block,
             &input.func.block(block.with_repr32()),
@@ -536,7 +585,16 @@ where
                     // This span's value is not live-out of this block; ignore it.
                     continue;
                 };
-                self.coalesce_affinity(live_ranges, input, is_same_region, edge_is_cold, out, span);
+                self.coalesce_affinity(
+                    live_ranges,
+                    input,
+                    events,
+                    Affinity::CrossEdge,
+                    is_same_region,
+                    edge_is_cold,
+                    out,
+                    span,
+                );
             }
 
             // Create affinities between block-call arguments in this block and
@@ -556,6 +614,8 @@ where
                 self.coalesce_affinity(
                     live_ranges,
                     input,
+                    events,
+                    Affinity::BlockCallArg,
                     is_same_region,
                     edge_is_cold,
                     arg_span,
@@ -573,10 +633,16 @@ where
     /// Given that `a` and `b` share an affinity across a control-flow edge: try
     /// merging them if they are in the same region and the edge is not cold, or
     /// otherwise remember the cross-region affinity for hinting.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one more parameter than the lint likes, all of them plain data"
+    )]
     fn coalesce_affinity(
         &mut self,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
+        affinity: Affinity,
         is_same_region: bool,
         edge_is_cold: bool,
         a: LiveSpan<E>,
@@ -584,8 +650,9 @@ where
     ) {
         if !is_same_region {
             self.cross_region_affinities.push((a, b));
+            event!(events, CrossRegionAffinity { a, b });
         } else if !edge_is_cold {
-            self.try_merge(input.machine, live_ranges, a, b);
+            self.try_merge(input.machine, live_ranges, events, affinity, a, b);
         }
     }
 
@@ -595,6 +662,7 @@ where
         &mut self,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         block: Block<E>,
         input_block: &impl InputBlock<'a>,
@@ -618,12 +686,20 @@ where
                     continue;
                 };
                 // Always within one block, so always within one region.
-                self.try_merge(input.machine, live_ranges, a, b);
+                self.try_merge(
+                    input.machine,
+                    live_ranges,
+                    events,
+                    Affinity::ReuseOperand,
+                    a,
+                    b,
+                );
 
                 debug_assert_eq!(target.pos(), Position::Early);
                 self.coalesce_across_reuse_split(
                     live_ranges,
                     input,
+                    events,
                     block,
                     target_val,
                     LivePoint::new(inst, Position::Early),
@@ -645,6 +721,7 @@ where
         &mut self,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         block: Block<E>,
         val: Val<E>,
         at: LivePoint<E>,
@@ -670,7 +747,16 @@ where
             let survives = tail.val(live_ranges) == val
                 && tail.start(live_ranges) == at
                 && tail.end(live_ranges) > after_inst;
-            if survives && self.try_merge(input.machine, live_ranges, head, tail) {
+            if survives
+                && self.try_merge(
+                    input.machine,
+                    live_ranges,
+                    events,
+                    Affinity::ReuseSplit,
+                    head,
+                    tail,
+                )
+            {
                 break;
             }
         }
@@ -830,11 +916,16 @@ where
 }
 
 /// Given that we've completed span set merging, create a bundle for each set.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one more parameter than the lint likes, all of them plain data"
+)]
 fn build_bundles<E>(
     coalescing: &mut Coalescing<E>,
     region_tree: &RegionTree<E>,
     live_ranges: &mut LiveRanges<E>,
     counts: &mut crate::counts::Counts,
+    events: &mut EventsLog<E>,
     input: &Input<'_, impl InputFunction>,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
@@ -857,7 +948,17 @@ where
                 let next_span = &coalescing.next_span;
                 let members = core::iter::successors(head, |&s| next_span[s]);
 
-                live_ranges.push_bundle(input, output, region, constraint, members)?;
+                let bundle = live_ranges.push_bundle(input, output, region, constraint, members)?;
+                event!(
+                    events,
+                    BundleConstructed {
+                        bundle,
+                        region,
+                        num_spans: bundle.spans(live_ranges).len(),
+                        num_vals: bundle.num_vals(live_ranges),
+                        constraint,
+                    }
+                );
             }
         }
 
@@ -939,6 +1040,7 @@ mod tests {
     fn analyze(context: &mut ContextInner<u32>, input: &Input<'_, TestFunction>) -> IResult<()> {
         let ContextInner {
             counts,
+            events,
             rpo,
             region_tree,
             liveness,
@@ -951,7 +1053,7 @@ mod tests {
         rpo.construct(func, dfs, output)?;
         region_tree.construct(func, counts, dfs, output)?;
         liveness.construct(func, counts, rpo, output)?;
-        live_ranges.construct(input, counts, liveness, output)
+        live_ranges.construct(input, counts, events, liveness, output)
     }
 
     /// Run every analysis up through coalescing.
@@ -1389,7 +1491,25 @@ mod tests {
                     Ok(())
                 })?;
 
-                // 9. Every span belongs to exactly one block's span list, and
+                // 9. A logged cross-region affinity really does cross
+                // regions.
+                #[cfg(feature = "visualizer")]
+                for (_, event) in context.context32.events.iter() {
+                    let crate::events::Event::CrossRegionAffinity { a, b } = event else {
+                        continue;
+                    };
+                    let (ra, rb) = (
+                        a.bundle(live_ranges).unwrap().region(live_ranges),
+                        b.bundle(live_ranges).unwrap().region(live_ranges),
+                    );
+                    if ra == rb {
+                        return Err(format!(
+                            "{a:?} and {b:?} were logged as a cross-region affinity, but both                              ended up in {ra:?}",
+                        ));
+                    }
+                }
+
+                // 10. Every span belongs to exactly one block's span list, and
                 // lies inside that block's program points.
                 let mut seen = 0;
                 for (block, _) in func.blocks() {
@@ -1414,7 +1534,7 @@ mod tests {
                     ));
                 }
 
-                // 10. Coalescing twice gives exactly the same bundles.
+                // 11. Coalescing twice gives exactly the same bundles.
                 let again = coalesce_input(test_input)?;
                 let again = &again.context32.live_ranges;
                 if again.len_bundles() != live_ranges.len_bundles() {
@@ -1776,5 +1896,129 @@ mod tests {
             first_bundle, second_bundle,
             "`rc0` and `rc1` are disjoint, so the pieces cannot share a bundle",
         );
+    }
+
+    /// A merge that happens says which two spans it joined and why.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn coalesced_spans_are_logged() {
+        use crate::events::Event;
+
+        let input =
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Any);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let arg = only_span(live_ranges, 0, 0);
+        let param = only_span(live_ranges, 1, 1);
+
+        let merges: Vec<_> = context
+            .context32
+            .events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::SpansCoalesced { a, b, affinity } => Some((*a, *b, *affinity)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            merges
+                .iter()
+                .any(|&(a, b, affinity)| (a, b) == (arg, param)
+                    && affinity == Affinity::BlockCallArg),
+            "{merges:#?}",
+        );
+    }
+
+    /// So does a merge that is refused, which is the more interesting half.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn refused_coalesces_are_logged() {
+        use crate::events::Event;
+
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let input = TestInput::with_block_arg_constraints(rc(0), rc(1));
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let arg = only_span(live_ranges, 0, 0);
+        let param = only_span(live_ranges, 1, 1);
+
+        let refusals: Vec<_> = context
+            .context32
+            .events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::CoalesceRefused {
+                    a,
+                    b,
+                    affinity,
+                    reason,
+                } => Some((*a, *b, *affinity, *reason)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            refusals.iter().any(|&(a, b, affinity, reason)| {
+                (a, b) == (arg, param)
+                    && affinity == Affinity::BlockCallArg
+                    && reason == RefusedReason::ConstraintConflict
+            }),
+            "{refusals:#?}",
+        );
+    }
+
+    /// Every bundle coalescing built is logged, with the shape it was built
+    /// with.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn constructed_bundles_are_logged() {
+        use crate::events::Event;
+
+        let input = TestInput::with_reuse_of_a_surviving_value();
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+
+        let logged: Vec<_> = context
+            .context32
+            .events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::BundleConstructed {
+                    bundle,
+                    region,
+                    num_spans,
+                    num_vals,
+                    constraint,
+                } => Some((*bundle, *region, *num_spans, *num_vals, *constraint)),
+                _ => None,
+            })
+            .collect();
+
+        let bundles: Vec<LiveBundle> = live_ranges.bundles().collect();
+        assert!(!bundles.is_empty());
+        assert_eq!(logged.len(), bundles.len(), "{logged:#?}");
+        for (bundle, region, num_spans, num_vals, constraint) in logged {
+            assert_eq!(region, bundle.region(live_ranges));
+            assert_eq!(constraint, bundle.constraint(live_ranges));
+            assert_eq!(num_spans, bundle.spans(live_ranges).len());
+            assert_eq!(num_vals, bundle.num_vals(live_ranges));
+        }
+    }
+
+    /// The whole log must survive `serde_json`, which is what catches a
+    /// non-finite float or a variant that internal tagging rejects.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn the_event_log_round_trips_through_json() {
+        for input in [
+            TestInput::with_reuse_of_a_surviving_value(),
+            TestInput::with_a_self_looping_entry_block(),
+            TestInput::with_a_critical_edge(),
+        ] {
+            let context = coalesce_input(&input).unwrap();
+            let json = serde_json::to_string(&context.context32.events).unwrap();
+            assert!(json.starts_with('['), "{json}");
+        }
     }
 }

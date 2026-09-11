@@ -1,13 +1,21 @@
 //! A zero-sized stand-in for `EventsLog`, so that signatures need no `cfg`.
 
+use crate::entity::EntityRepr;
+use core::marker::PhantomData;
+
 /// Does nothing, holds nothing.
 #[derive(Debug)]
-pub struct EventsLog;
+pub struct EventsLog<E>(PhantomData<E>)
+where
+    E: EntityRepr;
 
-impl EventsLog {
+impl<E> EventsLog<E>
+where
+    E: EntityRepr,
+{
     /// Create a new log.
     pub const fn new() -> Self {
-        EventsLog
+        EventsLog(PhantomData)
     }
 
     /// Reset the log to its empty state.
@@ -19,4 +27,4 @@ impl EventsLog {
     }
 }
 
-const _: () = assert!(core::mem::size_of::<EventsLog>() == 0);
+const _: () = assert!(core::mem::size_of::<EventsLog<u32>>() == 0);

@@ -175,6 +175,7 @@ where
     {
         let ContextInner {
             counts,
+            events,
             rpo,
             region_tree,
             liveness,
@@ -191,7 +192,7 @@ where
         rpo.construct(input.func, dfs, output)?;
         region_tree.construct(input.func, counts, dfs, output)?;
         liveness.construct(input.func, counts, rpo, output)?;
-        live_ranges.construct(input, counts, liveness, output)?;
+        live_ranges.construct(input, counts, events, liveness, output)?;
     }
 
     coalescing::coalesce(context, input)?;

@@ -1515,6 +1515,7 @@ mod tests {
             {
                 let ContextInner {
                     counts,
+                    events,
                     rpo,
                     region_tree,
                     liveness,
@@ -1527,7 +1528,7 @@ mod tests {
                 rpo.construct(func, dfs, output)?;
                 region_tree.construct(func, counts, dfs, output)?;
                 liveness.construct(func, counts, rpo, output)?;
-                live_ranges.construct(input, counts, liveness, output)?;
+                live_ranges.construct(input, counts, events, liveness, output)?;
             }
             crate::coalescing::coalesce(ctx, input)?;
             crate::region_allocation::region_allocate(ctx, input)?;

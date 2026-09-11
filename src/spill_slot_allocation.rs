@@ -852,6 +852,7 @@ mod tests {
     ) -> Result<(), String> {
         let ContextInner {
             counts,
+            events,
             rpo,
             region_tree,
             liveness,
@@ -865,7 +866,7 @@ mod tests {
             .construct(func, dfs, output)
             .and_then(|()| region_tree.construct(func, counts, dfs, output))
             .and_then(|()| liveness.construct(func, counts, rpo, output))
-            .and_then(|()| live_ranges.construct(input, counts, liveness, output));
+            .and_then(|()| live_ranges.construct(input, counts, events, liveness, output));
         result.map_err(|()| format!("analysis failed: {:?}", output.take_error()))
     }
 

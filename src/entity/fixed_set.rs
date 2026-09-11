@@ -224,6 +224,20 @@ where
     }
 }
 
+/// A set serializes as an ascending array of its members' indices.
+#[cfg(feature = "visualizer")]
+impl<K, const WORDS: usize> serde::Serialize for FixedEntitySet<K, WORDS>
+where
+    K: crate::entity::Entity + serde::Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_seq(self.iter())
+    }
+}
+
 /// An iterator over the entities in a [`FixedEntitySet`].
 pub struct Iter<'a, K> {
     words: core::iter::Enumerate<core::slice::Iter<'a, Word>>,
