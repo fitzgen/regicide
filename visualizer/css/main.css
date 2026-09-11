@@ -211,12 +211,53 @@ body {
   border-radius: 4px;
 }
 
+/* The row height is the list's geometry: `view.js` positions the virtualized
+   window by multiplying it, so a row is exactly this tall and never wraps. */
 #event-list {
+  --event-row: 18px;
+
   flex: 1;
   min-height: 0;
   overflow: auto;
   padding: 6px 10px;
   font-family: var(--mono);
+  font-size: 11px;
+}
+
+#event-count {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Sized to the whole result set, so the scrollbar tells the truth about how
+   long the log is while only a screenful of rows exists. */
+.event-spacer {
+  position: relative;
+}
+
+.event-rows {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Clipped rather than wrapped: a wrapped row is two rows tall, and the window
+   arithmetic assumes it is one. */
+.event-row {
+  height: var(--event-row);
+  line-height: var(--event-row);
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.event-row-pending,
+.event-empty {
+  color: var(--fg-dim);
 }
 
 /* Hovering a bar dims every bar of another bundle. */

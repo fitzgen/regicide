@@ -46,7 +46,10 @@ const ACTIONS = [
   { type: "clickBreadcrumb", index: 0 },
   { type: "search", query: "Bundle" },
   { type: "queryResult", id: 0, method: "details", result: details(V3) },
-  { type: "queryResult", id: 0, method: "searchEvents", result: [1, 2] },
+  { type: "queryResult", id: 0, method: "searchEvents", args: [""], result: [1, 2] },
+  { type: "queryResult", id: 0, method: "eventRows", result: [{ index: 1, kind: "X", summary: [] }] },
+  { type: "needEventRows", indices: [1, 2] },
+  { type: "clickEntityFromEvent", entity: V3 },
   { type: "queryResult", id: 0, method: "functionOutline", result: { lines: [], bars: [] } },
   { type: "queryResult", id: 0, method: "details", error: "boom" },
   { type: "hoverSpan", ref: SPAN0 },
@@ -232,6 +235,7 @@ test("a query result clears its pending entry", () => {
     type: "queryResult",
     id: queries[0].id,
     method: "searchEvents",
+    args: queries[0].args,
     result: [4, 5],
   }).state;
   assert.deepEqual(next.pending, {});
@@ -279,7 +283,12 @@ test("the outline arrives once the blob has loaded", () => {
   // The load response is not a query result, so `loaded` is what starts the
   // page: nothing else would ever ask for the function pane.
   const first = run([{ type: "loaded" }]);
-  assert.deepEqual(first.queries, [{ id: 0, method: "functionOutline", args: [] }]);
+  // The empty search rides along: it is the whole log, and it is what the
+  // event tab opens on.
+  assert.deepEqual(first.queries, [
+    { id: 0, method: "functionOutline", args: [] },
+    { id: 1, method: "searchEvents", args: [""] },
+  ]);
   assert.equal(first.state.outline, null, "the outline was invented before it arrived");
 
   const outline = { lines: [], bars: [] };
@@ -288,7 +297,8 @@ test("the outline arrives once the blob has loaded", () => {
     first.state,
   ).state;
   assert.equal(done.outline, outline);
-  assert.deepEqual(done.pending, {});
+  // The search it went out with is still in flight.
+  assert.deepEqual(done.pending, { 1: "searchEvents" });
 });
 
 test("clicking an entity in the function pane walks the breadcrumbs", () => {
@@ -349,4 +359,74 @@ test("an entity with no cached details is pending until its result arrives", () 
   ).state;
   assert.equal(failed.details[key], undefined);
   assert.equal(failed.pendingDetails, key);
+});
+
+test("a search marks itself pending and asks once", () => {
+  const { state, queries } = run([{ type: "search", query: "Spill" }]);
+  assert.deepEqual(state.search, { query: "Spill", results: null, pending: true });
+  assert.deepEqual(queries, [{ id: 0, method: "searchEvents", args: ["Spill"] }]);
+});
+
+test("a search result for abandoned text is dropped, and the current one kept", () => {
+  // Out-of-order responses are guaranteed: the glue debounces, so two queries
+  // can be in flight, and the worker answers a cheap query first. The text
+  // the result answered comes back with it, which is what makes this a string
+  // compare rather than a guess.
+  const { state } = run([{ type: "search", query: "Sp" }, { type: "search", query: "Spill" }]);
+
+  const stale = run(
+    [{ type: "queryResult", id: 0, method: "searchEvents", args: ["Sp"], result: [1, 2, 3] }],
+    state,
+  ).state;
+  assert.equal(stale.search.results, null, "a result for abandoned text was shown");
+  assert.equal(stale.search.pending, true, "the query still in flight was forgotten");
+  // The pending entry still clears: the query is answered either way.
+  assert.deepEqual(stale.pending, { 1: "searchEvents" });
+
+  const fresh = run(
+    [{ type: "queryResult", id: 1, method: "searchEvents", args: ["Spill"], result: [7] }],
+    stale,
+  ).state;
+  assert.deepEqual(fresh.search, { query: "Spill", results: [7], pending: false });
+});
+
+test("event rows are asked for once and kept by index", () => {
+  // The list is virtualized, so it asks for the window it is about to draw.
+  // Whatever it already has is not asked for again, which is what keeps a
+  // scroll from re-requesting the screen it is sitting on.
+  const first = run([{ type: "needEventRows", indices: [4, 5] }]);
+  assert.deepEqual(first.queries, [{ id: 0, method: "eventRows", args: [[4, 5]] }]);
+
+  const rows = [
+    { index: 4, kind: "SpillPlaced", summary: [] },
+    { index: 5, kind: "SpillPlaced", summary: [] },
+  ];
+  const { state } = run(
+    [{ type: "queryResult", id: 0, method: "eventRows", result: rows }],
+    first.state,
+  );
+  assert.deepEqual(Object.keys(state.eventRows), ["4", "5"]);
+  assert.equal(state.eventRows[5], rows[1]);
+
+  // Overlapping windows ask only for the part that is new.
+  assert.deepEqual(run([{ type: "needEventRows", indices: [5, 6] }], state).queries, [
+    { id: 1, method: "eventRows", args: [[6]] },
+  ]);
+  assert.deepEqual(run([{ type: "needEventRows", indices: [4, 5] }], state).queries, []);
+});
+
+test("clicking an entity in an event row is a function-pane click with a tab switch", () => {
+  // Two things in order: leave the log, then do exactly what a click in the
+  // function pane does. The second half is the existing handler, so the
+  // breadcrumb trail, the selection and the scroll cannot drift apart from
+  // it -- which is what this asserts.
+  const before = run([{ type: "selectTab", tab: "events" }, { type: "clickEntity", ref: SPAN0 }]).state;
+
+  const viaEvent = run([{ type: "clickEntityFromEvent", entity: BLOCK2 }], before);
+  const viaPane = run([{ type: "clickEntity", ref: BLOCK2 }], before);
+
+  assert.equal(viaEvent.state.tab, "function", "the log was still on screen");
+  assert.equal(viaPane.state.tab, "events", "a plain click moved the tab");
+  assert.deepEqual({ ...viaEvent.state, tab: null }, { ...viaPane.state, tab: null });
+  assert.deepEqual(viaEvent.queries, viaPane.queries);
 });

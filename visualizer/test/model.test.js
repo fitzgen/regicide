@@ -636,3 +636,149 @@ test("every entity every pane names is a real one, labeled by `entities.js`", ()
     assert.ok(links > 10, name + ": only " + links + " links");
   }
 });
+
+// ---------------------------------------------------------------------------
+// The event log's search.
+
+// The events the index attributes to an entity, which is the answer an entity
+// query is supposed to reproduce.
+function eventsOf(blob, kind, index) {
+  const map = blob.index.byEntity[kind];
+  return index < map.values.length ? map.values[index] : map.default;
+}
+
+test("an empty query is the whole log", () => {
+  const blob = fixture("spills-and-reloads");
+  const all = blob.events.map((_event, i) => i);
+  assert.deepEqual(modelOf(blob).searchEvents(""), all);
+  // Whitespace is a typo, not a query.
+  assert.deepEqual(modelOf(blob).searchEvents("   "), all);
+});
+
+test("an entity query is the whole index, parsed, and not a prefix of it", () => {
+  const blob = fixture("spills-and-reloads");
+  // No fixture's function has eleven values, so `v10` is added to the index
+  // by hand: the point is that `v1` parses as the value numbered one rather
+  // than matching every label starting `v1`, and it takes a `v10` with events
+  // of its own to tell those apart.
+  const vals = blob.index.byEntity.Val;
+  while (vals.values.length < 10) vals.values.push([]);
+  vals.values.push([61]);
+
+  const found = modelOf(blob).searchEvents("v1");
+  assert.deepEqual(found, vals.values[1]);
+  assert.ok(!found.includes(61), "v10's events came back for v1");
+});
+
+test("a query that names no such entity matches nothing at all", () => {
+  // Not "every V-ish event", and not a fall-through to the kind search: the
+  // user named something, and it does not exist.
+  const model = modelOf(fixture("spills-and-reloads"));
+  assert.deepEqual(model.searchEvents("v99999"), []);
+  assert.deepEqual(model.searchEvents("block99999"), []);
+  assert.deepEqual(model.searchEvents("nonsense"), []);
+});
+
+test("a kind query is a case-insensitive substring, over every matching kind", () => {
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  const found = model.searchEvents("sp");
+
+  const kinds = new Set(found.map((i) => blob.events[i].kind));
+  assert.ok([...kinds].some((kind) => kind.includes("Split")), "no Split kind matched");
+  assert.ok([...kinds].some((kind) => kind.includes("Spill")), "no Spill kind matched");
+  for (const kind of kinds) assert.ok(kind.toLowerCase().includes("sp"), kind);
+
+  // Each kind's own list is ascending, but their union is not, and a log out
+  // of order is not a log.
+  assert.deepEqual([...found].sort((a, b) => a - b), found);
+
+  assert.deepEqual(model.searchEvents("SP"), found);
+});
+
+test("an entity label wins over a kind that contains it", () => {
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  // `r4` is a register, not a search for kinds spelled `r4`.
+  assert.deepEqual(model.searchEvents("r4"), eventsOf(blob, "Reg", 4));
+  // `re` cannot be a register -- there is no index in it -- so it falls
+  // through to every kind spelled with one.
+  const union = [];
+  for (const [kind, indices] of Object.entries(blob.index.byKind)) {
+    if (kind.toLowerCase().includes("re")) union.push(...indices);
+  }
+  union.sort((x, y) => x - y);
+  assert.ok(union.length > 0, "nothing in this fixture is spelled with an `re`");
+  assert.deepEqual(model.searchEvents("re"), union);
+});
+
+test("the prefix is the longest one that leaves a number behind", () => {
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  // `rc4` is a register class, not register `4` with a `c` in the way, and
+  // the two have genuinely different events here.
+  const rc4 = eventsOf(blob, "RegClass", 4);
+  assert.deepEqual(model.searchEvents("rc4"), rc4);
+  assert.notDeepEqual(rc4, eventsOf(blob, "Reg", 4));
+  // And `region0` is a region rather than register `egion0`, which is not a
+  // register at all.
+  assert.deepEqual(model.searchEvents("region0"), eventsOf(blob, "Region", 0));
+});
+
+test("a register's events are the index's, hints included", () => {
+  // The register index covers every `RegSet` an event carries, so a bundle
+  // that was merely hinted towards a register is found by searching for it.
+  // No fixture's allocation produces a non-empty hint, so that half is
+  // asserted where the index is built -- `registers_are_indexed` in
+  // `index.rs`; what is checked here is that the search reads that index and
+  // does not go looking through the events itself.
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  for (let reg = 0; reg < blob.index.byEntity.Reg.values.length; reg++) {
+    assert.deepEqual(model.searchEvents("r" + reg), eventsOf(blob, "Reg", reg), "r" + reg);
+  }
+});
+
+test("an event is searchable by its own position in the log", () => {
+  // `EventIndex` is deliberately absent from `entityKinds`, so `event9` never
+  // parses as an entity and there is no `byEntity.EventIndex` to look in.
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  assert.deepEqual(model.searchEvents("event9"), [9]);
+  assert.deepEqual(model.searchEvents("event0"), [0]);
+  assert.deepEqual(model.searchEvents("event" + (blob.events.length - 1)), [
+    blob.events.length - 1,
+  ]);
+  // Past the end is no event, not a one-element list of one that is not there.
+  assert.deepEqual(model.searchEvents("event999999"), []);
+  // `event` alone is a kind search, and matches nothing here.
+  assert.deepEqual(model.searchEvents("event"), []);
+});
+
+test("the search answers with indices and the rows come separately", () => {
+  // The log is the one list that can be hundreds of thousands long, so a
+  // query for all of it comes back as numbers; only the window the list draws
+  // is turned into parts.
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  const all = model.searchEvents("");
+  assert.ok(all.every((i) => typeof i === "number"));
+
+  const rows = model.eventRows(all.slice(3, 6));
+  assert.deepEqual(rows.map((row) => row.index), [3, 4, 5]);
+  for (const row of rows) {
+    assert.equal(row.kind, blob.events[row.index].kind);
+    // The same shape the details pane's event list is drawn from, built by
+    // the same function: the first part is the kind, and entity references
+    // are parts carrying refs.
+    assert.equal(row.summary[0].text, row.kind);
+    for (const part of row.summary) {
+      if (part.entity) assert.equal(part.text, entityLabel(part.entity));
+    }
+  }
+
+  // An index past the end is dropped rather than thrown over: the window is
+  // computed from a scroll position and can outrun a result by a frame.
+  assert.deepEqual(model.eventRows([blob.events.length, -1]), []);
+  assert.deepEqual(model.eventRows(undefined), []);
+});

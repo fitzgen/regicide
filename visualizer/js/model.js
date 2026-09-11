@@ -4,7 +4,7 @@
 // parsed JSON blob and answers questions about it. This is the layer the node
 // tests exercise hardest, because it needs no environment at all.
 
-import { entityClass, entityLabel, installEntities } from "./entities.js";
+import { entityClass, entityLabel, installEntities, parseEntityLabel } from "./entities.js";
 
 // Read a serialized `SecondaryMap`.
 //
@@ -25,6 +25,8 @@ export function createModel(json) {
   let details = null;
   const index = json.index || {};
   const byEntity = index.byEntity || {};
+  const byKind = index.byKind || {};
+  const eventSchema = (json.schema || {}).events || {};
 
   // The events an entity is named by. Kinds with no index of their own (a
   // register unit, say) have no list rather than an empty one.
@@ -52,8 +54,21 @@ export function createModel(json) {
     // and `null` says there is no such entity.
     details: (ref) => (details ||= buildDetails(json, entityEvents)).details(ref),
 
-    // The event log tab's search. Commit 11.
-    searchEvents: (_query) => [],
+    // The event log tab's search: which events match, in log order. Indices
+    // only -- the log is the one list that can be hundreds of thousands long,
+    // and `eventRows` is what turns a window of it into something renderable.
+    searchEvents: (query) => searchEvents(json, byKind, entityEvents, query),
+
+    // Those events, rendered. Split from the search so that a query matching
+    // the whole log answers with an array of numbers rather than an array of
+    // summaries: the log is the one list that can be hundreds of thousands
+    // long, and only the rows the list actually shows are worth building.
+    eventRows: (indices) => {
+      const events = json.events || [];
+      return (indices || [])
+        .filter((i) => i >= 0 && i < events.length)
+        .map((i) => eventRow(events, eventSchema, i));
+    },
 
     // The function pane, rendered. Built once and kept: it is the largest
     // thing the model computes and the pane asks for it exactly once.
@@ -739,11 +754,7 @@ function buildDetails(json, entityEvents) {
         fields,
         // The true total beside the capped list, like every other list here.
         eventCount: indices.length,
-        events: indices.slice(0, DETAILS_CAP).map((index) => ({
-          index,
-          kind: (json.events || [])[index].kind,
-          summary: summarizeEvent((json.events || [])[index], eventSchema),
-        })),
+        events: indices.slice(0, DETAILS_CAP).map((i) => eventRow(json.events || [], eventSchema, i)),
       };
     },
   };
@@ -874,3 +885,56 @@ const plain = (value) =>
     : typeof value === "string"
       ? value
       : JSON.stringify(value);
+
+// ---------------------------------------------------------------------------
+// The event log.
+
+// One event as the log and the details pane both draw it.
+const eventRow = (events, eventSchema, index) => ({
+  index,
+  kind: events[index].kind,
+  summary: summarizeEvent(events[index], eventSchema),
+});
+
+// Which events match a search.
+//
+// Two query forms and nothing else: a whole entity label, or a
+// case-insensitive substring of an event kind. The spec asks for one term, so
+// there is no query language here to invent.
+function searchEvents(json, byKind, entityEvents, query) {
+  const events = json.events || [];
+  // Trimmed, because a trailing space is a typo and not a query, and an
+  // entity label with one around it parses as nothing at all.
+  const text = String(query === undefined || query === null ? "" : query).trim();
+  if (text === "") return events.map((_event, i) => i);
+
+  // `event9` is a position in the log rather than an entity: `EventIndex` is
+  // deliberately left out of the prefix table, so `parseEntityLabel` never
+  // returns one and there is no `byEntity.EventIndex` to go looking for.
+  const eventPrefix = (json.entityKinds || {}).EventIndex;
+  if (eventPrefix !== undefined && text.startsWith(eventPrefix)) {
+    const rest = text.slice(eventPrefix.length);
+    if (/^[0-9]+$/.test(rest)) {
+      const i = Number(rest);
+      return i < events.length ? [i] : [];
+    }
+  }
+
+  // An entity label wins. `r3` is a register, and only a query that parses as
+  // nothing -- `re`, with no digits -- falls through to matching `Remat`. An
+  // entity that exists but appears in no event matches nothing, which is not
+  // the same question as "which kinds contain this text".
+  const ref = parseEntityLabel(text);
+  if (ref !== null) return entityEvents(ref).slice();
+
+  // Matched once per kind rather than once per event, which is what `byKind`
+  // is for.
+  const needle = text.toLowerCase();
+  const found = [];
+  for (const [kind, indices] of Object.entries(byKind)) {
+    if (kind.toLowerCase().includes(needle)) found.push(...indices);
+  }
+  // Each kind's list is ascending, but their union is not, and a log out of
+  // order is not a log.
+  return found.sort((a, b) => a - b);
+}

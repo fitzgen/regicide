@@ -19,8 +19,18 @@ const LOAD_ID = -1;
 // it is the only side that parses; this is here for the message.
 const VERSION = 1;
 
+// How long the search waits for the typing to stop. A keystroke per query
+// over a large log is the exact thing the worker was introduced to avoid: the
+// UI would stay responsive, but every scan would still queue behind the last.
+// It lives here rather than in `handleAction` so that the handler stays pure
+// and synchronous.
+const SEARCH_DEBOUNCE_MS = 30;
+
 let state = initialState();
-const methods = new Map();
+
+// Queries sent but not answered, by id. The whole query, not just its method:
+// a search result is only useful if the text it answered comes back with it.
+const sent = new Map();
 
 // A Blob-URL worker is a responsiveness optimization, not a correctness
 // requirement: a page opened from `file://` has an opaque origin and some
@@ -46,14 +56,16 @@ try {
 
 function receive(message) {
   if (message.id === LOAD_ID) return loaded(message);
+  const query = sent.get(message.id) || {};
+  sent.delete(message.id);
   dispatch({
     type: "queryResult",
     id: message.id,
-    method: methods.get(message.id),
+    method: query.method,
+    args: query.args,
     result: message.result,
     error: message.error,
   });
-  methods.delete(message.id);
 }
 
 // The load response, which is not a query result: it settles whether the page
@@ -75,11 +87,24 @@ function loaded(message) {
   summary.textContent = blocks + " blocks, " + insts + " insts, " + events + " events";
 }
 
+let searchTimer = null;
+
 function dispatch(action) {
+  // The only action the glue delays. A later keystroke replaces the pending
+  // one outright, so a burst of typing costs one query.
+  if (action.type === "search") {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => run(action), SEARCH_DEBOUNCE_MS);
+    return;
+  }
+  run(action);
+}
+
+function run(action) {
   const next = handleAction(state, action);
   state = next.state;
   for (const query of next.queries) {
-    methods.set(query.id, query.method);
+    sent.set(query.id, query);
     post(query);
   }
   render(state);

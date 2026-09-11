@@ -43,8 +43,17 @@ export function initialState() {
     // "not here yet" from "this entity has none".
     pendingDetails: null,
 
-    // The event log tab.
-    search: { query: "", results: [], pending: false },
+    // The event log tab's query and the event indices it matched. `results`
+    // starts `null` rather than empty, so that the pane can tell "no search
+    // has answered yet" from "this query matched nothing".
+    search: { query: "", results: null, pending: false },
+
+    // Event rows, by event index. The search answers with indices alone -- the
+    // log is the one list that can be hundreds of thousands long -- so the
+    // rows for the window the list is actually showing are fetched as it
+    // scrolls. Never invalidated: an event never changes, and what accumulates
+    // here is bounded by what the user scrolled past.
+    eventRows: {},
 
     // The function pane, as `model.js` rendered it, or `null` until the load
     // response has come back and the outline query it starts has answered.

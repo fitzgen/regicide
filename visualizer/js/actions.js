@@ -19,11 +19,20 @@ const DETAILS_CACHE_SIZE = 50;
 // result would be guesswork.
 export function handleAction(state, action) {
   switch (action.type) {
-    case "loaded":
-      // The blob is readable, so the function pane can be asked for. The load
+    case "loaded": {
+      // The blob is readable, so the panes can be asked for. The load
       // response itself is not a query result -- it settles whether the page
       // can show anything at all -- so this is where the page starts.
-      return query(state, "functionOutline", []);
+      //
+      // The empty search goes out now rather than when the event tab is first
+      // shown: it is the whole log, it is what the tab opens on, and asking
+      // for it here means the tab is populated the moment it appears.
+      const search = { ...state.search, query: "", pending: true };
+      return queries({ ...state, search }, [
+        { method: "functionOutline", args: [] },
+        { method: "searchEvents", args: [""] },
+      ]);
+    }
 
     case "selectTab":
       // The tab and nothing else: the other tabs' state survives a round trip
@@ -48,8 +57,28 @@ export function handleAction(state, action) {
     }
 
     case "search": {
+      // Debounced in `main.js`, not here: a keystroke per query over a large
+      // log is the exact thing the worker was introduced to avoid, and the
+      // handler stays pure and synchronous by not knowing about it.
       const search = { ...state.search, query: action.query, pending: true };
       return query({ ...state, search }, "searchEvents", [action.query]);
+    }
+
+    case "needEventRows": {
+      // The view asks for the rows of the window it is about to draw. It only
+      // asks for what it is missing, and only once per index, so there is no
+      // guard here against a render that answers its own request.
+      const missing = action.indices.filter((i) => state.eventRows[i] === undefined);
+      if (missing.length === 0) return done(state);
+      return query(state, "eventRows", [missing]);
+    }
+
+    case "clickEntityFromEvent": {
+      // The tab first, then exactly what a click in the function pane does.
+      // Delegating rather than repeating is what keeps one set of rules for
+      // the breadcrumb trail, the selection, and the scroll.
+      const click = { type: "clickEntity", ref: action.entity };
+      return handleAction({ ...state, tab: "function" }, click);
     }
 
     case "queryResult": {
@@ -62,11 +91,24 @@ export function handleAction(state, action) {
           return done(cacheDetails(next, action.result));
         case "functionOutline":
           return done({ ...next, outline: action.result });
-        case "searchEvents":
+        case "searchEvents": {
+          // The one place a stale result is dropped rather than cached. A
+          // debounced search guarantees out-of-order responses, the query text
+          // lives in the state so the comparison is a string compare, and a
+          // result for text the user has moved on from has no cache value --
+          // unlike a details result, which is a breadcrumb away from being
+          // wanted again.
+          if ((action.args || [])[0] !== next.search.query) return done(next);
           return done({
             ...next,
             search: { ...next.search, results: action.result, pending: false },
           });
+        }
+        case "eventRows": {
+          const eventRows = { ...next.eventRows };
+          for (const row of action.result) eventRows[row.index] = row;
+          return done({ ...next, eventRows });
+        }
         default:
           return done(next);
       }
@@ -143,13 +185,21 @@ function done(state) {
 
 // A state change that also asks the worker something.
 function query(state, method, args) {
-  const id = state.nextQueryId;
+  return queries(state, [{ method, args }]);
+}
+
+// The same, for more than one question at once. Ids come from the state, so
+// they have to be handed out in order rather than each call reading the same
+// `nextQueryId`.
+function queries(state, list) {
+  let id = state.nextQueryId;
+  const pending = { ...state.pending };
+  const sent = list.map(({ method, args }) => {
+    pending[id] = method;
+    return { id: id++, method, args };
+  });
   return {
-    state: {
-      ...state,
-      nextQueryId: id + 1,
-      pending: { ...state.pending, [id]: method },
-    },
-    queries: [{ id, method, args }],
+    state: { ...state, nextQueryId: id, pending },
+    queries: sent,
   };
 }

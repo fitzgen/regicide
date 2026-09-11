@@ -45,6 +45,25 @@ let spanBundles = new Map();
 let shownSelection = null;
 let shownHover = null;
 
+// The event log's scroll position, the results it was drawn against, and the
+// rows already asked for.
+//
+// The one thing the view keeps that the state does not. A virtualized list
+// re-renders on every scroll frame, and routing that through `handleAction`
+// would be an action per frame for something derived purely from the scroll
+// offset: it is not application state, nothing else reads it, and it does not
+// survive a rebuild. Rows are a different matter and do live in the state --
+// they come from the worker -- so all the view keeps of them is which ones it
+// has already asked for, which is what stops a render triggered by the answer
+// from asking again.
+let eventScroll = 0;
+let shownResults = null;
+const askedRows = new Set();
+
+// The state the last render drew, so that a scroll can redraw the window
+// without one being passed in.
+let lastState = null;
+
 // Wire up the listeners. `dispatcher` takes an action.
 export function installView(root, dispatcher) {
   viewDispatch = dispatcher;
@@ -79,14 +98,36 @@ export function installView(root, dispatcher) {
   pane.addEventListener("mouseout", (e) => {
     if (e.target.closest(".bar")) viewDispatch({ type: "unhoverSpan" });
   });
+
+  root.querySelector("#event-query").addEventListener("input", (e) => {
+    viewDispatch({ type: "search", query: e.target.value });
+  });
+
+  // Clicking a reference in the log leaves the log: the function tab is where
+  // an entity can actually be looked at, and `actions.js` is what decides
+  // that.
+  const list = root.querySelector("#event-list");
+  list.addEventListener("click", (e) => {
+    const el = e.target.closest("[data-entity]");
+    const ref = el && refs.get(el.dataset.entity);
+    if (ref) viewDispatch({ type: "clickEntityFromEvent", entity: ref });
+  });
+
+  // Straight to the renderer, per the note on `eventScroll`.
+  list.addEventListener("scroll", () => {
+    eventScroll = list.scrollTop;
+    if (lastState !== null) renderEventRows(lastState);
+  });
 }
 
 // Draw `state`.
 export function render(state) {
+  lastState = state;
   renderTabs(state);
   renderBreadcrumbs(state);
   renderFunction(state);
   renderDetails(state);
+  renderEvents(state);
 }
 
 function renderTabs(state) {
@@ -353,4 +394,117 @@ function renderDetails(state) {
     events.append(more);
   }
   pane.append(events);
+}
+
+// ---------------------------------------------------------------------------
+// The event log tab.
+
+// How many rows beyond the visible window to draw, so that a fast scroll does
+// not show a blank strip before the next frame catches up.
+const EVENT_OVERSCAN = 10;
+
+// The search field, the count, and the list.
+function renderEvents(state) {
+  const input = document.getElementById("event-query");
+  // Never while the field has focus: the state lags the field by the search
+  // debounce, and assigning `value` mid-word moves the caret to the end.
+  if (document.activeElement !== input && input.value !== state.search.query) {
+    input.value = state.search.query;
+  }
+
+  const results = state.search.results;
+  const count = document.getElementById("event-count");
+  count.textContent =
+    results === null ? "" : results.length === 1 ? "1 event" : results.length + " events";
+
+  // A new set of results is a new list, and the browser keeps `scrollTop`
+  // across the rebuild: the old offset would land the user somewhere
+  // arbitrary in it.
+  if (results !== shownResults) {
+    shownResults = results;
+    eventScroll = 0;
+    document.getElementById("event-list").scrollTop = 0;
+  }
+  renderEventRows(state);
+}
+
+// The rows, drawn on every scroll as well as every render.
+//
+// Virtualized: a spacer gives the scrollbar the height the whole log would
+// have, and only the rows in view are in the DOM. A log of two hundred
+// thousand events is two hundred thousand elements otherwise, which no
+// browser will draw. The spacer is kept between redraws rather than rebuilt,
+// because emptying the container would collapse its height and the browser
+// would clamp `scrollTop` to the top.
+function renderEventRows(state) {
+  const list = document.getElementById("event-list");
+  const results = state.search.results;
+  if (results === null || results.length === 0) {
+    list.textContent = "";
+    if (results === null) return;
+    const empty = document.createElement("p");
+    empty.className = "event-empty";
+    // The distinction matters: a log with no events at all is a different
+    // thing from a query that matched none of them.
+    empty.textContent = state.search.query === "" ? "No events." : "No matches.";
+    list.append(empty);
+    return;
+  }
+
+  // Arithmetic on a fixed row height, like the function pane's bars: a row is
+  // one line of preformatted text, so nothing has to be measured.
+  const rowHeight = parseFloat(getComputedStyle(list).getPropertyValue("--event-row"));
+  const first = Math.max(0, Math.floor(eventScroll / rowHeight) - EVENT_OVERSCAN);
+  const visible = Math.ceil((eventScroll + list.clientHeight) / rowHeight) + EVENT_OVERSCAN;
+  const last = Math.min(results.length, visible);
+
+  let spacer = list.querySelector(".event-spacer");
+  let rows = spacer && spacer.firstChild;
+  if (spacer === null) {
+    list.textContent = "";
+    spacer = document.createElement("div");
+    spacer.className = "event-spacer";
+    rows = document.createElement("ol");
+    rows.className = "event-rows";
+    spacer.append(rows);
+    list.append(spacer);
+  }
+  spacer.style.height = results.length * rowHeight + "px";
+  rows.style.transform = "translateY(" + first * rowHeight + "px)";
+  rows.textContent = "";
+
+  const missing = [];
+  for (let i = first; i < last; i++) {
+    const index = results[i];
+    const row = state.eventRows[index];
+    const item = document.createElement("li");
+    item.className = "event-row";
+    const label = document.createElement("span");
+    label.className = entityClass({ kind: "EventIndex", index });
+    // Not clickable, unlike the references inside the row: this is the line
+    // the user is already looking at.
+    label.textContent = entityLabel({ kind: "EventIndex", index });
+    item.append(label, " ");
+    if (row === undefined) {
+      // The rows for this window are on their way. A placeholder rather than
+      // a blank line, so the list does not look like it ends here.
+      missing.push(index);
+      item.classList.add("event-row-pending");
+      item.append("…");
+    } else {
+      // The same parts the details pane renders, through the same function,
+      // so an entity is spelled and coloured identically in both.
+      appendParts(item, row.summary, { swatch: true });
+    }
+    rows.append(item);
+  }
+
+  // Asked for out of band, because dispatching from inside a render would
+  // re-enter it, and only once per index, so that the render which draws the
+  // answer cannot ask for it again.
+  const wanted = missing.filter((index) => !askedRows.has(index));
+  if (wanted.length > 0) {
+    for (const index of wanted) askedRows.add(index);
+    queueMicrotask(() => viewDispatch({ type: "needEventRows", indices: wanted }));
+  }
 }
