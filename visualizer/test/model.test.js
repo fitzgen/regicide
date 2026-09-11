@@ -463,6 +463,55 @@ test("an instruction lists every span live across it, used there or not", () => 
   assert.equal(blob.function.insts[1].operands.length, 1);
 });
 
+test("a constraint spells out its register class", () => {
+  // Two levels for a group class, one for a class of plain registers, and
+  // every name in the expansion clickable -- a constraint is read to find out
+  // which registers it stands for.
+  const model = modelOf(fixture("spills-and-reloads"));
+  const constraint = (kind, index) =>
+    model.details({ kind, index }).fields.find((field) => field.label === "Constraint");
+
+  assert.equal(flat(constraint("Use", 0).value), "reg rc4 { r4, r5 }");
+  assert.deepEqual(
+    constraint("Use", 0).value.filter((part) => part.entity),
+    [
+      { text: "rc4", entity: { kind: "RegClass", index: 4 }, cls: "kind-RegClass" },
+      { text: "r4", entity: { kind: "Reg", index: 4 }, cls: "kind-Reg" },
+      { text: "r5", entity: { kind: "Reg", index: 5 }, cls: "kind-Reg" },
+    ],
+  );
+
+  // rc2 is the fixture's one class of more than one group, and no span in it
+  // is constrained to a group class, so one is grafted on.
+  const blob = fixture("spills-and-reloads");
+  blob.function.spans[0].constraint = { reg: 2 };
+  assert.equal(
+    shown(modelOf(blob).details({ kind: "LiveSpan", index: 0 })).Constraint,
+    "reg rc2 { group0 { r0, r1 }, group1 { r2, r3 } }",
+  );
+
+  // `any` and `stack` have no class to expand.
+  blob.function.spans[0].constraint = "stack";
+  assert.equal(shown(modelOf(blob).details({ kind: "LiveSpan", index: 0 })).Constraint, "stack");
+});
+
+test("a wide register class's expansion is capped", () => {
+  // Inline in a sentence rather than a field of its own, so the cap is low and
+  // the overflow is worded the way a capped list field is.
+  const blob = fixture("spills-and-reloads");
+  blob.machine.classes[3].regs = [0, 1, 2, 3, 4, 5, 0, 1, 2, 3];
+  assert.equal(
+    shown(modelOf(blob).details({ kind: "LiveSpan", index: 0 })).Constraint,
+    "reg rc3 { r0, r1, r2, r3, r4, r5, r0, r1, …and 2 more }",
+  );
+
+  // A class the machine does not have, and one no register reached, stay bare.
+  blob.machine.classes[3].regs = [];
+  assert.equal(shown(modelOf(blob).details({ kind: "LiveSpan", index: 0 })).Constraint, "reg rc3");
+  blob.function.spans[0].constraint = { reg: 99 };
+  assert.equal(shown(modelOf(blob).details({ kind: "LiveSpan", index: 0 })).Constraint, "reg rc99");
+});
+
 test("an emergency slot says so and has no value of its own", () => {
   // An emergency slot is borrowed to break a move cycle; no value has a home
   // in it, which is a thing to say rather than a blank field.

@@ -395,6 +395,11 @@ function buildBars(spans, instRows) {
 // log; `count` is always the true total, so the view can say "200 of 1,204".
 const DETAILS_CAP = 200;
 
+// How many of a register class's or group's members a constraint spells out.
+// Lower than `DETAILS_CAP`, because this one is inline in a sentence rather
+// than a field of its own, and a wide machine would bury the constraint.
+const MEMBERS_CAP = 8;
+
 // Build the details machinery over a parsed blob.
 //
 // Everything it cross-references -- which spans a value has, which region a
@@ -524,6 +529,39 @@ function buildDetails(json, entityEvents) {
     text(")"),
   ];
   const edgeParts = (from, to) => [entity("Block", from), text(" -> "), entity("Block", to)];
+
+  // `any`, `stack`, or `reg rc0 { group0 { r0, r1 }, group1 { r2, r3 } }`.
+  //
+  // The class is spelled out rather than left as a label: which registers it
+  // stands for is the question a constraint is being read to answer, and a
+  // click away is a click too far for it. Both levels, because a group class's
+  // members are groups and their registers are the actual answer.
+  const constraintParts = (constraint) =>
+    typeof constraint === "string"
+      ? [text(constraint)]
+      : [text("reg "), ...classParts(constraint.reg)];
+
+  const regParts = (indices) => indices.map((r) => [entity("Reg", r)]);
+
+  const classParts = (i) =>
+    members(entity("RegClass", i), classes[i], (cls) =>
+      cls.isGroup ? cls.groups.map(groupParts) : regParts(cls.regs),
+    );
+
+  const groupParts = (i) =>
+    members(entity("RegGroup", i), regGroups[i], (group) => regParts(group.members));
+
+  // `<label> { a, b }`, or the bare label when there is nothing to expand --
+  // an index the machine does not have, or a class no register reached.
+  function members(head, record, expand) {
+    const items = record === undefined ? [] : expand(record);
+    if (items.length === 0) return [head];
+    const shown = items.slice(0, MEMBERS_CAP);
+    const parts = [head, text(" { "), ...joinParts(shown)];
+    if (items.length > shown.length) parts.push(text(", …and " + (items.length - shown.length) + " more"));
+    parts.push(text(" }"));
+    return parts;
+  }
 
   // The fields of one entity, or `null` when there is no such entity. A
   // `switch` over the Rust type name: the kind is what the blob's `schema`
@@ -817,12 +855,6 @@ const num = (value) => String(Math.round(value * 1e4) / 1e4);
 
 // `inst3:early`, with the instruction clickable.
 const pointParts = (point) => [entity("Inst", point.inst), text(":" + point.pos)];
-
-// `any`, `stack`, or `reg rc2`.
-const constraintParts = (constraint) =>
-  typeof constraint === "string"
-    ? [text(constraint)]
-    : [text("reg "), entity("RegClass", constraint.reg)];
 
 // The entity an allocation names, as parts.
 function allocationParts(allocation) {
