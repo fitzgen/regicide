@@ -1,5 +1,7 @@
 //! Writing the register allocation visualization HTML.
 
+mod index;
+
 use crate::{
     context::ContextInner,
     entity::{Block, EntityRepr, Inst, Region, Val, VisualizedEntity},
