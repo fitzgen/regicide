@@ -464,7 +464,7 @@ where
     )?;
 
     // And finally propagate hints across regions.
-    hint_across_regions(coalescing, region_tree, live_ranges, input.machine);
+    hint_across_regions(coalescing, region_tree, live_ranges, events, input.machine);
 
     coalescing.cross_region_affinities.clear();
     coalescing.region_blocks.clear();
@@ -986,6 +986,7 @@ fn hint_across_regions<E>(
     coalescing: &Coalescing<E>,
     region_tree: &RegionTree<E>,
     live_ranges: &mut LiveRanges<E>,
+    events: &mut EventsLog<E>,
     machine: &Machine,
 ) where
     E: EntityRepr,
@@ -1012,7 +1013,7 @@ fn hint_across_regions<E>(
         };
 
         let constraint = child.constraint(live_ranges);
-        parent.hint(live_ranges, machine, constraint);
+        parent.hint(live_ranges, events, machine, constraint, Some(child));
     }
 }
 

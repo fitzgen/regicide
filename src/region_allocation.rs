@@ -12,6 +12,7 @@ use crate::{
     counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
     error::{Error, IResult},
+    events::{EventsLog, SplitKind},
     live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
     machine::{Machine, Reg, RegClassMembers},
     output::{OutputInner, RegAllocation},
@@ -33,6 +34,7 @@ where
 
     let ContextInner {
         counts,
+        events,
         region_tree,
         live_ranges,
         region_allocation,
@@ -42,7 +44,7 @@ where
 
     // Reverse the pre-order so we visit children before parents.
     for region in region_tree.pre_order_iter().rev() {
-        region_allocation.allocate_region(input, live_ranges, counts, output, region)?;
+        region_allocation.allocate_region(input, live_ranges, counts, events, output, region)?;
     }
 
     counts.final_live_spans += live_ranges.len_spans();
@@ -175,6 +177,7 @@ where
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         region: Region<E>,
     ) -> IResult<()> {
@@ -186,7 +189,7 @@ where
         // this region's bundles yet, because we haven't allocated registers
         // within this region yet.
         for bundle in region.bundles(live_ranges) {
-            self.push_bundle(input, live_ranges, bundle, Phase::default());
+            self.push_bundle(input, live_ranges, events, bundle, Phase::default());
         }
 
         // Keep processing bundles until they've all been assigned!
@@ -197,38 +200,48 @@ where
 
             let phase = entry.phase();
 
-            if self.assign_to_preferred(input, live_ranges, output, entry)? {
+            event!(
+                events,
+                BundleQueuePopped {
+                    bundle: entry.bundle(),
+                    region: entry.bundle().region(live_ranges),
+                    priority: entry.priority(),
+                    phase,
+                }
+            );
+
+            if self.assign_to_preferred(input, live_ranges, events, output, entry)? {
                 counts.preferred_assignments.inc();
                 continue;
             }
 
-            if self.assign_to_non_preferred(input, live_ranges, output, entry)? {
+            if self.assign_to_non_preferred(input, live_ranges, events, output, entry)? {
                 counts.non_preferred_assignments.inc();
                 continue;
             }
 
             if phase <= Phase::AssignEvict
-                && self.assign_via_eviction(input, live_ranges, output, entry)?
+                && self.assign_via_eviction(input, live_ranges, events, output, entry)?
             {
                 counts.evictions.inc();
                 continue;
             }
 
             if phase <= Phase::SplitBetweenSpans
-                && self.split_between_spans(input, live_ranges, counts, output, entry)?
+                && self.split_between_spans(input, live_ranges, counts, events, output, entry)?
             {
                 counts.split_between_spans.inc();
                 continue;
             }
 
             if phase <= Phase::SplitWithinSpan
-                && self.split_within_span(input, live_ranges, counts, output, entry)?
+                && self.split_within_span(input, live_ranges, counts, events, output, entry)?
             {
                 counts.split_within_span.inc();
                 continue;
             }
 
-            self.split_into_minimal_or_spill(input, live_ranges, counts, output, entry)?;
+            self.split_into_minimal_or_spill(input, live_ranges, counts, events, output, entry)?;
             counts.split_into_minimal_or_spill.inc();
         }
 
@@ -243,12 +256,22 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         live_ranges: &LiveRanges<E>,
+        events: &mut EventsLog<E>,
         bundle: LiveBundle<E>,
         phase: Phase,
     ) {
         let priority = compute_bundle_priority(input, live_ranges, bundle);
         self.set_bundle_priority(bundle, priority);
         self.queue.push(PqEntry::new(phase, priority, bundle));
+        event!(
+            events,
+            BundleQueued {
+                bundle,
+                region: bundle.region(live_ranges),
+                priority,
+                phase,
+            }
+        );
     }
 
     fn set_bundle_priority(&mut self, bundle: LiveBundle<E>, priority: Priority) {
@@ -263,6 +286,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<bool> {
@@ -312,7 +336,9 @@ where
             None => Ok(false),
             Some(reg) => {
                 let reg = output.with_repr::<E, _>(reg)?;
-                bundle.set_reg_allocation(live_ranges, RegAllocation::Reg(reg));
+                let alloc = RegAllocation::Reg(reg);
+                bundle.set_reg_allocation(live_ranges, alloc);
+                event!(events, BundleAssignedPreferred { bundle, alloc });
                 Ok(true)
             }
         }
@@ -322,6 +348,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<bool> {
@@ -337,6 +364,14 @@ where
             OperandConstraint::Reg(rc) => rc,
             OperandConstraint::Stack => {
                 self.stack_bundles.push(bundle);
+                event!(
+                    events,
+                    BundleSpilledToStack {
+                        bundle,
+                        region: bundle.region(live_ranges),
+                        forced: true,
+                    }
+                );
                 return Ok(true);
             }
             OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
@@ -378,6 +413,14 @@ where
             None => Ok(false),
             Some(alloc) => {
                 bundle.set_reg_allocation(live_ranges, alloc);
+                event!(
+                    events,
+                    BundleAssignedNonPreferred {
+                        bundle,
+                        alloc,
+                        preference: bundle.preference(live_ranges).clone(),
+                    }
+                );
                 Ok(true)
             }
         }
@@ -403,6 +446,7 @@ where
         &mut self,
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<bool> {
@@ -483,9 +527,25 @@ where
         match evicted {
             None => Ok(false),
             Some((alloc, evicted)) => {
+                event!(
+                    events,
+                    BundleEvicted {
+                        bundle: evicted,
+                        by: bundle,
+                        alloc,
+                    }
+                );
                 evicted.clear_reg_allocation(live_ranges);
                 bundle.set_reg_allocation(live_ranges, alloc);
-                self.push_bundle(input, live_ranges, evicted, Phase::AssignEvict);
+                event!(
+                    events,
+                    BundleAssignedViaEviction {
+                        bundle,
+                        alloc,
+                        evicted,
+                    }
+                );
+                self.push_bundle(input, live_ranges, events, evicted, Phase::AssignEvict);
                 Ok(true)
             }
         }
@@ -544,6 +604,7 @@ where
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<bool> {
@@ -552,6 +613,13 @@ where
         // Can't split between fewer than two spans.
         if bundle.spans(live_ranges).len() < 2 {
             counts.split_between_spans_failed.inc();
+            event!(
+                events,
+                BundleSplitFailed {
+                    bundle,
+                    split: SplitKind::BetweenSpans,
+                }
+            );
             return Ok(false);
         }
 
@@ -620,27 +688,44 @@ where
 
         let Some((index, winner)) = best else {
             counts.split_between_spans_failed.inc();
+            event!(
+                events,
+                BundleSplitFailed {
+                    bundle,
+                    split: SplitKind::BetweenSpans,
+                }
+            );
             return Ok(false);
         };
 
-        let suffix = bundle.split_at_span(live_ranges, input, output, index)?;
+        let suffix = bundle.split_at_span(live_ranges, input, events, output, index)?;
+
+        event!(
+            events,
+            BundleSplitBetweenSpans {
+                bundle,
+                suffix,
+                at: first_span_start(live_ranges, suffix),
+                index,
+            }
+        );
 
         if let Some(reg) = winner {
             let mut winning_reg = RegSet::new();
             winning_reg.insert(reg);
 
-            suffix.add_hint(live_ranges, &winning_reg);
-            suffix.add_hint(live_ranges, &pref);
+            suffix.add_hint(live_ranges, events, &winning_reg, None);
+            suffix.add_hint(live_ranges, events, &pref, None);
 
-            bundle.add_hint(live_ranges, &winning_reg);
+            bundle.add_hint(live_ranges, events, &winning_reg, None);
             // Note: `bundle` already has a hint of `pref`, no need to add it
             // again.
         }
 
         // Push again with the same phase: we can afford to keep splitting
         // between spans until we can't split between spans anymore.
-        self.push_bundle(input, live_ranges, bundle, entry.phase());
-        self.push_bundle(input, live_ranges, suffix, entry.phase());
+        self.push_bundle(input, live_ranges, events, bundle, entry.phase());
+        self.push_bundle(input, live_ranges, events, suffix, entry.phase());
 
         Ok(true)
     }
@@ -655,6 +740,7 @@ where
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<bool> {
@@ -673,6 +759,13 @@ where
         });
         if !cuttable {
             counts.split_within_span_failed.inc();
+            event!(
+                events,
+                BundleSplitFailed {
+                    bundle,
+                    split: SplitKind::WithinSpan,
+                }
+            );
             return Ok(false);
         }
 
@@ -742,16 +835,33 @@ where
         self.split_spans.clear();
         self.split_uses.clear();
 
-        let suffix = bundle.split_at_point(live_ranges, input, output, cut.index, cut.at)?;
+        // Name the span before the split rewrites it in place.
+        let span = bundle
+            .spans(live_ranges)
+            .nth(cut.index)
+            .expect("a cut names one of the bundle's spans");
+
+        let suffix =
+            bundle.split_at_point(live_ranges, input, events, output, cut.index, cut.at)?;
+
+        event!(
+            events,
+            BundleSplitWithinSpan {
+                bundle,
+                suffix,
+                span,
+                at: cut.at,
+            }
+        );
 
         if let Some(reg) = winner {
             let mut winning_reg = RegSet::new();
             winning_reg.insert(reg);
 
-            suffix.add_hint(live_ranges, &winning_reg);
-            suffix.add_hint(live_ranges, &pref);
+            suffix.add_hint(live_ranges, events, &winning_reg, None);
+            suffix.add_hint(live_ranges, events, &pref, None);
 
-            bundle.add_hint(live_ranges, &winning_reg);
+            bundle.add_hint(live_ranges, events, &winning_reg, None);
             // Note: `bundle` already has a hint of `pref`.
         }
 
@@ -761,8 +871,8 @@ where
         // after that, then we will split into minimal bundles and/or spill.
         debug_assert!(entry.phase() <= Phase::SplitWithinSpan);
         let phase = Phase::SplitWithinSpan.next();
-        self.push_bundle(input, live_ranges, bundle, phase);
-        self.push_bundle(input, live_ranges, suffix, phase);
+        self.push_bundle(input, live_ranges, events, bundle, phase);
+        self.push_bundle(input, live_ranges, events, suffix, phase);
 
         Ok(true)
     }
@@ -778,6 +888,7 @@ where
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
     ) -> IResult<()> {
@@ -809,23 +920,53 @@ where
                 }
                 counts.spilled_bundles.inc();
                 self.stack_bundles.push(bundle);
+                event!(
+                    events,
+                    BundleSpilledToStack {
+                        bundle,
+                        region: bundle.region(live_ranges),
+                        forced: false,
+                    }
+                );
                 return Ok(());
             }
 
             let pref = bundle.preference(live_ranges).clone();
 
+            event!(
+                events,
+                BundleSplitIntoMinimal {
+                    bundle,
+                    num_pieces: cuts.len() + 1,
+                }
+            );
+
             for cut in cuts.drain(..).rev() {
                 let piece = match cut {
-                    Cut::BetweenSpans(k) => bundle.split_at_span(live_ranges, input, output, k)?,
+                    Cut::BetweenSpans(k) => {
+                        bundle.split_at_span(live_ranges, input, events, output, k)?
+                    }
                     Cut::WithinSpan(WithinSpanCut { index, at }) => {
-                        bundle.split_at_point(live_ranges, input, output, index, at)?
+                        bundle.split_at_point(live_ranges, input, events, output, index, at)?
                     }
                 };
-                piece.add_hint(live_ranges, &pref);
-                self.push_bundle(input, live_ranges, piece, Phase::SplitIntoMinimalOrSpill);
+                piece.add_hint(live_ranges, events, &pref, None);
+                self.push_bundle(
+                    input,
+                    live_ranges,
+                    events,
+                    piece,
+                    Phase::SplitIntoMinimalOrSpill,
+                );
             }
 
-            self.push_bundle(input, live_ranges, bundle, Phase::SplitIntoMinimalOrSpill);
+            self.push_bundle(
+                input,
+                live_ranges,
+                events,
+                bundle,
+                Phase::SplitIntoMinimalOrSpill,
+            );
             Ok(())
         })();
 
@@ -843,6 +984,18 @@ where
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Where `bundle`'s first span begins.
+fn first_span_start<E>(live_ranges: &LiveRanges<E>, bundle: LiveBundle<E>) -> LivePoint<E>
+where
+    E: EntityRepr,
+{
+    bundle
+        .spans(live_ranges)
+        .next()
+        .expect("a bundle always holds at least one span")
+        .start(live_ranges)
 }
 
 fn compute_bundle_priority<E>(
@@ -921,6 +1074,22 @@ pub enum Phase {
     /// If this is a minimal bundle, then we have to resort to spilling either
     /// this bundle or one of the others it conflicts with to the stack.
     SplitIntoMinimalOrSpill = 3,
+}
+
+/// A phase serializes as a camelCase string, matching the JSON's other tags.
+#[cfg(feature = "visualizer")]
+impl serde::Serialize for Phase {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::AssignEvict => "assignEvict",
+            Self::SplitBetweenSpans => "splitBetweenSpans",
+            Self::SplitWithinSpan => "splitWithinSpan",
+            Self::SplitIntoMinimalOrSpill => "splitIntoMinimalOrSpill",
+        })
+    }
 }
 
 impl Phase {
@@ -1038,6 +1207,17 @@ where
             .field("priority", &self.priority())
             .field("bundle", &self.bundle())
             .finish()
+    }
+}
+
+/// A priority serializes as the packed integer the queue orders by.
+#[cfg(feature = "visualizer")]
+impl serde::Serialize for Priority {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u32(self.bits)
     }
 }
 
@@ -1208,6 +1388,218 @@ mod tests {
     use super::*;
     use crate::machine::RegGroup;
     use std::{vec, vec::Vec};
+
+    #[cfg(feature = "visualizer")]
+    use crate::{context::Context, events::Event, test::TestInput};
+    #[cfg(feature = "visualizer")]
+    use mutatis::check::{Check, CheckResult};
+    #[cfg(feature = "visualizer")]
+    use std::{
+        collections::{BTreeMap, BTreeSet},
+        format,
+        string::String,
+    };
+
+    /// Run every phase up through region allocation.
+    ///
+    /// Returns `None` when allocation gave up on this input, e.g. because the
+    /// function needs more registers at once than the machine has; there is no
+    /// complete event log to check in that case.
+    #[cfg(feature = "visualizer")]
+    fn allocate(test_input: &TestInput) -> Result<Option<Context>, String> {
+        let mut context = Context::new();
+        assert!(context.is_reset());
+
+        let result = test_input.with_input(|input| -> IResult<()> {
+            let inner = &mut context.context32;
+            let ContextInner {
+                counts,
+                events,
+                rpo,
+                region_tree,
+                liveness,
+                live_ranges,
+                dfs,
+                output,
+                ..
+            } = inner;
+            let func = input.func;
+            rpo.construct(func, dfs, output)?;
+            region_tree.construct(func, counts, dfs, output)?;
+            liveness.construct(func, counts, rpo, output)?;
+            live_ranges.construct(input, counts, events, liveness, output)?;
+            crate::coalescing::coalesce(inner, input)?;
+            region_allocate(inner, input)
+        });
+
+        if result.is_err() {
+            return match context.context32.output.take_error() {
+                // Not every function fits on every machine, and that is not
+                // the event log's problem.
+                crate::error::InternalError::Error(Error::TooManyLiveRegs) => Ok(None),
+                error => Err(format!("allocation failed: {error:?}")),
+            };
+        }
+
+        Ok(Some(context))
+    }
+
+    /// Every bundle and every span that exists at the end of allocation can be
+    /// traced back to the event that created it.
+    ///
+    /// This is what keeps the visualizer's parent links trustworthy: a split
+    /// that forgets to log its parentage orphans a piece here.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn everything_has_a_provenance() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(1_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = allocate(test_input)? else {
+                    return Ok(());
+                };
+                let inner = &context.context32;
+                let live_ranges = &inner.live_ranges;
+
+                let mut constructed_bundles = BTreeSet::new();
+                let mut bundle_parents: BTreeMap<LiveBundle<u32>, usize> = BTreeMap::new();
+                let mut constructed_spans = BTreeSet::new();
+                let mut span_parents: BTreeMap<crate::live_ranges::LiveSpan<u32>, usize> =
+                    BTreeMap::new();
+
+                for (_, event) in inner.events.iter() {
+                    match *event {
+                        Event::BundleConstructed { bundle, .. } => {
+                            constructed_bundles.insert(bundle);
+                        }
+                        Event::BundleSplit { child, .. } => {
+                            *bundle_parents.entry(child).or_default() += 1;
+                        }
+                        Event::SpanConstructed { span, .. } => {
+                            constructed_spans.insert(span);
+                        }
+                        Event::SpanSplit {
+                            parent,
+                            first,
+                            second,
+                            ..
+                        } => {
+                            if first != parent {
+                                return Err(format!(
+                                    "a span split rewrites its first piece in place, so {first:?} \
+                                     should be {parent:?}"
+                                ));
+                            }
+                            *span_parents.entry(second).or_default() += 1;
+                        }
+                        _ => {}
+                    }
+                }
+
+                for bundle in live_ranges.bundles() {
+                    let parents = bundle_parents.get(&bundle).copied().unwrap_or(0);
+                    let constructed = constructed_bundles.contains(&bundle);
+                    if usize::from(constructed) + parents != 1 {
+                        return Err(format!(
+                            "{bundle:?} was constructed {} time(s) and split out of a parent \
+                             {parents} time(s); it should be exactly one of the two",
+                            usize::from(constructed),
+                        ));
+                    }
+                }
+
+                for span in live_ranges.spans() {
+                    let parents = span_parents.get(&span).copied().unwrap_or(0);
+                    let constructed = constructed_spans.contains(&span);
+                    if usize::from(constructed) + parents != 1 {
+                        return Err(format!(
+                            "{span:?} was constructed {} time(s) and cut out of a parent \
+                             {parents} time(s); it should be exactly one of the two",
+                            usize::from(constructed),
+                        ));
+                    }
+                }
+
+                Ok(())
+            })
+    }
+
+    /// The queue events tell the whole story of the queue: nothing is popped
+    /// that was not queued, and every pop ends in exactly one outcome.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn every_pop_is_queued_and_resolved() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(1_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = allocate(test_input)? else {
+                    return Ok(());
+                };
+
+                // The bundle each queue event names, and whether the event
+                // resolves a pop.
+                fn outcome(event: &Event<u32>) -> Option<LiveBundle<u32>> {
+                    match *event {
+                        Event::BundleAssignedPreferred { bundle, .. }
+                        | Event::BundleAssignedNonPreferred { bundle, .. }
+                        | Event::BundleAssignedViaEviction { bundle, .. }
+                        | Event::BundleSpilledToStack { bundle, .. }
+                        | Event::BundleSplitBetweenSpans { bundle, .. }
+                        | Event::BundleSplitWithinSpan { bundle, .. }
+                        | Event::BundleSplitIntoMinimal { bundle, .. } => Some(bundle),
+                        _ => None,
+                    }
+                }
+
+                let mut queued: BTreeMap<LiveBundle<u32>, usize> = BTreeMap::new();
+                let mut popped: Option<LiveBundle<u32>> = None;
+                let mut resolutions = 0;
+
+                for (_, event) in context.context32.events.iter() {
+                    match *event {
+                        Event::BundleQueued { bundle, .. } => {
+                            *queued.entry(bundle).or_default() += 1;
+                        }
+                        Event::BundleQueuePopped { bundle, .. } => {
+                            if let Some(prev) = popped
+                                && resolutions != 1
+                            {
+                                return Err(format!(
+                                    "popping {prev:?} led to {resolutions} outcomes, want 1"
+                                ));
+                            }
+                            match queued.get_mut(&bundle) {
+                                Some(n) if *n > 0 => *n -= 1,
+                                _ => return Err(format!("popped {bundle:?} without queueing it")),
+                            }
+                            popped = Some(bundle);
+                            resolutions = 0;
+                        }
+                        _ => {
+                            if outcome(event) == popped {
+                                resolutions += 1;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(prev) = popped
+                    && resolutions != 1
+                {
+                    return Err(format!(
+                        "popping {prev:?} led to {resolutions} outcomes, want 1"
+                    ));
+                }
+
+                // And the queue drains: every region finishes with an empty
+                // one.
+                if let Some((bundle, _)) = queued.iter().find(|&(_, &n)| n > 0) {
+                    return Err(format!("{bundle:?} was left on the queue"));
+                }
+
+                Ok(())
+            })
+    }
 
     const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
     const MAX_GROUP_SIZE: usize = PRIORITY_GROUP_SIZE_MAX;

@@ -4,6 +4,9 @@ use crate::{
     entity::{Block, EntityRepr, Region, Val},
     input::OperandConstraint,
     live_ranges::{LiveBundle, LivePoint, LiveSpan, Use},
+    machine::RegSet,
+    output::RegAllocation,
+    region_allocation::{Phase, Priority},
 };
 
 define_entities! {
@@ -39,6 +42,17 @@ pub enum RefusedReason {
 
     /// The two sets hold spans that are live at the same time.
     Overlap,
+}
+
+/// Which kind of split was attempted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+pub enum SplitKind {
+    /// Cutting a bundle between two of its spans.
+    BetweenSpans,
+
+    /// Cutting a bundle between two uses inside one of its spans.
+    WithinSpan,
 }
 
 /// Something the register allocator did.
@@ -147,6 +161,162 @@ where
         num_vals: usize,
         /// The merged constraint of all of its uses.
         constraint: OperandConstraint,
+    },
+
+    /// A bundle was pushed onto the allocation queue.
+    BundleQueued {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// The region it is allocated within.
+        region: Region<E>,
+        /// Its priority.
+        priority: Priority,
+        /// The phase it will be processed in.
+        phase: Phase,
+    },
+
+    /// A bundle was popped off the allocation queue.
+    BundleQueuePopped {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// The region it is allocated within.
+        region: Region<E>,
+        /// Its priority.
+        priority: Priority,
+        /// The phase it is being processed in.
+        phase: Phase,
+    },
+
+    /// A bundle got one of the registers it was hinted towards.
+    BundleAssignedPreferred {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// What it got.
+        alloc: RegAllocation<E>,
+    },
+
+    /// A bundle got a register it was not hinted towards.
+    BundleAssignedNonPreferred {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// What it got.
+        alloc: RegAllocation<E>,
+        /// What it wanted and did not get.
+        preference: RegSet,
+    },
+
+    /// A bundle got a register only by throwing another bundle out of it.
+    BundleAssignedViaEviction {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// What it got.
+        alloc: RegAllocation<E>,
+        /// The bundle it displaced.
+        evicted: LiveBundle<E>,
+    },
+
+    /// A bundle lost its register to a higher-priority bundle.
+    BundleEvicted {
+        /// The victim.
+        bundle: LiveBundle<E>,
+        /// The bundle that took its register.
+        by: LiveBundle<E>,
+        /// The register that changed hands.
+        alloc: RegAllocation<E>,
+    },
+
+    /// A bundle was cut in two between two of its spans.
+    BundleSplitBetweenSpans {
+        /// The bundle, which keeps the spans before the cut.
+        bundle: LiveBundle<E>,
+        /// The new bundle holding the spans after it.
+        suffix: LiveBundle<E>,
+        /// Where the suffix begins.
+        at: LivePoint<E>,
+        /// Which of the bundle's spans the suffix begins at.
+        index: usize,
+    },
+
+    /// A bundle was cut in two inside one of its spans.
+    BundleSplitWithinSpan {
+        /// The bundle, which keeps everything before the cut.
+        bundle: LiveBundle<E>,
+        /// The new bundle holding everything after it.
+        suffix: LiveBundle<E>,
+        /// The span that was cut.
+        span: LiveSpan<E>,
+        /// Where it was cut.
+        at: LivePoint<E>,
+    },
+
+    /// A split phase found nothing it was allowed to cut.
+    BundleSplitFailed {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// The kind of cut that was not available. Not named `kind`, which
+        /// the serialized form uses for the event's own name.
+        split: SplitKind,
+    },
+
+    /// A bundle was shredded into minimal pieces, as the last thing to try
+    /// before spilling.
+    BundleSplitIntoMinimal {
+        /// The bundle, which keeps the first piece.
+        bundle: LiveBundle<E>,
+        /// How many bundles it became, counting that first piece.
+        num_pieces: usize,
+    },
+
+    /// A bundle will live in memory rather than in a register.
+    BundleSpilledToStack {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// The region it is allocated within.
+        region: Region<E>,
+        /// Was it a constraint that put it there, rather than a failure to
+        /// find it a register?
+        forced: bool,
+    },
+
+    /// A bundle was biased towards a set of registers.
+    BundleHint {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// The registers it is now biased towards.
+        hint: RegSet,
+        /// The bundle in the region below that wanted the same registers, if
+        /// the hint crossed a region boundary.
+        from: Option<LiveBundle<E>>,
+    },
+
+    /// A bundle came from splitting another one.
+    ///
+    /// The only record of bundle parentage: nothing in the bundle itself says
+    /// where it came from.
+    BundleSplit {
+        /// The bundle that was split, which keeps the first piece.
+        parent: LiveBundle<E>,
+        /// The new bundle holding the second piece.
+        child: LiveBundle<E>,
+        /// The region both are allocated within.
+        region: Region<E>,
+    },
+
+    /// A span was cut in two by a bundle split.
+    ///
+    /// The first piece is written over the parent in place, so `first` is
+    /// always `parent`; only `second` is a new span.
+    SpanSplit {
+        /// The span that was cut.
+        parent: LiveSpan<E>,
+        /// The piece before the cut.
+        first: LiveSpan<E>,
+        /// The piece after it.
+        second: LiveSpan<E>,
+        /// Where it was cut.
+        at: LivePoint<E>,
+        /// The value both pieces hold.
+        val: Val<E>,
     },
 }
 

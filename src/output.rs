@@ -40,6 +40,27 @@ where
     RegGroup(RegGroup),
 }
 
+/// A register allocation serializes as its variant name wrapping a bare index,
+/// which is what tells the visualizer whether that index is a register or a
+/// register group.
+#[cfg(feature = "visualizer")]
+impl<E> serde::Serialize for RegAllocation<E>
+where
+    E: EntityRepr,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Reg(reg) => serializer.serialize_newtype_variant("RegAllocation", 0, "reg", reg),
+            Self::RegGroup(group) => {
+                serializer.serialize_newtype_variant("RegAllocation", 1, "regGroup", group)
+            }
+        }
+    }
+}
+
 /// Where a value lives on the stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum StackAllocation<E = u32>

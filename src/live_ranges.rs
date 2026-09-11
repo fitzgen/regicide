@@ -1392,6 +1392,7 @@ where
         self,
         live_ranges: &mut LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         i: usize,
     ) -> IResult<LiveBundle<E>> {
@@ -1440,6 +1441,14 @@ where
             suffix,
         )?;
         new.recompute_constraint(live_ranges, input);
+        event!(
+            events,
+            BundleSplit {
+                parent: self,
+                child: new,
+                region,
+            }
+        );
         Ok(new)
     }
 
@@ -1478,6 +1487,7 @@ where
         self,
         live_ranges: &mut LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         i: usize,
         at: LivePoint<E>,
@@ -1552,6 +1562,17 @@ where
         for u in hi_uses {
             live_ranges.use_span[u] = new_span;
         }
+
+        event!(
+            events,
+            SpanSplit {
+                parent: old,
+                first: old,
+                second: new_span,
+                at,
+                val,
+            }
+        );
 
         let prefix_len_spans = i + 1;
         let suffix_len_spans = n - i;
@@ -1650,6 +1671,15 @@ where
                 .sum::<usize>();
             debug_assert_eq!(self_len_uses + new_len_uses, orig_len_uses);
         }
+
+        event!(
+            events,
+            BundleSplit {
+                parent: self,
+                child: new,
+                region,
+            }
+        );
 
         Ok(new)
     }
@@ -1755,12 +1785,15 @@ where
         .as_f32()
     }
 
-    /// Bias this bundle towards the registers that `constraint` names.
+    /// Bias this bundle towards the registers that `constraint` names, on
+    /// behalf of `from`.
     pub(crate) fn hint(
         self,
         live_ranges: &mut LiveRanges<E>,
+        events: &mut EventsLog<E>,
         machine: &Machine,
         constraint: OperandConstraint,
+        from: Option<LiveBundle<E>>,
     ) {
         match constraint {
             // Fallthrough.
@@ -1775,9 +1808,10 @@ where
             OperandConstraint::Reuse(_) => unreachable!("constraints should already be resolved"),
         }
 
-        let data = &mut live_ranges.bundles[self];
-
-        let class = match data.constraint.merge_resolved(&constraint, machine) {
+        let class = match self
+            .constraint(live_ranges)
+            .merge_resolved(&constraint, machine)
+        {
             Some(OperandConstraint::Reg(intersection)) => intersection,
             Some(OperandConstraint::Any) | Some(OperandConstraint::Stack) | None => return,
             Some(OperandConstraint::Reuse(_)) => {
@@ -1791,15 +1825,31 @@ where
         };
 
         debug_assert!(!class.member_set(machine).is_empty());
-        data.add_hint(class.member_set(machine).clone());
+
+        // Via `add_hint`, so that every hint is logged in one place.
+        self.add_hint(live_ranges, events, class.member_set(machine), from);
     }
 
-    /// Bias this bundle towards `regs`.
-    pub(crate) fn add_hint(self, live_ranges: &mut LiveRanges<E>, regs: &RegSet) {
+    /// Bias this bundle towards `regs`, on behalf of `from`.
+    pub(crate) fn add_hint(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        events: &mut EventsLog<E>,
+        regs: &RegSet,
+        from: Option<LiveBundle<E>>,
+    ) {
         if regs.is_empty() {
             return;
         }
         live_ranges.bundles[self].add_hint(regs.clone());
+        event!(
+            events,
+            BundleHint {
+                bundle: self,
+                hint: regs.clone(),
+                from,
+            }
+        );
     }
 
     /// Recompute this bundle's constraint from the spans it currently holds.
@@ -3354,6 +3404,7 @@ mod tests {
 
         for prefix_end in 1..num_cut_spans {
             let (mut live_ranges, spans) = build();
+            let mut events = EventsLog::<u32>::new();
             let mut output = OutputInner::<u32>::new();
             let (cut, rest) = (evens(&spans), odds(&spans));
 
@@ -3382,7 +3433,13 @@ mod tests {
 
             let suffix = test_input
                 .with_input(|input| {
-                    prefix.split_at_span(&mut live_ranges, input, &mut output, prefix_end)
+                    prefix.split_at_span(
+                        &mut live_ranges,
+                        input,
+                        &mut events,
+                        &mut output,
+                        prefix_end,
+                    )
                 })
                 .unwrap();
 
@@ -3549,6 +3606,7 @@ mod tests {
                 let (probe, spans) = build();
                 for at in cut_points(&probe, spans[i]) {
                     let (mut live_ranges, spans) = build();
+                    let mut events = EventsLog::<u32>::new();
                     let mut output = OutputInner::<u32>::new();
                     let leftovers = odds(&live_ranges.spans().collect::<Vec<_>>());
 
@@ -3606,7 +3664,14 @@ mod tests {
 
                     let suffix = test_input
                         .with_input(|input| {
-                            bundle.split_at_point(&mut live_ranges, input, &mut output, i, at)
+                            bundle.split_at_point(
+                                &mut live_ranges,
+                                input,
+                                &mut events,
+                                &mut output,
+                                i,
+                                at,
+                            )
                         })
                         .unwrap();
 
