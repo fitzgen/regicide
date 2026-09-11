@@ -3,6 +3,7 @@
 //! ```text
 //! cargo run --example visualize --all-features -- /tmp/regicide.html
 //! cargo run --example visualize --all-features -- -s 42 -i 200 /tmp/other.html
+//! cargo run --example visualize --all-features -- -r 8 /tmp/roomy.html
 //! ```
 //!
 //! The function is always a `regicide::test::TestInput`, mutated `--iters`
@@ -16,16 +17,23 @@
 //! not a random one, and any page can be asked for again by repeating the two
 //! numbers printed to stderr.
 
-use regicide::{Context, Error, Input, InputFunction, test::TestInput};
+use regicide::{
+    Context, Error, Input, InputFunction,
+    test::{TestInput, TestMachine},
+};
 use std::{env, process};
 
 const USAGE: &str = "\
-usage: visualize [-s SEED] [-i ITERS] <path.html>
+usage: visualize [-s SEED] [-i ITERS] [-r REGS] <path.html>
 
   -s, --seed SEED    seed the `mutatis::Session` that mutates the input
                      (default 21)
   -i, --iters ITERS  mutate it this many times (default 100); 0 means the
                      unmutated default `TestInput`
+  -r, --regs REGS    give every register bank this many registers, keeping
+                     the machine's shape; 1 to 64, and a two-bank machine
+                     ends up with twice as many (default: whatever the
+                     mutations produced, which is at most four per bank)
   -h, --help         print this message";
 
 /// The seed the page is built with when `--seed` was not given.
@@ -53,9 +61,20 @@ fn main() {
     // be asked for again.
     let seed = args.seed.unwrap_or(DEFAULT_SEED);
     let iters = args.iters.unwrap_or(DEFAULT_ITERS);
-    eprintln!("mutating the default TestInput: seed {seed}, {iters} iterations");
+    let regs = match args.regs {
+        Some(regs) => format!("{regs} regs per bank"),
+        None => "generated registers".to_string(),
+    };
+    eprintln!("mutating the default TestInput: seed {seed}, {iters} iterations, {regs}");
 
     let mut input = TestInput::default();
+    // Before the mutations rather than after, so the input is built against
+    // the machine it will be allocated on. The count lives on the machine, so
+    // each mutation's `fixup` re-applies it rather than undoing it.
+    if let Some(regs) = args.regs {
+        input.machine.set_regs_per_bank(regs);
+        input.fixup();
+    }
     let mut session = mutatis::Session::new().seed(seed);
     for i in 0..iters {
         if let Err(e) = session.mutate(&mut input) {
@@ -80,7 +99,7 @@ fn emit(input: &Input<'_, impl InputFunction>, path: &str) {
         Err(Error::TooManyLiveRegs) => {
             eprintln!(
                 "this input needs more registers at one point than its machine has; \
-                 try another --seed"
+                 try another --seed, or more --regs"
             );
             process::exit(1);
         }
@@ -102,6 +121,7 @@ struct Args {
     path: String,
     seed: Option<u64>,
     iters: Option<u64>,
+    regs: Option<usize>,
 }
 
 impl Args {
@@ -110,6 +130,7 @@ impl Args {
         let mut path = None;
         let mut seed = None;
         let mut iters = None;
+        let mut regs = None;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -136,6 +157,20 @@ impl Args {
                 }
                 "-s" | "--seed" => seed = Some(number(&name, &value(&name)?)?),
                 "-i" | "--iters" => iters = Some(number(&name, &value(&name)?)?),
+                "-r" | "--regs" => {
+                    // Range-checked here rather than left to
+                    // `set_regs_per_bank`'s assertion: a number out of range
+                    // is the user's typo, and a panic is a poor way to say so.
+                    let n = number(&name, &value(&name)?)?;
+                    let most = TestMachine::MAX_REGS_PER_BANK_TARGET;
+                    // Through `try_from`, so that a number too large for a
+                    // `usize` is this message rather than a panic.
+                    let within = usize::try_from(n).is_ok_and(|n| (1..=most).contains(&n));
+                    if !within {
+                        return Err(format!("{name} wants 1 to {most} registers, not {n}"));
+                    }
+                    regs = Some(usize::try_from(n).unwrap());
+                }
                 _ if name.starts_with('-') => return Err(format!("unknown flag {name}")),
                 _ if path.is_some() => return Err(format!("more than one path: {name}")),
                 _ => path = Some(name),
@@ -143,7 +178,12 @@ impl Args {
         }
 
         match path {
-            Some(path) => Ok(Args { path, seed, iters }),
+            Some(path) => Ok(Args {
+                path,
+                seed,
+                iters,
+                regs,
+            }),
             None => Err("no output path".to_string()),
         }
     }

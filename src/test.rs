@@ -1415,6 +1415,19 @@ impl<'a> InputInst<'a> for TestInst<'a> {
 #[derive(Clone, Debug, Hash)]
 pub struct TestMachine {
     banks: Vec<TestBank>,
+
+    /// How many registers every bank should have, or `None` for however many
+    /// the mutator happened to generate.
+    ///
+    /// The visualizer example's `--regs` knob, and the reason it lives here
+    /// rather than being applied by the caller: [`TestInputMutator`] calls
+    /// [`TestMachine::fixup`] after every mutation, and `fixup` is what
+    /// decides how many registers a bank has. A count set from outside would
+    /// be undone by the next mutation; a count set here is re-applied by it.
+    ///
+    /// Every bank, not a total: the mutated machine's shape is kept, so
+    /// `Some(8)` on a two-bank machine is sixteen registers.
+    regs_per_bank: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Hash, Mutate)]
@@ -1474,7 +1487,10 @@ impl Default for TestClassMembers {
 
 impl Default for TestMachine {
     fn default() -> Self {
-        let mut machine = TestMachine { banks: Vec::new() };
+        let mut machine = TestMachine {
+            banks: Vec::new(),
+            regs_per_bank: None,
+        };
         machine.fixup();
         machine
     }
@@ -1490,6 +1506,16 @@ impl TestMachine {
     const MAX_NON_ALLOCATABLE_PER_BANK: u8 = 2;
     const MAX_GROUPS_PER_BANK: usize = 3;
     const MAX_CLASSES_PER_BANK: usize = 4;
+
+    /// The most registers per bank that [`TestMachine::set_regs_per_bank`] will
+    /// take.
+    ///
+    /// Deliberately far above `MAX_REGS_PER_BANK`, which bounds the machines
+    /// the mutator *generates* and so the shape of every property test: this
+    /// bounds only what a caller may ask for. Well inside the real ceilings --
+    /// `Reg::MAX` and `RegUnit::MAX` are both 512, and two banks of sixty-four
+    /// two-unit registers is 256 units.
+    pub const MAX_REGS_PER_BANK_TARGET: usize = 64;
 
     /// The widest a generated register may be, in register units.
     const MAX_REG_UNITS: u8 = 2;
@@ -1540,6 +1566,7 @@ impl TestMachine {
                     },
                 ],
             }],
+            regs_per_bank: None,
         };
         machine.fixup();
         machine
@@ -1568,6 +1595,7 @@ impl TestMachine {
                     spill_cost: 0,
                 }],
             }],
+            regs_per_bank: None,
         };
         machine.fixup();
         machine
@@ -1640,6 +1668,7 @@ impl TestMachine {
                     }],
                 },
             ],
+            regs_per_bank: None,
         };
         machine.fixup();
         machine
@@ -1679,6 +1708,30 @@ impl TestMachine {
         self.banks.iter().map(|bank| bank.classes.len()).sum()
     }
 
+    /// Give every bank exactly `n` registers, now and after every later
+    /// [`TestMachine::fixup`].
+    ///
+    /// The machine's shape survives: banks, groups, non-allocatable registers
+    /// and classes are all still whatever they were, so this widens a machine
+    /// rather than replacing it. `n` is per bank, so a two-bank machine ends
+    /// up with `2 * n` registers.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `n` is between one and
+    /// [`TestMachine::MAX_REGS_PER_BANK_TARGET`]: a bank needs one register
+    /// the allocator owns for stack-to-stack moves, and the ceiling is what
+    /// keeps the derived register classes inside the real entity limits.
+    pub fn set_regs_per_bank(&mut self, n: usize) {
+        assert!(
+            (1..=Self::MAX_REGS_PER_BANK_TARGET).contains(&n),
+            "regs per bank must be between 1 and {}, not {n}",
+            Self::MAX_REGS_PER_BANK_TARGET,
+        );
+        self.regs_per_bank = Some(n);
+        self.fixup();
+    }
+
     /// Repair this description so that [`TestMachine::build`] cannot fail.
     pub fn fixup(&mut self) {
         self.banks.truncate(Self::MAX_BANKS);
@@ -1691,7 +1744,14 @@ impl TestMachine {
 
             // A bank needs a register that the allocator owns for
             // stack-to-stack moves.
-            bank.regs.truncate(Self::MAX_REGS_PER_BANK);
+            let target = self.regs_per_bank.unwrap_or(Self::MAX_REGS_PER_BANK);
+            bank.regs.truncate(target);
+            if self.regs_per_bank.is_some() {
+                // Padded with the narrowest register, so that a wider bank is
+                // a bank with more places to put a value rather than one with
+                // wider values in it.
+                bank.regs.resize(target, 1);
+            }
             if bank.regs.is_empty() {
                 bank.regs.push(1);
             }
@@ -1745,6 +1805,25 @@ impl TestMachine {
                         dedupe_keeping_first(regs);
                         if regs.is_empty() {
                             regs.push(0);
+                        }
+                        // A widened bank's new registers have to reach a
+                        // class, or they are registers the allocator can see
+                        // and never use: the repair above only reduces member
+                        // indices modulo `num_regs`, it never adds members, so
+                        // padding alone would widen the machine without
+                        // loosening the allocation by a single register.
+                        //
+                        // Appended, so the class's original members stay at
+                        // the front and its preference order survives. Classes
+                        // of groups are left alone: one class holds groups of
+                        // one size, and there is no group to put a lone new
+                        // register in.
+                        if self.regs_per_bank.is_some() {
+                            for reg in 0..u8::try_from(num_regs).unwrap() {
+                                if !regs.contains(&reg) {
+                                    regs.push(reg);
+                                }
+                            }
                         }
                     }
 
@@ -1839,7 +1918,7 @@ impl Mutate<TestMachine> for TestMachineMutator {
         machine: &mut TestMachine,
     ) -> mutatis::Result<()> {
         <Vec<TestBank> as DefaultMutate>::DefaultMutate::default()
-            .proj(|TestMachine { banks }: &mut TestMachine| banks)
+            .proj(|TestMachine { banks, .. }: &mut TestMachine| banks)
             .map(|_ctx, m| {
                 m.fixup();
                 Ok(())
@@ -1852,6 +1931,7 @@ impl Generate<TestMachine> for TestMachineMutator {
     fn generate(&mut self, context: &mut mutatis::Context) -> mutatis::Result<TestMachine> {
         let mut machine = TestMachine {
             banks: <Vec<TestBank> as DefaultMutate>::DefaultMutate::default().generate(context)?,
+            regs_per_bank: None,
         };
         machine.fixup();
         Ok(machine)
@@ -4223,6 +4303,61 @@ mod tests {
 
                 Ok(())
             })
+    }
+
+    /// A register count set with `set_regs_per_bank` survives every later
+    /// mutation, and every register it adds reaches a class.
+    ///
+    /// This is the whole reason the count lives on `TestMachine` rather than
+    /// being applied by the caller: `TestInputMutator` runs `fixup` after
+    /// every mutation, and `fixup` is what decides how many registers a bank
+    /// has. Padding without the class pass would be just as useless -- the
+    /// allocator would see registers that no operand constraint can name --
+    /// so both halves are checked here.
+    #[test]
+    fn a_register_count_survives_mutation() {
+        const REGS: usize = 9;
+
+        let check = |input: &TestInput, when: &str| {
+            for (i, bank) in input.machine.banks.iter().enumerate() {
+                assert_eq!(
+                    bank.regs.len(),
+                    REGS,
+                    "bank {i} has {} registers {when}, not {REGS}",
+                    bank.regs.len(),
+                );
+                for class in &bank.classes {
+                    if let TestClassMembers::Regs(regs) = &class.members {
+                        assert_eq!(
+                            regs.len(),
+                            REGS,
+                            "a class of bank {i} holds {} of its {REGS} registers {when}",
+                            regs.len(),
+                        );
+                    }
+                }
+            }
+            // And the machine still builds, which is what says the widened
+            // description is a legal one.
+            input.machine.build();
+        };
+
+        // From a machine with register groups as well as the default one: a
+        // bank with groups is where padding could go wrong, since a class of
+        // groups is deliberately left as it was.
+        for machine in [TestMachine::default(), TestMachine::groups_and_registers()] {
+            let mut input = TestInput::default();
+            input.machine = machine;
+            input.machine.set_regs_per_bank(REGS);
+            input.fixup();
+            check(&input, "to begin with");
+
+            let mut session = mutatis::Session::new().seed(0);
+            for i in 0..1_000 {
+                session.mutate(&mut input).unwrap();
+                check(&input, &format!("after mutation {i}"));
+            }
+        }
     }
 
     /// Build a valid function of `num_blocks` blocks with `insts_per_block`
