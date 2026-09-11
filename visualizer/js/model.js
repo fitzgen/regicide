@@ -20,6 +20,9 @@ export function createModel(json) {
 
   const func = json.function || {};
   let outline = null;
+  // Both are built on first use: the indexes they need are proportional to the
+  // whole function, and a page whose user never clicks anything never pays.
+  let details = null;
   const index = json.index || {};
   const byEntity = index.byEntity || {};
 
@@ -44,10 +47,10 @@ export function createModel(json) {
     event: (i) => (json.events || [])[i],
     entity: (ref) => ({ ref, events: entityEvents(ref) }),
 
-    // The details pane. Commit 10. The result carries its own `ref` back, so
-    // that the main thread can cache it without tracking which request it
-    // answered.
-    details: (ref) => ({ ref, fields: [], events: [] }),
+    // The details pane. The result carries its own `ref` back, so that the
+    // main thread can cache it without tracking which request it answered,
+    // and `null` says there is no such entity.
+    details: (ref) => (details ||= buildDetails(json, entityEvents)).details(ref),
 
     // The event log tab's search. Commit 11.
     searchEvents: (_query) => [],
@@ -358,3 +361,516 @@ function buildBars(spans, instRows) {
   }
   return bars;
 }
+
+// ---------------------------------------------------------------------------
+// The details pane.
+//
+// One field list per entity kind, in the order the spec lists them, plus the
+// events that name the entity. Every field's value is the same `parts` array
+// the function outline uses, so the view renders a clickable entity reference
+// in exactly one place.
+
+// How many entries of a list, or events, are rendered. An entity in a large
+// function can appear in thousands of events, and the pane is not the event
+// log; `count` is always the true total, so the view can say "200 of 1,204".
+const DETAILS_CAP = 200;
+
+// Build the details machinery over a parsed blob.
+//
+// Everything it cross-references -- which spans a value has, which region a
+// block is in, which spans are live at an instruction -- is indexed once here.
+// Doing any of it per query is a scan of the whole function per click.
+function buildDetails(json, entityEvents) {
+  const func = json.function || {};
+  const machine = json.machine || {};
+  const eventSchema = (json.schema || {}).events || {};
+
+  const blocks = func.blocks || [];
+  const insts = func.insts || [];
+  const regions = func.regions || [];
+  const spans = func.spans || [];
+  const bundles = func.bundles || [];
+  const uses = func.uses || [];
+  const slots = func.spillSlots || [];
+  const regs = machine.regs || [];
+  const classes = machine.classes || [];
+  const banks = machine.banks || [];
+  const regGroups = machine.regGroups || [];
+
+  // Values have no array of their own in the blob -- nothing about a value is
+  // worth storing that its def, spans and uses do not already say -- so the
+  // range check has to come from the highest index anything mentions.
+  let valCount = 0;
+  const note = (val) => (valCount = Math.max(valCount, val + 1));
+  for (const span of spans) note(span.val);
+  for (const inst of insts) for (const operand of inst.operands) note(operand.val);
+  for (const block of blocks) {
+    for (const val of block.params) note(val);
+    for (const args of block.callArgs) for (const val of args) note(val);
+  }
+
+  // val -> its spans, uses and bundles, all in ascending order.
+  const spansOf = group(spans.length, (i) => spans[i].val);
+  const usesOf = group(uses.length, (i) => spans[uses[i].span].val);
+  const bundlesOf = new Map();
+  for (const [val, list] of spansOf) {
+    const seen = [];
+    for (const i of list) {
+      const bundle = spans[i].bundle;
+      if (bundle !== null && !seen.includes(bundle)) seen.push(bundle);
+    }
+    bundlesOf.set(val, seen);
+  }
+
+  // val -> where it comes into existence, as parts. An operand or a block
+  // parameter; a value with neither is one nothing defines, which is legal
+  // input and renders as `none`.
+  const defOf = new Map();
+  blocks.forEach((block, b) => {
+    block.params.forEach((val, i) => {
+      if (!defOf.has(val)) defOf.set(val, [entity("Block", b), text(" param " + i)]);
+    });
+  });
+  insts.forEach((inst, i) => {
+    inst.operands.forEach((operand) => {
+      if (operand.defUse !== "def" || defOf.has(operand.val)) return;
+      defOf.set(operand.val, [entity("Inst", i), text(" " + operand.pos)]);
+    });
+  });
+
+  // block -> the region that owns it, which is what makes an edge "incoming".
+  const regionOf = new Map();
+  regions.forEach((region, i) => {
+    if (region === null) return;
+    for (const block of region.blocks) regionOf.set(block, i);
+  });
+
+  // inst -> the spans live at either of its points. A span is live during an
+  // instruction when it brackets one of them, which includes spans with no use
+  // in the instruction at all.
+  const spansAt = new Map();
+  insts.forEach((_inst, i) => spansAt.set(i, []));
+  spans.forEach((span, i) => {
+    const from = Math.floor(at(span.start) / 2);
+    const to = Math.floor(at(span.end) / 2);
+    for (let inst = from; inst <= to; inst++) {
+      const list = spansAt.get(inst);
+      if (list !== undefined) list.push(i);
+    }
+  });
+
+  // slot -> the value that lives in it, and the instructions and edges whose
+  // edits touch it. Neither is stored: a slot knows only its size.
+  const valOfSlot = new Map();
+  for (const span of spans) {
+    const ref = allocationRef(span.allocation);
+    if (ref && ref.kind === "SpillSlot" && !valOfSlot.has(ref.index)) {
+      valOfSlot.set(ref.index, span.val);
+    }
+  }
+  const usersOfSlot = new Map();
+  const touches = (slot, parts) => {
+    const list = usersOfSlot.get(slot);
+    if (list === undefined) usersOfSlot.set(slot, [parts]);
+    else list.push(parts);
+  };
+  insts.forEach((inst, i) => {
+    for (const edit of inst.edits) {
+      for (const slot of editSlots(edit.edit)) touches(slot, [entity("Inst", i)]);
+    }
+  });
+  blocks.forEach((block, b) => {
+    for (const edge of block.edgeEdits) {
+      for (const slot of editSlots(edge.edit)) {
+        touches(slot, [entity("Block", b), text(" edge " + edge.succ)]);
+      }
+    }
+  });
+
+  // group -> its slots, the other direction of `spillSlots[i].group`.
+  const slotsOfGroup = group(slots.length, (i) => slots[i].group);
+
+  // The parts for an entity as the other panes spell it.
+  const spanParts = (i) => [
+    entity("LiveSpan", i),
+    text("("),
+    ...valueParts(spans[i].val, spans[i].allocation),
+    text(")"),
+  ];
+  const blockWith = (b, vals) => [
+    entity("Block", b),
+    text("("),
+    ...joinParts(vals.map((val) => [entity("Val", val)])),
+    text(")"),
+  ];
+  const edgeParts = (from, to) => [entity("Block", from), text(" -> "), entity("Block", to)];
+
+  // The fields of one entity, or `null` when there is no such entity. A
+  // `switch` over the Rust type name: the kind is what the blob's `schema`
+  // speaks in, and re-deriving it from a display prefix would be a parser.
+  function fieldsOf(ref) {
+    const i = ref.index;
+    switch (ref.kind) {
+      case "Val": {
+        if (!inRange(i, valCount)) return null;
+        return [
+          { label: "Def", value: defOf.get(i) || none() },
+          listField("Uses", "Use", usesOf.get(i) || []),
+          list("Spans", (spansOf.get(i) || []).map(spanParts), (spansOf.get(i) || []).length),
+          listField("Bundles", "LiveBundle", bundlesOf.get(i) || []),
+        ];
+      }
+
+      case "Block": {
+        const block = blocks[i];
+        if (block === undefined) return null;
+        // The arguments a predecessor passes ride on its own outgoing edge, so
+        // each edge has to be found from the other end -- and counted, since a
+        // conditional whose arms share a target appears twice in both lists
+        // and passes its own arguments along each.
+        const nth = new Map();
+        const preds = block.predecessors.map((p) => {
+          const n = nth.get(p) || 0;
+          nth.set(p, n + 1);
+          const edges = [];
+          blocks[p].successors.forEach((s, e) => s === i && edges.push(e));
+          const edge = edges[n];
+          return blockWith(p, edge === undefined ? [] : blocks[p].callArgs[edge] || []);
+        });
+        const succs = block.successors.map((s) => blockWith(s, blocks[s].params));
+        return [
+          { label: "Frequency", value: [text(num(block.frequency))] },
+          listField("Instructions", "Inst", block.insts),
+          list("Predecessors", preds, preds.length),
+          list("Successors", succs, succs.length),
+          list("Live-in spans", block.liveInSpans.map(spanParts), block.liveInSpans.length),
+          list("Live-out spans", block.liveOutSpans.map(spanParts), block.liveOutSpans.length),
+        ];
+      }
+
+      case "Use": {
+        const use = uses[i];
+        if (use === undefined) return null;
+        const inst = insts[use.point.inst];
+        const operand = inst === undefined ? undefined : inst.operands[use.operand];
+        return [
+          {
+            label: "Constraint",
+            value: operand === undefined ? none() : constraintParts(operand.constraint),
+          },
+          { label: "Operand", value: [text(String(use.operand))] },
+          { label: "Instruction", value: pointParts(use.point) },
+          { label: "Spill weight", value: [text(num(use.weight))] },
+        ];
+      }
+
+      case "LiveSpan": {
+        const span = spans[i];
+        if (span === undefined) return null;
+        const weight = span.uses.reduce((sum, u) => sum + (uses[u] ? uses[u].weight : 0), 0);
+        return [
+          { label: "Value", value: [entity("Val", span.val)] },
+          { label: "Bundle", value: span.bundle === null ? none() : [entity("LiveBundle", span.bundle)] },
+          { label: "Allocation", value: allocationParts(span.allocation) },
+          { label: "Constraint", value: constraintParts(span.constraint) },
+          // Summed from its uses: weight is recorded per use, because that is
+          // where it is earned.
+          { label: "Weight", value: [text(num(weight))] },
+          { label: "Start", value: pointParts(span.start) },
+          { label: "End", value: pointParts(span.end) },
+          {
+            label: "Split off of",
+            value: span.parent === null
+              ? none()
+              : [entity("LiveSpan", span.parent.parent), text(" at "), ...pointParts(span.parent.at)],
+          },
+          { label: "Block", value: [entity("Block", span.block)] },
+          listField("Uses", "Use", span.uses),
+        ];
+      }
+
+      case "LiveBundle": {
+        const bundle = bundles[i];
+        if (bundle === undefined) return null;
+        const vals = [];
+        for (const s of bundle.spans) if (!vals.includes(spans[s].val)) vals.push(spans[s].val);
+        return [
+          { label: "Allocation", value: allocationParts(bundle.allocation) },
+          { label: "Constraint", value: constraintParts(bundle.constraint) },
+          listField("Hint", "Reg", bundle.preference),
+          {
+            label: "Split off of",
+            value: bundle.parent === null ? none() : [entity("LiveBundle", bundle.parent)],
+          },
+          list("Spans", bundle.spans.map(spanParts), bundle.spans.length),
+          listField("Values", "Val", vals),
+          { label: "Region", value: [entity("Region", bundle.region)] },
+          { label: "Spill weight", value: [text(num(bundle.spillWeight))] },
+          { label: "Minimal", value: [text(bundle.isMinimal ? "yes" : "no")] },
+        ];
+      }
+
+      case "Region": {
+        const region = regions[i];
+        if (region === undefined || region === null) return null;
+        const incoming = [];
+        const outgoing = [];
+        for (const b of region.blocks) {
+          for (const p of blocks[b].predecessors) {
+            if (regionOf.get(p) !== i) incoming.push(edgeParts(p, b));
+          }
+          for (const s of blocks[b].successors) {
+            if (regionOf.get(s) !== i) outgoing.push(edgeParts(b, s));
+          }
+        }
+        return [
+          { label: "Parent", value: region.parent === null ? none() : [entity("Region", region.parent)] },
+          listField("Children", "Region", region.children),
+          listField("Blocks", "Block", region.blocks),
+          list("Incoming edges", incoming, incoming.length),
+          list("Outgoing edges", outgoing, outgoing.length),
+          listField("Bundles", "LiveBundle", region.bundles),
+          { label: "Depth", value: [text(String(region.depth))] },
+        ];
+      }
+
+      case "Inst": {
+        const inst = insts[i];
+        if (inst === undefined) return null;
+        const live = spansAt.get(i) || [];
+        const operands = inst.operands.map((operand, n) => [
+          text(n + ": " + operand.defUse + " " + operand.pos + " "),
+          entity("Val", operand.val),
+          text(" "),
+          ...constraintParts(operand.constraint),
+        ]);
+        return [
+          list("Live spans", live.map(spanParts), live.length),
+          { label: "Block", value: [entity("Block", inst.block)] },
+          list("Operands", operands, operands.length),
+          list("Edits", inst.edits.map((edit) => editParts(edit.edit)), inst.edits.length),
+        ];
+      }
+
+      case "SpillSlot": {
+        const slot = slots[i];
+        if (slot === undefined) return null;
+        const val = valOfSlot.get(i);
+        const users = usersOfSlot.get(i) || [];
+        return [
+          {
+            label: "Value",
+            value: slot.emergency
+              ? [text("none; an emergency slot, borrowed to break a move cycle")]
+              : val === undefined
+                ? none()
+                : [entity("Val", val)],
+          },
+          { label: "Size", value: [text(slot.size + (slot.size === 1 ? " byte" : " bytes"))] },
+          list("Used by", users, users.length),
+          { label: "Group", value: slot.group === null ? none() : [entity("SpillSlotGroup", slot.group)] },
+        ];
+      }
+
+      case "SpillSlotGroup": {
+        const members = slotsOfGroup.get(i);
+        if (members === undefined) return null;
+        return [listField("Members", "SpillSlot", members)];
+      }
+
+      case "Reg": {
+        const reg = regs[i];
+        if (reg === undefined) return null;
+        return [
+          { label: "Bank", value: [entity("RegBank", reg.bank)] },
+          listField("Classes", "RegClass", reg.classes),
+          listField("Groups", "RegGroup", reg.groups),
+          { label: "Allocatable", value: [text(reg.allocatable ? "yes" : "no")] },
+        ];
+      }
+
+      case "RegClass": {
+        const cls = classes[i];
+        if (cls === undefined) return null;
+        // A group class's members are groups; a plain one's are registers.
+        // One field either way, because the pane asks the same question.
+        return [
+          { label: "Bank", value: [entity("RegBank", cls.bank)] },
+          cls.isGroup
+            ? listField("Members", "RegGroup", cls.groups)
+            : listField("Members", "Reg", cls.regs),
+          { label: "Spill cost", value: [text(num(cls.spillCost))] },
+          { label: "Derived", value: [text(cls.derived ? "yes" : "no")] },
+        ];
+      }
+
+      case "RegGroup": {
+        const regGroup = regGroups[i];
+        if (regGroup === undefined) return null;
+        return [
+          listField("Members", "Reg", regGroup.members),
+          { label: "Bank", value: [entity("RegBank", regGroup.bank)] },
+        ];
+      }
+
+      case "RegBank": {
+        const bank = banks[i];
+        if (bank === undefined) return null;
+        return [
+          listField("Registers", "Reg", bank.regs),
+          listField("Classes", "RegClass", bank.classes),
+          listField("Non-allocatable", "Reg", bank.nonAllocatable),
+          { label: "Slot size", value: [text(bank.size + (bank.size === 1 ? " byte" : " bytes"))] },
+        ];
+      }
+
+      default:
+        return null;
+    }
+  }
+
+  return {
+    details(ref) {
+      const fields = fieldsOf(ref);
+      if (fields === null) return null;
+      const indices = entityEvents(ref);
+      return {
+        ref,
+        fields,
+        // The true total beside the capped list, like every other list here.
+        eventCount: indices.length,
+        events: indices.slice(0, DETAILS_CAP).map((index) => ({
+          index,
+          kind: (json.events || [])[index].kind,
+          summary: summarizeEvent((json.events || [])[index], eventSchema),
+        })),
+      };
+    },
+  };
+}
+
+// Invert a mapping from index to key, dropping `null` keys.
+function group(length, keyOf) {
+  const out = new Map();
+  for (let i = 0; i < length; i++) {
+    const key = keyOf(i);
+    if (key === null || key === undefined) continue;
+    const list = out.get(key);
+    if (list === undefined) out.set(key, [i]);
+    else list.push(i);
+  }
+  return out;
+}
+
+// A field with no value. Text, not an empty list: an empty field on screen
+// reads as a rendering bug rather than as an answer.
+const none = () => [text("none")];
+
+const inRange = (index, length) => Number.isInteger(index) && index >= 0 && index < length;
+
+// Parts lists joined by `sep`, flattened into one parts list.
+function joinParts(items, sep = ", ") {
+  const out = [];
+  items.forEach((parts, i) => {
+    if (i > 0) out.push(text(sep));
+    out.push(...parts);
+  });
+  return out;
+}
+
+// A field holding a list. `count` is the true total and the value is what
+// survived the cap, so the two disagree exactly when the list was truncated.
+function list(label, items, count) {
+  const shown = items.slice(0, DETAILS_CAP);
+  const value = count === 0 ? none() : joinParts(shown);
+  if (count > shown.length) value.push(text(", …and " + (count - shown.length) + " more"));
+  return { label, count, value };
+}
+
+const listField = (label, kind, indices) =>
+  list(label, indices.map((i) => [entity(kind, i)]), indices.length);
+
+// A float as short as it can be written without lying about it.
+const num = (value) => String(Math.round(value * 1e4) / 1e4);
+
+// `inst3:early`, with the instruction clickable.
+const pointParts = (point) => [entity("Inst", point.inst), text(":" + point.pos)];
+
+// `any`, `stack`, or `reg rc2`.
+const constraintParts = (constraint) =>
+  typeof constraint === "string"
+    ? [text(constraint)]
+    : [text("reg "), entity("RegClass", constraint.reg)];
+
+// The entity an allocation names, as parts.
+function allocationParts(allocation) {
+  const ref = allocationRef(allocation);
+  return ref === null ? none() : [entity(ref.kind, ref.index)];
+}
+
+// The spill slots an edit reads or writes.
+function editSlots(edit) {
+  if (edit.criticalEdge) return editSlots(edit.criticalEdge.edit);
+  const move = edit.move;
+  if (move && move.spill) return [move.spill.to];
+  if (move && move.reload) return [move.reload.from];
+  return [];
+}
+
+// One event as a single line of parts.
+//
+// Schema-driven rather than a switch over forty event kinds: the blob's
+// `schema.events` already says which field holds which kind of entity, and a
+// second list here would be the one that goes stale. Commit 11's event log
+// renders events with this same function.
+function summarizeEvent(event, eventSchema) {
+  const fields = eventSchema[event.kind] || {};
+  const parts = [text(event.kind)];
+  for (const key of Object.keys(event)) {
+    if (key === "kind") continue;
+    parts.push(text(" " + key + "="), ...fieldParts(fields[key], event[key]));
+  }
+  return parts;
+}
+
+// One value of an event or a blob record, against the schema descriptor that
+// says what it holds. A descriptor is an entity type name, a one-element array
+// of one, or an object keyed by field or variant name.
+function fieldParts(descriptor, value) {
+  if (value === null || value === undefined) return none();
+  if (typeof descriptor === "string") return [entity(descriptor, value)];
+  if (Array.isArray(descriptor)) {
+    if (!Array.isArray(value)) return [text(plain(value))];
+    return [text("["), ...joinParts(value.map((v) => fieldParts(descriptor[0], v))), text("]")];
+  }
+  // A program point is the one shape the schema does not describe -- its
+  // instruction is an entity, but a point is not itself one -- so it is
+  // recognized structurally.
+  if (isPoint(value)) return pointParts(value);
+  if (descriptor && typeof value === "object" && !Array.isArray(value)) {
+    const keys = Object.keys(value);
+    // One key is an enum variant and reads as a prefix; more than one is a
+    // struct and reads as its fields.
+    if (keys.length === 1) {
+      return [text(keys[0] + " "), ...fieldParts(descriptor[keys[0]], value[keys[0]])];
+    }
+    const inner = keys.map((k) => [text(k + ": "), ...fieldParts(descriptor[k], value[k])]);
+    return [text("{"), ...joinParts(inner), text("}")];
+  }
+  return [text(plain(value))];
+}
+
+const isPoint = (value) =>
+  value !== null &&
+  typeof value === "object" &&
+  typeof value.inst === "number" &&
+  typeof value.pos === "string" &&
+  Object.keys(value).length === 2;
+
+// A value with no entities in it, as text.
+const plain = (value) =>
+  typeof value === "number"
+    ? num(value)
+    : typeof value === "string"
+      ? value
+      : JSON.stringify(value);

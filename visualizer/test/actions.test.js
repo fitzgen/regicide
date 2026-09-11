@@ -18,8 +18,8 @@ const SPAN0 = { kind: "LiveSpan", index: 0 };
 const BLOCK2 = { kind: "Block", index: 2 };
 const BUNDLE4 = { kind: "LiveBundle", index: 4 };
 
-// The details result for `ref`, in commit 10's shape.
-const details = (ref) => ({ ref, fields: [], events: [] });
+// The details result for `ref`, in the model's shape.
+const details = (ref) => ({ ref, fields: [], eventCount: 0, events: [] });
 
 // Apply a sequence of actions, checking the stored-selection invariant after
 // each. Later commits' tests reuse this rather than trusting `selected`.
@@ -303,4 +303,50 @@ test("clicking an entity in the function pane walks the breadcrumbs", () => {
   assert.deepEqual(state.scrollToEntity, SPAN0);
   assert.equal(state.pendingDetails, entityKey(SPAN0));
   assert.deepEqual(queries, [{ id: 1, method: "details", args: [SPAN0] }]);
+});
+
+test("clicking an entity in the details pane walks the trail like any other click", () => {
+  // The details pane's listener dispatches the same `clickEntity`, so a
+  // reference followed from a field truncates the trail, pushes, selects, and
+  // -- the part that only matters from this pane -- scrolls the function pane
+  // to what was clicked.
+  let { state } = run([
+    { type: "clickEntity", ref: SPAN0 },
+    { type: "clickEntity", ref: V3 },
+    { type: "clickEntity", ref: BUNDLE4 },
+    { type: "clickBreadcrumb", index: 1 },
+  ]);
+  const { state: next, queries } = run([{ type: "clickEntity", ref: BLOCK2 }], state);
+  assert.deepEqual(next.breadcrumbs, [SPAN0, V3, BLOCK2]);
+  assert.equal(next.activeBreadcrumb, 2);
+  assert.deepEqual(next.selected, BLOCK2);
+  assert.deepEqual(next.scrollToEntity, BLOCK2);
+  // Four queries preceded it -- three clicks and the breadcrumb -- and ids
+  // come from the state, so this one is the fifth.
+  assert.deepEqual(queries, [{ id: 4, method: "details", args: [BLOCK2] }]);
+});
+
+test("an entity with no cached details is pending until its result arrives", () => {
+  // The pane's three display states hang off this: a cache hit renders, a
+  // pending flag renders "Loading…", and neither renders an empty pane.
+  const { state, queries } = run([{ type: "clickEntity", ref: V3 }]);
+  const key = entityKey(V3);
+  assert.equal(state.details[key], undefined);
+  assert.equal(state.pendingDetails, key);
+
+  const result = details(V3);
+  const arrived = run(
+    [{ type: "queryResult", id: queries[0].id, method: "details", result }],
+    state,
+  ).state;
+  assert.equal(arrived.pendingDetails, null);
+  assert.equal(arrived.details[key], result);
+
+  // And a failed query leaves neither, which is the empty-pane case.
+  const failed = run(
+    [{ type: "queryResult", id: queries[0].id, method: "details", error: "boom" }],
+    state,
+  ).state;
+  assert.equal(failed.details[key], undefined);
+  assert.equal(failed.pendingDetails, key);
 });

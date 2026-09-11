@@ -35,6 +35,11 @@ let elements = new Map();
 // The bars, with the bundle each belongs to, for the hover highlight.
 let bars = [];
 
+// `entityKey` of a span -> the bundle it was placed in, taken from the bars.
+// The details pane colours a span with its bundle's color, and the outline is
+// the only thing that knows which that is.
+let spanBundles = new Map();
+
 // What the classes on screen currently reflect, so that an unrelated re-render
 // does no work.
 let shownSelection = null;
@@ -54,15 +59,19 @@ export function installView(root, dispatcher) {
     if (crumb) viewDispatch({ type: "clickBreadcrumb", index: Number(crumb.dataset.index) });
   });
 
-  // One handler for the whole pane, on the pane itself: the lines and bars are
+  // One handler per pane, on the pane itself: the lines, bars and fields are
   // rebuilt wholesale, and per-element listeners would have to be rebuilt with
-  // them.
-  const pane = root.querySelector("#function-pane");
-  pane.addEventListener("click", (e) => {
+  // them. Both panes share it, so that clicking a reference in the details
+  // pane does exactly what clicking one in the function pane does -- including
+  // scrolling the function pane to it.
+  const clickEntity = (e) => {
     const el = e.target.closest("[data-entity]");
     const ref = el && refs.get(el.dataset.entity);
     if (ref) viewDispatch({ type: "clickEntity", ref });
-  });
+  };
+  const pane = root.querySelector("#function-pane");
+  pane.addEventListener("click", clickEntity);
+  root.querySelector("#details-pane").addEventListener("click", clickEntity);
   pane.addEventListener("mouseover", (e) => {
     const bar = e.target.closest(".bar");
     if (bar) viewDispatch({ type: "hoverSpan", ref: refs.get(bar.dataset.entity) });
@@ -77,6 +86,7 @@ export function render(state) {
   renderTabs(state);
   renderBreadcrumbs(state);
   renderFunction(state);
+  renderDetails(state);
 }
 
 function renderTabs(state) {
@@ -126,6 +136,7 @@ function buildFunction(outline) {
   refs = new Map();
   elements = new Map();
   bars = [];
+  spanBundles = new Map();
   shownSelection = null;
   shownHover = null;
   if (!outline) return;
@@ -146,17 +157,10 @@ function buildFunction(outline) {
     // Real spaces rather than padding, so that a selection copied out of the
     // pane keeps its shape.
     el.append(" ".repeat(line.depth * INDENT));
-    for (const part of line.parts) {
-      if (!part.entity) {
-        el.append(part.text);
-        continue;
-      }
-      const span = document.createElement("span");
-      span.className = "ent " + part.cls;
-      span.textContent = part.text;
-      remember(span, part.entity);
-      el.append(span);
-    }
+    // No swatches here: the pane's columns only line up because every
+    // character in it is one monospace cell wide, and the bars beside it
+    // already carry the colour.
+    appendParts(el, line.parts, { track: true });
     textLayer.append(el);
   }
 
@@ -179,6 +183,7 @@ function buildFunction(outline) {
     label.textContent = bar.label;
     el.append(label);
     remember(el, bar.span);
+    spanBundles.set(entityKey(bar.span), bar.bundle);
     barLayer.append(el);
     bars.push({ el, bundle: bar.bundle });
     columns = Math.max(columns, bar.column + 1);
@@ -190,14 +195,68 @@ function buildFunction(outline) {
   pane.append(body);
 }
 
-// Make `el` the clickable, scrollable stand-in for `ref`.
-function remember(el, ref) {
+// Make `el` a clickable stand-in for `ref`.
+//
+// The ref itself is kept, rather than reparsed out of the key on click: a page
+// that can turn a string back into a ref has two spellings of every entity,
+// and they will disagree.
+function rememberRef(el, ref) {
   const key = entityKey(ref);
   el.dataset.entity = key;
   refs.set(key, ref);
+  return key;
+}
+
+// Make `el` the clickable, scrollable stand-in for `ref`.
+//
+// Only for the function pane: `elements` is what selection and scrolling are
+// applied to between rebuilds, and the details pane is rebuilt every render,
+// so tracking its elements would fill the map with detached ones.
+function remember(el, ref) {
+  const key = rememberRef(el, ref);
   const found = elements.get(key);
   if (found === undefined) elements.set(key, [el]);
   else found.push(el);
+}
+
+// Render a `parts` array -- the model's one renderable shape -- into `el`.
+//
+// The only place an entity reference becomes DOM, so the function pane and the
+// details pane cannot spell the same entity two ways.
+function appendParts(el, parts, { swatch = false, track = false } = {}) {
+  for (const part of parts) {
+    if (!part.entity) {
+      el.append(part.text);
+      continue;
+    }
+    const span = document.createElement("span");
+    span.className = "ent " + part.cls;
+    if (swatch) {
+      const chip = swatchFor(part.entity);
+      if (chip) span.append(chip);
+    }
+    span.append(part.text);
+    if (track) remember(span, part.entity);
+    else rememberRef(span, part.entity);
+    el.append(span);
+  }
+}
+
+// The bundle colour for a bundle or for a span, or nothing for anything else.
+// Clicking through from a bar to its bundle should look continuous, which it
+// only does if both are drawn in the bundle's own color.
+function swatchFor(ref) {
+  const bundle =
+    ref.kind === "LiveBundle"
+      ? ref
+      : ref.kind === "LiveSpan"
+        ? spanBundles.get(entityKey(ref))
+        : null;
+  if (!bundle) return null;
+  const chip = document.createElement("span");
+  chip.className = "swatch";
+  chip.style.background = bundleColor(bundle.index);
+  return chip;
 }
 
 // Everything that changes without the DOM being rebuilt.
@@ -227,4 +286,71 @@ function scrollToEntity(state) {
   if (found) found[0].scrollIntoView({ block: "center" });
   // Out of band: dispatching from inside a render would re-enter it.
   queueMicrotask(() => viewDispatch({ type: "scrolled", what: "entity" }));
+}
+
+// Rebuilt whole on every render. The pane is a few dozen fields, and the
+// selection changing rewrites nearly all of them anyway.
+function renderDetails(state) {
+  const pane = document.getElementById("details-pane");
+  pane.textContent = "";
+  if (state.selected === null) return;
+
+  // Always read the cache at the *selected* key, so that a result arriving for
+  // an entity the user has already clicked away from cannot appear.
+  const key = entityKey(state.selected);
+  const details = state.details[key];
+  if (!details) {
+    // No result and no request means the query failed. An empty pane is honest
+    // about knowing nothing; "Loading…" there would look like a hang.
+    if (state.pendingDetails === key) {
+      const loading = document.createElement("p");
+      loading.className = "details-loading";
+      loading.textContent = "Loading…";
+      pane.append(loading);
+    }
+    return;
+  }
+
+  const head = document.createElement("h2");
+  head.className = "details-head " + entityClass(details.ref);
+  const chip = swatchFor(details.ref);
+  if (chip) head.append(chip);
+  // Not clickable: it is already the selection, and clicking it would push a
+  // breadcrumb that goes nowhere.
+  head.append(entityLabel(details.ref));
+  pane.append(head);
+
+  const fields = document.createElement("dl");
+  fields.className = "details-fields";
+  for (const field of details.fields) {
+    const label = document.createElement("dt");
+    // The count is the true total, so it reads "(1204)" beside a list of 200.
+    label.textContent = field.label + (field.count === undefined ? "" : " (" + field.count + ")");
+    const value = document.createElement("dd");
+    appendParts(value, field.value, { swatch: true });
+    fields.append(label, value);
+  }
+  pane.append(fields);
+
+  const heading = document.createElement("h3");
+  heading.className = "details-heading";
+  heading.textContent = "Events (" + details.eventCount + ")";
+  pane.append(heading);
+
+  const events = document.createElement("ol");
+  events.className = "details-events";
+  for (const event of details.events) {
+    const item = document.createElement("li");
+    const ref = { kind: "EventIndex", index: event.index };
+    const link = { text: entityLabel(ref), entity: ref, cls: entityClass(ref) };
+    appendParts(item, [link, { text: " " }, ...event.summary], { swatch: true });
+    events.append(item);
+  }
+  if (details.eventCount > details.events.length) {
+    const more = document.createElement("li");
+    more.className = "details-more";
+    more.textContent = "…and " + (details.eventCount - details.events.length) + " more";
+    events.append(more);
+  }
+  pane.append(events);
 }

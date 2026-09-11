@@ -313,3 +313,74 @@ body {
   background: var(--bg-sunken);
   border-color: var(--fg-dim);
 }
+
+/* The details pane. Dense, because a span has ten fields and the pane is 320px
+   wide; the labels carry the structure rather than whitespace. */
+#details-pane {
+  font-size: 12px;
+}
+
+.details-head {
+  margin: 0 0 10px;
+  font-family: var(--mono);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.details-heading {
+  margin: 14px 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+.details-fields {
+  margin: 0;
+}
+
+.details-fields dt {
+  margin-top: 7px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
+/* Entity names wrap mid-list rather than overflowing a 320px pane, and a
+   long list of them is still a paragraph of text. */
+.details-fields dd {
+  margin: 1px 0 0;
+  font-family: var(--mono);
+  overflow-wrap: break-word;
+}
+
+.details-events {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.details-events li {
+  padding: 2px 0;
+  border-top: 1px solid var(--border);
+  overflow-wrap: break-word;
+}
+
+.details-more,
+.details-loading {
+  color: var(--fg-dim);
+}
+
+/* The bundle's colour beside a bundle or a span, so that clicking through from
+   a bar reads as the same thing seen twice. Inline-block with its own width so
+   that it cannot inherit the text's. */
+.swatch {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 3px;
+  border-radius: 2px;
+  vertical-align: baseline;
+}
