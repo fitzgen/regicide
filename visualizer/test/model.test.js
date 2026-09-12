@@ -579,6 +579,23 @@ test("an instruction lists every span live across it, used there or not", () => 
   assert.equal(blob.function.insts[1].operands.length, 1);
 });
 
+test("an edge argument whose span has just ended has no allocation", () => {
+  // `end` is exclusive here too. The last span of a value can end exactly at
+  // the point an edge hands it over, and then the value is not anywhere: the
+  // register the span had is free for someone else, and naming it would be a
+  // confident wrong answer to the question the line exists to ask.
+  const blob = fixture("critical-edge");
+  // block1's edge to block2 passes v0 at `{5, "late"}`; span1 is what covers
+  // it. Ended one point earlier, nothing does.
+  const edges = (b) =>
+    outlineOf(b).lines.filter((line) => line.kind === "edge").map(text);
+  assert.deepEqual(blob.function.spans[1].end, { inst: 6, pos: "early" });
+  assert.equal(edges(blob)[2], "--> block2(v0[r0])");
+
+  blob.function.spans[1].end = { inst: 5, pos: "late" };
+  assert.equal(edges(blob)[2], "--> block2(v0)");
+});
+
 test("a span that ends at an instruction is not live in it", () => {
   // `end` is exclusive. Every span that reaches the end of a block ends at
   // `{last + 1, "early"}`, so a pane that rounds the end up hands the whole

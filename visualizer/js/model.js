@@ -211,7 +211,10 @@ function buildOutline(func) {
     let covering = null;
     for (const i of spansByVal.get(val) || []) {
       const span = spans[i];
-      if (at(span.start) > p || p > at(span.end)) continue;
+      // `end` is exclusive: a span that has ended at `point` does not cover
+      // it, and reporting where the value used to be is worse than saying
+      // nothing, because nothing is the truth.
+      if (at(span.start) > p || p >= at(span.end)) continue;
       // A span that merely touches `point` with an endpoint is the weaker
       // answer: the value arrives or leaves there.
       if (at(span.start) < p && p < at(span.end)) return span.allocation;
