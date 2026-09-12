@@ -308,7 +308,11 @@ pub(crate) struct Histogram {
     /// The 99th percentile.
     p99: u64,
 
-    /// The bars, covering `min..=max` with no gaps.
+    /// The bars, which tile a *superset* of `min..=max` with no gaps and no
+    /// overlap: the bar width is rounded up to a power of two, so the last few
+    /// bars can sit entirely past `max` with a count of zero. That is the price
+    /// of an x-axis that does not jump around as the numbers change, and the
+    /// figures printed beside the chart are exact regardless.
     buckets: Vec<Bucket>,
 }
 
