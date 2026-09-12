@@ -3657,6 +3657,110 @@ impl TestInput {
         input
     }
 
+    /// An input whose entry block branches back to itself passing its own
+    /// parameter straight back for its own parameter, and whose parameter is
+    /// split at the top of the block.
+    ///
+    /// The gap atop the entry block is the one gap two paths share: the
+    /// function's own arrival and the back edge both run it. The parameter is
+    /// pinned to the one register that its own instruction's result takes over,
+    /// so it is spilled and reloaded around that instruction, and the store
+    /// lands in that gap. An edge into the entry block therefore cannot lean on
+    /// that store the way an edge into any other block can.
+    pub fn with_a_spilled_self_looping_entry_param() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let param = Val::try_new(0).unwrap();
+        let clobber = Val::try_new(1).unwrap();
+        let entry = Block::try_new(0).unwrap();
+        let pinned = RegClass::try_new(usize::from(TestMachine::SECOND_REG_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::BlockParam { block: entry, i: 0 },
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::SECOND_REG_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // Read the parameter in the one register it is allowed, and define
+            // a value that takes that same register over: the parameter has to
+            // go somewhere else to survive the instruction.
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(pinned),
+                        param,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        clobber,
+                    ),
+                ],
+                side_effects: true,
+            },
+            // And read it there again afterwards, so it comes back.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(pinned),
+                    param,
+                )],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target: entry,
+                    args: vec![param],
+                }],
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![param],
+                    insts: vec![inst(0), inst(1), inst(2)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input whose entry block takes two parameters, each read
     /// once. One place for both would be a contract no caller could meet, and
     /// no other fixture has a block with two parameters to say so with.

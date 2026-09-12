@@ -768,7 +768,17 @@ where
                             self.emit_dest(counts, events, pos, incoming_val, alloc)
                         }
                         Allocation::Stack(_) => {
-                            if incoming_val == val {
+                            if incoming_val == val
+                                // The gap atop the entry block is shared by
+                                // every path in, including by callers,
+                                // implicitly, so a store spill placement puts
+                                // there moves the value out of the one place it
+                                // arrives in, which is not where an edge
+                                // delivers it. An edge into the entry block has
+                                // to fill the slot itself, and we don't emit a
+                                // destination there.
+                                && block.with_repr32() != func.entry_block()
+                            {
                                 // Nothing to do here because either (1) this is
                                 // a reg-to-stack move, which is handled by
                                 // spill placement, or (2) this is
@@ -2526,6 +2536,7 @@ mod tests {
             TestInput::with_an_entry_param_read_two_ways(),
             TestInput::with_entry_params_in_two_banks(),
             TestInput::with_a_self_looping_entry_block(),
+            TestInput::with_a_spilled_self_looping_entry_param(),
         ]
     }
 
