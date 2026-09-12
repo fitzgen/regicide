@@ -82,11 +82,15 @@ export function handleAction(state, action) {
 
     case "needEventRows": {
       // The view asks for the rows of the window it is about to draw. It only
-      // asks for what it is missing, and only once per index, so there is no
-      // guard here against a render that answers its own request.
-      const missing = action.indices.filter((i) => state.eventRows[i] === undefined);
+      // asks for what it is missing and what is not already in flight, so
+      // there is no guard here against a render that answers its own request.
+      const missing = action.indices.filter(
+        (i) => state.eventRows[i] === undefined && state.askedRows[i] === undefined,
+      );
       if (missing.length === 0) return done(state);
-      return query(state, "eventRows", [missing]);
+      return query({ ...state, askedRows: withRows(state.askedRows, missing) }, "eventRows", [
+        missing,
+      ]);
     }
 
     case "clickEntityFromEvent": {
@@ -132,7 +136,7 @@ export function handleAction(state, action) {
         case "eventRows": {
           const eventRows = { ...next.eventRows };
           for (const row of action.result) eventRows[row.index] = row;
-          return done({ ...next, eventRows });
+          return done({ ...next, eventRows, askedRows: withoutRows(next, action.args) });
         }
         default:
           return done(next);
@@ -244,9 +248,28 @@ function failed(state, action) {
       // The results stay: stale rows under an error banner beat an empty list,
       // and the query text in the state still says what they answered.
       return { ...state, search: { ...state.search, pending: false } };
+    case "eventRows":
+      // Un-ask them, or the rows this query was for stay "..." for the life of
+      // the page: the view asks once per index and would never ask again.
+      return { ...state, askedRows: withoutRows(state, action.args) };
     default:
       return state;
   }
+}
+
+// `asked` plus `indices`.
+function withRows(asked, indices) {
+  const next = { ...asked };
+  for (const i of indices) next[i] = true;
+  return next;
+}
+
+// `state.askedRows` minus the indices an `eventRows` query asked for, which
+// are the first of its echoed args.
+function withoutRows(state, args) {
+  const next = { ...state.askedRows };
+  for (const i of (args || [])[0] || []) delete next[i];
+  return next;
 }
 
 // Clear the pending details key, given the args of the query that answered.

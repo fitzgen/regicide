@@ -524,7 +524,7 @@ test("event rows are asked for once and kept by index", () => {
     { index: 5, kind: "SpillPlaced", summary: [] },
   ];
   const { state } = run(
-    [{ type: "queryResult", id: 0, method: "eventRows", result: rows }],
+    [{ type: "queryResult", id: 0, method: "eventRows", args: [[4, 5]], result: rows }],
     first.state,
   );
   assert.deepEqual(Object.keys(state.eventRows), ["4", "5"]);
@@ -535,6 +535,38 @@ test("event rows are asked for once and kept by index", () => {
     { id: 1, method: "eventRows", args: [[6]] },
   ]);
   assert.deepEqual(run([{ type: "needEventRows", indices: [4, 5] }], state).queries, []);
+});
+
+test("a query in flight is not asked for twice, and a failed one is re-asked", () => {
+  // The view asks for the window it is about to draw on every render, so the
+  // indices already in flight have to be remembered somewhere -- and un-asked
+  // when the query fails, or those rows read "..." for the life of the page.
+  const first = run([{ type: "needEventRows", indices: [4, 5] }]);
+  assert.deepEqual(first.state.askedRows, { 4: true, 5: true });
+  assert.deepEqual(run([{ type: "needEventRows", indices: [4, 5] }], first.state).queries, []);
+
+  const failed = run(
+    [{ type: "queryResult", id: 0, method: "eventRows", args: [[4, 5]], error: "boom" }],
+    first.state,
+  ).state;
+  assert.deepEqual(failed.askedRows, {});
+  assert.equal(failed.error, "boom");
+  assert.deepEqual(run([{ type: "needEventRows", indices: [4, 5] }], failed).queries, [
+    { id: 1, method: "eventRows", args: [[4, 5]] },
+  ]);
+});
+
+test("an answered query stops being in flight without being re-asked", () => {
+  // Both halves matter: the indices leave `askedRows`, and `eventRows` is what
+  // keeps them from being asked for again.
+  const first = run([{ type: "needEventRows", indices: [4] }]);
+  const rows = [{ index: 4, kind: "SpillPlaced", summary: [] }];
+  const { state } = run(
+    [{ type: "queryResult", id: 0, method: "eventRows", args: [[4]], result: rows }],
+    first.state,
+  );
+  assert.deepEqual(state.askedRows, {});
+  assert.deepEqual(run([{ type: "needEventRows", indices: [4] }], state).queries, []);
 });
 
 test("clicking an entity in an event row is a function-pane click with a tab switch", () => {

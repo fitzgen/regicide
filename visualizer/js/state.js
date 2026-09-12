@@ -61,6 +61,13 @@ export function initialState() {
     // here is bounded by what the user scrolled past.
     eventRows: {},
 
+    // The event indices an `eventRows` query is in flight for, as an object
+    // rather than a `Set` so that the state stays plain JSON. What stops the
+    // render that draws an answer from asking for it again, and why it lives
+    // here rather than in the view: a query that fails has to be un-asked, and
+    // only the reducer sees the response.
+    askedRows: {},
+
     // The histograms and their grouping for the table of contents, or `null`
     // until the queries the load response starts have answered. Two fields,
     // because they are two answers: the grouping is a list of ids and counts

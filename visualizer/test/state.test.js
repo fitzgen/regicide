@@ -17,6 +17,7 @@ test("initialState has the documented shape", () => {
   // nothing" are different things on screen.
   assert.deepEqual(state.search, { query: "", results: null, pending: false });
   assert.deepEqual(state.eventRows, {});
+  assert.deepEqual(state.askedRows, {});
   assert.equal(state.histograms, null);
   assert.equal(state.histogramGroups, null);
   assert.equal(state.outline, null);

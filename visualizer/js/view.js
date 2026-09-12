@@ -45,20 +45,19 @@ let spanBundles = new Map();
 let shownSelection = null;
 let shownHover = null;
 
-// The event log's scroll position, the results it was drawn against, and the
-// rows already asked for.
+// The event log's scroll position and the results it was drawn against.
 //
 // The one thing the view keeps that the state does not. A virtualized list
 // re-renders on every scroll frame, and routing that through `handleAction`
 // would be an action per frame for something derived purely from the scroll
 // offset: it is not application state, nothing else reads it, and it does not
 // survive a rebuild. Rows are a different matter and do live in the state --
-// they come from the worker -- so all the view keeps of them is which ones it
-// has already asked for, which is what stops a render triggered by the answer
-// from asking again.
+// they come from the worker -- and so does the set of indices already asked
+// for, which is what stops a render triggered by the answer from asking again.
+// That set was once kept here too, but only the reducer sees a query fail, and
+// a failed query has to be un-asked or its rows stay blank for good.
 let eventScroll = 0;
 let shownResults = null;
-const askedRows = new Set();
 
 // How far the details pane can be dragged. Narrower than this and a field's
 // label and value no longer fit on one line; wider and the function pane it
@@ -599,11 +598,10 @@ function renderEventRows(state) {
   }
 
   // Asked for out of band, because dispatching from inside a render would
-  // re-enter it, and only once per index, so that the render which draws the
-  // answer cannot ask for it again.
-  const wanted = missing.filter((index) => !askedRows.has(index));
+  // re-enter it, and only for what is not already in flight, so that the
+  // render which draws the answer cannot ask for it again.
+  const wanted = missing.filter((index) => state.askedRows[index] === undefined);
   if (wanted.length > 0) {
-    for (const index of wanted) askedRows.add(index);
     queueMicrotask(() => viewDispatch({ type: "needEventRows", indices: wanted }));
   }
 }
