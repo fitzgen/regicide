@@ -284,6 +284,16 @@ impl InstData {
         }
     }
 
+    /// This instruction's block-call list itself, mutably, so that outgoing
+    /// edges can be added and removed.
+    #[cfg(test)]
+    fn block_call_list_mut(&mut self) -> Option<&mut Vec<BlockCall>> {
+        match self {
+            InstData::Op { .. } => None,
+            InstData::Branch { targets, .. } => Some(targets),
+        }
+    }
+
     /// This instruction's operand list itself, mutably, so that operands can
     /// be added and removed.
     #[cfg(test)]
@@ -486,6 +496,16 @@ impl TestFunction {
         self.insts[inst].operand_list_mut()
     }
 
+    /// Give `block` another parameter, without repairing the function.
+    ///
+    /// The results side cannot grow to match --- `block_param_allocs_mut`
+    /// hands back a slice --- so this is the only way to make a block's
+    /// parameters and its parameter allocations disagree.
+    #[cfg(test)]
+    pub(crate) fn push_block_param(&mut self, block: Block, val: Val) {
+        self.blocks[block].params.push(val);
+    }
+
     /// Move `val` into the machine's `reg_class`th class, the numbering
     /// [`TestMachine::BOTH_REGS_CLASS`] uses, without repairing the function.
     #[cfg(test)]
@@ -497,6 +517,18 @@ impl TestFunction {
     #[cfg(test)]
     pub(crate) fn set_block_call_target(&mut self, inst: Inst, call: usize, target: Block) {
         self.insts[inst].block_calls_mut()[call].target = target;
+    }
+
+    /// Give a branch a second copy of one of its outgoing edges, so that the
+    /// block has more successors than before without changing where any of
+    /// them go or what they carry. Without repair.
+    #[cfg(test)]
+    pub(crate) fn duplicate_block_call(&mut self, inst: Inst, call: usize) {
+        let calls = self.insts[inst]
+            .block_call_list_mut()
+            .expect("only a branch has outgoing edges");
+        let call = calls[call].clone();
+        calls.push(call);
     }
 
     /// Repair this function until it is well formed: a terminated,
@@ -1610,6 +1642,31 @@ impl TestMachine {
         };
         machine.fixup();
         machine
+    }
+
+    /// Give `bank` one more register that the allocator does not own, and
+    /// answer which [`Reg`] it will be once the machine is built.
+    ///
+    /// No class holds it. That is the ordinary state of affairs for a stack
+    /// pointer or a flags register --- a class holds one only when an operand
+    /// has to pin a read to it --- and it leaves every choice the allocator
+    /// makes exactly as it was, so a test that puts something in this register
+    /// by hand knows that nothing else did.
+    #[cfg(test)]
+    pub(crate) fn push_non_allocatable_reg(&mut self, bank: usize) -> Reg {
+        let before: usize = self.banks[..bank]
+            .iter()
+            .map(|bank| bank.regs.len() + usize::from(bank.non_allocatable))
+            .sum();
+        let bank = &mut self.banks[bank];
+        let reg = before + bank.regs.len() + usize::from(bank.non_allocatable);
+        bank.non_allocatable += 1;
+        assert!(
+            bank.non_allocatable <= Self::MAX_NON_ALLOCATABLE_PER_BANK,
+            "a bank holds at most {} registers the allocator does not own",
+            Self::MAX_NON_ALLOCATABLE_PER_BANK,
+        );
+        Reg::try_new(reg).unwrap()
     }
 
     /// How many register classes this machine defines, which is the number of
@@ -3268,6 +3325,150 @@ impl TestInput {
         input
     }
 
+    /// An input with a move placed after a block's terminator.
+    ///
+    /// Two predecessors of a merge block pass *different* values for its one
+    /// parameter, so at least one of the two edges needs a move to put the
+    /// parameter where the other edge already leaves it. `first` is pinned to
+    /// the second register right up to `block1`'s terminator and the merge
+    /// block reads its parameter out of the first register, so that move
+    /// cannot be hoisted to the start of `block1`: it belongs to the
+    /// `block1 -> block3` edge.
+    ///
+    /// `block1` ends in an unconditional branch with no operands of its own,
+    /// which is the one shape that lets move generation place that move after
+    /// the predecessor's terminator rather than splitting the edge.
+    pub fn with_a_move_after_an_unconditional_branch() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let param = Val::try_new(2).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let merge = block(3);
+        let first_reg = RegClass::try_new(usize::from(TestMachine::FIRST_REG_CLASS)).unwrap();
+        let second_reg = RegClass::try_new(usize::from(TestMachine::SECOND_REG_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: inst(0),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(1),
+                i: 0,
+            },
+            ValDef::BlockParam { block: merge, i: 0 },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+        let branch = |target, args| InstData::Branch {
+            operands: vec![],
+            targets: vec![BlockCall { target, args }],
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // block0: define both values and fork.
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Reg(second_reg),
+                first,
+            ),
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, second),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: block(1),
+                        args: vec![],
+                    },
+                    BlockCall {
+                        target: block(2),
+                        args: vec![],
+                    },
+                ],
+            },
+            // block1: read `first` where it is defined, and then pass it to
+            // the merge block, which wants it somewhere else.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(second_reg),
+                first,
+            ),
+            branch(merge, vec![first]),
+            // block2: pass its own value for the same parameter.
+            branch(merge, vec![second]),
+            // block3: read the parameter. The terminator is the block's own so
+            // that `ensure_terminators` does not append one after the read.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(first_reg),
+                param,
+            ),
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for block_data in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(3), inst(4)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(5)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param],
+                insts: vec![inst(6), inst(7)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block_data).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// An input whose entry block branches back to itself, passing a value of
     /// its own for its own parameter: the one shape where the checker's entry
     /// state is met against something rather than believed. `block0` reads its
@@ -4327,6 +4528,107 @@ mod tests {
             matches!(actual, Error::IncompatibleRegClass { inst: i, operand: 0 } if i == inst),
             "expected an `IncompatibleRegClass`, got {actual:?}",
         );
+    }
+
+    /// A machine with one register the allocator owns and one it does not,
+    /// plus the two classes that let an operand name either the pair or the
+    /// non-allocatable register alone.
+    ///
+    /// `TestMachine` cannot describe this: it only ever puts allocatable
+    /// registers in a class, so the shape these checks are about has to be
+    /// built by hand.
+    fn machine_with_a_non_allocatable_class() -> Machine {
+        let mut builder = MachineBuilder::new();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::from_log2(0))
+            .unwrap();
+
+        let reg = builder
+            .define_reg(
+                bank,
+                RegUnit::try_new(0).unwrap()..RegUnit::try_new(1).unwrap(),
+            )
+            .unwrap();
+        let non_allocatable = builder.define_non_allocatable_reg(bank).unwrap();
+
+        // Class 0 holds both, and is what a value in this machine lives in.
+        // Class 1 holds only the register the allocator may not hand out.
+        builder
+            .define_reg_class(bank, 1.0, [reg, non_allocatable])
+            .unwrap();
+        builder
+            .define_reg_class(bank, 1.0, [non_allocatable])
+            .unwrap();
+
+        builder.finish().unwrap()
+    }
+
+    /// A use may name a non-allocatable register --- that is what those
+    /// registers are for --- but a definition constrained to a class with no
+    /// register the allocator owns has nowhere to go, so it is the input that
+    /// is wrong and not any allocation of it.
+    #[test]
+    fn reject_a_definition_pinned_to_a_non_allocatable_register() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        let machine = machine_with_a_non_allocatable_class();
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        assert_eq!(operand.kind(), DefUse::Def);
+        func.values[operand.val()].reg_class = 0;
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+            operand.val(),
+        );
+
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(
+                actual,
+                Error::DefInNonAllocatableRegClass { inst: i, operand: 0 } if i == inst,
+            ),
+            "expected a `DefInNonAllocatableRegClass`, got {actual:?}",
+        );
+    }
+
+    /// The same constraint on a use of that value, which is exactly how an
+    /// instruction says it reads the stack pointer.
+    #[test]
+    fn accept_a_use_pinned_to_a_non_allocatable_register() {
+        let machine = machine_with_a_non_allocatable_class();
+        let mut input = TestInput::with_use_constraints(&[OperandConstraint::Reg(
+            RegClass::try_new(1).unwrap(),
+        )]);
+        for (_val, val_data) in input.func.values.iter_mut() {
+            val_data.reg_class = 0;
+        }
+
+        assert_eq!(check_ssa(&machine, &input.func), Ok(()));
+    }
+
+    /// ... and so is a definition in a class that holds a register the
+    /// allocator owns as well, which is the whole point of checking the class
+    /// rather than the mere presence of a non-allocatable member.
+    #[test]
+    fn accept_a_definition_in_a_class_that_also_holds_an_allocatable_register() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        let machine = machine_with_a_non_allocatable_class();
+        let operand = &mut func.insts[inst].operands_mut()[0];
+        func.values[operand.val()].reg_class = 0;
+        *operand = Operand::new(
+            operand.pos(),
+            operand.kind(),
+            OperandConstraint::Reg(RegClass::try_new(0).unwrap()),
+            operand.val(),
+        );
+
+        assert_eq!(check_ssa(&machine, &func), Ok(()));
     }
 
     #[test]

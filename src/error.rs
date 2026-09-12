@@ -365,6 +365,16 @@ pub enum Error {
         operand: usize,
     },
 
+    /// A definition's `Reg` constraint names a register class in which the
+    /// allocator owns nothing.
+    DefInNonAllocatableRegClass {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of the definition that cannot be placed.
+        operand: usize,
+    },
+
     /// The function has an instruction index above the largest one supported.
     TooManyInsts {
         /// The first [`Inst`] found whose index is out of range.
@@ -537,6 +547,11 @@ impl fmt::Debug for Error {
                 f,
                 "operand {operand} of {inst:?} names a register class that is not contained in \
                  its value's register class"
+            ),
+            Self::DefInNonAllocatableRegClass { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} is a definition constrained to a register class \
+                 that holds no register the allocator may hand out"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

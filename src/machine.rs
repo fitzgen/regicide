@@ -271,7 +271,6 @@ where
 
     /// Does this register cover any units, and so may be allocated?
     #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
     pub(crate) fn is_allocatable(self, machine: &Machine) -> bool {
         let units = &machine.registers[self.with_repr32()].units;
         units.start != units.end
@@ -279,7 +278,6 @@ where
 
     /// Does this register cover no units, and so may never be allocated?
     #[inline]
-    #[expect(dead_code, reason = "will probably need it")]
     pub(crate) fn is_non_allocatable(self, machine: &Machine) -> bool {
         !self.is_allocatable(machine)
     }
@@ -342,6 +340,20 @@ impl RegClass {
         match self.members(machine) {
             RegClassMembers::Regs(regs) => regs.len() == 1,
             RegClassMembers::Groups(groups) => groups.len() == 1,
+        }
+    }
+
+    /// Does this class hold anywhere the allocator may actually put a value?
+    #[inline]
+    pub(crate) fn has_an_allocatable_member(self, machine: &Machine) -> bool {
+        match self.members(machine) {
+            RegClassMembers::Regs(regs) => regs.iter().any(|reg| reg.is_allocatable(machine)),
+            RegClassMembers::Groups(groups) => groups.iter().any(|group| {
+                group
+                    .members(machine)
+                    .iter()
+                    .all(|reg| reg.is_allocatable(machine))
+            }),
         }
     }
 

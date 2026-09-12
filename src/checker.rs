@@ -119,6 +119,50 @@ pub enum CheckerError {
         actual: usize,
     },
 
+    /// A critical-edge edit appears among the edits atop a block.
+    ///
+    /// The edits before a block's first instruction are the ones its single
+    /// incoming edge delivers. A critical-edge edit goes on an edge the client
+    /// still has to split, which is never one of those, and the block's own
+    /// outgoing edges come at the end of its stream rather than the start.
+    CriticalEdgeEditAtBlockEntry {
+        /// The [`Block`] whose entry edits it sits in.
+        block: Block,
+        /// The misplaced edit.
+        edit: CriticalEdgeEdit,
+    },
+
+    /// An instruction or point edit appears after a block's critical-edge
+    /// edits, which are the last thing its stream holds: everything the block
+    /// itself runs has already happened by then.
+    ItemAfterCriticalEdgeEdits {
+        /// The [`Block`] whose stream it sits in.
+        block: Block,
+        /// The misplaced instruction or edit.
+        item: InstOrEdit,
+    },
+
+    /// The results put something in a spill slot they never allocated, so
+    /// there is no size to hold it to and no stack for it to live on.
+    NoSuchSpillSlot {
+        /// The [`SpillSlot`] the results name but do not allocate.
+        slot: SpillSlot,
+    },
+
+    /// A block has a different number of parameter allocations than it has
+    /// parameters.
+    ///
+    /// The two are walked in lock-step, so without this the shorter of them
+    /// silently decides how many parameters are checked at all.
+    WrongBlockParamAllocCount {
+        /// The [`Block`] whose parameter allocations were counted.
+        block: Block,
+        /// The number of parameters the block has.
+        expected: usize,
+        /// The number of allocations it was given.
+        actual: usize,
+    },
+
     /// An operand's allocation is made of a different number of locations than
     /// its value occupies registers.
     WrongScalarCount {
@@ -169,6 +213,20 @@ pub enum CheckerError {
         class: RegClass,
         /// The [`RegAllocation`] it is instead.
         alloc: RegAllocation,
+    },
+
+    /// A definition lands in a non-allocatable register.
+    ///
+    /// A non-allocatable register covers no register units, so nothing the
+    /// allocator does can keep a value that lives in one from being trampled;
+    /// the register is only in a class at all so that an operand can pin a
+    /// *read* to it. Defining a value there claims a home the allocator does
+    /// not own.
+    DefInNonAllocatableReg {
+        /// Where the allocation came from.
+        site: Site,
+        /// The non-allocatable [`Reg`] the definition landed in.
+        reg: Reg,
     },
 
     /// An operand that must be in a register is on the stack.
@@ -234,6 +292,19 @@ pub enum CheckerError {
         loc: ScalarAllocation,
     },
 
+    /// A definition writes a location that another operand of the same
+    /// instruction reads at the same point, destroying the value being read.
+    DefClobbersUse {
+        /// The [`Inst`] whose operands collide.
+        inst: Inst,
+        /// The index of the defining operand.
+        operand: usize,
+        /// The index of the reading operand it destroys.
+        other: usize,
+        /// The location they share.
+        loc: ScalarAllocation,
+    },
+
     /// A value the input does not say may be rematerialized was
     /// rematerialized anyway.
     NotRematerializable {
@@ -250,6 +321,23 @@ pub enum CheckerError {
         block: Block,
         /// The [`Val`] that was rematerialized.
         val: Val,
+    },
+
+    /// A value that is not computed from nothing was rematerialized.
+    ///
+    /// A [`Remat`] recomputes its value on its own, wherever it is placed, so
+    /// the only values it can express are the ones whose defining instruction
+    /// reads nothing. Rematerializing anything else recomputes it from whatever
+    /// happens to be lying around at the destination instead of from what the
+    /// definition read.
+    RematOfDerivedValue {
+        /// The [`Block`] whose edits rematerialize it.
+        block: Block,
+        /// The [`Val`] that was rematerialized.
+        val: Val,
+        /// The [`Inst`] that defines it, or `None` when it is a block
+        /// parameter.
+        def: Option<Inst>,
     },
 
     /// A block parameter is not in the location the results say it arrives in.
@@ -389,6 +477,42 @@ pub enum CheckerError {
         reg: Reg,
     },
 
+    /// A move puts something in a register the machine never lets the
+    /// allocator hand out, and that whatever it put there is not allowed to
+    /// live in.
+    ///
+    /// Unlike a definition (see [`CheckerError::DefInNonAllocatableReg`]), a
+    /// move into a non-allocatable register is perfectly ordinary: it is how a
+    /// value reaches an operand pinned to `sp`, or to the flags. What makes one
+    /// wrong is the register not being somewhere that value was ever allowed or
+    /// the move's source holding nothing the checker can name, in which case
+    /// nothing about the destination can be justified at all.
+    MoveIntoNonAllocatableReg {
+        /// The [`Block`] whose edits contain the move.
+        block: Block,
+        /// The [`Val`] the move put there, if the checker knows of one.
+        val: Option<Val>,
+        /// The non-allocatable [`Reg`] the move wrote.
+        reg: Reg,
+    },
+
+    /// A move or rematerialization sits after a block's terminator, where the
+    /// machine would never run it.
+    ///
+    /// Running an edit there is the same as running it on the block's outgoing
+    /// edge, but only when the terminator is the whole of that edge: the block
+    /// must have a single successor, and the terminator must have no operands
+    /// of its own for the edit to disturb. Anything else belongs on the edge,
+    /// as a [`CriticalEdgeEdit`].
+    EditAfterTerminator {
+        /// The [`Block`] whose edits contain it.
+        block: Block,
+        /// The terminator it comes after.
+        terminator: Inst,
+        /// The offending edit.
+        edit: EdgeEdit,
+    },
+
     /// A [`CriticalEdgeEdit`] names an edge that its block does not have, or
     /// names a target that is not where that edge goes.
     BadCriticalEdgeSuccessor {
@@ -411,6 +535,27 @@ impl fmt::Debug for CheckerError {
             } => write!(
                 f,
                 "{inst:?} has {expected} operand(s) but was given {actual} allocation(s)"
+            ),
+            Self::CriticalEdgeEditAtBlockEntry { block, edit } => write!(
+                f,
+                "{edit:?} sits among the edits atop {block:?}, which are the ones its incoming \
+                 edge delivers"
+            ),
+            Self::ItemAfterCriticalEdgeEdits { block, item } => write!(
+                f,
+                "{item:?} comes after {block:?}'s critical-edge edits, which are the last thing \
+                 its stream may hold"
+            ),
+            Self::NoSuchSpillSlot { slot } => {
+                write!(f, "the results use {slot:?}, which they do not allocate")
+            }
+            Self::WrongBlockParamAllocCount {
+                block,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{block:?} has {expected} parameter(s) but was given {actual} allocation(s)"
             ),
             Self::WrongScalarCount {
                 inst,
@@ -452,6 +597,27 @@ impl fmt::Debug for CheckerError {
                     "{site:?} is allocated to {alloc:?}, which is not in {class:?}"
                 )
             }
+            Self::MoveIntoNonAllocatableReg {
+                block,
+                val: Some(val),
+                reg,
+            } => write!(
+                f,
+                "a move in {block:?} puts {val:?} in {reg:?}, which is not allocatable and not in \
+                 {val:?}'s own register class"
+            ),
+            Self::MoveIntoNonAllocatableReg {
+                block,
+                val: None,
+                reg,
+            } => write!(
+                f,
+                "a move in {block:?} puts an unknown value in {reg:?}, which is not allocatable"
+            ),
+            Self::DefInNonAllocatableReg { site, reg } => write!(
+                f,
+                "{site:?} is defined in {reg:?}, which is not allocatable"
+            ),
             Self::NotAReg { inst, operand } => write!(
                 f,
                 "operand {operand} of {inst:?} must be in a register but is on the stack"
@@ -499,6 +665,16 @@ impl fmt::Debug for CheckerError {
                 f,
                 "operands {other} and {operand} of {inst:?} both define {loc:?}"
             ),
+            Self::DefClobbersUse {
+                inst,
+                operand,
+                other,
+                loc,
+            } => write!(
+                f,
+                "operand {operand} of {inst:?} defines {loc:?}, which operand {other} reads at \
+                 the same point"
+            ),
             Self::NotRematerializable { block, val } => write!(
                 f,
                 "{block:?} rematerializes {val:?}, which the input does not give a \
@@ -507,6 +683,23 @@ impl fmt::Debug for CheckerError {
             Self::RematOfRegGroup { block, val } => write!(
                 f,
                 "{block:?} rematerializes {val:?}, which occupies more than one register"
+            ),
+            Self::RematOfDerivedValue {
+                block,
+                val,
+                def: Some(def),
+            } => write!(
+                f,
+                "{block:?} rematerializes {val:?}, which {def:?} computes from values it reads"
+            ),
+            Self::RematOfDerivedValue {
+                block,
+                val,
+                def: None,
+            } => write!(
+                f,
+                "{block:?} rematerializes {val:?}, which is a block parameter and so no \
+                 instruction computes"
             ),
             Self::MisplacedBlockParam {
                 block,
@@ -611,6 +804,15 @@ impl fmt::Debug for CheckerError {
             } => write!(
                 f,
                 "{block:?} rematerializes {val:?} into {reg:?}, which is not in {class:?}"
+            ),
+            Self::EditAfterTerminator {
+                block,
+                terminator,
+                edit,
+            } => write!(
+                f,
+                "{edit:?} in {block:?} comes after {terminator:?}, which is not an edge this \
+                 edit may be placed on"
             ),
             Self::BadCriticalEdgeSuccessor {
                 block,
@@ -790,6 +992,7 @@ struct Stats {
     shrunk_entry_states: usize,
     entry_block_edges: usize,
     block_param_allocs: usize,
+    edits_after_terminator: usize,
 }
 
 /// The abstract interpreter itself.
@@ -818,6 +1021,21 @@ where
     /// its operands defined each. Scratch space, cleared per instruction.
     def_locs: Vec<(usize, ScalarAllocation)>,
 
+    /// The locations the instruction in hand has read at the point in hand,
+    /// and which of its operands read each. Scratch space, cleared per point
+    /// rather than per instruction, so that a definition only ever meets the
+    /// reads it really races with.
+    use_locs: Vec<(usize, ScalarAllocation)>,
+
+    /// The instruction that defines each value, or `None` for a value no
+    /// instruction defines, such as a block parameter, or a `Val` this function
+    /// never mentions.
+    ///
+    /// The input function does not expose this, and the map validation builds
+    /// while checking definitions is private to it, so the checker builds its
+    /// own.
+    defs: SecondaryMap<Val, Option<Inst>>,
+
     stats: Stats,
 }
 
@@ -834,10 +1052,39 @@ where
             worklist: Vec::new(),
             errors: Vec::new(),
             def_locs: Vec::new(),
+            use_locs: Vec::new(),
+            defs: Self::index_defs(input.func),
             stats: Stats::default(),
         };
         checker.seed = checker.seed_entry();
         checker
+    }
+
+    /// Map each value an instruction defines back to that instruction.
+    ///
+    /// Block parameters are left `None`: they are defined by their block's
+    /// predecessors passing them, not by any one instruction.
+    fn index_defs(func: &F) -> SecondaryMap<Val, Option<Inst>> {
+        // Taking the block by reference keeps its borrow inside the callee,
+        // where it cannot outlive the block itself.
+        fn index_block<'a>(
+            defs: &mut SecondaryMap<Val, Option<Inst>>,
+            input_block: &impl InputBlock<'a>,
+        ) {
+            for (inst, input_inst) in input_block.insts() {
+                for op in input_inst.operands() {
+                    if op.kind() == DefUse::Def {
+                        defs[op.val()] = Some(inst);
+                    }
+                }
+            }
+        }
+
+        let mut defs = SecondaryMap::new(None);
+        for (block, _) in func.blocks() {
+            index_block(&mut defs, &func.block(block));
+        }
+        defs
     }
 
     /// The state on entry to the function.
@@ -919,14 +1166,19 @@ where
             let Some(InstOrEdit::Edit(edit)) = insts_and_edits.next() else {
                 unreachable!()
             };
-            arrived = true;
-            match edit {
-                Edit::Move(mv) => self.apply_edit(&mut state, block, EdgeEdit::Move(mv), mode),
-                Edit::Remat(remat) => {
-                    self.apply_edit(&mut state, block, EdgeEdit::Remat(remat), mode)
+            let edge_edit = match edit {
+                Edit::Move(mv) => EdgeEdit::Move(mv),
+                Edit::Remat(remat) => EdgeEdit::Remat(remat),
+                Edit::CriticalEdge(edit) => {
+                    self.error(
+                        mode,
+                        CheckerError::CriticalEdgeEditAtBlockEntry { block, edit },
+                    );
+                    continue;
                 }
-                Edit::CriticalEdge(_) => unreachable!("critical edges come after the terminator"),
-            }
+            };
+            arrived = true;
+            self.apply_edit(&mut state, block, edge_edit, mode);
         }
 
         // Now rename what this block's one incoming edge left to us, if any.
@@ -944,22 +1196,48 @@ where
 
         // Now go through the block's instructions and any other edits in the
         // middle of the block.
+        //
+        // Edits may follow the terminator, but only where running them there
+        // is the same as running them on the block's outgoing edge: one
+        // successor to take, and a terminator with no operands of its own to
+        // come between the edit and the edge. This is the contract
+        // `move_generation::edge_position` places them under.
+        let terminator = crate::liveness::block_last_inst(&input_block);
+        let terminator_is_the_whole_edge =
+            input_block.len_successors() == 1 && func.inst(terminator).operands_len() == 0;
+        let mut past_terminator = false;
         while insts_and_edits.peek().is_some_and(|item| {
             matches!(
                 item,
                 InstOrEdit::Inst(_) | InstOrEdit::Edit(Edit::Move(_) | Edit::Remat(_))
             )
         }) {
-            match insts_and_edits.next().unwrap() {
-                InstOrEdit::Inst(inst) => self.check_inst(&mut state, inst, mode),
-                InstOrEdit::Edit(Edit::Move(mv)) => {
-                    self.apply_edit(&mut state, block, EdgeEdit::Move(mv), mode)
+            let edit = match insts_and_edits.next().unwrap() {
+                InstOrEdit::Inst(inst) => {
+                    self.check_inst(&mut state, inst, mode);
+                    past_terminator |= inst == terminator;
+                    continue;
                 }
-                InstOrEdit::Edit(Edit::Remat(remat)) => {
-                    self.apply_edit(&mut state, block, EdgeEdit::Remat(remat), mode)
+                InstOrEdit::Edit(Edit::Move(mv)) => EdgeEdit::Move(mv),
+                InstOrEdit::Edit(Edit::Remat(remat)) => EdgeEdit::Remat(remat),
+                InstOrEdit::Edit(Edit::CriticalEdge(_)) => {
+                    unreachable!("the loop condition excludes critical-edge edits")
                 }
-                InstOrEdit::Edit(Edit::CriticalEdge(_)) => unreachable!(),
+            };
+            if past_terminator {
+                self.stats.edits_after_terminator += 1;
+                if !terminator_is_the_whole_edge {
+                    self.error(
+                        mode,
+                        CheckerError::EditAfterTerminator {
+                            block,
+                            terminator,
+                            edit,
+                        },
+                    );
+                }
             }
+            self.apply_edit(&mut state, block, edit, mode);
         }
 
         // Finally, collect the block's outgoing critical-edge edits, bucketing
@@ -982,8 +1260,9 @@ where
                     }
                     self.stats.critical_edge_edits += 1;
                 }
-                _ => unreachable!(
-                    "the only insts or edits after the terminator are critical-edge edits"
+                item => self.error(
+                    mode,
+                    CheckerError::ItemAfterCriticalEdgeEdits { block, item },
                 ),
             }
         }
@@ -1024,6 +1303,19 @@ where
         let output = self.output;
         let machine = self.input.machine;
 
+        let expected = func.block(block).len_params();
+        let actual = output.block_param_allocs(block).len();
+        if expected != actual {
+            self.error(
+                mode,
+                CheckerError::WrongBlockParamAllocCount {
+                    block,
+                    expected,
+                    actual,
+                },
+            );
+        }
+
         // Where each parameter seen so far arrives, so that the next one can
         // be checked against them.
         let mut param_locs: Vec<(Val, ScalarAllocation)> = Vec::new();
@@ -1044,6 +1336,9 @@ where
             let scalars = self.scalars(alloc);
             self.check_alloc_legality(site, param, alloc, &scalars, mode);
             self.check_reg_class(site, param.reg_class(self.input), alloc, mode);
+
+            // A parameter is a definition, so it gets the definition rule too.
+            self.check_def_is_allocatable(site, &scalars, mode);
 
             for (index, loc) in scalars.into_iter().enumerate() {
                 if !state.holds(loc, Part { val: param, index }) {
@@ -1185,6 +1480,21 @@ where
                     self.error(mode, CheckerError::RematOfRegGroup { block, val });
                 }
 
+                // Rematerializations (currently) may have no inputs.
+                let def = self.defs[val];
+                let derived = match def {
+                    None => true,
+                    Some(def) => self
+                        .input
+                        .func
+                        .inst(def)
+                        .operands()
+                        .any(|op| op.kind() == DefUse::Use),
+                };
+                if derived {
+                    self.error(mode, CheckerError::RematOfDerivedValue { block, val, def });
+                }
+
                 // A rematerialization names its value, so unlike a move it is
                 // held to that value's own class rather than only to its bank.
                 let class = val.reg_class(self.input);
@@ -1231,6 +1541,42 @@ where
         // so a later read of the destination is then an error.
         let parts = state.parts(from).cloned().unwrap_or_default();
 
+        // Writing a register the allocator does not own is how a value reaches
+        // an operand pinned to it, so the destination is judged by what it
+        // receives: only a value whose own class holds the register could have
+        // been pinned there.
+        if let ScalarAllocation::Reg(reg) = to {
+            if reg.is_non_allocatable(machine) {
+                if parts.is_empty() {
+                    self.error(
+                        mode,
+                        CheckerError::MoveIntoNonAllocatableReg {
+                            block,
+                            val: None,
+                            reg,
+                        },
+                    );
+                }
+                for part in &parts {
+                    if !part
+                        .val
+                        .reg_class(self.input)
+                        .member_set(machine)
+                        .contains(reg)
+                    {
+                        self.error(
+                            mode,
+                            CheckerError::MoveIntoNonAllocatableReg {
+                                block,
+                                val: Some(part.val),
+                                reg,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
         // Every value moved must be able to live where the move puts it.
         for part in &parts {
             let val = part.val;
@@ -1252,7 +1598,10 @@ where
                 }
                 ScalarAllocation::Stack(slot) => {
                     let expected = expected.size(machine);
-                    let actual = self.output.spill_slot(slot);
+                    let Some(actual) = self.output.try_spill_slot(slot) else {
+                        self.error(mode, CheckerError::NoSuchSpillSlot { slot });
+                        continue;
+                    };
                     if actual != expected {
                         self.error(
                             mode,
@@ -1314,7 +1663,10 @@ where
         mode: Mode,
     ) {
         let expected = bank.size(self.input.machine);
-        let actual = self.output.spill_slot(slot);
+        let Some(actual) = self.output.try_spill_slot(slot) else {
+            self.error(mode, CheckerError::NoSuchSpillSlot { slot });
+            return;
+        };
         if actual != expected {
             self.error(
                 mode,
@@ -1360,11 +1712,13 @@ where
         }
 
         self.def_locs.clear();
+        self.use_locs.clear();
 
-        // The instruction reads and writes at two points, and reads before it
-        // writes at each of them, so there are four passes to make in order.
+        // The instruction reads and writes (at the same time) in two phases:
+        // early and late.
 
-        // Early uses.
+        // Early uses. Run all these first, before defs, so that we can detect
+        // conflicting defs via `self.use_locs`.
         for (i, &op) in operands.iter().enumerate() {
             if op.pos().is_early() && op.kind() == DefUse::Use {
                 self.read_operand(state, inst, i, op, &scalars[i], mode);
@@ -1378,7 +1732,11 @@ where
             }
         }
 
-        // Late uses.
+        // The early uses and any early defs that could conflict with them have
+        // all completed, so we can clear them now.
+        self.use_locs.clear();
+
+        // Late uses. These are evaluated before defs, like above.
         for (i, &op) in operands.iter().enumerate() {
             if op.pos().is_late() && op.kind() == DefUse::Use {
                 self.read_operand(state, inst, i, op, &scalars[i], mode);
@@ -1581,7 +1939,10 @@ where
             let ScalarAllocation::Stack(slot) = loc else {
                 continue;
             };
-            let actual = self.output.spill_slot(slot);
+            let Some(actual) = self.output.try_spill_slot(slot) else {
+                self.error(mode, CheckerError::NoSuchSpillSlot { slot });
+                continue;
+            };
             if actual != expected {
                 self.error(
                     mode,
@@ -1649,6 +2010,24 @@ where
         }
     }
 
+    /// Check that a definition landed in a register the allocator is allowed
+    /// to hand out.
+    ///
+    /// A non-allocatable register may be read (pinning an operand to `sp` is
+    /// exactly what putting one in a class is for). It cannot be the home a
+    /// definition gives its value because the allocator does not own it or
+    /// track its interference.
+    fn check_def_is_allocatable(&mut self, site: Site, scalars: &[ScalarAllocation], mode: Mode) {
+        let machine = self.input.machine;
+        for &loc in scalars {
+            if let ScalarAllocation::Reg(reg) = loc {
+                if reg.is_non_allocatable(machine) {
+                    self.error(mode, CheckerError::DefInNonAllocatableReg { site, reg });
+                }
+            }
+        }
+    }
+
     /// Check that an operand's allocation holds the value the operand reads.
     fn read_operand(
         &mut self,
@@ -1662,6 +2041,8 @@ where
         let val = op.val();
 
         for (index, &loc) in scalars.iter().enumerate() {
+            self.use_locs.push((i, loc));
+
             let mut actual = state
                 .parts(loc)
                 .map(|parts| parts.iter().map(|part| part.val).collect::<Vec<_>>())
@@ -1702,6 +2083,8 @@ where
         let machine = self.input.machine;
         let val = op.val();
 
+        self.check_def_is_allocatable(Site::Operand { inst, operand: i }, scalars, mode);
+
         // Check for conflicting definitions.
         for &loc in scalars {
             let conflict = self
@@ -1720,6 +2103,27 @@ where
                     },
                 );
             }
+
+            // And for a definition landing on something this instruction reads
+            // at the same point, which destroys the read value rather than
+            // merely sharing a location with it.
+            let clobbered = self
+                .use_locs
+                .iter()
+                .find(|&&(_, read)| Interfere::interfere(machine, read, loc))
+                .map(|&(other, _)| other);
+            if let Some(other) = clobbered {
+                self.error(
+                    mode,
+                    CheckerError::DefClobbersUse {
+                        inst,
+                        operand: i,
+                        other,
+                        loc,
+                    },
+                );
+            }
+
             self.def_locs.push((i, loc));
         }
 
@@ -1859,6 +2263,7 @@ mod tests {
             TestInput::with_two_entry_params(),
             TestInput::with_entry_params_in_two_banks(),
             TestInput::with_a_self_looping_entry_block(),
+            TestInput::with_a_move_after_an_unconditional_branch(),
         ]
     }
 
@@ -1951,6 +2356,8 @@ mod tests {
             ENTRY_BLOCK_EDGES: entry_block_edges = "an edge arriving at the entry block",
             BLOCK_PARAM_ALLOCS: block_param_allocs =
                 "a block parameter the results give a location",
+            EDITS_AFTER_TERMINATOR: edits_after_terminator =
+                "an edit placed after a block's terminator",
         }
     }
 
@@ -2389,6 +2796,55 @@ mod tests {
         };
     }
 
+    /// A rematerialized value is one that is computed from nothing.
+    ///
+    /// A `Remat` carries no inputs, so it can only stand in for a definition
+    /// that reads nothing --- which is the rule `index_remats` picks its
+    /// candidates by --- and never for a block parameter, which no instruction
+    /// computes at all.
+    #[test]
+    fn checks_that_a_rematerialized_value_is_computed_from_nothing() {
+        // The parameter half: point the remat at the value the edge defines
+        // rather than the argument it carries.
+        let test_input = TestInput::with_a_rematerialized_block_arg();
+        let stats = check_allocation(&test_input).unwrap();
+        assert!(stats.remats > 0, "the fixture should rematerialize");
+
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            for (_, edit) in edits.iter_mut() {
+                if let Edit::Remat(remat) = edit {
+                    // `v1` is the block parameter this fixture defines.
+                    remat.val = Val::try_new(1).unwrap();
+                }
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("is a block parameter and so no instruction computes"),
+            "{error}",
+        );
+
+        // And the reading half: leave the remat where it is and give the
+        // definition it stands in for an operand to read. That also leaves the
+        // instruction with more operands than the results give it allocations,
+        // which is reported as well; `check_against` does not validate the
+        // copy it checks, and this is the only way to reach a definition that
+        // reads from a fixture whose definitions do not.
+        let mut test_input = TestInput::with_a_rematerialized_block_arg();
+        let allocated = test_input.clone();
+        let def = Inst::try_new(0).unwrap();
+        let arg = first_val(&test_input);
+        test_input.func.operands_mut(def).push(Operand::new(
+            Position::Early,
+            DefUse::Use,
+            OperandConstraint::Any,
+            arg,
+        ));
+
+        let error = check_against(&allocated, &test_input).unwrap_err();
+        assert!(error.contains("computes from values it reads"), "{error}",);
+    }
+
     /// A value that the allocator moved from one place to another does not
     /// arrive if the move is taken away.
     #[test]
@@ -2405,6 +2861,28 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("reads register"), "{error}");
+    }
+
+    /// A block has exactly as many parameter allocations as it has parameters.
+    ///
+    /// The two are walked together, so a short list of allocations would
+    /// otherwise decide how many parameters get checked at all, and the rest
+    /// would go unexamined rather than unallocated.
+    #[test]
+    fn checks_the_number_of_block_param_allocations() {
+        let mut test_input = TestInput::with_stack_param_and_arg();
+        check_allocation(&test_input).unwrap();
+
+        // The entry block is the one to grow: nothing branches to it, so the
+        // extra parameter reaches the count check without first tripping the
+        // renaming that an edge into a block would do.
+        let allocated = test_input.clone();
+        let entry = test_input.func.entry_block();
+        let val = first_val(&test_input);
+        test_input.func.push_block_param(entry, val);
+
+        let error = check_against(&allocated, &test_input).unwrap_err();
+        assert!(error.contains("parameter(s) but was given"), "{error}");
     }
 
     /// A block parameter is where the results say it arrives.
@@ -2531,6 +3009,38 @@ mod tests {
         assert!(error.contains("rather than the 1 byte(s)"), "{error}");
     }
 
+    /// A move or rematerialization placed after a block's terminator is only
+    /// where the machine will run it when the terminator is the whole of the
+    /// block's outgoing edge.
+    ///
+    /// Nothing else asks this: such an edit is applied to the block's state
+    /// like any other, and the state cannot tell that the machine jumped away
+    /// before reaching it.
+    #[test]
+    fn checks_that_an_edit_after_a_terminator_is_on_an_edge_it_may_be_on() {
+        let mut test_input = TestInput::with_a_move_after_an_unconditional_branch();
+        let stats = check_allocation(&test_input).unwrap();
+        assert!(
+            stats.edits_after_terminator > 0,
+            "the fixture should place an edit after one of its unconditional branches",
+        );
+
+        // Give the branch that hosts the edit a second outgoing edge, going
+        // to the same place with the same argument. Nothing about where the
+        // machine goes changes, but the block no longer leaves along the one
+        // edge, so the code after its terminator is no longer that edge's.
+        let allocated = test_input.clone();
+        test_input
+            .func
+            .duplicate_block_call(Inst::try_new(4).unwrap(), 0);
+
+        let error = check_against(&allocated, &test_input).unwrap_err();
+        assert!(
+            error.contains("which is not an edge this edit may be placed on"),
+            "{error}",
+        );
+    }
+
     /// An edit the allocator put on a critical edge names the edge it is
     /// really on, so a client splitting that edge splits the right one.
     #[test]
@@ -2586,6 +3096,107 @@ mod tests {
         assert!(error.contains("which is not in"), "{error}");
     }
 
+    /// A definition does not land in a register the machine never lets the
+    /// allocator hand out.
+    ///
+    /// `check_reg_class` cannot say this. A non-allocatable register is in a
+    /// class exactly when some operand needs to pin a read to it, and being in
+    /// a class the value is allowed in is all that check asks for. But such a
+    /// register covers no register units, so the allocator can see nothing
+    /// interfere with a value that lives there and can keep nothing else off
+    /// it: a definition there has no home at all.
+    #[test]
+    fn checks_that_a_definition_is_not_put_in_a_non_allocatable_register() {
+        // An instruction's definition.
+        let mut test_input = TestInput::with_a_move_after_an_unconditional_branch();
+        let sp = test_input.machine.push_non_allocatable_reg(0);
+        check_allocation(&test_input).unwrap();
+
+        let def = Inst::try_new(0).unwrap();
+        let error = check_with_broken_results!(&test_input, |inner| {
+            let allocs = inner.output.inst_allocs_mut(def);
+            assert_eq!(allocs.len(), 1);
+            allocs[0] = Allocation::Reg(RegAllocation::Reg(sp));
+        })
+        .unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "operand 0 of inst0 is defined in {sp:?}, which is not allocatable"
+            )),
+            "{error}",
+        );
+
+        // And a block parameter, which is a definition of its own.
+        let mut test_input = TestInput::with_two_entry_params();
+        let sp = test_input.machine.push_non_allocatable_reg(0);
+        check_allocation(&test_input).unwrap();
+
+        let entry = Block::try_new(0).unwrap();
+        let error = check_with_broken_results!(&test_input, |inner| {
+            let params = inner.output.block_param_allocs_mut(entry);
+            params[0] = Some(Allocation::Reg(RegAllocation::Reg(sp)));
+        })
+        .unwrap_err();
+        assert!(
+            error.contains(&format!("is defined in {sp:?}, which is not allocatable")),
+            "{error}",
+        );
+    }
+
+    /// A move into a register the allocator does not own carries something
+    /// that was allowed to be there.
+    ///
+    /// Writing such a register is ordinary --- it is how a value reaches an
+    /// operand pinned to `sp` --- so the question is never whether the move
+    /// may happen but what it puts there: a value whose own class does not
+    /// hold the register could not have been pinned to it by anything, and a
+    /// source holding nothing the checker can name justifies nothing at all.
+    #[test]
+    fn checks_what_a_move_into_a_non_allocatable_register_carries() {
+        let mut test_input = TestInput::with_a_move_after_an_unconditional_branch();
+        let sp = test_input.machine.push_non_allocatable_reg(0);
+        let stats = check_allocation(&test_input).unwrap();
+        assert!(
+            stats.reg_reg_moves > 0,
+            "the fixture should move a value from one register to another",
+        );
+
+        // The moved value is in `rc2`, which holds the two registers the
+        // allocator owns and not this one.
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            for (_, edit) in edits.iter_mut() {
+                if let Edit::Move(Move::RegReg { to, .. }) = edit {
+                    *to = sp.with_repr().unwrap();
+                }
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "puts v0 in {sp:?}, which is not allocatable and not in v0's own register class"
+            )),
+            "{error}",
+        );
+
+        // Nothing ever writes this register, so a move out of it carries
+        // nothing that could justify writing it back.
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            for (_, edit) in edits.iter_mut() {
+                if let Edit::Move(Move::RegReg { from, to }) = edit {
+                    *from = sp.with_repr().unwrap();
+                    *to = sp.with_repr().unwrap();
+                }
+            }
+        })
+        .unwrap_err();
+        assert!(
+            error.contains(&format!(
+                "puts an unknown value in {sp:?}, which is not allocatable"
+            )),
+            "{error}",
+        );
+    }
+
     /// A move puts its value in a spill slot of the size that value needs, and
     /// not in one of some other value's.
     #[test]
@@ -2613,6 +3224,94 @@ mod tests {
         assert!(
             error.contains("byte(s) one of its registers needs"),
             "{error}"
+        );
+    }
+
+    /// A slot the results move a value into is a slot the results allocate.
+    ///
+    /// Reading a slot's size is the first thing every stack check does, so
+    /// without this the checker would panic on results that name a slot out of
+    /// thin air rather than reporting them.
+    #[test]
+    fn checks_that_a_slot_the_results_use_is_one_they_allocate() {
+        let test_input = TestInput::with_values_in_two_banks_spilled_and_reloaded();
+        let stats = check_allocation(&test_input).unwrap();
+        assert!(stats.spills > 0, "the fixture should spill both its values");
+
+        // Far past the two slots the fixture allocates, and still inside every
+        // entity representation `run_dispatch` might have picked.
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            for (_, edit) in edits.iter_mut() {
+                if let Edit::Move(Move::Spill { to, .. }) = edit {
+                    *to = SpillSlot::try_new(50).unwrap();
+                }
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("which they do not allocate"), "{error}");
+    }
+
+    /// The edits atop a block are the ones its incoming edge delivers, so a
+    /// critical-edge edit --- which goes on an edge the client has yet to
+    /// split, and which the block's own stream keeps until the very end --- is
+    /// never one of them.
+    #[test]
+    fn checks_that_no_critical_edge_edit_sits_atop_a_block() {
+        let test_input = TestInput::with_a_rematerialized_block_arg();
+        let stats = check_allocation(&test_input).unwrap();
+        assert!(
+            stats.deferred_renames > 0,
+            "the fixture should put a remat atop a block",
+        );
+
+        // Wrap the remat up as an edge edit without moving it off the position
+        // it is stored under, which is a point atop the block.
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            for (_, edit) in edits.iter_mut() {
+                if let Edit::Remat(remat) = *edit {
+                    *edit = Edit::CriticalEdge(CriticalEdgeEdit {
+                        target: Block::try_new(1).unwrap(),
+                        succ: 0,
+                        edit: EdgeEdit::Remat(remat),
+                    });
+                }
+            }
+        })
+        .unwrap_err();
+        assert!(error.contains("sits among the edits atop"), "{error}");
+    }
+
+    /// A block's critical-edge edits are the last thing its stream holds:
+    /// everything the block itself runs has already happened by the time an
+    /// edge leaving it is reached.
+    #[test]
+    fn checks_that_nothing_follows_a_blocks_critical_edge_edits() {
+        let test_input = TestInput::with_a_critical_edge();
+        let stats = check_allocation(&test_input).unwrap();
+        assert!(
+            stats.critical_edge_edits > 0,
+            "the fixture should put an edit on a critical edge",
+        );
+
+        // Give the edge edit a neighbour stored under its own position, which
+        // is the only way to put something after it: the positions themselves
+        // are what sort the edge edits to the end.
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            let i = edits
+                .iter()
+                .position(|(_, edit)| matches!(edit, Edit::CriticalEdge(_)))
+                .expect("the fixture has a critical-edge edit");
+            let pos = edits[i].0;
+            let reg = Reg::try_new(0).unwrap();
+            edits.insert(
+                i + 1,
+                (pos, Edit::Move(Move::RegReg { from: reg, to: reg })),
+            );
+        })
+        .unwrap_err();
+        assert!(
+            error.contains("critical-edge edits, which are the last thing"),
+            "{error}",
         );
     }
 
@@ -2806,6 +3505,51 @@ mod tests {
 
         let error = check_against(&allocated, &test_input).unwrap_err();
         assert!(error.contains("both define"), "{error}");
+    }
+
+    /// A definition of one instruction does not land on something the same
+    /// instruction reads at the same point.
+    ///
+    /// [`CheckerError::ConflictingDef`] cannot say this --- it compares
+    /// definitions with definitions --- and neither can the state: the read
+    /// happens before the write in the checker just as it does in the machine,
+    /// so the read finds the right value and only the *other* reader of that
+    /// register, if any, would ever notice.
+    #[test]
+    fn checks_for_a_def_that_clobbers_a_use() {
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let mut test_input = TestInput::with_reuse_def(OperandConstraint::Any);
+        check_allocation(&test_input).unwrap();
+
+        let (inst, def_i, def_op, reuse) = operands(&test_input)
+            .into_iter()
+            .find_map(|(inst, i, op)| match op.constraint() {
+                OperandConstraint::Reuse(target) => Some((inst, i, op, target)),
+                _ => None,
+            })
+            .expect("the fixture has a reuse");
+
+        let allocated = test_input.clone();
+
+        // Untie the pair, and move the read the tie named to the definition's
+        // own point. The allocation still puts both in one register, which is
+        // exactly right for the tie it was made for and destroys the read here.
+        *test_input.func.operand_mut(inst, def_i) = Operand::new(
+            def_op.pos(),
+            def_op.kind(),
+            OperandConstraint::Reg(class),
+            def_op.val(),
+        );
+        let reused = *test_input.func.operand_mut(inst, reuse);
+        *test_input.func.operand_mut(inst, reuse) = Operand::new(
+            def_op.pos(),
+            DefUse::Use,
+            OperandConstraint::Reg(class),
+            reused.val(),
+        );
+
+        let error = check_against(&allocated, &test_input).unwrap_err();
+        assert!(error.contains("reads at the same point"), "{error}");
     }
 
     /// A value occupying a whole register group is checked member by member,

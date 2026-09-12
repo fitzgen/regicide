@@ -586,11 +586,21 @@ impl<'a> Output<'a> {
     }
 
     /// The size of the given spill slot.
+    ///
+    /// # Panics
+    ///
+    /// Panics if these results do not contain `slot`. Use
+    /// [`Output::try_spill_slot`] to ask without asserting.
     pub fn spill_slot(&self, slot: SpillSlot) -> SpillSlotSize {
-        let sizes: &[SpillSlotSize] = with_inner!(self, |inner| inner.spill_slots.sizes());
-        *sizes
-            .get(slot.index())
+        self.try_spill_slot(slot)
             .expect("no such spill slot in these results")
+    }
+
+    /// The size of the given spill slot, or `None` if these results do not
+    /// contain it.
+    pub(crate) fn try_spill_slot(&self, slot: SpillSlot) -> Option<SpillSlotSize> {
+        let sizes: &[SpillSlotSize] = with_inner!(self, |inner| inner.spill_slots.sizes());
+        sizes.get(slot.index()).copied()
     }
 
     /// The slots that make up `group`, in the order of the register group whose
@@ -1014,6 +1024,17 @@ impl<E: EntityRepr> OutputInner<E> {
         };
         let range = self.inst_allocs[inst];
         &self.operand_allocs.as_slice()[range.indices()]
+    }
+
+    /// Those allocations, mutably, so that a test can break a correct
+    /// allocation and watch the checker notice.
+    #[cfg(test)]
+    pub(crate) fn inst_allocs_mut(&mut self, inst: Inst) -> &mut [Allocation] {
+        let Some(inst) = inst.with_repr::<E>() else {
+            return &mut [];
+        };
+        let range = self.inst_allocs[inst];
+        &mut self.operand_allocs.as_mut_slice()[range.indices()]
     }
 
     #[inline]

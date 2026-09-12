@@ -530,6 +530,12 @@ fn check_block_reg_classes<'a>(
                     if class.intersect(machine, class_of(operand.val())) != Some(class) {
                         return Err(Error::IncompatibleRegClass { inst, operand: i });
                     }
+
+                    // And a definition pinned to registers the allocator does
+                    // not own has nowhere to go.
+                    if operand.kind() == DefUse::Def && !class.has_an_allocatable_member(machine) {
+                        return Err(Error::DefInNonAllocatableRegClass { inst, operand: i });
+                    }
                 }
 
                 // `validate_entity_references` has already shown that `target`
