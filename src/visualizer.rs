@@ -228,11 +228,15 @@ fn strip_exports(src: &str) -> String {
 /// Escape the two sequences the HTML parser reacts to inside a `<script>`
 /// element, either of which would otherwise end the element early.
 ///
-/// `\/` is a valid escape in both a JSON string and a JavaScript one, and
-/// neither sequence occurs anywhere else in either language, which a test
-/// checks by looking for them in the emitted page.
+/// `\/` and `\u0021` are both valid escapes in a JSON string and in a
+/// JavaScript one, and neither sequence occurs anywhere else in either
+/// language, which a test checks by looking for them in the emitted page.
+///
+/// `\!` would do the same job to the HTML parser but is *not* a legal JSON
+/// escape, so a single `<!--` anywhere in the blob would have made the whole
+/// thing unparseable and left the page with nothing to show.
 fn escape_script(text: &str) -> String {
-    text.replace("</", "<\\/").replace("<!--", "<\\!--")
+    text.replace("</", "<\\/").replace("<!--", "<\\u0021--")
 }
 
 const fn kind<T: VisualizedEntity>() -> (&'static str, &'static str) {
@@ -329,11 +333,13 @@ mod tests {
         &rest[..rest.find("</script>").expect("the script's closing tag")]
     }
 
-    /// The JSON blob back out of a page, undoing [`escape_script`].
-    fn data_json(page: &str) -> String {
+    /// The JSON blob back out of a page.
+    ///
+    /// Nothing is undone: [`escape_script`] emits only escapes JSON already
+    /// understands, so the escaped text parses as-is. Un-escaping by hand here
+    /// instead would hide an escape that JSON does not accept.
+    fn data_json(page: &str) -> &str {
         script_body(page, DATA_TAG)
-            .replace("<\\/", "</")
-            .replace("<\\!--", "<!--")
     }
 
     /// If a prefix ever drifts from the `Debug` impl the rest of the crate
@@ -563,12 +569,26 @@ mod tests {
         std::fs::remove_file(&path).expect("the page is removable");
 
         let json: serde_json::Value =
-            serde_json::from_str(&data_json(&page)).expect("the blob parses");
+            serde_json::from_str(data_json(&page)).expect("the blob parses");
         assert_eq!(json["version"], VERSION);
         assert_eq!(
             json["function"]["blocks"].as_array().expect("blocks").len(),
             test.func.len_blocks()
         );
+    }
+
+    /// The escaping has to survive `JSON.parse`, which is the one thing the
+    /// page does with the blob. An escape the HTML parser accepts but JSON
+    /// rejects loses not one string but the entire visualization.
+    #[test]
+    fn escapes_are_valid_json() {
+        let text = r#"a </script> and a <!-- comment --> walk in"#;
+        let escaped = escape_script(&serde_json::to_string(&text).unwrap());
+        assert!(!escaped.contains("</"), "`</` survived: {escaped}");
+        assert!(!escaped.contains("<!--"), "`<!--` survived: {escaped}");
+
+        let back: String = serde_json::from_str(&escaped).expect("the escaped string parses");
+        assert_eq!(back, text);
     }
 
     /// Either sequence ends the `<script>` element early, which turns the rest
