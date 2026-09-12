@@ -540,8 +540,13 @@ function buildDetails(json, entityEvents) {
   const spansAt = new Map();
   insts.forEach((_inst, i) => spansAt.set(i, []));
   spans.forEach((span, i) => {
+    // `end` is exclusive, so the last instruction covered is the one before the
+    // point it names: a span ending at `{k, "early"}` covers nothing in `k`, and
+    // every span reaching the end of a block ends at the next block's first
+    // point. Rounding the other way attributed all of them to an instruction
+    // they are dead in, and disagreed with the bars, which already step back.
     const from = Math.floor(at(span.start) / 2);
-    const to = Math.floor(at(span.end) / 2);
+    const to = Math.ceil(at(span.end) / 2) - 1;
     for (let inst = from; inst <= to; inst++) {
       const list = spansAt.get(inst);
       if (list !== undefined) list.push(i);

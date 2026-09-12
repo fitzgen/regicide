@@ -579,6 +579,28 @@ test("an instruction lists every span live across it, used there or not", () => 
   assert.equal(blob.function.insts[1].operands.length, 1);
 });
 
+test("a span that ends at an instruction is not live in it", () => {
+  // `end` is exclusive. Every span that reaches the end of a block ends at
+  // `{last + 1, "early"}`, so a pane that rounds the end up hands the whole
+  // live set of one block to the first instruction of the next.
+  const blob = fixture("spills-and-reloads");
+  const model = modelOf(blob);
+  const live = (i) => shown(model.details({ kind: "Inst", index: i }))["Live spans"];
+
+  // span0 and span1 end at `{2, "early"}` and span2 and span3 begin there, so
+  // inst2 is the reloads' and not the spilled values'.
+  assert.deepEqual(
+    [blob.function.spans[0].end, blob.function.spans[1].end],
+    [{ inst: 2, pos: "early" }, { inst: 2, pos: "early" }],
+  );
+  assert.deepEqual(live(2), "span2(v0[stack0]), span3(v1[stack1])");
+  assert.deepEqual(live(3), "span4(v0[r1]), span5(v1[r4])");
+
+  // And the last instruction, which every span has ended before, lists none
+  // rather than all of them.
+  assert.deepEqual(live(4), "none");
+});
+
 test("a constraint spells out its register class", () => {
   // Two levels for a group class, one for a class of plain registers, and
   // every name in the expansion clickable -- a constraint is read to find out
@@ -731,7 +753,10 @@ test("a list's count is the true total and its value is what survived the cap", 
   const field = modelOf(blob)
     .details({ kind: "Inst", index: inst })
     .fields.find((f) => f.label === "Live spans");
-  assert.equal(field.count, 300 + spans.slice(0, original).filter((s) => s.end.inst >= inst).length);
+  // `end` is exclusive, so an original span counts only if it reaches past the
+  // instruction or ends at its late point.
+  const covers = (s) => s.end.inst > inst || (s.end.inst === inst && s.end.pos === "late");
+  assert.equal(field.count, 300 + spans.slice(0, original).filter(covers).length);
   assert.ok(field.count > 200, "the fixture was not perturbed enough to truncate");
   // Each entry is a span and the value and register inside its label, so it
   // is the spans that are counted.
