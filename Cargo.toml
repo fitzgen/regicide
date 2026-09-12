@@ -9,9 +9,6 @@ rustc-hash = { version = "2.1.3", default-features = false }
 hashbrown = { version = "0.17.1", default-features = false, optional = true }
 serde = { version = "1.0.228", features = ["derive"], optional = true }
 serde_json = { version = "1.0.145", optional = true }
-# The same feature list as the dev-dependency below, so that every build has
-# one `mutatis` and not two: `visualizer` exposes `regicide::test`, whose
-# mutators need it, and `cfg(test)` needs it whether `visualizer` is on or not.
 mutatis = { version = "0.5.2", features = ["check", "derive"], optional = true }
 
 [dev-dependencies]

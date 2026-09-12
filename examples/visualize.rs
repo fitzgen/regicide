@@ -5,17 +5,6 @@
 //! cargo run --example visualize --all-features -- -s 42 -i 200 /tmp/other.html
 //! cargo run --example visualize --all-features -- -r 8 /tmp/roomy.html
 //! ```
-//!
-//! The function is always a `regicide::test::TestInput`, mutated `--iters`
-//! times by a `mutatis::Session` seeded with `--seed`: the point of the page
-//! is to go looking at allocations nobody wrote by hand, and one function
-//! written out longhand here would only ever be the one function.
-//! `regicide::test` is not public API; the `visualizer` feature this example
-//! requires is what exposes it.
-//!
-//! Both flags default, so the bare invocation above is a particular page and
-//! not a random one, and any page can be asked for again by repeating the two
-//! numbers printed to stderr.
 
 use regicide::{
     Context, Error, Input, InputFunction,
@@ -36,15 +25,7 @@ usage: visualize [-s SEED] [-i ITERS] [-r REGS] <path.html>
                      mutations produced, which is at most four per bank)
   -h, --help         print this message";
 
-/// The seed the page is built with when `--seed` was not given.
-///
-/// Chosen by trying the small ones: a mutated input is as likely to be a
-/// single instruction as anything else, and this one comes out with two
-/// blocks, three spill slots, moves, and twenty-eight distinct event kinds --
-/// enough of the allocator's machinery that every pane has something to draw.
 const DEFAULT_SEED: u64 = 21;
-
-/// How many times the input is mutated when `--iters` was not given.
 const DEFAULT_ITERS: u64 = 100;
 
 fn main() {
@@ -56,9 +37,6 @@ fn main() {
         }
     };
 
-    // Always seeded explicitly: `Session::new()` otherwise draws from a
-    // process-global counter, and a page worth keeping has to be one that can
-    // be asked for again.
     let seed = args.seed.unwrap_or(DEFAULT_SEED);
     let iters = args.iters.unwrap_or(DEFAULT_ITERS);
     let regs = match args.regs {
@@ -68,9 +46,6 @@ fn main() {
     eprintln!("mutating the default TestInput: seed {seed}, {iters} iterations, {regs}");
 
     let mut input = TestInput::default();
-    // Before the mutations rather than after, so the input is built against
-    // the machine it will be allocated on. The count lives on the machine, so
-    // each mutation's `fixup` re-applies it rather than undoing it.
     if let Some(regs) = args.regs {
         input.machine.set_regs_per_bank(regs);
         input.fixup();
@@ -86,16 +61,10 @@ fn main() {
 }
 
 /// Allocate registers for `input` and write the page.
-///
-/// Generic, because `InputFunction` has GATs and is not object-safe; the
-/// signature mirrors `regicide::run`'s own.
 fn emit(input: &Input<'_, impl InputFunction>, path: &str) {
     let mut context = Context::new();
     let output = match regicide::run(&mut context, input) {
         Ok(output) => output,
-        // The one failure a mutated input reaches often: `TestMachine` has at
-        // most two banks of four registers, and nothing keeps a mutation from
-        // asking for more at one point.
         Err(Error::TooManyLiveRegs) => {
             eprintln!(
                 "this input needs more registers at one point than its machine has; \
@@ -113,10 +82,10 @@ fn emit(input: &Input<'_, impl InputFunction>, path: &str) {
         eprintln!("could not write {path}: {e}");
         process::exit(1);
     }
+
     println!("wrote {path}");
 }
 
-/// The command line.
 struct Args {
     path: String,
     seed: Option<u64>,
@@ -125,7 +94,6 @@ struct Args {
 }
 
 impl Args {
-    /// Parse it, by hand rather than by adding a crate for three flags.
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
         let mut path = None;
         let mut seed = None;
@@ -155,16 +123,11 @@ impl Args {
                     println!("{USAGE}");
                     process::exit(0);
                 }
-                "-s" | "--seed" => seed = Some(number(&name, &value(&name)?)?),
-                "-i" | "--iters" => iters = Some(number(&name, &value(&name)?)?),
+                "-s" | "--seed" => seed = Some(parse_u64(&name, &value(&name)?)?),
+                "-i" | "--iters" => iters = Some(parse_u64(&name, &value(&name)?)?),
                 "-r" | "--regs" => {
-                    // Range-checked here rather than left to
-                    // `set_regs_per_bank`'s assertion: a number out of range
-                    // is the user's typo, and a panic is a poor way to say so.
-                    let n = number(&name, &value(&name)?)?;
+                    let n = parse_u64(&name, &value(&name)?)?;
                     let most = TestMachine::MAX_REGS_PER_BANK_TARGET;
-                    // Through `try_from`, so that a number too large for a
-                    // `usize` is this message rather than a panic.
                     let within = usize::try_from(n).is_ok_and(|n| (1..=most).contains(&n));
                     if !within {
                         return Err(format!("{name} wants 1 to {most} registers, not {n}"));
@@ -189,8 +152,7 @@ impl Args {
     }
 }
 
-/// One flag's value as an integer.
-fn number(flag: &str, value: &str) -> Result<u64, String> {
+fn parse_u64(flag: &str, value: &str) -> Result<u64, String> {
     value
         .parse()
         .map_err(|_| format!("{flag} wants a non-negative integer, not `{value}`"))
