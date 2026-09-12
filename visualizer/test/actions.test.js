@@ -426,13 +426,61 @@ test("an entity with no cached details is pending until its result arrives", () 
   assert.equal(arrived.pendingDetails, null);
   assert.equal(arrived.details[key], result);
 
-  // And a failed query leaves neither, which is the empty-pane case.
+  // And a failed query leaves neither, which is the empty-pane case. The
+  // pending key has to go with it: the pane would otherwise read "Loading..."
+  // for the rest of the session, since coming back to the entity is answered
+  // out of the cache and there is nothing in it.
   const failed = run(
-    [{ type: "queryResult", id: queries[0].id, method: "details", error: "boom" }],
+    [{ type: "queryResult", id: queries[0].id, method: "details", args: [V3], error: "boom" }],
     state,
   ).state;
   assert.equal(failed.details[key], undefined);
-  assert.equal(failed.pendingDetails, key);
+  assert.equal(failed.pendingDetails, null);
+  assert.equal(failed.error, "boom");
+});
+
+test("a failed query clears only its own pending mark", () => {
+  // Two details queries in flight, the first failing. The pane is waiting on
+  // the second, and an error on the first must not make it say the entity has
+  // no details.
+  const first = run([{ type: "clickEntity", ref: V3 }]);
+  const second = run([{ type: "clickEntity", ref: BLOCK2 }], first.state);
+  const key = entityKey(BLOCK2);
+  assert.equal(second.state.pendingDetails, key);
+
+  const after = run(
+    [{ type: "queryResult", id: first.queries[0].id, method: "details", args: [V3], error: "boom" }],
+    second.state,
+  ).state;
+  assert.equal(after.pendingDetails, key);
+});
+
+test("a failed search stops the spinner and keeps what was on screen", () => {
+  const { state, queries } = run([
+    { type: "search", query: "Spill" },
+  ]);
+  const shown = run(
+    [{ type: "queryResult", id: queries[0].id, method: "searchEvents", args: ["Spill"], result: [7] }],
+    state,
+  ).state;
+
+  const again = run([{ type: "search", query: "Spilled" }], shown);
+  assert.equal(again.state.search.pending, true);
+
+  const failed = run(
+    [{
+      type: "queryResult",
+      id: again.queries[0].id,
+      method: "searchEvents",
+      args: ["Spilled"],
+      error: "boom",
+    }],
+    again.state,
+  ).state;
+  assert.equal(failed.search.pending, false, "the event list kept spinning");
+  assert.equal(failed.error, "boom");
+  // Stale rows under an error banner beat an empty list.
+  assert.deepEqual(failed.search.results, [7]);
 });
 
 test("a search marks itself pending and asks once", () => {

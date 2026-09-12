@@ -101,7 +101,7 @@ export function handleAction(state, action) {
       const pending = { ...state.pending };
       delete pending[action.id];
       const next = { ...state, pending, error: action.error || null };
-      if (action.error) return done(next);
+      if (action.error) return done(failed(next, action));
       switch (action.method) {
         case "details":
           // `null` when the model has nothing to say about the ref. There is
@@ -228,6 +228,25 @@ function cacheDetails(state, result) {
     // Only the query this answers: another is still in flight.
     pendingDetails: state.pendingDetails === key ? null : state.pendingDetails,
   };
+}
+
+// Undo what a query that failed had marked as in flight.
+//
+// The error banner says something went wrong, but a pane left pending says
+// "Loading..." forever: the details pane short-circuits on a cache hit alone,
+// so even clicking away and back would not retry. Only this query's marks are
+// cleared -- another may still be in flight.
+function failed(state, action) {
+  switch (action.method) {
+    case "details":
+      return clearPendingDetails(state, action.args);
+    case "searchEvents":
+      // The results stay: stale rows under an error banner beat an empty list,
+      // and the query text in the state still says what they answered.
+      return { ...state, search: { ...state.search, pending: false } };
+    default:
+      return state;
+  }
 }
 
 // Clear the pending details key, given the args of the query that answered.
