@@ -80,8 +80,8 @@ pub enum MoveEliminationLevel {
 
 /// The constraints describing where an operand may be located.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "lowercase"))]
 pub enum OperandConstraint {
     /// This operand may be placed in any location: register or stack.
     Any,
@@ -366,7 +366,7 @@ where
         Val::try_new(index).unwrap()
     }
 
-    #[cfg(any(test, fuzz, feature = "visualizer"))]
+    #[cfg(any(test, fuzz, feature = "test-utils"))]
     pub(crate) fn set_val(&mut self, val: Val<E>) {
         *self = Self::new(self.pos(), self.kind(), self.constraint(), val);
     }
@@ -410,8 +410,8 @@ where
 /// The position of an operand's definition or use of its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "lowercase"))]
 #[repr(u8)]
 pub enum Position {
     /// The operand is accessed early, just after entering the instruction.
@@ -435,8 +435,8 @@ impl Position {
 /// A definition or use of an associated value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "lowercase"))]
 #[repr(u8)]
 pub enum DefUse {
     /// A definition.

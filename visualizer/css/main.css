@@ -1,4 +1,4 @@
-/* The palette, in one place. Later commits pick from these rather than
+/* The palette, in one place. Everything else picks from these rather than
    inventing colors. */
 :root {
   color-scheme: light dark;

@@ -225,7 +225,7 @@ where
 }
 
 /// A set serializes as an ascending array of its members' indices.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<K, const WORDS: usize> serde::Serialize for FixedEntitySet<K, WORDS>
 where
     K: crate::entity::Entity + serde::Serialize,

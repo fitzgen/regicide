@@ -15,19 +15,11 @@ use crate::{
 };
 use alloc::string::String;
 use function::{FUNCTION_SCHEMA, FunctionInfo, MACHINE_SCHEMA, MachineInfo};
-use index::{EventIndexes, Histogram, Index};
+use index::{EventIndices, Histogram, Index};
 use schema::SerializeTable;
 
-/// The blob format this crate emits, which `main.js` refuses to render if it
-/// does not recognize. Bump it when a change would make an older page
-/// misread a newer blob, rather than merely miss a field.
 const VERSION: u32 = 1;
 
-/// The page's skeleton, and the assets that fill it in.
-///
-/// `include_str!` bakes them into the binary: the page has to be writable from
-/// any working directory, so there is no runtime lookup to get wrong. The cost
-/// is that touching anything under `visualizer/` rebuilds the crate.
 const INDEX_HTML: &str = include_str!("../visualizer/index.html");
 const MAIN_CSS: &str = include_str!("../visualizer/css/main.css");
 const ENTITIES_JS: &str = include_str!("../visualizer/js/entities.js");
@@ -38,30 +30,23 @@ const ACTIONS_JS: &str = include_str!("../visualizer/js/actions.js");
 const VIEW_JS: &str = include_str!("../visualizer/js/view.js");
 const MAIN_JS: &str = include_str!("../visualizer/js/main.js");
 
-/// Where each asset goes. Each of these appears exactly once in
-/// `index.html`, which a test checks, because a renamed marker would
-/// otherwise emit a page that silently does nothing.
 const CSS_MARKER: &str = "/* REGICIDE_CSS */";
 const WORKER_MARKER: &str = "/* REGICIDE_WORKER_JS */";
 const DATA_MARKER: &str = "/* REGICIDE_DATA_JSON */";
 const APP_MARKER: &str = "/* REGICIDE_APP_JS */";
 
 /// The whole visualization, as one JSON object.
-///
-/// The format version is `version` and not `schema`: `schema` is the table
-/// that says which field holds which kind of entity, and one key cannot be
-/// both.
 #[derive(serde::Serialize)]
 #[serde(bound = "")]
 #[serde(rename_all = "camelCase")]
-struct Blob<'a, E>
+struct VizBlob<'a, E>
 where
     E: EntityRepr,
 {
     /// The format version.
     version: u32,
 
-    /// Entity type name -> display prefix, the only place prefixes appear.
+    /// Entity type name to display prefix, the only place prefixes appear.
     entity_kinds: EntityKinds,
 
     /// Which field of which struct holds which kind of entity, the only place
@@ -78,7 +63,7 @@ where
     events: &'a EventsLog<E>,
 
     /// The ways into the event log that are not a position.
-    index: &'a EventIndexes<E>,
+    index: &'a EventIndices<E>,
 
     /// The summaries the histograms tab draws.
     histograms: &'a [Histogram],
@@ -98,7 +83,7 @@ struct Schema {
     machine: SerializeTable,
 }
 
-/// [`ENTITY_KINDS`] as a JSON object.
+/// `ENTITY_KINDS` as a JSON object.
 struct EntityKinds;
 
 impl serde::Serialize for EntityKinds {
@@ -135,7 +120,7 @@ where
     E: EntityRepr,
     F: InputFunction,
 {
-    let data = blob_json(context, input)?;
+    let data = viz_blob_json(context, input)?;
 
     // Dependency order, and `model.js` in the worker's bundle only: the main
     // thread gets labels from `entities.js` and everything else through worker
@@ -157,13 +142,13 @@ where
 }
 
 /// Serialize the blob.
-fn blob_json<E, F>(context: &ContextInner<E>, input: &Input<'_, F>) -> std::io::Result<String>
+fn viz_blob_json<E, F>(context: &ContextInner<E>, input: &Input<'_, F>) -> std::io::Result<String>
 where
     E: EntityRepr,
     F: InputFunction,
 {
     let index = Index::build(input, context);
-    let blob = Blob {
+    let blob = VizBlob {
         version: VERSION,
         entity_kinds: EntityKinds,
         schema: Schema {
@@ -174,7 +159,7 @@ where
         machine: MachineInfo::new(input.machine),
         function: FunctionInfo::new(input, context, &index),
         events: &context.events,
-        index: &index.indexes,
+        index: &index.indices,
         histograms: &index.histograms,
     };
 
@@ -196,11 +181,8 @@ fn bundle(sources: &[&str]) -> String {
 /// Drop every line that imports a sibling module, which the concatenation
 /// above has already brought into scope.
 ///
-/// This is a line-oriented hack and should be treated as one: it breaks on a
-/// multi-line import, on a re-export, and on a template literal whose text
-/// starts a line with `import `. None of those fail under `node --test` — they
-/// fail only in the stitched page — so `js_sources_are_stitchable` enforces
-/// the rule they rely on.
+/// XXX: This is a line-oriented hack: it breaks on a multi-line import, on a
+/// re-export, and on a template literal whose text starts a line with `import`.
 fn strip_imports(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
@@ -216,6 +198,8 @@ fn strip_imports(src: &str) -> String {
 
 /// Drop the `export ` keyword from every declaration that has one, leaving a
 /// plain top-level declaration behind.
+///
+/// XXX: This is also a hack, like `strip_imports`.
 fn strip_exports(src: &str) -> String {
     let mut out = String::with_capacity(src.len());
     for line in src.lines() {
@@ -519,7 +503,7 @@ mod tests {
     fn function_arrays_are_indexable() {
         let test = TestInput::with_values_in_two_banks_spilled_and_reloaded();
         allocated(&test, |context, input| {
-            let json = blob_json(context, input).expect("the blob serializes");
+            let json = viz_blob_json(context, input).expect("the blob serializes");
             let json: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
             let function = &json["function"];
             // `regions` is indexed by a strongly-connected component's
@@ -682,7 +666,7 @@ mod tests {
 
     /// The blobs the JS suites read.
     ///
-    /// Without them, commits 09-12 would each hand-write a small blob and a
+    /// Without them, those suites would each hand-write a small blob and a
     /// change to the Rust shape would leave every JS test passing against a
     /// format that no longer exists.
     #[test]
@@ -748,7 +732,7 @@ mod tests {
     /// nothing and makes a fixture diff readable.
     fn pretty_blob(test: &TestInput) -> String {
         allocated(test, |context, input| {
-            let compact = blob_json(context, input).expect("the blob serializes");
+            let compact = viz_blob_json(context, input).expect("the blob serializes");
             let value: serde_json::Value =
                 serde_json::from_str(&compact).expect("the blob is valid JSON");
             let mut pretty = serde_json::to_string_pretty(&value).expect("a `Value` serializes");

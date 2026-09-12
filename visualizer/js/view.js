@@ -383,9 +383,9 @@ function applyFunctionState(state) {
   }
 }
 
-// The other half of commit 08's one-shot: scroll, then report that the request
-// has been served. Cleared even when nothing matches -- the entity may be real
-// but drawn nowhere, and a request that never clears blocks the next one.
+// The other half of the one-shot: scroll, then report that the request has
+// been served. Cleared even when nothing matches -- the entity may be real but
+// drawn nowhere, and a request that never clears blocks the next one.
 function scrollToEntity(state) {
   if (state.scrollToEntity === null) return;
   const found = elements.get(entityKey(state.scrollToEntity));
@@ -692,8 +692,8 @@ function histogramStats(histogram) {
     return stats;
   }
   // A mean over no samples is not zero, and printing `0.00` there would claim
-  // a measurement nobody took. Commit 05 keeps it finite so that nothing here
-  // has to guard against `NaN`, but "no samples" is still the honest reading.
+  // a measurement nobody took. It arrives finite, so nothing here has to guard
+  // against `NaN`, but "no samples" is still the honest reading.
   const parts = [
     ["count", histogram.count],
     ["min", histogram.min],
@@ -754,7 +754,7 @@ function histogramBars(histogram) {
   return table;
 }
 
-// Commit 08's one-shot, for the other pane. Cleared even when no histogram
+// The same one-shot, for the other pane. Cleared even when no histogram
 // matches -- an id that is in the state but not in the DOM would otherwise
 // have every later render retrying it forever.
 function scrollToHistogram(state) {

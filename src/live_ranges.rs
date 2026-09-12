@@ -66,7 +66,7 @@ where
 
 /// A point serializes as the instruction and half it names, never as the packed
 /// bits.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<E> serde::Serialize for LivePoint<E>
 where
     E: EntityRepr,
@@ -201,9 +201,7 @@ where
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SpillWeight(PackedSpillWeight);
 
-/// JSON has no `NaN` and no infinities, and `serde_json` errors on both, so a
-/// weight that is not finite is reported as zero rather than failing the write.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl serde::Serialize for SpillWeight {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -819,15 +817,12 @@ where
         let Self {
             uses,
             spans,
-            bundles: _,
-            bundle_spans_storage: _,
-            span_bundle: _,
             block_spans,
             live_in_spans,
             live_out_spans,
             block_uses,
             use_span,
-            region_bundles: _,
+            ..
         } = self;
 
         // Construct a span for each value live in or across this block.
@@ -840,8 +835,10 @@ where
             let block = output.with_repr(block)?;
             let spans_start = spans.next_key(output)?;
             let uses_start = uses.next_key(output)?;
+
             #[cfg(feature = "visualizer")]
             let events_start = events.len();
+
             for span in liveness.block_spans(input.func, block, uses, output)? {
                 push_span_and_split_conflicts(
                     input, uses, spans, counts, events, span, block, block_end, output,
@@ -854,11 +851,6 @@ where
             // spans are both in a contiguous run.
             //
             // See `live_in_spans` and `live_out_spans`.
-            //
-            // The key is total --- no two of a block's spans share a value, a
-            // range, and a first use --- so the order does not depend on how
-            // the sort breaks ties, which is what lets the fix-up below find
-            // where each span moved to.
             let sort_key = |data: &LiveSpanData<E>| {
                 let bucket = match (data.start == block_start, data.end == block_end) {
                     // Live-in only.
@@ -1341,20 +1333,16 @@ where
         live_ranges.bundles[self].spans
     }
 
-    /// How many distinct `Val`s this bundle's spans belong to.
-    ///
-    /// Quadratic, but bundles are small and this only runs when events are
-    /// being recorded.
     pub(crate) fn num_vals(self, live_ranges: &LiveRanges<E>) -> usize {
-        let spans = self.spans(live_ranges);
-        spans
-            .clone()
-            .enumerate()
-            .filter(|(i, span)| {
-                let val = span.val(live_ranges);
-                !spans.clone().take(*i).any(|s| s.val(live_ranges) == val)
-            })
-            .count()
+        assert!(
+            cfg!(any(feature = "trace-log", feature = "visualizer")),
+            "this method is inefficient and only exists for diagnostics",
+        );
+        let mut vals = alloc::collections::BTreeSet::new();
+        for span in self.spans(live_ranges) {
+            vals.insert(span.val(live_ranges));
+        }
+        vals.len()
     }
 
     /// Split this bundle in two between spans.
@@ -1993,9 +1981,6 @@ fn reuse_aware_constraint(
 
 /// Rewrite the provisional span keys in the events a block's span construction
 /// logged, after the sort has moved those spans.
-///
-/// `keys_before` and `keys_after` are the block's sort keys in push order and in
-/// sorted order; the key is total, so a key identifies a span in both.
 #[cfg(feature = "visualizer")]
 fn remap_block_span_events<E, K>(
     events: &mut EventsLog<E>,
@@ -2009,10 +1994,8 @@ fn remap_block_span_events<E, K>(
 {
     let remap = |span: LiveSpan<E>| -> LiveSpan<E> {
         let old = span.index() - spans_start.index();
-        let new = keys_after
-            .binary_search(&keys_before[old])
-            .expect("the sort key is total, so every span kept its key");
-        LiveSpan::try_new(spans_start.index() + new).expect("a key that already existed")
+        let new = keys_after.binary_search(&keys_before[old]).unwrap();
+        LiveSpan::try_new(spans_start.index() + new).unwrap()
     };
 
     for event in events.iter_mut_from(events_start) {
@@ -2023,19 +2006,13 @@ fn remap_block_span_events<E, K>(
                 *before = before.map(remap);
                 *copy = remap(*copy);
             }
-            // Span construction runs before every other phase, so nothing else
-            // can be in the log yet.
-            _ => unreachable!("only span construction has run"),
+            _ => unreachable!("only span construction has run; unexpected event: {event:?}"),
         }
     }
 }
 
 /// Push a span covering `start..end` of `val`, holding the uses in
-/// `uses_start..uses_end`, and log its construction.
-///
-/// `constraint` is the merged constraint of those uses and `block` the block
-/// they lie in; neither is part of the span, and both are only what the event
-/// reports.
+/// `uses_start..uses_end`.
 fn push_span<E>(
     spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
     output: &mut OutputInner<E>,

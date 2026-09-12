@@ -58,7 +58,7 @@ test("parseEntityLabel rejects everything else", () => {
     assert.equal(entities.parseEntityLabel(text), null, text);
   }
   // An event is a log position, not an entity: it has no `byEntity` list and
-  // commit 11 parses it separately.
+  // is parsed separately.
   assert.equal(entities.parseEntityLabel("event9"), null);
 });
 

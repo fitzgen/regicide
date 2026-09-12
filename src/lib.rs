@@ -37,8 +37,6 @@ mod counts;
 mod dfs;
 mod dominators;
 mod error;
-#[cfg(not(feature = "visualizer"))]
-mod events_disabled;
 mod input;
 mod live_ranges;
 mod liveness;
@@ -62,7 +60,9 @@ mod visualizer;
 
 #[cfg(any(test, feature = "checker"))]
 pub mod checker;
-#[cfg(any(test, fuzz, feature = "visualizer"))]
+
+#[cfg(any(test, fuzz, feature = "test-utils"))]
+#[doc(hidden)]
 pub mod test;
 
 pub use context::Context;

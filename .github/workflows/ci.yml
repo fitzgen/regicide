@@ -61,6 +61,8 @@ jobs:
             flags: --no-default-features --features hashbrown,entity-repr-8,entity-repr-16
           - name: std+checker
             flags: --no-default-features --features std,checker
+          - name: serialize
+            flags: --no-default-features --features hashbrown,serialize
           - name: visualizer
             flags: --no-default-features --features visualizer
           - name: visualizer+trace-log

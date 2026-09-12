@@ -44,8 +44,8 @@ export function createModel(json) {
 
   return {
     // How big the function is. The load response carries it, so the page can
-    // say something true about the blob before any pane exists; commit 09
-    // replaces it with the function itself.
+    // say something true about the blob before any pane exists; the function
+    // pane replaces it with the function itself.
     summary: () => ({
       blocks: (func.blocks || []).length,
       insts: (func.insts || []).length,
@@ -81,7 +81,7 @@ export function createModel(json) {
     // thing the model computes and the pane asks for it exactly once.
     functionOutline: () => (outline ||= buildOutline(func)),
 
-    // The histograms tab. The blob's own array, unchanged: commit 05
+    // The histograms tab. The blob's own array, unchanged: the Rust side
     // computed every statistic, and recomputing any of them here would be a
     // second answer to a question that already has one.
     histograms: () => json.histograms || [],
@@ -952,8 +952,8 @@ function editSlots(edit) {
 //
 // Schema-driven rather than a switch over forty event kinds: the blob's
 // `schema.events` already says which field holds which kind of entity, and a
-// second list here would be the one that goes stale. Commit 11's event log
-// renders events with this same function.
+// second list here would be the one that goes stale. The event log renders
+// events with this same function.
 function summarizeEvent(event, eventSchema) {
   const fields = eventSchema[event.kind] || {};
   const parts = [text(event.kind)];

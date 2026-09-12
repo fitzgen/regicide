@@ -732,8 +732,8 @@ test("a register's pane names its bank and classes, and the events that touched 
 });
 
 test("an event summary names its entities as clickable parts", () => {
-  // Written once and reused by commit 11's event log: the two panes must not
-  // render the same event differently, so the summary comes from the model.
+  // Written once and reused by the event log: the two panes must not render
+  // the same event differently, so the summary comes from the model.
   const blob = fixture("spills-and-reloads");
   const model = modelOf(blob);
   const found = model
@@ -1047,8 +1047,8 @@ test("the search answers with indices and the rows come separately", () => {
 // The histograms.
 
 test("the histograms come back exactly as the blob carries them", () => {
-  // Commit 05 computed every statistic. Recomputing one here would be a second
-  // answer to a question that already has one.
+  // The Rust side computed every statistic. Recomputing one here would be a
+  // second answer to a question that already has one.
   const blob = fixture("spills-and-reloads");
   assert.equal(modelOf(blob).histograms(), blob.histograms);
 });

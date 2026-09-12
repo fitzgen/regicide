@@ -1,4 +1,4 @@
-//! The type table: what the bare integers in the blob mean.
+//! The schema table: what the bare integers in the blob mean.
 //!
 //! Entities serialize as bare indices, so nothing in the JSON says whether a
 //! `3` is a value, a block, or a register. This table says, field by field,
@@ -10,15 +10,16 @@ use serde::ser::{SerializeMap, SerializeSeq as _};
 ///
 /// Exactly three forms, and the JavaScript walks them recursively:
 ///
-/// * [`Descriptor::Entity`] is an entity type's name, and the value under it
-///   is that entity's index;
-/// * [`Descriptor::List`] is an array of whatever it wraps;
-/// * [`Descriptor::Fields`] is an object, which covers both a struct and a
-///   tagged union, because the two are traversed identically: recurse into
-///   whichever keys are present.
+/// * `Descriptor::Entity` is an entity type's name, and the value under it is
+///   that entity's index;
 ///
-/// A field that holds no entity — an ordinal, a count, a point, a weight —
-/// has no descriptor at all and is simply absent.
+/// * `Descriptor::List` is an array of whatever it wraps;
+///
+/// * `Descriptor::Fields` is an object, which covers both a struct and a tagged
+///   union, because the two are traversed identically: recurse into whichever
+///   keys are present.
+///
+/// A field that holds no entity has no descriptor at all and is absent.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Descriptor {
     /// An entity index, under the named entity type.
@@ -84,7 +85,7 @@ pub(crate) type Fields = &'static [(&'static str, Option<Descriptor>)];
 /// `function` and `machine` halves by struct name.
 pub(crate) type Table = &'static [(&'static str, Fields)];
 
-/// Serializes a [`Table`] as a plain object, skipping the fields that name no
+/// Serializes a `Table` as a plain object, skipping the fields that name no
 /// entity.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SerializeTable(pub(crate) Table);
@@ -102,8 +103,7 @@ impl serde::Serialize for SerializeTable {
     }
 }
 
-/// Serializes one [`Fields`] as an object of the fields that have a
-/// descriptor.
+/// Serializes one `Fields` as an object of the fields that have a descriptor.
 struct SerializeFields<'a>(&'a Fields);
 
 impl serde::Serialize for SerializeFields<'_> {
@@ -135,23 +135,23 @@ pub(crate) fn visit_table_kinds(table: Table, f: &mut impl FnMut(&'static str)) 
 
 use Descriptor::{Entity, Fields as Obj, List};
 
-/// An [`crate::input::OperandConstraint`]: only its `Reg` variant names one.
+/// An `crate::input::OperandConstraint`: only its `Reg` variant names one.
 pub(crate) const CONSTRAINT: Descriptor = Obj(&[("reg", Entity("RegClass"))]);
 
-/// A [`crate::machine::RegSet`], which serializes as its members.
+/// A `crate::machine::RegSet`, which serializes as its members.
 pub(crate) const REG_SET: Descriptor = List(&Entity("Reg"));
 
-/// A [`crate::output::RegAllocation`].
+/// A `crate::output::RegAllocation`.
 pub(crate) const REG_ALLOCATION: Descriptor =
     Obj(&[("reg", Entity("Reg")), ("regGroup", Entity("RegGroup"))]);
 
-/// A [`crate::output::StackAllocation`].
+/// A `crate::output::StackAllocation`.
 pub(crate) const STACK_ALLOCATION: Descriptor = Obj(&[
     ("slot", Entity("SpillSlot")),
     ("slotGroup", Entity("SpillSlotGroup")),
 ]);
 
-/// A [`crate::output::Allocation`], which flattens the two above.
+/// A `crate::output::Allocation`, which flattens the two above.
 pub(crate) const ALLOCATION: Descriptor = Obj(&[
     ("reg", Entity("Reg")),
     ("regGroup", Entity("RegGroup")),
@@ -159,15 +159,15 @@ pub(crate) const ALLOCATION: Descriptor = Obj(&[
     ("slotGroup", Entity("SpillSlotGroup")),
 ]);
 
-/// A [`crate::output::ScalarAllocation`].
+/// A `crate::output::ScalarAllocation`.
 pub(crate) const SCALAR_ALLOCATION: Descriptor =
     Obj(&[("reg", Entity("Reg")), ("slot", Entity("SpillSlot"))]);
 
-/// A [`crate::parallel_moves::ParallelMove`].
+/// A `crate::parallel_moves::ParallelMove`.
 pub(crate) const PARALLEL_MOVE: Descriptor =
     Obj(&[("src", SCALAR_ALLOCATION), ("dst", SCALAR_ALLOCATION)]);
 
-/// A [`crate::output::Move`].
+/// A `crate::output::Move`.
 pub(crate) const MOVE: Descriptor = Obj(&[
     (
         "regReg",
@@ -183,13 +183,13 @@ pub(crate) const MOVE: Descriptor = Obj(&[
     ),
 ]);
 
-/// A [`crate::output::Remat`].
+/// A `crate::output::Remat`.
 pub(crate) const REMAT: Descriptor = Obj(&[("val", Entity("Val")), ("dest", Entity("Reg"))]);
 
-/// A [`crate::output::EdgeEdit`].
+/// A `crate::output::EdgeEdit`.
 pub(crate) const EDGE_EDIT: Descriptor = Obj(&[("move", MOVE), ("remat", REMAT)]);
 
-/// A [`crate::output::Edit`].
+/// A `crate::output::Edit`.
 ///
 /// A critical edge's `succ` is a successor ordinal, not a block, and so is
 /// deliberately absent: typing it would make the page render `block1`.
@@ -202,7 +202,7 @@ pub(crate) const EDIT: Descriptor = Obj(&[
     ),
 ]);
 
-/// A [`crate::move_generation::MovePosition`]: a point names no entity of its
+/// A `crate::move_generation::MovePosition`: a point names no entity of its
 /// own, and an edge's `succ` is an ordinal.
 pub(crate) const MOVE_POSITION: Descriptor =
     Obj(&[("criticalEdge", Obj(&[("pred", Entity("Block"))]))]);

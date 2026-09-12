@@ -21,16 +21,29 @@ regicide = {
 }
 mutatis = { version = "0.5.2", features = ["check", "derive"] }
 
+[[example]]
+name = "visualize"
+required-features = ["visualizer", "test-utils"]
+
 [features]
+# Use Rust's `std` crate (instead of just `core` and `alloc`).
 std = []
+# Enable the register allocation checker.
 checker = []
+# Enable timing each pass in the register allocator.
 timing = ["std"]
+# Enable trace-level logs.
 trace-log = []
+# Enable 8-bit entity representations.
 entity-repr-8 = []
+# Enable 16-bit entity representations.
 entity-repr-16 = []
-# Also exposes `regicide::test`, which is not public API: the example builds
-# its input with `TestInput`, and mutates it when asked for a seed.
-visualizer = ["std", "dep:serde", "dep:serde_json", "dep:mutatis"]
+# Enable serialization via `serde`.
+serialize = ["dep:serde"]
+# Enable the HTML visualizer.
+visualizer = ["std", "serialize", "dep:serde_json", "dep:mutatis"]
+# Internal feature.
+test-utils = []
 
 [lints]
 workspace = true
@@ -71,7 +84,3 @@ multiple_bound_locations = "warn"
 extra_unused_type_parameters = "warn"
 cast_possible_truncation = "warn"
 cast_sign_loss = "warn"
-
-[[example]]
-name = "visualize"
-required-features = ["visualizer"]

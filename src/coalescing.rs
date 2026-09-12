@@ -633,10 +633,6 @@ where
     /// Given that `a` and `b` share an affinity across a control-flow edge: try
     /// merging them if they are in the same region and the edge is not cold, or
     /// otherwise remember the cross-region affinity for hinting.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one more parameter than the lint likes, all of them plain data"
-    )]
     fn coalesce_affinity(
         &mut self,
         live_ranges: &LiveRanges<E>,
@@ -916,10 +912,6 @@ where
 }
 
 /// Given that we've completed span set merging, create a bundle for each set.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "one more parameter than the lint likes, all of them plain data"
-)]
 fn build_bundles<E>(
     coalescing: &mut Coalescing<E>,
     region_tree: &RegionTree<E>,

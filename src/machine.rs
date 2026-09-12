@@ -259,26 +259,26 @@ where
 {
     /// The range of units that this register covers.
     #[inline]
-    pub(crate) fn units(self, machine: &Machine) -> Range<RegUnit> {
+    pub fn units(self, machine: &Machine) -> Range<RegUnit> {
         machine.registers[self.with_repr32()].units.clone()
     }
 
     /// This register's associated register bank.
     #[inline]
-    pub(crate) fn bank(self, machine: &Machine) -> RegBank {
+    pub fn bank(self, machine: &Machine) -> RegBank {
         machine.registers[self.with_repr32()].bank
     }
 
     /// Does this register cover any units, and so may be allocated?
     #[inline]
-    pub(crate) fn is_allocatable(self, machine: &Machine) -> bool {
+    pub fn is_allocatable(self, machine: &Machine) -> bool {
         let units = &machine.registers[self.with_repr32()].units;
         units.start != units.end
     }
 
     /// Does this register cover no units, and so may never be allocated?
     #[inline]
-    pub(crate) fn is_non_allocatable(self, machine: &Machine) -> bool {
+    pub fn is_non_allocatable(self, machine: &Machine) -> bool {
         !self.is_allocatable(machine)
     }
 }
@@ -305,14 +305,7 @@ impl RegGroup {
 
     /// This register group's associated register bank.
     #[inline]
-    #[cfg_attr(
-        not(feature = "visualizer"),
-        expect(
-            dead_code,
-            reason = "the sibling of Reg::bank and RegClass::bank, kept for symmetry"
-        )
-    )]
-    pub(crate) fn bank(self, machine: &Machine) -> RegBank {
+    pub fn bank(self, machine: &Machine) -> RegBank {
         machine.groups[self].bank
     }
 }
@@ -339,7 +332,7 @@ impl RegClass {
 
     /// Does this class contain exactly one register (or one register group)?
     #[inline]
-    pub(crate) fn is_singleton(self, machine: &Machine) -> bool {
+    pub fn is_singleton(self, machine: &Machine) -> bool {
         match self.members(machine) {
             RegClassMembers::Regs(regs) => regs.len() == 1,
             RegClassMembers::Groups(groups) => groups.len() == 1,
@@ -363,7 +356,7 @@ impl RegClass {
     /// How many registers a value of this register-group class occupies, or
     /// `None` when it is a single-register class.
     #[inline]
-    pub(crate) fn group_size(self, machine: &Machine) -> Option<usize> {
+    pub fn group_size(self, machine: &Machine) -> Option<usize> {
         match self.members(machine) {
             RegClassMembers::Groups(groups) => Some(groups[0].members(machine).len()),
             RegClassMembers::Regs(_) => None,
@@ -380,7 +373,7 @@ impl RegClass {
 
     /// This register class's associated register bank.
     #[inline]
-    pub(crate) fn bank(self, machine: &Machine) -> RegBank {
+    pub fn bank(self, machine: &Machine) -> RegBank {
         machine.classes[self].bank
     }
 
@@ -595,28 +588,24 @@ impl Machine {
     pub(crate) fn num_user_classes(&self) -> usize {
         self.num_user_classes
     }
-}
 
-/// Walking the whole register file, which only the visualizer does.
-#[cfg(feature = "visualizer")]
-impl Machine {
-    /// Every register, in index order.
-    pub(crate) fn regs(&self) -> impl ExactSizeIterator<Item = Reg> {
+    /// Every register.
+    pub fn regs(&self) -> impl ExactSizeIterator<Item = Reg> {
         self.registers.keys()
     }
 
-    /// Every register group, in index order.
-    pub(crate) fn reg_groups(&self) -> impl ExactSizeIterator<Item = RegGroup> {
+    /// Every register group.
+    pub fn reg_groups(&self) -> impl ExactSizeIterator<Item = RegGroup> {
         self.groups.keys()
     }
 
-    /// Every register class, the derived ones included, in index order.
-    pub(crate) fn reg_classes(&self) -> impl ExactSizeIterator<Item = RegClass> {
+    /// Every register class, derived register classes included.
+    pub fn reg_classes(&self) -> impl ExactSizeIterator<Item = RegClass> {
         self.classes.keys()
     }
 
-    /// Every register bank, in index order.
-    pub(crate) fn reg_banks(&self) -> impl ExactSizeIterator<Item = RegBank> {
+    /// Every register bank.
+    pub fn reg_banks(&self) -> impl ExactSizeIterator<Item = RegBank> {
         self.banks.keys()
     }
 }

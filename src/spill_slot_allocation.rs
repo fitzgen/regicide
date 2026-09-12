@@ -95,9 +95,7 @@ define_entities! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpillSlotSize(u8);
 
-/// A slot size serializes as its byte count, which is what a stack frame is
-/// measured in.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl serde::Serialize for SpillSlotSize {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

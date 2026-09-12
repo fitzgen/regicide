@@ -27,10 +27,7 @@ where
     Stack(StackAllocation<E>),
 }
 
-/// An allocation serializes as whichever of its two halves it holds, whose
-/// four variant names are already distinct, so the visualizer sees one flat
-/// vocabulary of places a value can be.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<E> serde::Serialize for Allocation<E>
 where
     E: EntityRepr,
@@ -59,10 +56,7 @@ where
     RegGroup(RegGroup),
 }
 
-/// A register allocation serializes as its variant name wrapping a bare index,
-/// which is what tells the visualizer whether that index is a register or a
-/// register group.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<E> serde::Serialize for RegAllocation<E>
 where
     E: EntityRepr,
@@ -94,10 +88,7 @@ where
     SpillSlotGroup(SpillSlotGroup<E>),
 }
 
-/// A stack allocation serializes as its variant name wrapping a bare index,
-/// which is what tells the visualizer whether that index is a slot or a group
-/// of slots.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<E> serde::Serialize for StackAllocation<E>
 where
     E: EntityRepr,
@@ -134,9 +125,7 @@ where
     Stack(SpillSlot<E>),
 }
 
-/// A scalar allocation serializes in the same vocabulary as [`Allocation`],
-/// restricted to the two variants that name exactly one location.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<E> serde::Serialize for ScalarAllocation<E>
 where
     E: EntityRepr,
@@ -371,9 +360,9 @@ where
 
 /// TODO FITZGEN
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub enum Move<E = u32>
 where
     E: EntityRepr,
@@ -405,8 +394,8 @@ where
 
 /// TODO FITZGEN
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub struct Remat<E = u32>
 where
     E: EntityRepr,
@@ -420,9 +409,9 @@ where
 
 /// An edit that goes on an edge the client has to split first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub struct CriticalEdgeEdit<E = u32>
 where
     E: EntityRepr,
@@ -440,9 +429,9 @@ where
 
 /// What a [`CriticalEdgeEdit`] does once the edge is split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub enum EdgeEdit<E = u32>
 where
     E: EntityRepr,
@@ -456,9 +445,9 @@ where
 
 /// TODO FITZGEN
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub enum Edit<E = u32>
 where
     E: EntityRepr,

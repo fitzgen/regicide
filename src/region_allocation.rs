@@ -1076,8 +1076,7 @@ pub enum Phase {
     SplitIntoMinimalOrSpill = 3,
 }
 
-/// A phase serializes as a camelCase string, matching the JSON's other tags.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl serde::Serialize for Phase {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1210,8 +1209,7 @@ where
     }
 }
 
-/// A priority serializes as the packed integer the queue orders by.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl serde::Serialize for Priority {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where

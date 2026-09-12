@@ -16,28 +16,9 @@ use crate::{
 };
 use alloc::vec::Vec;
 
-#[cfg(feature = "visualizer")]
-use crate::{
-    entity::{Entity, Inst},
-    machine::{RegClass, RegGroup},
-    move_generation::MovePosition,
-    output::Remat,
-    visualizer::schema::{
-        ALLOCATION, CONSTRAINT, Descriptor, EDGE_EDIT, MOVE, MOVE_POSITION, PARALLEL_MOVE,
-        REG_ALLOCATION, REG_SET, SCALAR_ALLOCATION, STACK_ALLOCATION,
-    },
-};
-
-define_entities! {
-    /// An event in the event log.
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    #[allow(dead_code, reason = "only the visualizer names events by index")]
-    pub struct EventIndex = "event";
-}
-
 /// Why two spans were considered for coalescing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 pub enum Affinity {
     /// A block-call argument and the parameter it is passed to.
     BlockCallArg,
@@ -54,7 +35,7 @@ pub enum Affinity {
 
 /// Why a coalesce was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 pub enum RefusedReason {
     /// The two sets' uses want disjoint locations.
     ConstraintConflict,
@@ -65,7 +46,7 @@ pub enum RefusedReason {
 
 /// Which kind of split was attempted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 pub enum SplitKind {
     /// Cutting a bundle between two of its spans.
     BetweenSpans,
@@ -76,7 +57,7 @@ pub enum SplitKind {
 
 /// Why a scratch location was needed while sequentializing a batch of moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 pub enum ScratchReason {
     /// Neither end of the move is a register, and the machine cannot move
     /// memory to memory directly.
@@ -90,14 +71,14 @@ pub enum ScratchReason {
 #[derive(Debug)]
 #[cfg_attr(
     not(feature = "visualizer"),
-    allow(
+    expect(
         dead_code,
         reason = "without the visualizer an event is only ever `Debug`-formatted for `trace!`"
     )
 )]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(tag = "kind"))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(tag = "kind"))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub enum Event<E>
 where
     E: EntityRepr,
@@ -495,7 +476,7 @@ where
         /// Where the move goes.
         pos: PackedMovePosition<E>,
         /// The move.
-        #[cfg_attr(feature = "visualizer", serde(rename = "move"))]
+        #[cfg_attr(feature = "serialize", serde(rename = "move"))]
         move_: Move<E>,
         /// Its index in the finished edit list, so that the visualizer can
         /// map an edit it renders back to the event that made it.
@@ -521,463 +502,482 @@ where
     },
 }
 
-/// An entity that an event names, for the visualizer's per-entity event
-/// index.
-///
-/// The machine-level kinds are not generic over `E`: registers, register
-/// groups, and register classes come from the machine description, which one
-/// entity representation does not narrow.
 #[cfg(feature = "visualizer")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum EntityRef<E>
-where
-    E: EntityRepr,
-{
-    /// A value.
-    Val(Val<E>),
-
-    /// A live span.
-    Span(LiveSpan<E>),
-
-    /// A live bundle.
-    Bundle(LiveBundle<E>),
-
-    /// A basic block.
-    Block(Block<E>),
-
-    /// A region of the region tree.
-    Region(Region<E>),
-
-    /// An instruction.
-    Inst(Inst<E>),
-
-    /// A use of a value.
-    Use(Use<E>),
-
-    /// A stack slot.
-    SpillSlot(SpillSlot<E>),
-
-    /// A group of stack slots.
-    SpillSlotGroup(SpillSlotGroup<E>),
-
-    /// A register.
-    Reg(Reg),
-
-    /// A register group.
-    RegGroup(RegGroup),
-
-    /// A register class.
-    RegClass(RegClass),
-}
-
+pub use self::viz_enabled::*;
 #[cfg(feature = "visualizer")]
-impl<E> Event<E>
-where
-    E: EntityRepr,
-{
-    /// This event's name, which is also its serialized `kind` tag.
-    ///
-    /// The match has no `_` arm, so a new variant does not get to keep the
-    /// wrong name.
-    pub(crate) fn kind(&self) -> &'static str {
-        match self {
-            Self::SpanConstructed { .. } => "SpanConstructed",
-            Self::EagerSplit { .. } => "EagerSplit",
-            Self::ReuseSplit { .. } => "ReuseSplit",
-            Self::SpansCoalesced { .. } => "SpansCoalesced",
-            Self::CoalesceRefused { .. } => "CoalesceRefused",
-            Self::CrossRegionAffinity { .. } => "CrossRegionAffinity",
-            Self::BundleConstructed { .. } => "BundleConstructed",
-            Self::BundleQueued { .. } => "BundleQueued",
-            Self::BundleQueuePopped { .. } => "BundleQueuePopped",
-            Self::BundleAssignedPreferred { .. } => "BundleAssignedPreferred",
-            Self::BundleAssignedNonPreferred { .. } => "BundleAssignedNonPreferred",
-            Self::BundleAssignedViaEviction { .. } => "BundleAssignedViaEviction",
-            Self::BundleEvicted { .. } => "BundleEvicted",
-            Self::BundleSplitBetweenSpans { .. } => "BundleSplitBetweenSpans",
-            Self::BundleSplitWithinSpan { .. } => "BundleSplitWithinSpan",
-            Self::BundleSplitFailed { .. } => "BundleSplitFailed",
-            Self::BundleSplitIntoMinimal { .. } => "BundleSplitIntoMinimal",
-            Self::BundleSpilledToStack { .. } => "BundleSpilledToStack",
-            Self::BundleHint { .. } => "BundleHint",
-            Self::BundleSplit { .. } => "BundleSplit",
-            Self::SpillSlotCreated { .. } => "SpillSlotCreated",
-            Self::SpillSlotGroupCreated { .. } => "SpillSlotGroupCreated",
-            Self::SpillSlotAssigned { .. } => "SpillSlotAssigned",
-            Self::ValueSpilled { .. } => "ValueSpilled",
-            Self::SpillPlaced { .. } => "SpillPlaced",
-            Self::SpillBlockChosen { .. } => "SpillBlockChosen",
-            Self::SpanSplit { .. } => "SpanSplit",
-            Self::HalfMoveSource { .. } => "HalfMoveSource",
-            Self::HalfMoveDest { .. } => "HalfMoveDest",
-            Self::MoveResolved { .. } => "MoveResolved",
-            Self::RematEmitted { .. } => "RematEmitted",
-            Self::ScratchRegChosen { .. } => "ScratchRegChosen",
-            Self::ScratchRegUnavailable { .. } => "ScratchRegUnavailable",
-            Self::ParallelMoveBatchSolved { .. } => "ParallelMoveBatchSolved",
-            Self::MoveEmitted { .. } => "MoveEmitted",
-            Self::CriticalEdgeEdit { .. } => "CriticalEdgeEdit",
-        }
+mod viz_enabled {
+    use super::*;
+    use crate::{
+        entity::{Entity, Inst, PrimaryMap},
+        machine::{RegClass, RegGroup},
+        move_generation::MovePosition,
+        output::Remat,
+        visualizer::schema::{
+            ALLOCATION, CONSTRAINT, Descriptor, EDGE_EDIT, MOVE, MOVE_POSITION, PARALLEL_MOVE,
+            REG_ALLOCATION, REG_SET, SCALAR_ALLOCATION, STACK_ALLOCATION,
+        },
+    };
+
+    define_entities! {
+        /// An event in the event log.
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct EventIndex = "event";
     }
 
-    /// Call `f` with every entity this event names.
+    /// An entity that an event names, for the visualizer's per-entity event
+    /// index.
     ///
-    /// Every variant is destructured field by field, with no `..` and no `_`
-    /// arm, so that a new variant *or a new field on an existing variant*
-    /// fails to compile rather than going quietly unindexed.
-    ///
-    /// Fields that name no entity — points, weights, counts, ordinals, and
-    /// plain enums — contribute nothing, except that a `LivePoint`
-    /// contributes the instruction it lies in.
-    pub(crate) fn visit_entities(&self, f: &mut impl FnMut(EntityRef<E>)) {
-        match self {
-            Self::SpanConstructed {
-                span,
-                val,
-                start,
-                end,
-                block,
-                num_uses: _,
-                constraint,
-                has_fixed_use: _,
-            } => {
-                f(EntityRef::Span(*span));
-                f(EntityRef::Val(*val));
-                visit_point(*start, f);
-                visit_point(*end, f);
-                f(EntityRef::Block(*block));
-                visit_constraint(*constraint, f);
-            }
+    /// The machine-level kinds are not generic over `E`: registers, register
+    /// groups, and register classes come from the machine description, which one
+    /// entity representation does not narrow.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum EntityRef<E>
+    where
+        E: EntityRepr,
+    {
+        /// A value.
+        Val(Val<E>),
 
-            Self::EagerSplit {
-                val,
-                at,
-                before,
-                constraint,
-                conflicting,
-            } => {
-                f(EntityRef::Val(*val));
-                visit_point(*at, f);
-                f(EntityRef::Span(*before));
-                visit_constraint(*constraint, f);
-                visit_constraint(*conflicting, f);
-            }
+        /// A live span.
+        Span(LiveSpan<E>),
 
-            Self::ReuseSplit {
-                val,
-                at,
-                target_use,
-                before,
-                copy,
-            } => {
-                f(EntityRef::Val(*val));
-                visit_point(*at, f);
-                f(EntityRef::Use(*target_use));
-                if let Some(before) = *before {
-                    f(EntityRef::Span(before));
+        /// A live bundle.
+        Bundle(LiveBundle<E>),
+
+        /// A basic block.
+        Block(Block<E>),
+
+        /// A region of the region tree.
+        Region(Region<E>),
+
+        /// An instruction.
+        Inst(Inst<E>),
+
+        /// A use of a value.
+        Use(Use<E>),
+
+        /// A stack slot.
+        SpillSlot(SpillSlot<E>),
+
+        /// A group of stack slots.
+        SpillSlotGroup(SpillSlotGroup<E>),
+
+        /// A register.
+        Reg(Reg),
+
+        /// A register group.
+        RegGroup(RegGroup),
+
+        /// A register class.
+        RegClass(RegClass),
+    }
+
+    impl<E> Event<E>
+    where
+        E: EntityRepr,
+    {
+        /// This event's name, which is also its serialized `kind` tag.
+        ///
+        /// The match has no `_` arm, so a new variant does not get to keep the
+        /// wrong name.
+        pub(crate) fn kind(&self) -> &'static str {
+            match self {
+                Self::SpanConstructed { .. } => "SpanConstructed",
+                Self::EagerSplit { .. } => "EagerSplit",
+                Self::ReuseSplit { .. } => "ReuseSplit",
+                Self::SpansCoalesced { .. } => "SpansCoalesced",
+                Self::CoalesceRefused { .. } => "CoalesceRefused",
+                Self::CrossRegionAffinity { .. } => "CrossRegionAffinity",
+                Self::BundleConstructed { .. } => "BundleConstructed",
+                Self::BundleQueued { .. } => "BundleQueued",
+                Self::BundleQueuePopped { .. } => "BundleQueuePopped",
+                Self::BundleAssignedPreferred { .. } => "BundleAssignedPreferred",
+                Self::BundleAssignedNonPreferred { .. } => "BundleAssignedNonPreferred",
+                Self::BundleAssignedViaEviction { .. } => "BundleAssignedViaEviction",
+                Self::BundleEvicted { .. } => "BundleEvicted",
+                Self::BundleSplitBetweenSpans { .. } => "BundleSplitBetweenSpans",
+                Self::BundleSplitWithinSpan { .. } => "BundleSplitWithinSpan",
+                Self::BundleSplitFailed { .. } => "BundleSplitFailed",
+                Self::BundleSplitIntoMinimal { .. } => "BundleSplitIntoMinimal",
+                Self::BundleSpilledToStack { .. } => "BundleSpilledToStack",
+                Self::BundleHint { .. } => "BundleHint",
+                Self::BundleSplit { .. } => "BundleSplit",
+                Self::SpillSlotCreated { .. } => "SpillSlotCreated",
+                Self::SpillSlotGroupCreated { .. } => "SpillSlotGroupCreated",
+                Self::SpillSlotAssigned { .. } => "SpillSlotAssigned",
+                Self::ValueSpilled { .. } => "ValueSpilled",
+                Self::SpillPlaced { .. } => "SpillPlaced",
+                Self::SpillBlockChosen { .. } => "SpillBlockChosen",
+                Self::SpanSplit { .. } => "SpanSplit",
+                Self::HalfMoveSource { .. } => "HalfMoveSource",
+                Self::HalfMoveDest { .. } => "HalfMoveDest",
+                Self::MoveResolved { .. } => "MoveResolved",
+                Self::RematEmitted { .. } => "RematEmitted",
+                Self::ScratchRegChosen { .. } => "ScratchRegChosen",
+                Self::ScratchRegUnavailable { .. } => "ScratchRegUnavailable",
+                Self::ParallelMoveBatchSolved { .. } => "ParallelMoveBatchSolved",
+                Self::MoveEmitted { .. } => "MoveEmitted",
+                Self::CriticalEdgeEdit { .. } => "CriticalEdgeEdit",
+            }
+        }
+
+        /// Call `f` with every entity this event names.
+        ///
+        /// Every variant is destructured field by field, with no `..` and no `_`
+        /// arm, so that a new variant *or a new field on an existing variant*
+        /// fails to compile rather than going quietly unindexed.
+        ///
+        /// Fields that name no entity — points, weights, counts, ordinals, and
+        /// plain enums — contribute nothing, except that a `LivePoint`
+        /// contributes the instruction it lies in.
+        pub(crate) fn visit_entities(&self, f: &mut impl FnMut(EntityRef<E>)) {
+            match self {
+                Self::SpanConstructed {
+                    span,
+                    val,
+                    start,
+                    end,
+                    block,
+                    num_uses: _,
+                    constraint,
+                    has_fixed_use: _,
+                } => {
+                    f(EntityRef::Span(*span));
+                    f(EntityRef::Val(*val));
+                    visit_point(*start, f);
+                    visit_point(*end, f);
+                    f(EntityRef::Block(*block));
+                    visit_constraint(*constraint, f);
                 }
-                f(EntityRef::Span(*copy));
-            }
 
-            Self::SpansCoalesced { a, b, affinity: _ } => {
-                f(EntityRef::Span(*a));
-                f(EntityRef::Span(*b));
-            }
-
-            Self::CoalesceRefused {
-                a,
-                b,
-                affinity: _,
-                reason: _,
-            } => {
-                f(EntityRef::Span(*a));
-                f(EntityRef::Span(*b));
-            }
-
-            Self::CrossRegionAffinity { a, b } => {
-                f(EntityRef::Span(*a));
-                f(EntityRef::Span(*b));
-            }
-
-            Self::BundleConstructed {
-                bundle,
-                region,
-                num_spans: _,
-                num_vals: _,
-                constraint,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Region(*region));
-                visit_constraint(*constraint, f);
-            }
-
-            Self::BundleQueued {
-                bundle,
-                region,
-                priority: _,
-                phase: _,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Region(*region));
-            }
-
-            Self::BundleQueuePopped {
-                bundle,
-                region,
-                priority: _,
-                phase: _,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Region(*region));
-            }
-
-            Self::BundleAssignedPreferred { bundle, alloc } => {
-                f(EntityRef::Bundle(*bundle));
-                visit_reg_allocation(*alloc, f);
-            }
-
-            Self::BundleAssignedNonPreferred {
-                bundle,
-                alloc,
-                preference,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                visit_reg_allocation(*alloc, f);
-                visit_reg_set(preference, f);
-            }
-
-            Self::BundleAssignedViaEviction {
-                bundle,
-                alloc,
-                evicted,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                visit_reg_allocation(*alloc, f);
-                f(EntityRef::Bundle(*evicted));
-            }
-
-            Self::BundleEvicted { bundle, by, alloc } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Bundle(*by));
-                visit_reg_allocation(*alloc, f);
-            }
-
-            Self::BundleSplitBetweenSpans {
-                bundle,
-                suffix,
-                at,
-                index: _,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Bundle(*suffix));
-                visit_point(*at, f);
-            }
-
-            Self::BundleSplitWithinSpan {
-                bundle,
-                suffix,
-                span,
-                at,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Bundle(*suffix));
-                f(EntityRef::Span(*span));
-                visit_point(*at, f);
-            }
-
-            Self::BundleSplitFailed { bundle, split: _ } => {
-                f(EntityRef::Bundle(*bundle));
-            }
-
-            Self::BundleSplitIntoMinimal {
-                bundle,
-                num_pieces: _,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-            }
-
-            Self::BundleSpilledToStack {
-                bundle,
-                region,
-                forced: _,
-            } => {
-                f(EntityRef::Bundle(*bundle));
-                f(EntityRef::Region(*region));
-            }
-
-            Self::BundleHint { bundle, hint, from } => {
-                f(EntityRef::Bundle(*bundle));
-                visit_reg_set(hint, f);
-                if let Some(from) = *from {
-                    f(EntityRef::Bundle(from));
+                Self::EagerSplit {
+                    val,
+                    at,
+                    before,
+                    constraint,
+                    conflicting,
+                } => {
+                    f(EntityRef::Val(*val));
+                    visit_point(*at, f);
+                    f(EntityRef::Span(*before));
+                    visit_constraint(*constraint, f);
+                    visit_constraint(*conflicting, f);
                 }
-            }
 
-            Self::BundleSplit {
-                parent,
-                child,
-                region,
-            } => {
-                f(EntityRef::Bundle(*parent));
-                f(EntityRef::Bundle(*child));
-                f(EntityRef::Region(*region));
-            }
+                Self::ReuseSplit {
+                    val,
+                    at,
+                    target_use,
+                    before,
+                    copy,
+                } => {
+                    f(EntityRef::Val(*val));
+                    visit_point(*at, f);
+                    f(EntityRef::Use(*target_use));
+                    if let Some(before) = *before {
+                        f(EntityRef::Span(before));
+                    }
+                    f(EntityRef::Span(*copy));
+                }
 
-            Self::SpillSlotCreated {
-                slot,
-                size: _,
-                emergency: _,
-            } => {
-                f(EntityRef::SpillSlot(*slot));
-            }
+                Self::SpansCoalesced { a, b, affinity: _ } => {
+                    f(EntityRef::Span(*a));
+                    f(EntityRef::Span(*b));
+                }
 
-            Self::SpillSlotGroupCreated {
-                group,
-                members,
-                size: _,
-            } => {
-                f(EntityRef::SpillSlotGroup(*group));
-                for slot in members {
+                Self::CoalesceRefused {
+                    a,
+                    b,
+                    affinity: _,
+                    reason: _,
+                } => {
+                    f(EntityRef::Span(*a));
+                    f(EntityRef::Span(*b));
+                }
+
+                Self::CrossRegionAffinity { a, b } => {
+                    f(EntityRef::Span(*a));
+                    f(EntityRef::Span(*b));
+                }
+
+                Self::BundleConstructed {
+                    bundle,
+                    region,
+                    num_spans: _,
+                    num_vals: _,
+                    constraint,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Region(*region));
+                    visit_constraint(*constraint, f);
+                }
+
+                Self::BundleQueued {
+                    bundle,
+                    region,
+                    priority: _,
+                    phase: _,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Region(*region));
+                }
+
+                Self::BundleQueuePopped {
+                    bundle,
+                    region,
+                    priority: _,
+                    phase: _,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Region(*region));
+                }
+
+                Self::BundleAssignedPreferred { bundle, alloc } => {
+                    f(EntityRef::Bundle(*bundle));
+                    visit_reg_allocation(*alloc, f);
+                }
+
+                Self::BundleAssignedNonPreferred {
+                    bundle,
+                    alloc,
+                    preference,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    visit_reg_allocation(*alloc, f);
+                    visit_reg_set(preference, f);
+                }
+
+                Self::BundleAssignedViaEviction {
+                    bundle,
+                    alloc,
+                    evicted,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    visit_reg_allocation(*alloc, f);
+                    f(EntityRef::Bundle(*evicted));
+                }
+
+                Self::BundleEvicted { bundle, by, alloc } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Bundle(*by));
+                    visit_reg_allocation(*alloc, f);
+                }
+
+                Self::BundleSplitBetweenSpans {
+                    bundle,
+                    suffix,
+                    at,
+                    index: _,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Bundle(*suffix));
+                    visit_point(*at, f);
+                }
+
+                Self::BundleSplitWithinSpan {
+                    bundle,
+                    suffix,
+                    span,
+                    at,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Bundle(*suffix));
+                    f(EntityRef::Span(*span));
+                    visit_point(*at, f);
+                }
+
+                Self::BundleSplitFailed { bundle, split: _ } => {
+                    f(EntityRef::Bundle(*bundle));
+                }
+
+                Self::BundleSplitIntoMinimal {
+                    bundle,
+                    num_pieces: _,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                }
+
+                Self::BundleSpilledToStack {
+                    bundle,
+                    region,
+                    forced: _,
+                } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Region(*region));
+                }
+
+                Self::BundleHint { bundle, hint, from } => {
+                    f(EntityRef::Bundle(*bundle));
+                    visit_reg_set(hint, f);
+                    if let Some(from) = *from {
+                        f(EntityRef::Bundle(from));
+                    }
+                }
+
+                Self::BundleSplit {
+                    parent,
+                    child,
+                    region,
+                } => {
+                    f(EntityRef::Bundle(*parent));
+                    f(EntityRef::Bundle(*child));
+                    f(EntityRef::Region(*region));
+                }
+
+                Self::SpillSlotCreated {
+                    slot,
+                    size: _,
+                    emergency: _,
+                } => {
                     f(EntityRef::SpillSlot(*slot));
                 }
-            }
 
-            Self::SpillSlotAssigned { val, slot } => {
-                f(EntityRef::Val(*val));
-                visit_stack_allocation(*slot, f);
-            }
-
-            Self::ValueSpilled { val, num_spans: _ } => {
-                f(EntityRef::Val(*val));
-            }
-
-            Self::SpillPlaced {
-                val,
-                span,
-                at,
-                block,
-                slot,
-            } => {
-                f(EntityRef::Val(*val));
-                f(EntityRef::Span(*span));
-                visit_point(*at, f);
-                f(EntityRef::Block(*block));
-                visit_stack_allocation(*slot, f);
-            }
-
-            Self::SpillBlockChosen {
-                val,
-                block,
-                num_candidates: _,
-            } => {
-                f(EntityRef::Val(*val));
-                f(EntityRef::Block(*block));
-            }
-
-            Self::SpanSplit {
-                parent,
-                first,
-                second,
-                at,
-                val,
-            } => {
-                f(EntityRef::Span(*parent));
-                f(EntityRef::Span(*first));
-                f(EntityRef::Span(*second));
-                visit_point(*at, f);
-                f(EntityRef::Val(*val));
-            }
-
-            Self::HalfMoveSource {
-                pos,
-                val,
-                alloc,
-                replaced,
-            } => {
-                visit_move_position(*pos, f);
-                f(EntityRef::Val(*val));
-                visit_allocation(*alloc, f);
-                if let Some(replaced) = *replaced {
-                    visit_allocation(replaced, f);
+                Self::SpillSlotGroupCreated {
+                    group,
+                    members,
+                    size: _,
+                } => {
+                    f(EntityRef::SpillSlotGroup(*group));
+                    for slot in members {
+                        f(EntityRef::SpillSlot(*slot));
+                    }
                 }
-            }
 
-            Self::HalfMoveDest { pos, val, alloc } => {
-                visit_move_position(*pos, f);
-                f(EntityRef::Val(*val));
-                visit_allocation(*alloc, f);
-            }
+                Self::SpillSlotAssigned { val, slot } => {
+                    f(EntityRef::Val(*val));
+                    visit_stack_allocation(*slot, f);
+                }
 
-            Self::MoveResolved { pos, val, src, dst } => {
-                visit_move_position(*pos, f);
-                f(EntityRef::Val(*val));
-                visit_allocation(*src, f);
-                visit_allocation(*dst, f);
-            }
+                Self::ValueSpilled { val, num_spans: _ } => {
+                    f(EntityRef::Val(*val));
+                }
 
-            Self::RematEmitted { pos, val, dest } => {
-                visit_move_position(*pos, f);
-                f(EntityRef::Val(*val));
-                f(EntityRef::Reg(dest.with_repr32()));
-            }
+                Self::SpillPlaced {
+                    val,
+                    span,
+                    at,
+                    block,
+                    slot,
+                } => {
+                    f(EntityRef::Val(*val));
+                    f(EntityRef::Span(*span));
+                    visit_point(*at, f);
+                    f(EntityRef::Block(*block));
+                    visit_stack_allocation(*slot, f);
+                }
 
-            Self::ScratchRegChosen {
-                pos,
-                mv,
-                scratch,
-                reason: _,
-            } => {
-                visit_move_position(*pos, f);
-                visit_parallel_move(*mv, f);
-                visit_scalar_allocation(*scratch, f);
-            }
+                Self::SpillBlockChosen {
+                    val,
+                    block,
+                    num_candidates: _,
+                } => {
+                    f(EntityRef::Val(*val));
+                    f(EntityRef::Block(*block));
+                }
 
-            Self::ScratchRegUnavailable { pos, mv } => {
-                visit_move_position(*pos, f);
-                visit_parallel_move(*mv, f);
-            }
+                Self::SpanSplit {
+                    parent,
+                    first,
+                    second,
+                    at,
+                    val,
+                } => {
+                    f(EntityRef::Span(*parent));
+                    f(EntityRef::Span(*first));
+                    f(EntityRef::Span(*second));
+                    visit_point(*at, f);
+                    f(EntityRef::Val(*val));
+                }
 
-            Self::ParallelMoveBatchSolved {
-                pos,
-                num_input_moves: _,
-                num_solved_moves: _,
-            } => {
-                visit_move_position(*pos, f);
-            }
+                Self::HalfMoveSource {
+                    pos,
+                    val,
+                    alloc,
+                    replaced,
+                } => {
+                    visit_move_position(*pos, f);
+                    f(EntityRef::Val(*val));
+                    visit_allocation(*alloc, f);
+                    if let Some(replaced) = *replaced {
+                        visit_allocation(replaced, f);
+                    }
+                }
 
-            Self::MoveEmitted {
-                pos,
-                move_,
-                index: _,
-            } => {
-                visit_move_position(*pos, f);
-                visit_move(*move_, f);
-            }
+                Self::HalfMoveDest { pos, val, alloc } => {
+                    visit_move_position(*pos, f);
+                    f(EntityRef::Val(*val));
+                    visit_allocation(*alloc, f);
+                }
 
-            Self::CriticalEdgeEdit {
-                pred,
-                succ: _,
-                target,
-                edit,
-            } => {
-                f(EntityRef::Block(*pred));
-                f(EntityRef::Block(*target));
-                visit_edge_edit(*edit, f);
+                Self::MoveResolved { pos, val, src, dst } => {
+                    visit_move_position(*pos, f);
+                    f(EntityRef::Val(*val));
+                    visit_allocation(*src, f);
+                    visit_allocation(*dst, f);
+                }
+
+                Self::RematEmitted { pos, val, dest } => {
+                    visit_move_position(*pos, f);
+                    f(EntityRef::Val(*val));
+                    f(EntityRef::Reg(dest.with_repr32()));
+                }
+
+                Self::ScratchRegChosen {
+                    pos,
+                    mv,
+                    scratch,
+                    reason: _,
+                } => {
+                    visit_move_position(*pos, f);
+                    visit_parallel_move(*mv, f);
+                    visit_scalar_allocation(*scratch, f);
+                }
+
+                Self::ScratchRegUnavailable { pos, mv } => {
+                    visit_move_position(*pos, f);
+                    visit_parallel_move(*mv, f);
+                }
+
+                Self::ParallelMoveBatchSolved {
+                    pos,
+                    num_input_moves: _,
+                    num_solved_moves: _,
+                } => {
+                    visit_move_position(*pos, f);
+                }
+
+                Self::MoveEmitted {
+                    pos,
+                    move_,
+                    index: _,
+                } => {
+                    visit_move_position(*pos, f);
+                    visit_move(*move_, f);
+                }
+
+                Self::CriticalEdgeEdit {
+                    pred,
+                    succ: _,
+                    target,
+                    edit,
+                } => {
+                    f(EntityRef::Block(*pred));
+                    f(EntityRef::Block(*target));
+                    visit_edge_edit(*edit, f);
+                }
             }
         }
     }
-}
 
-/// The `events` half of the blob's `schema` table: which field of which event
-/// holds which kind of entity.
-///
-/// Every variant lists *every* field, with the ones that name no entity
-/// spelled `_`, and the expansion feeds that list to a match as exhaustive as
-/// [`Event::visit_entities`]'s. A new variant, or a new field on an existing
-/// variant, is therefore a compile error here as well as there, rather than a
-/// field that quietly stops being a link.
-#[cfg(feature = "visualizer")]
-macro_rules! event_schema {
+    /// The `events` half of the blob's `schema` table: which field of which event
+    /// holds which kind of entity.
+    ///
+    /// Every variant lists *every* field, with the ones that name no entity
+    /// spelled `_`, and the expansion feeds that list to a match as exhaustive as
+    /// [`Event::visit_entities`]'s. A new variant, or a new field on an existing
+    /// variant, is therefore a compile error here as well as there, rather than a
+    /// field that quietly stops being a link.
+    macro_rules! event_schema {
     ( $(
         $variant:ident { $( $field:ident $( as $name:literal )? : $desc:tt , )* }
     )* ) => {
@@ -1002,383 +1002,359 @@ macro_rules! event_schema {
     };
 }
 
-/// The name a schema field serializes under, which is its serde name and not
-/// always its Rust name.
-#[cfg(feature = "visualizer")]
-macro_rules! event_schema_name {
-    ( $field:ident as $name:literal ) => {
-        $name
-    };
-    ( $field:ident ) => {
-        stringify!($field)
-    };
-}
+    /// The name a schema field serializes under, which is its serde name and not
+    /// always its Rust name.
+    macro_rules! event_schema_name {
+        ( $field:ident as $name:literal ) => {
+            $name
+        };
+        ( $field:ident ) => {
+            stringify!($field)
+        };
+    }
 
-/// One field's descriptor: `_` for a field that names no entity, `[Thing]` for
-/// a list of them, `(EXPR)` for a named composite, and a bare entity type name
-/// otherwise.
-#[cfg(feature = "visualizer")]
-macro_rules! event_schema_desc {
-    ( _ ) => {
-        None
-    };
-    ( [$inner:ident] ) => {
-        Some(Descriptor::List(&Descriptor::Entity(stringify!($inner))))
-    };
-    ( ($descriptor:expr) ) => {
-        Some($descriptor)
-    };
-    ( $kind:ident ) => {
-        Some(Descriptor::Entity(stringify!($kind)))
-    };
-}
+    /// One field's descriptor: `_` for a field that names no entity, `[Thing]` for
+    /// a list of them, `(EXPR)` for a named composite, and a bare entity type name
+    /// otherwise.
+    macro_rules! event_schema_desc {
+        ( _ ) => {
+            None
+        };
+        ( [$inner:ident] ) => {
+            Some(Descriptor::List(&Descriptor::Entity(stringify!($inner))))
+        };
+        ( ($descriptor:expr) ) => {
+            Some($descriptor)
+        };
+        ( $kind:ident ) => {
+            Some(Descriptor::Entity(stringify!($kind)))
+        };
+    }
 
-#[cfg(feature = "visualizer")]
-event_schema! {
-    SpanConstructed {
-        span: LiveSpan,
-        val: Val,
-        start: _,
-        end: _,
-        block: Block,
-        num_uses: _,
-        constraint: (CONSTRAINT),
-        has_fixed_use: _,
-    }
-    EagerSplit {
-        val: Val,
-        at: _,
-        before: LiveSpan,
-        constraint: (CONSTRAINT),
-        conflicting: (CONSTRAINT),
-    }
-    ReuseSplit {
-        val: Val,
-        at: _,
-        target_use: Use,
-        before: LiveSpan,
-        copy: LiveSpan,
-    }
-    SpansCoalesced {
-        a: LiveSpan,
-        b: LiveSpan,
-        affinity: _,
-    }
-    CoalesceRefused {
-        a: LiveSpan,
-        b: LiveSpan,
-        affinity: _,
-        reason: _,
-    }
-    CrossRegionAffinity {
-        a: LiveSpan,
-        b: LiveSpan,
-    }
-    BundleConstructed {
-        bundle: LiveBundle,
-        region: Region,
-        num_spans: _,
-        num_vals: _,
-        constraint: (CONSTRAINT),
-    }
-    BundleQueued {
-        bundle: LiveBundle,
-        region: Region,
-        priority: _,
-        phase: _,
-    }
-    BundleQueuePopped {
-        bundle: LiveBundle,
-        region: Region,
-        priority: _,
-        phase: _,
-    }
-    BundleAssignedPreferred {
-        bundle: LiveBundle,
-        alloc: (REG_ALLOCATION),
-    }
-    BundleAssignedNonPreferred {
-        bundle: LiveBundle,
-        alloc: (REG_ALLOCATION),
-        preference: (REG_SET),
-    }
-    BundleAssignedViaEviction {
-        bundle: LiveBundle,
-        alloc: (REG_ALLOCATION),
-        evicted: LiveBundle,
-    }
-    BundleEvicted {
-        bundle: LiveBundle,
-        by: LiveBundle,
-        alloc: (REG_ALLOCATION),
-    }
-    BundleSplitBetweenSpans {
-        bundle: LiveBundle,
-        suffix: LiveBundle,
-        at: _,
-        index: _,
-    }
-    BundleSplitWithinSpan {
-        bundle: LiveBundle,
-        suffix: LiveBundle,
-        span: LiveSpan,
-        at: _,
-    }
-    BundleSplitFailed {
-        bundle: LiveBundle,
-        split: _,
-    }
-    BundleSplitIntoMinimal {
-        bundle: LiveBundle,
-        num_pieces: _,
-    }
-    BundleSpilledToStack {
-        bundle: LiveBundle,
-        region: Region,
-        forced: _,
-    }
-    BundleHint {
-        bundle: LiveBundle,
-        hint: (REG_SET),
-        from: LiveBundle,
-    }
-    BundleSplit {
-        parent: LiveBundle,
-        child: LiveBundle,
-        region: Region,
-    }
-    SpillSlotCreated {
-        slot: SpillSlot,
-        size: _,
-        emergency: _,
-    }
-    SpillSlotGroupCreated {
-        group: SpillSlotGroup,
-        members: [SpillSlot],
-        size: _,
-    }
-    SpillSlotAssigned {
-        val: Val,
-        slot: (STACK_ALLOCATION),
-    }
-    ValueSpilled {
-        val: Val,
-        num_spans: _,
-    }
-    SpillPlaced {
-        val: Val,
-        span: LiveSpan,
-        at: _,
-        block: Block,
-        slot: (STACK_ALLOCATION),
-    }
-    SpillBlockChosen {
-        val: Val,
-        block: Block,
-        num_candidates: _,
-    }
-    SpanSplit {
-        parent: LiveSpan,
-        first: LiveSpan,
-        second: LiveSpan,
-        at: _,
-        val: Val,
-    }
-    HalfMoveSource {
-        pos: (MOVE_POSITION),
-        val: Val,
-        alloc: (ALLOCATION),
-        replaced: (ALLOCATION),
-    }
-    HalfMoveDest {
-        pos: (MOVE_POSITION),
-        val: Val,
-        alloc: (ALLOCATION),
-    }
-    MoveResolved {
-        pos: (MOVE_POSITION),
-        val: Val,
-        src: (ALLOCATION),
-        dst: (ALLOCATION),
-    }
-    RematEmitted {
-        pos: (MOVE_POSITION),
-        val: Val,
-        dest: Reg,
-    }
-    ScratchRegChosen {
-        pos: (MOVE_POSITION),
-        mv: (PARALLEL_MOVE),
-        scratch: (SCALAR_ALLOCATION),
-        reason: _,
-    }
-    ScratchRegUnavailable {
-        pos: (MOVE_POSITION),
-        mv: (PARALLEL_MOVE),
-    }
-    ParallelMoveBatchSolved {
-        pos: (MOVE_POSITION),
-        num_input_moves: _,
-        num_solved_moves: _,
-    }
-    MoveEmitted {
-        pos: (MOVE_POSITION),
-        move_ as "move": (MOVE),
-        index: _,
-    }
-    CriticalEdgeEdit {
-        pred: Block,
-        succ: _,
-        target: Block,
-        edit: (EDGE_EDIT),
-    }
-}
-
-/// A point names the instruction it lies in; which half of it does not name
-/// anything.
-#[cfg(feature = "visualizer")]
-fn visit_point<E>(point: LivePoint<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    f(EntityRef::Inst(point.inst()));
-}
-
-/// A move position is either a point in a block or an outgoing edge of one;
-/// the edge's `succ` is an ordinal, not an entity.
-#[cfg(feature = "visualizer")]
-fn visit_move_position<E>(pos: PackedMovePosition<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match pos.unpack() {
-        MovePosition::Point(point) => visit_point(point, f),
-        MovePosition::CriticalEdge { pred, succ: _ } => f(EntityRef::Block(pred)),
-    }
-}
-
-/// A `Reg` constraint names the class it allows; the rest name nothing.
-#[cfg(feature = "visualizer")]
-fn visit_constraint<E>(constraint: OperandConstraint, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match constraint {
-        OperandConstraint::Reg(class) => f(EntityRef::RegClass(class)),
-        OperandConstraint::Any | OperandConstraint::Stack | OperandConstraint::Reuse(_) => {}
-    }
-}
-
-/// A set of registers names every one of its members, which is what makes
-/// "who wanted `r3`?" answerable.
-#[cfg(feature = "visualizer")]
-fn visit_reg_set<E>(regs: &RegSet, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    for reg in regs.iter() {
-        f(EntityRef::Reg(reg));
-    }
-}
-
-#[cfg(feature = "visualizer")]
-fn visit_allocation<E>(alloc: Allocation<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match alloc {
-        Allocation::Reg(alloc) => visit_reg_allocation(alloc, f),
-        Allocation::Stack(alloc) => visit_stack_allocation(alloc, f),
-    }
-}
-
-#[cfg(feature = "visualizer")]
-fn visit_reg_allocation<E>(alloc: RegAllocation<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match alloc {
-        RegAllocation::Reg(reg) => f(EntityRef::Reg(reg.with_repr32())),
-        RegAllocation::RegGroup(group) => f(EntityRef::RegGroup(group)),
-    }
-}
-
-#[cfg(feature = "visualizer")]
-fn visit_stack_allocation<E>(alloc: StackAllocation<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match alloc {
-        StackAllocation::SpillSlot(slot) => f(EntityRef::SpillSlot(slot)),
-        StackAllocation::SpillSlotGroup(group) => f(EntityRef::SpillSlotGroup(group)),
-    }
-}
-
-#[cfg(feature = "visualizer")]
-fn visit_scalar_allocation<E>(alloc: ScalarAllocation<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match alloc {
-        ScalarAllocation::Reg(reg) => f(EntityRef::Reg(reg.with_repr32())),
-        ScalarAllocation::Stack(slot) => f(EntityRef::SpillSlot(slot)),
-    }
-}
-
-#[cfg(feature = "visualizer")]
-fn visit_parallel_move<E>(mv: ParallelMove<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    let ParallelMove { src, dst } = mv;
-    visit_scalar_allocation(src, f);
-    visit_scalar_allocation(dst, f);
-}
-
-#[cfg(feature = "visualizer")]
-fn visit_move<E>(move_: Move<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match move_ {
-        Move::RegReg { from, to } => {
-            f(EntityRef::Reg(from.with_repr32()));
-            f(EntityRef::Reg(to.with_repr32()));
+    event_schema! {
+        SpanConstructed {
+            span: LiveSpan,
+            val: Val,
+            start: _,
+            end: _,
+            block: Block,
+            num_uses: _,
+            constraint: (CONSTRAINT),
+            has_fixed_use: _,
         }
-        Move::Spill { from, to } => {
-            f(EntityRef::Reg(from.with_repr32()));
-            f(EntityRef::SpillSlot(to));
+        EagerSplit {
+            val: Val,
+            at: _,
+            before: LiveSpan,
+            constraint: (CONSTRAINT),
+            conflicting: (CONSTRAINT),
         }
-        Move::Reload { from, to } => {
-            f(EntityRef::SpillSlot(from));
-            f(EntityRef::Reg(to.with_repr32()));
+        ReuseSplit {
+            val: Val,
+            at: _,
+            target_use: Use,
+            before: LiveSpan,
+            copy: LiveSpan,
+        }
+        SpansCoalesced {
+            a: LiveSpan,
+            b: LiveSpan,
+            affinity: _,
+        }
+        CoalesceRefused {
+            a: LiveSpan,
+            b: LiveSpan,
+            affinity: _,
+            reason: _,
+        }
+        CrossRegionAffinity {
+            a: LiveSpan,
+            b: LiveSpan,
+        }
+        BundleConstructed {
+            bundle: LiveBundle,
+            region: Region,
+            num_spans: _,
+            num_vals: _,
+            constraint: (CONSTRAINT),
+        }
+        BundleQueued {
+            bundle: LiveBundle,
+            region: Region,
+            priority: _,
+            phase: _,
+        }
+        BundleQueuePopped {
+            bundle: LiveBundle,
+            region: Region,
+            priority: _,
+            phase: _,
+        }
+        BundleAssignedPreferred {
+            bundle: LiveBundle,
+            alloc: (REG_ALLOCATION),
+        }
+        BundleAssignedNonPreferred {
+            bundle: LiveBundle,
+            alloc: (REG_ALLOCATION),
+            preference: (REG_SET),
+        }
+        BundleAssignedViaEviction {
+            bundle: LiveBundle,
+            alloc: (REG_ALLOCATION),
+            evicted: LiveBundle,
+        }
+        BundleEvicted {
+            bundle: LiveBundle,
+            by: LiveBundle,
+            alloc: (REG_ALLOCATION),
+        }
+        BundleSplitBetweenSpans {
+            bundle: LiveBundle,
+            suffix: LiveBundle,
+            at: _,
+            index: _,
+        }
+        BundleSplitWithinSpan {
+            bundle: LiveBundle,
+            suffix: LiveBundle,
+            span: LiveSpan,
+            at: _,
+        }
+        BundleSplitFailed {
+            bundle: LiveBundle,
+            split: _,
+        }
+        BundleSplitIntoMinimal {
+            bundle: LiveBundle,
+            num_pieces: _,
+        }
+        BundleSpilledToStack {
+            bundle: LiveBundle,
+            region: Region,
+            forced: _,
+        }
+        BundleHint {
+            bundle: LiveBundle,
+            hint: (REG_SET),
+            from: LiveBundle,
+        }
+        BundleSplit {
+            parent: LiveBundle,
+            child: LiveBundle,
+            region: Region,
+        }
+        SpillSlotCreated {
+            slot: SpillSlot,
+            size: _,
+            emergency: _,
+        }
+        SpillSlotGroupCreated {
+            group: SpillSlotGroup,
+            members: [SpillSlot],
+            size: _,
+        }
+        SpillSlotAssigned {
+            val: Val,
+            slot: (STACK_ALLOCATION),
+        }
+        ValueSpilled {
+            val: Val,
+            num_spans: _,
+        }
+        SpillPlaced {
+            val: Val,
+            span: LiveSpan,
+            at: _,
+            block: Block,
+            slot: (STACK_ALLOCATION),
+        }
+        SpillBlockChosen {
+            val: Val,
+            block: Block,
+            num_candidates: _,
+        }
+        SpanSplit {
+            parent: LiveSpan,
+            first: LiveSpan,
+            second: LiveSpan,
+            at: _,
+            val: Val,
+        }
+        HalfMoveSource {
+            pos: (MOVE_POSITION),
+            val: Val,
+            alloc: (ALLOCATION),
+            replaced: (ALLOCATION),
+        }
+        HalfMoveDest {
+            pos: (MOVE_POSITION),
+            val: Val,
+            alloc: (ALLOCATION),
+        }
+        MoveResolved {
+            pos: (MOVE_POSITION),
+            val: Val,
+            src: (ALLOCATION),
+            dst: (ALLOCATION),
+        }
+        RematEmitted {
+            pos: (MOVE_POSITION),
+            val: Val,
+            dest: Reg,
+        }
+        ScratchRegChosen {
+            pos: (MOVE_POSITION),
+            mv: (PARALLEL_MOVE),
+            scratch: (SCALAR_ALLOCATION),
+            reason: _,
+        }
+        ScratchRegUnavailable {
+            pos: (MOVE_POSITION),
+            mv: (PARALLEL_MOVE),
+        }
+        ParallelMoveBatchSolved {
+            pos: (MOVE_POSITION),
+            num_input_moves: _,
+            num_solved_moves: _,
+        }
+        MoveEmitted {
+            pos: (MOVE_POSITION),
+            move_ as "move": (MOVE),
+            index: _,
+        }
+        CriticalEdgeEdit {
+            pred: Block,
+            succ: _,
+            target: Block,
+            edit: (EDGE_EDIT),
         }
     }
-}
 
-#[cfg(feature = "visualizer")]
-fn visit_edge_edit<E>(edit: EdgeEdit<E>, f: &mut impl FnMut(EntityRef<E>))
-where
-    E: EntityRepr,
-{
-    match edit {
-        EdgeEdit::Move(move_) => visit_move(move_, f),
-        EdgeEdit::Remat(Remat { val, dest }) => {
-            f(EntityRef::Val(val));
-            f(EntityRef::Reg(dest.with_repr32()));
+    /// A point names the instruction it lies in; which half of it does not name
+    /// anything.
+    fn visit_point<E>(point: LivePoint<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        f(EntityRef::Inst(point.inst()));
+    }
+
+    /// A move position is either a point in a block or an outgoing edge of one;
+    /// the edge's `succ` is an ordinal, not an entity.
+    fn visit_move_position<E>(pos: PackedMovePosition<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match pos.unpack() {
+            MovePosition::Point(point) => visit_point(point, f),
+            MovePosition::CriticalEdge { pred, succ: _ } => f(EntityRef::Block(pred)),
         }
     }
-}
 
-#[cfg(feature = "visualizer")]
-pub use self::enabled::EventsLog;
-#[cfg(not(feature = "visualizer"))]
-pub use crate::events_disabled::EventsLog;
+    /// A `Reg` constraint names the class it allows; the rest name nothing.
+    fn visit_constraint<E>(constraint: OperandConstraint, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match constraint {
+            OperandConstraint::Reg(class) => f(EntityRef::RegClass(class)),
+            OperandConstraint::Any | OperandConstraint::Stack | OperandConstraint::Reuse(_) => {}
+        }
+    }
 
-#[cfg(feature = "visualizer")]
-mod enabled {
-    use super::*;
-    use crate::entity::PrimaryMap;
+    /// A set of registers names every one of its members, which is what makes
+    /// "who wanted `r3`?" answerable.
+    fn visit_reg_set<E>(regs: &RegSet, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        for reg in regs.iter() {
+            f(EntityRef::Reg(reg));
+        }
+    }
+
+    fn visit_allocation<E>(alloc: Allocation<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match alloc {
+            Allocation::Reg(alloc) => visit_reg_allocation(alloc, f),
+            Allocation::Stack(alloc) => visit_stack_allocation(alloc, f),
+        }
+    }
+
+    fn visit_reg_allocation<E>(alloc: RegAllocation<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match alloc {
+            RegAllocation::Reg(reg) => f(EntityRef::Reg(reg.with_repr32())),
+            RegAllocation::RegGroup(group) => f(EntityRef::RegGroup(group)),
+        }
+    }
+
+    fn visit_stack_allocation<E>(alloc: StackAllocation<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match alloc {
+            StackAllocation::SpillSlot(slot) => f(EntityRef::SpillSlot(slot)),
+            StackAllocation::SpillSlotGroup(group) => f(EntityRef::SpillSlotGroup(group)),
+        }
+    }
+
+    fn visit_scalar_allocation<E>(alloc: ScalarAllocation<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match alloc {
+            ScalarAllocation::Reg(reg) => f(EntityRef::Reg(reg.with_repr32())),
+            ScalarAllocation::Stack(slot) => f(EntityRef::SpillSlot(slot)),
+        }
+    }
+
+    fn visit_parallel_move<E>(mv: ParallelMove<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        let ParallelMove { src, dst } = mv;
+        visit_scalar_allocation(src, f);
+        visit_scalar_allocation(dst, f);
+    }
+
+    fn visit_move<E>(move_: Move<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match move_ {
+            Move::RegReg { from, to } => {
+                f(EntityRef::Reg(from.with_repr32()));
+                f(EntityRef::Reg(to.with_repr32()));
+            }
+            Move::Spill { from, to } => {
+                f(EntityRef::Reg(from.with_repr32()));
+                f(EntityRef::SpillSlot(to));
+            }
+            Move::Reload { from, to } => {
+                f(EntityRef::SpillSlot(from));
+                f(EntityRef::Reg(to.with_repr32()));
+            }
+        }
+    }
+
+    fn visit_edge_edit<E>(edit: EdgeEdit<E>, f: &mut impl FnMut(EntityRef<E>))
+    where
+        E: EntityRepr,
+    {
+        match edit {
+            EdgeEdit::Move(move_) => visit_move(move_, f),
+            EdgeEdit::Remat(Remat { val, dest }) => {
+                f(EntityRef::Val(val));
+                f(EntityRef::Reg(dest.with_repr32()));
+            }
+        }
+    }
 
     /// Every event the register allocator recorded, in the order it recorded
     /// them.
@@ -1415,10 +1391,7 @@ mod enabled {
             events.is_reset()
         }
 
-        /// Record `event`.
-        ///
-        /// Panics after `u32::MAX - 1` events, which is well past the point
-        /// where a visualization would be useful.
+        /// Record `event` into this log.
         pub fn push(&mut self, event: Event<E>) -> EventIndex {
             self.events.push_unwrap(event)
         }
@@ -1441,20 +1414,56 @@ mod enabled {
     }
 }
 
+#[cfg(not(feature = "visualizer"))]
+pub use self::viz_disabled::*;
+#[cfg(not(feature = "visualizer"))]
+mod viz_disabled {
+    use crate::entity::EntityRepr;
+    use core::marker::PhantomData;
+
+    /// Does nothing, holds nothing.
+    #[derive(Debug)]
+    pub struct EventsLog<E>(PhantomData<E>)
+    where
+        E: EntityRepr;
+
+    impl<E> EventsLog<E>
+    where
+        E: EntityRepr,
+    {
+        /// Create a new log.
+        pub const fn new() -> Self {
+            EventsLog(PhantomData)
+        }
+
+        /// Reset the log to its empty state.
+        pub fn reset(&mut self) {}
+
+        /// Is this log in its reset state?
+        pub fn is_reset(&self) -> bool {
+            true
+        }
+    }
+}
+
 /// Record an event.
 ///
 /// Traces always; logs only under the `visualizer` feature.
 macro_rules! event {
-    ( $events:expr, $variant:ident { $( $body:tt )* } ) => {{
+    ( $events:expr, $event:expr ) => {{
         let events = &mut *$events;
         let _ = &events;
+
         if cfg!(any(
             feature = "trace-log",
             debug_assertions,
             feature = "visualizer",
         )) {
-            let event = $crate::events::Event::$variant { $( $body )* };
+            use $crate::events::Event::*;
+
+            let event = $event;
             $crate::trace!("event: {event:?}");
+
             #[cfg(feature = "visualizer")]
             events.push(event);
         }

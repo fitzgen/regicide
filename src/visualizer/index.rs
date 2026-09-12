@@ -1,5 +1,5 @@
 //! Everything the visualizer's JavaScript needs that is cheaper or more
-//! reliable to compute here: per-entity and per-kind event indexes, the
+//! reliable to compute here: per-entity and per-kind event indices, the
 //! parentage of split spans and bundles, and the histograms.
 //!
 //! All of it runs once, when the visualization is written, and never during
@@ -28,9 +28,9 @@ pub(crate) struct Index<E>
 where
     E: EntityRepr,
 {
-    /// The event indexes, which the visualization holds under its `index` key.
+    /// The event indices, which the visualization holds under its `index` key.
     #[serde(rename = "index")]
-    pub(crate) indexes: EventIndexes<E>,
+    pub(crate) indices: EventIndices<E>,
 
     /// The histograms, which it holds under its `histograms` key.
     pub(crate) histograms: Vec<Histogram>,
@@ -40,7 +40,7 @@ where
 #[derive(Debug, serde::Serialize)]
 #[serde(bound = "")]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct EventIndexes<E>
+pub(crate) struct EventIndices<E>
 where
     E: EntityRepr,
 {
@@ -73,7 +73,7 @@ where
     at: LivePoint<E>,
 }
 
-impl<E> EventIndexes<E>
+impl<E> EventIndices<E>
 where
     E: EntityRepr,
 {
@@ -91,7 +91,7 @@ where
     }
 }
 
-/// The per-entity indexes.
+/// The per-entity indices.
 ///
 /// One typed map per entity kind an event can name, side by side under
 /// `byEntity` and keyed by the entity type's own name, so that the lookup on
@@ -228,7 +228,7 @@ where
         );
 
         Self {
-            indexes: EventIndexes {
+            indices: EventIndices {
                 by_entity,
                 by_kind,
                 span_parents,
@@ -280,7 +280,7 @@ const NUM_BUCKETS: u64 = 16;
 /// A distribution of counts, summarized.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct Histogram {
-    /// The anchor commit 12's table of contents links to.
+    /// The anchor the table of contents links to.
     id: &'static str,
 
     /// The name to display.
@@ -308,11 +308,9 @@ pub(crate) struct Histogram {
     /// The 99th percentile.
     p99: u64,
 
-    /// The bars, which tile a *superset* of `min..=max` with no gaps and no
+    /// The bars, which tile a superset of `min..=max` with no gaps and no
     /// overlap: the bar width is rounded up to a power of two, so the last few
-    /// bars can sit entirely past `max` with a count of zero. That is the price
-    /// of an x-axis that does not jump around as the numbers change, and the
-    /// figures printed beside the chart are exact regardless.
+    /// bars can sit entirely past `max` with a count of zero.
     buckets: Vec<Bucket>,
 }
 
@@ -818,7 +816,7 @@ mod tests {
                 with_indexed(test_input, |_input, inner, index| {
                     let len = inner.events.iter().count();
                     let mut error = None;
-                    index.indexes.by_entity.for_each_list(&mut |entity, list| {
+                    index.indices.by_entity.for_each_list(&mut |entity, list| {
                         for &event in list {
                             let Some((_, logged)) = inner.events.iter().find(|&(i, _)| i == event)
                             else {
@@ -841,7 +839,7 @@ mod tests {
                     for (event, logged) in inner.events.iter() {
                         logged.visit_entities(&mut |entity| {
                             let mut found = false;
-                            index.indexes.by_entity.for_each_list(&mut |other, list| {
+                            index.indices.by_entity.for_each_list(&mut |other, list| {
                                 found |= other == entity && list.contains(&event);
                             });
                             if !found {
@@ -870,7 +868,7 @@ mod tests {
             .run(|test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
                     let mut seen = BTreeSet::new();
-                    for (kind, list) in &index.indexes.by_kind {
+                    for (kind, list) in &index.indices.by_kind {
                         for &event in list {
                             if !seen.insert(event) {
                                 return Err(format!("event {event:?} is in two `byKind` lists"));
@@ -934,7 +932,7 @@ mod tests {
             .iters(1_000)
             .run(|test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
-                    for (span, parent) in index.indexes.span_parents.iter() {
+                    for (span, parent) in index.indices.span_parents.iter() {
                         let Some(parent) = parent else { continue };
                         if parent.parent.index() >= span.index() {
                             return Err(format!(
@@ -943,7 +941,7 @@ mod tests {
                             ));
                         }
                     }
-                    for (bundle, parent) in index.indexes.bundle_parents.iter() {
+                    for (bundle, parent) in index.indices.bundle_parents.iter() {
                         let Some(parent) = parent else { continue };
                         if parent.index() >= bundle.index() {
                             return Err(format!(
@@ -956,12 +954,12 @@ mod tests {
                     for (_, event) in inner.events.iter() {
                         match event {
                             Event::SpanSplit { second, .. } => {
-                                if index.indexes.span_parents[*second].is_none() {
+                                if index.indices.span_parents[*second].is_none() {
                                     return Err(format!("{second:?} lost its parent"));
                                 }
                             }
                             Event::BundleSplit { child, .. } => {
-                                if index.indexes.bundle_parents[*child].is_none() {
+                                if index.indices.bundle_parents[*child].is_none() {
                                     return Err(format!("{child:?} lost its parent"));
                                 }
                             }
@@ -986,7 +984,7 @@ mod tests {
                     }
                     for span in inner.live_ranges.spans() {
                         let mut root = span;
-                        while let Some(parent) = index.indexes.span_parents[root] {
+                        while let Some(parent) = index.indices.span_parents[root] {
                             root = parent.parent;
                         }
                         if !constructed_spans.contains(&root) {
@@ -997,7 +995,7 @@ mod tests {
                     }
                     for bundle in inner.live_ranges.bundles() {
                         let mut root = bundle;
-                        while let Some(parent) = index.indexes.bundle_parents[root] {
+                        while let Some(parent) = index.indices.bundle_parents[root] {
                             root = parent;
                         }
                         if !constructed_bundles.contains(&root) {
@@ -1145,8 +1143,8 @@ mod tests {
             .iters(1_000)
             .run(|test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
-                    let by_reg = &index.indexes.by_entity.reg;
-                    let by_group = &index.indexes.by_entity.reg_group;
+                    let by_reg = &index.indices.by_entity.reg;
+                    let by_group = &index.indices.by_entity.reg_group;
                     for (event, logged) in inner.events.iter() {
                         let regs: RegSet = match logged {
                             Event::BundleEvicted { .. } => {

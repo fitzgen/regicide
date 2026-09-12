@@ -199,7 +199,6 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Has
 
 /// An entity type the visualizer knows how to name.
 #[cfg(feature = "visualizer")]
-#[allow(dead_code, reason = "read through `ENTITY_KINDS` in commit 07")]
 pub(crate) trait VisualizedEntity: Entity {
     /// The type's own name, e.g. `"LiveSpan"`.
     const KIND: &'static str;
@@ -266,7 +265,7 @@ macro_rules! define_entities {
                 }
             }
 
-            #[cfg(feature = "visualizer")]
+            #[cfg(feature = "serialize")]
             impl<T: crate::entity::EntityRepr> serde::Serialize for $name<T> {
                 fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
                 where
@@ -355,7 +354,7 @@ macro_rules! define_fixed_size_entities {
                 }
             }
 
-            #[cfg(feature = "visualizer")]
+            #[cfg(feature = "serialize")]
             impl serde::Serialize for $name {
                 fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
                 where
@@ -525,7 +524,7 @@ mod tests {
     /// An entity is its index in the JSON and nothing more; the type is
     /// recovered from the `schema` table, not from the encoding.
     #[test]
-    #[cfg(feature = "visualizer")]
+    #[cfg(feature = "serialize")]
     fn entities_serialize_as_bare_indices() {
         use crate::entity::{Block, Val};
         use crate::{Reg, RegBank};

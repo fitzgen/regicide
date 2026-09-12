@@ -124,9 +124,9 @@ define_entities! {
 ///
 /// This is the un-bitpacked version of `PackedMovePosition`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "visualizer", derive(serde::Serialize))]
-#[cfg_attr(feature = "visualizer", serde(rename_all = "camelCase"))]
-#[cfg_attr(feature = "visualizer", serde(bound = ""))]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "serialize", serde(rename_all = "camelCase"))]
+#[cfg_attr(feature = "serialize", serde(bound = ""))]
 pub(crate) enum MovePosition<E>
 where
     E: EntityRepr,
@@ -170,7 +170,7 @@ where
 
 /// A position serializes as the unpacked form, never as its bits: the bits are
 /// an implementation detail and the visualizer needs the instruction.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<E> serde::Serialize for PackedMovePosition<E>
 where
     E: EntityRepr,

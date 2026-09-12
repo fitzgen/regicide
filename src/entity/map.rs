@@ -296,7 +296,7 @@ where
 
 /// A `PrimaryMap` is dense by construction, so position is the entity's index
 /// and it needs no keys in the JSON.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<K, V> serde::Serialize for PrimaryMap<K, V>
 where
     V: serde::Serialize,
@@ -372,6 +372,7 @@ where
     }
 
     /// Returns an iterator over the keys in the map.
+    #[cfg(feature = "checker")]
     pub fn keys(&self) -> PrimaryMapKeys<K> {
         self.inner.keys()
     }
@@ -396,7 +397,7 @@ where
 
 /// A `SecondaryMap` is *not* dense: `elems` only grows to the highest key ever
 /// written, so the default has to travel with the values.
-#[cfg(feature = "visualizer")]
+#[cfg(feature = "serialize")]
 impl<K, V> serde::Serialize for SecondaryMap<K, V>
 where
     V: serde::Serialize,

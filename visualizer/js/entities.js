@@ -28,8 +28,8 @@ export function installEntities(entityKinds) {
   prefixes = { ...entityKinds };
   byLongestPrefix = Object.entries(prefixes)
     // `EventIndex` is an entity type in Rust, but an event is not something to
-    // select and has no `byEntity` list. Commit 11 handles "event9" as its own
-    // parser case, jumping to a log position.
+    // select and has no `byEntity` list. "event9" is handled as its own parser
+    // case, jumping to a log position.
     .filter(([kind]) => kind !== "EventIndex")
     .sort((a, b) => b[1].length - a[1].length);
 }
@@ -75,8 +75,7 @@ export function parseEntityLabel(text) {
 }
 
 // The color a bundle's span bars are drawn in, from the ramp `main.css`
-// defines. Commit 09 uses it; the ramp is here so that the model and the view
-// agree on it.
+// defines. The ramp is here so that the model and the view agree on it.
 export function bundleColor(index) {
   return "var(--bundle-" + (index % BUNDLE_RAMP_LENGTH) + ")";
 }

@@ -40,9 +40,9 @@ const sent = new Map();
 // cannot drift.
 //
 // The fallback evaluates the worker's own source rather than importing it:
-// `model.js` is deliberately not part of this script (commit 06), so there is
-// nothing here to import, and evaluating the same text is what keeps the two
-// paths the same code.
+// `model.js` is deliberately not part of this script, so there is nothing here
+// to import, and evaluating the same text is what keeps the two paths the same
+// code.
 let post;
 try {
   const url = URL.createObjectURL(new Blob([workerSource], { type: "text/javascript" }));

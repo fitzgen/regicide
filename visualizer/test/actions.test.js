@@ -23,7 +23,7 @@ const EVENT7 = { kind: "EventIndex", index: 7 };
 const details = (ref) => ({ ref, fields: [], eventCount: 0, events: [] });
 
 // Apply a sequence of actions, checking the stored-selection invariant after
-// each. Later commits' tests reuse this rather than trusting `selected`.
+// each. Tests reuse this rather than trusting `selected`.
 function run(actions, state = initialState()) {
   let queries = [];
   for (const action of actions) {
@@ -39,7 +39,7 @@ function run(actions, state = initialState()) {
   return { state, queries };
 }
 
-// Every action the page has. Commits 09-12 fill in what they do.
+// Every action the page has.
 const ACTIONS = [
   { type: "loaded" },
   { type: "selectTab", tab: "events" },
@@ -376,8 +376,8 @@ test("the outline arrives once the blob has loaded", () => {
 });
 
 test("clicking an entity in the function pane walks the breadcrumbs", () => {
-  // The function pane's click is commit 08's `clickEntity`, unchanged: a span
-  // bar and a value in a line go through the same handler.
+  // The function pane's click is `clickEntity`, unchanged: a span bar and a
+  // value in a line go through the same handler.
   const { state, queries } = run([
     { type: "clickEntity", ref: V3 },
     { type: "clickEntity", ref: SPAN0 },
