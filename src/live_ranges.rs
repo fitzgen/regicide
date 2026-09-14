@@ -2102,6 +2102,9 @@ where
 
     /// And whether the constraint is a single, fixed register.
     is_fixed: bool,
+
+    /// Whether this use reads the value, as opposed to defining it.
+    is_read: bool,
 }
 
 impl<E> ResolvedUse<E>
@@ -2119,12 +2122,19 @@ where
         let operand = usize::from(use_data.operand);
         let constraint = reuse_aware_constraint(input, point.inst().with_repr32(), operand);
         let is_fixed = constraint.is_fixed(input.machine);
+        let is_read = input
+            .func
+            .inst(point.inst().with_repr32())
+            .operand(operand)
+            .kind()
+            == DefUse::Use;
         ResolvedUse {
             use_,
             point,
             operand,
             constraint,
             is_fixed,
+            is_read,
         }
     }
 
@@ -2137,7 +2147,7 @@ where
         end: LivePoint<E>,
     ) -> bool {
         let input_inst = input.func.inst(self.point.inst().with_repr32());
-        input_inst.operand(self.operand).kind() == DefUse::Use
+        self.is_read
             && is_reuse_target(&input_inst, self.operand)
             && (end > self.point.next_point() || another_tie_follows(&input_inst, self.operand))
     }
@@ -2167,6 +2177,9 @@ where
     /// The piece's last point, thus far.
     point: LivePoint<E>,
 
+    /// The point of the earliest read folded in, if the piece holds any.
+    first_read: Option<LivePoint<E>>,
+
     /// Where its run on uses starts.
     run_start: Use<E>,
 
@@ -2192,6 +2205,7 @@ where
             constraint: OperandConstraint::Any,
             has_fixed_use: false,
             point: start,
+            first_read: None,
             run_start: uses_start,
             run_constraint: OperandConstraint::Any,
             run_has_fixed_use: false,
@@ -2207,6 +2221,7 @@ where
             constraint: u.constraint,
             has_fixed_use: u.is_fixed,
             point: u.point,
+            first_read: u.is_read.then_some(u.point),
             run_start: u.use_,
             run_constraint: u.constraint,
             run_has_fixed_use: u.is_fixed,
@@ -2236,7 +2251,80 @@ where
         }
         self.constraint = merged;
         self.has_fixed_use |= u.is_fixed;
+        if self.first_read.is_none() && u.is_read {
+            self.first_read = Some(u.point);
+        }
         self.point = u.point;
+    }
+
+    /// Would folding `u` in pin a read to the stack that need not be there?
+    ///
+    /// `Any` merged with `Stack` is `Stack`, so one stack operand silently
+    /// drags the rest of the piece onto the stack, where it never competes for
+    /// a register at all. Cutting costs a move, though, so it is only worth it
+    /// where the side keeping its register holds a read at some other point.
+    fn a_read_would_land_on_the_stack(&self, u: &ResolvedUse<E>) -> bool {
+        match (self.constraint, u.constraint) {
+            // The piece would be dragged onto the stack: cut if it holds a read
+            // that would rather stay in a register.
+            (OperandConstraint::Any, OperandConstraint::Stack) => {
+                self.first_read.is_some_and(|read| read < u.point)
+            }
+
+            // `u` would be dragged onto the stack by the piece: cut if `u` is
+            // itself a read, at a point the piece does not already reach.
+            (OperandConstraint::Stack, OperandConstraint::Any) => u.is_read && self.point < u.point,
+
+            // Everything else either merges without moving either side onto or
+            // off of the stack, or does not merge at all, in which case
+            // `merge_resolved` has already said so.
+            _ => false,
+        }
+    }
+
+    /// Cut the span just before `u`, which cannot join this piece.
+    ///
+    /// The piece so far becomes its own span, reaching far enough to cover its
+    /// own last point, and `u` begins a fresh piece that the caller goes on
+    /// accumulating into.
+    ///
+    /// The new piece starts at the last instruction boundary, not at `u`
+    /// itself, because the move between the two pieces cannot happen in the
+    /// middle of an instruction.
+    fn split_before(
+        &self,
+        spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
+        output: &mut OutputInner<E>,
+        events: &mut EventsLog<E>,
+        val: Val<E>,
+        block: Block<E>,
+        u: &ResolvedUse<E>,
+    ) -> IResult<Self> {
+        let before = push_span(
+            spans,
+            output,
+            events,
+            val,
+            (self.start, core::cmp::max(u.point, self.point.next_point())),
+            (self.uses_start, u.use_),
+            self.constraint,
+            self.has_fixed_use,
+            block,
+        )?;
+        event!(
+            events,
+            EagerSplit {
+                val,
+                at: u.point,
+                before,
+                constraint: self.constraint,
+                conflicting: u.constraint,
+            }
+        );
+        Ok(Piece::restarting_at(
+            u.point.inst_boundary_at_or_before(),
+            u,
+        ))
     }
 
     /// Split this piece around the reuse-tie at `u`.
@@ -2340,8 +2428,14 @@ where
     }
 }
 
-/// Push the given span, eagerly splitting where its uses' constraints conflict
-/// and at every `Reuse` target that outlives its instruction.
+/// Push the given span, eagerly splitting it whenever:
+///
+/// * nothing can satisfy all of the uses constraints simultaneously,
+///
+/// * a value is named as a `Reuse` target and outlives its instruction, or
+///
+/// * a use that could be in a register would unnecessarily be constrained to
+///   the stack.
 fn push_span_and_split_conflicts<E>(
     input: &Input<'_, impl InputFunction>,
     uses: &PrimaryMap<Use<E>, UseData<E>>,
@@ -2371,41 +2465,18 @@ where
             .constraint
             .merge_resolved(&u.constraint, input.machine)
         {
-            // No conflict: we can fold `use_` into this piece.
-            Some(merged) => piece.fold(&u, merged, input.machine),
+            // The constraints merge, and merging them costs no read its
+            // register: we can fold `use_` into this piece.
+            Some(merged) if !piece.a_read_would_land_on_the_stack(&u) => {
+                piece.fold(&u, merged, input.machine)
+            }
 
-            // Conflict: `use_` cannot fold into this piece, so split the span.
-            None => {
-                let before = push_span(
-                    spans,
-                    output,
-                    events,
-                    val,
-                    (
-                        piece.start,
-                        core::cmp::max(u.point, piece.point.next_point()),
-                    ),
-                    (piece.uses_start, u.use_),
-                    piece.constraint,
-                    piece.has_fixed_use,
-                    block,
-                )?;
-                event!(
-                    events,
-                    EagerSplit {
-                        val,
-                        at: u.point,
-                        before,
-                        constraint: piece.constraint,
-                        conflicting: u.constraint,
-                    }
-                );
+            // Either nothing at all satisfies both constraints, or the only
+            // thing that does is a stack slot that a read on one side would
+            // rather not be pinned to. Split the span, either way.
+            _ => {
+                piece = piece.split_before(spans, output, events, val, block, &u)?;
                 counts.eager_splits.inc();
-
-                // The new piece starts at the last instruction boundary, not at
-                // the conflicting use, because a move between the two pieces
-                // cannot happen in the middle of an instruction.
-                piece = Piece::restarting_at(u.point.inst_boundary_at_or_before(), &u);
             }
         }
     }
@@ -2843,6 +2914,12 @@ mod tests {
             TestInput::with_an_entry_param_read_two_ways(),
             TestInput::with_entry_params_in_two_banks(),
             TestInput::with_values_in_two_banks_spilled_and_reloaded(),
+            TestInput::with_use_constraints(&[
+                OperandConstraint::Any,
+                OperandConstraint::Stack,
+                OperandConstraint::Any,
+                OperandConstraint::Any,
+            ]),
         ]
     }
 
@@ -2894,6 +2971,75 @@ mod tests {
         let test_input = TestInput::with_use_constraints(&[rc(0), rc(2)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         assert_eq!(live_ranges.spans().count(), 1);
+    }
+
+    /// A stack operand does not drag the reads around it onto the stack. The
+    /// span is cut on both sides of it, so the reads before it keep their
+    /// register and the reads after it get one back.
+    #[test]
+    fn split_a_span_whose_any_uses_straddle_a_stack_use() {
+        let (any, stack) = (OperandConstraint::Any, OperandConstraint::Stack);
+
+        let test_input = TestInput::with_use_constraints(&[any, stack, any, any]);
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let first_use = LivePoint::new(inst(1), Position::Early);
+        let stack_use = LivePoint::new(inst(2), Position::Early);
+        let third_use = LivePoint::new(inst(3), Position::Early);
+        let last_use = LivePoint::new(inst(4), Position::Early);
+
+        // The three pieces abut exactly, and the middle one covers the stack
+        // operand's instruction and nothing more.
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), stack_use);
+        assert_eq!(spans[1].start(&live_ranges), stack_use);
+        assert_eq!(spans[1].end(&live_ranges), third_use);
+        assert_eq!(spans[2].start(&live_ranges), third_use);
+        assert!(spans[2].end(&live_ranges) > last_use);
+
+        // Each use is recorded by the piece that covers it.
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def, first_use]);
+        assert_eq!(points(spans[1]), vec![stack_use]);
+        assert_eq!(points(spans[2]), vec![third_use, last_use]);
+
+        // And only the middle piece is pinned to the stack.
+        let constraints: Vec<OperandConstraint> = test_input.with_input(|input| {
+            spans
+                .iter()
+                .map(|s| s.constraint(&live_ranges, input))
+                .collect()
+        });
+        assert_eq!(constraints, vec![any, stack, any]);
+    }
+
+    /// A definition is not split off from the stack read that follows it: the
+    /// value has to reach the slot either way, so cutting here would only turn
+    /// "define into the slot" into "define into a register, then store it".
+    #[test]
+    fn a_stack_use_does_not_split_a_definition_off_by_itself() {
+        let test_input = TestInput::with_use_constraints(&[OperandConstraint::Stack]);
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 1, "{spans:#?}");
+        assert_eq!(
+            spans[0].start(&live_ranges),
+            LivePoint::new(inst(0), Position::Late),
+            "the definition writes straight into the slot"
+        );
+
+        let constraint = test_input.with_input(|input| spans[0].constraint(&live_ranges, input));
+        assert_eq!(constraint, OperandConstraint::Stack);
     }
 
     /// Every span construction is logged, and so is the eager split that made
@@ -2950,6 +3096,41 @@ mod tests {
         assert_eq!(at, LivePoint::new(inst(2), Position::Early));
         assert_eq!(constraint, rc(0));
         assert_eq!(conflicting, rc(1));
+    }
+
+    /// Both directions of a stack cut are logged, each naming the constraint
+    /// the piece would have been forced to take on.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn splits_off_of_and_back_onto_the_stack_are_logged() {
+        use crate::events::Event;
+
+        let (any, stack) = (OperandConstraint::Any, OperandConstraint::Stack);
+        let test_input = TestInput::with_use_constraints(&[any, stack, any, any]);
+        let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
+
+        let val = live_ranges.spans().next().unwrap().val(&live_ranges);
+        let splits: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::EagerSplit {
+                    val,
+                    at,
+                    constraint,
+                    conflicting,
+                    ..
+                } => Some((*val, *at, *constraint, *conflicting)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            splits,
+            vec![
+                (val, LivePoint::new(inst(2), Position::Early), any, stack),
+                (val, LivePoint::new(inst(3), Position::Early), stack, any),
+            ],
+            "{splits:#?}"
+        );
     }
 
     /// A reuse split names the use it was made for and the one-point span the

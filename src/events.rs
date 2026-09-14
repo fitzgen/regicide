@@ -104,7 +104,9 @@ where
         has_fixed_use: bool,
     },
 
-    /// A span was split because two of its uses' constraints conflict.
+    /// A span was split where carrying one more use would have cost the uses
+    /// before it their location: either the two constraints do not merge at
+    /// all, or they merge only onto the stack.
     EagerSplit {
         /// The value being split.
         val: Val<E>,
@@ -114,7 +116,8 @@ where
         before: LiveSpan<E>,
         /// The constraint accumulated over that piece.
         constraint: OperandConstraint,
-        /// The constraint that would not merge into it.
+        /// The constraint that would not merge into it, or would only merge
+        /// into it on the stack.
         conflicting: OperandConstraint,
     },
 
