@@ -823,8 +823,9 @@ impl MachineBuilder {
     /// [`MachineBuilder::define_non_allocatable_reg`].
     ///
     /// The order registers are given in a [`RegClass`] is what expresses
-    /// preference between them; defining one here says only that it exists. To
-    /// define a register that the allocator may not draw upon freely, use
+    /// preference between them.
+    ///
+    /// To define a register that the allocator may not draw upon freely, use
     /// [`MachineBuilder::define_non_allocatable_reg`] instead.
     pub fn define_reg(&mut self, bank: RegBank, units: Range<RegUnit>) -> Result<Reg> {
         self.define_reg_impl(bank, units, Allocatable::Yes)
@@ -833,18 +834,28 @@ impl MachineBuilder {
     /// Define a register that the allocator does not own.
     ///
     /// The allocator will not draw upon this register when it needs one, and in
-    /// particular will never stage a stack-to-stack move through it -- but
-    /// instructions may still name it as an operand, and it still interferes
-    /// with the registers it overlaps. This is how to model the stack pointer, a
-    /// link register, a hardware zero register, or a flags register.
+    /// particular will never stage temporary moves through it. However,
+    /// instructions may still name it as an operand.
+    ///
+    /// Non-allocatable registers can be used to model the stack pointer, frame
+    /// pointer, link register, hardware zero register, etc... which are
+    /// manually-managed by explicit instructions by the function.
     ///
     /// A non-allocatable register may still be a member of a [`RegClass`]. A
-    /// class holding one such register is how an operand says it must go in that
-    /// particular register and nowhere else, which is the point of naming these
-    /// registers at all.
+    /// class holding one such register is how an operand says it must go in
+    /// that particular register and nowhere else.
     ///
-    /// Give it whatever units it really covers, so that it interferes correctly;
-    /// an empty range suits a register with nothing to conflict with.
+    /// **Non-allocatable registers must be disjoint from all allocatable
+    /// registers, regardless of register bank.**
+    ///
+    /// **Values cannot be defined in non-allocatable registers.** An
+    /// [`Operand`][crate::Operand] of kind [`Def`][crate::DefUse::Def] may not
+    /// be [constrained][crate::OperandConstraint] to a [`RegClass`] that
+    /// contains only non-allocatable registers (and, therefore, no allocatable
+    /// registers). It also follows that, because
+    /// [`OperandConstraint::Reuse`][crate::OperandConstraint::Reuse] can only
+    /// appear on definitions, non-allocatable registers may not be used with
+    /// reuse constraints.
     pub fn define_non_allocatable_reg(&mut self, bank: RegBank) -> Result<Reg> {
         self.define_reg_impl(
             bank,
