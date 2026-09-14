@@ -3712,6 +3712,15 @@ mod tests {
         check_allocation(&test_input).unwrap();
     }
 
+    /// A definition tied to an unconstrained read lands where that read is
+    /// actually placed, even when a sibling read pins the run elsewhere and an
+    /// earlier read has already claimed the target's piece for another class.
+    #[test]
+    fn a_reuse_follows_its_target_past_an_earlier_pinned_read() {
+        let test_input = TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read();
+        check_allocation(&test_input).unwrap();
+    }
+
     /// An operand that names a register the allocator does not own, and no
     /// value, checks out --- and reports that register back, which is what a
     /// client reads the operand's allocation for.

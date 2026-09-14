@@ -688,14 +688,18 @@ where
                 ) else {
                     continue;
                 };
-                // Always within one block, so always within one region.
-                self.try_merge(
+                let merged = self.try_merge(
                     input.machine,
                     live_ranges,
                     events,
                     Affinity::ReuseOperand,
                     a,
                     b,
+                );
+                debug_assert!(
+                    merged,
+                    "operand {j} of {inst:?} reuses operand {i}, but their spans \
+                     ({a:?} and {b:?}) could not be coalesced into one bundle"
                 );
 
                 debug_assert_eq!(target.pos(), Position::Early);

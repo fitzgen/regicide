@@ -3213,6 +3213,117 @@ impl TestInput {
         input
     }
 
+    /// The mirror image of `with_a_pinned_read_before_a_reuse_that_reads_twice`:
+    /// the tie names the *unpinned* read, and the sibling beside it is the one
+    /// pinned to `r1`, while an earlier read is pinned to the disjoint `r0`.
+    pub fn with_a_pinned_read_before_a_reuse_of_an_unpinned_read() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let tied = Val::try_new(1).unwrap();
+
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let second_reg = RegClass::try_new(TestMachine::SECOND_REG_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for inst in [0, 2] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(inst).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+                side_effects: true,
+            },
+            // The pinned read, on an instruction of its own so that it is not
+            // part of the tie's run, and so that its piece is already claimed
+            // for `r0` by the time the tie's point is reached.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(first_reg),
+                    Some(defined),
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    // The tie's target, demanding nothing of its own.
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(defined),
+                    ),
+                    // The sibling at the same point that pins the run to `r1`,
+                    // which the earlier read's `r0` cannot satisfy.
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(second_reg),
+                        Some(defined),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        Some(tied),
+                    ),
+                ],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// Like `with_reuse_of_a_surviving_value`, but the tie is at a *second*
     /// block's first instruction, so the reused value arrives live-in and the
     /// piece up to the tie is empty. Pushing one anyway would hold a third
@@ -4808,6 +4919,7 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_two_reads_and_a_reuse_of_a_surviving_value(),
         TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
         TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
+        TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read(),
         TestInput::with_a_reuse_of_a_live_in_value(),
         TestInput::with_two_reuses_at_one_point(),
         TestInput::with_two_reuses_of_a_dying_value(),

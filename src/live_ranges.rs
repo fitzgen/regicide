@@ -1954,9 +1954,10 @@ where
 
 /// Get the constraint that an instruction's `operand` places on its span.
 ///
-/// Resolves a `Reuse` to its target's constraint, then strengthens both halves
-/// of a tie to demand a register: a stack home belongs to one value alone and
-/// so cannot be reused for two different values.
+/// Resolves a `Reuse` to its target's constraint, narrows both halves of a tie
+/// by the same sibling reads, and then strengthens both to demand a register:
+/// a stack home belongs to one value alone and so cannot be reused for two
+/// different values.
 fn reuse_aware_constraint(
     input: &Input<'_, impl InputFunction>,
     inst: Inst,
@@ -1966,14 +1967,21 @@ fn reuse_aware_constraint(
     let constraint = input_inst.operand(operand).constraint();
     let mut resolved = constraint.resolved(|j| input_inst.operand(j).constraint());
 
-    // A `Reuse` is defined in the register its target is read from, and every
-    // operand reading that value in a register at that point reads it from the
-    // same one: `Piece::fold` folds them all into one span. So a sibling that
-    // names a narrower class than the target's own operand does constrains the
-    // definition too, and folding those in here is what lets the definition's
-    // span see the resulting conflict and split, rather than the tie being
-    // quietly broken.
-    if let OperandConstraint::Reuse(target) = constraint {
+    // The operand whose reads decide where the tie lives: the target for a
+    // `Reuse`, and the operand itself when some `Reuse` names it.
+    let tie_target = match constraint {
+        OperandConstraint::Reuse(target) => Some(target),
+        _ if is_reuse_target(&input_inst, operand) => Some(operand),
+        _ => None,
+    };
+
+    // A `Reuse` is defined in the register its target is read from, so a
+    // sibling reading that value in a register at that point under a narrower
+    // class than the target's own operand does constrains the definition too.
+    // Both halves fold those siblings in identically: narrowing only the
+    // definition would leave the target free to fold into an earlier piece the
+    // definition cannot share, and the tie would be quietly broken.
+    if let Some(target) = tie_target {
         let target = input_inst.operand(target);
         for other in input_inst.operands() {
             if other.kind() != DefUse::Use
@@ -1998,10 +2006,7 @@ fn reuse_aware_constraint(
         }
     }
 
-    let is_tied = matches!(constraint, OperandConstraint::Reuse(_))
-        || input_inst
-            .operands()
-            .any(|op| op.constraint() == OperandConstraint::Reuse(operand));
+    let is_tied = tie_target.is_some();
     match resolved {
         OperandConstraint::Any if is_tied => {
             let val = input_inst.operand(operand).val().unwrap();
@@ -3306,13 +3311,7 @@ mod tests {
     }
 
     /// The same three pieces, but with the plain read pinned to `r0` while the
-    /// tie resolves to the value's two-register class.
-    ///
-    /// The overwritten piece holds both reads, so it can only live in `r0` ---
-    /// which `is_fixed` alone cannot see, since the tie itself is not fixed.
-    /// Losing that flag costs no correctness: `LiveBundle::recompute` would
-    /// leave `BUNDLE_HAS_FIXED_USES` clear and `Priority::new` would hand a
-    /// bundle with exactly one home to the low-priority tier.
+    /// tie's own operand demands nothing.
     #[test]
     fn a_fixed_read_beside_a_reuse_fixes_the_overwritten_piece() {
         let test_input = TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value();
@@ -3338,13 +3337,22 @@ mod tests {
         assert_eq!(spans[2].start(&live_ranges), tie);
         assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
 
-        // The tie is not fixed, so the flag can only have come from the run
-        // of reads that joined it.
+        // Both halves of the tie resolve to the pinned read's class: the
+        // target (operand 1) because the sibling narrows it, and the
+        // definition (operand 2) because it is narrowed by the very same
+        // sibling. Agreeing is what keeps them in one bundle.
         test_input.with_input(|input| {
-            let resolved = reuse_aware_constraint(input, inst(1), 1);
+            let pinned = reuse_aware_constraint(input, inst(1), 0);
+            let target = reuse_aware_constraint(input, inst(1), 1);
+            let def = reuse_aware_constraint(input, inst(1), 2);
+            assert_eq!(
+                target, pinned,
+                "the tie's target is narrowed to the pinned read beside it",
+            );
+            assert_eq!(def, target, "both halves of the tie must agree");
             assert!(
-                !resolved.is_fixed(input.machine),
-                "the tie itself should not be fixed, or the flag proves nothing: {resolved:?}",
+                target.is_fixed(input.machine),
+                "and that class is a single register: {target:?}",
             );
         });
         assert!(
@@ -3427,6 +3435,67 @@ mod tests {
         assert_eq!(points(spans[0]), vec![def, pinned_read]);
         assert_eq!(points(spans[1]), vec![tie, tie, tie]);
         assert_eq!(points(spans[2]), vec![later_use]);
+    }
+
+    /// A tie's target joins the sibling that pins its run, rather than folding
+    /// into an earlier piece pinned somewhere else.
+    #[test]
+    fn a_reuse_target_joins_the_sibling_that_pins_its_run() {
+        let test_input = TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The reuse at `inst2` names operand 0; operand 1 reads the same value
+        // at the same point, and `inst1` read it at an earlier one.
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val().unwrap());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let pinned_read = LivePoint::new(inst(1), Position::Early);
+        let tie = LivePoint::new(inst(2), Position::Early);
+        let overwritten = LivePoint::new(inst(2), Position::Late);
+
+        // The earlier pinned read's piece stops at the tie ...
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), tie);
+        // ... and the doomed copy the definition overwrites holds *both* reads
+        // at the tie's point: the target and the sibling that pins it.
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(spans[1].end(&live_ranges), overwritten);
+
+        let uses = |span: LiveSpan| -> Vec<(usize, LivePoint<u32>)> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| (u.operand(&live_ranges), u.point(&live_ranges)))
+                .collect()
+        };
+        assert_eq!(uses(spans[0]), vec![(0, def), (0, pinned_read)]);
+        assert_eq!(
+            uses(spans[1]),
+            vec![(0, tie), (1, tie)],
+            "the tie's target did not stay behind in the pinned read's piece",
+        );
+
+        // And so the definition's span can share a bundle with its target's:
+        // the two constraints merge, which is what coalescing needs.
+        let tied =
+            test_input.with_input(|input| input.func.inst(inst(2)).operand(2).val().unwrap());
+        let def_span = live_ranges
+            .spans()
+            .find(|span| span.val(&live_ranges) == tied)
+            .unwrap();
+        test_input.with_input(|input| {
+            let target = spans[1].constraint(&live_ranges, input);
+            let definition = def_span.constraint(&live_ranges, input);
+            assert!(
+                target.merge_resolved(&definition, input.machine).is_some(),
+                "the tie's halves must be coalescable: {target:?} and {definition:?}",
+            );
+        });
     }
 
     /// A tie at a block's first instruction, on a live-in value, splits it in
