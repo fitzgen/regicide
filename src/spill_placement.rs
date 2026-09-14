@@ -26,26 +26,23 @@
 //! This pass starts from somewhere near the (2) side of the spectrum and then
 //! pushes spills backwards (up the dominator tree) towards (1). This means we
 //! start from minimal partial redundancy and then try to improve our placements
-//! by coalescing and removing redundant spills as much as we can. (You could
-//! also imagine implementing the dual: starting from the def and pushing the
-//! spill forwards, down the dominator tree, which minimizes spills and then
-//! tries to improve things by removing partial redundancy; we chose our
-//! approach because, ultimately, we prioritize avoiding partial redundancy over
-//! minimizing code size).
+//! by coalescing and removing redundant spills as much as we can.
 //!
 //! Concretely, what this pass does is, for each stack-alocated span, walk up
-//! the dominator tree to the first legal placement of the spill, and then keep
-//! hoisting it up while our current block's immediate dominator has only one
-//! successor (this block) and it is legal to place the spill in the immediate
-//! dominator. This avoids introducing new partial redundancies while lifting
-//! spills out of loops and up the dominator tree, where it can deduplicate with
-//! other spills. (Ideally we would walk up the dominator tree until the
-//! stack-allocated span's block no longer post-dominates the current block, but
-//! we don't have a post-dominator tree here.)
+//! the dominator tree to the first legal placement of the spill that is in the
+//! same region as the value's definition, and then keep hoisting it up while
+//! our current block's immediate dominator has only one successor (this block)
+//! and it is legal to place the spill in the immediate dominator. This
+//! prioritizes never spilling inside loops (via the region guards) and then
+//! avoiding introducing new partial redundancies while lifting spills up the
+//! dominator tree, where they can deduplicate with other spills. (Ideally we
+//! would walk up the dominator tree until the stack-allocated span's block no
+//! longer post-dominates the current block, but we don't have a post-dominator
+//! tree here.)
 //!
 //! A union-find over blocks records the site each walked block resolved to, so
-//! a later walk stops at an earlier one's trail and we collapse duplicate
-//! spills as they appear.
+//! a later walk short-cuts upon reaching an earlier walk's trail and we
+//! collapse duplicate spills as they appear.
 //!
 //! We could additionally post-process our spills to remove any dominated by
 //! another, but we don't do that here. Move elimination will remove these
@@ -55,7 +52,7 @@ use crate::{
     Block, Entity as _, Val,
     context::ContextInner,
     counts::Counts,
-    entity::{EntityRepr, EntitySet, SecondaryMap},
+    entity::{EntityRepr, EntitySet, Region, SecondaryMap},
     error::IResult,
     events::EventsLog,
     input::{DefUse, Input, InputBlock as _, InputFunction, InputInst as _, Position},
@@ -63,6 +60,7 @@ use crate::{
     liveness::block_first_inst,
     output::OutputInner,
     region_allocation::RegionAllocation,
+    region_tree::RegionTree,
     rpo::Rpo,
     spill_slot_allocation::SpillSlots,
     timing::Timing,
@@ -84,6 +82,7 @@ where
         counts,
         events,
         rpo,
+        region_tree,
         live_ranges,
         region_allocation,
         spill_slots,
@@ -97,6 +96,7 @@ where
         counts,
         events,
         rpo,
+        region_tree,
         live_ranges,
         region_allocation,
         spill_slots,
@@ -338,6 +338,7 @@ where
         counts: &mut Counts,
         events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
+        region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &SpillSlots<E>,
@@ -356,7 +357,15 @@ where
         let spans = core::mem::take(&mut self.spans);
 
         for val_spans in spans.chunk_by(|a, b| a.val(live_ranges) == b.val(live_ranges)) {
-            self.place_spills_for_value(input, counts, events, live_ranges, spill_slots, val_spans);
+            self.place_spills_for_value(
+                input,
+                counts,
+                events,
+                region_tree,
+                live_ranges,
+                spill_slots,
+                val_spans,
+            );
         }
 
         self.spans = spans;
@@ -439,6 +448,7 @@ where
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
+        region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
         spill_slots: &SpillSlots<E>,
         val_spans: &[LiveSpan<E>],
@@ -472,10 +482,21 @@ where
 
         self.find_legal_spill_blocks(input, events, live_ranges, val_spans);
 
+        // Spills belong in the region that defines the value: a legal block
+        // in a nested region is inside a loop the definition is outside of, so
+        // a spill there would run once per iteration.
+        let def_region = def_block.region(region_tree);
+
         // Place the spill for each on-stack span.
         for &span in val_spans {
             if self.on_stack(span, live_ranges) {
-                self.place_one_spill(input, def_block, span.block(input.func, live_ranges));
+                self.place_one_spill(
+                    input,
+                    region_tree,
+                    def_block,
+                    def_region,
+                    span.block(input.func, live_ranges),
+                );
             }
         }
 
@@ -575,7 +596,9 @@ where
     fn place_one_spill(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         def_block: Block<E>,
+        def_region: Region<E>,
         stack_block: Block<E>,
     ) {
         let stack_block = self.union_find.find(stack_block);
@@ -584,7 +607,13 @@ where
             return;
         }
 
-        let spill_block = self.first_legal_placement_up_dom_tree(input, def_block, stack_block);
+        let spill_block = self.first_legal_placement_up_dom_tree(
+            input,
+            region_tree,
+            def_block,
+            def_region,
+            stack_block,
+        );
         let spill_block = self.push_up_dom_tree_without_redundancy(input, def_block, spill_block);
 
         if self.is_spill_site.insert(spill_block) {
@@ -592,25 +621,42 @@ where
         }
     }
 
-    /// Walk up the dominator tree from `stack_block` to the first block a spill
-    /// could be legally placed within.
+    /// Walk up the dominator tree from `stack_block` to the first block in
+    /// the definition's region that a spill could be legally placed within.
+    ///
+    /// The defining block is always a legal placement and is trivially in its
+    /// own region, so the walk never climbs past it and this method always
+    /// terminates.
     fn first_legal_placement_up_dom_tree(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         def_block: Block<E>,
+        def_region: Region<E>,
         stack_block: Block<E>,
     ) -> Block<E> {
         let mut spill_block = stack_block;
         loop {
             spill_block = self.union_find.find(spill_block);
+            debug_assert!(
+                input
+                    .func
+                    .block(def_block.with_repr32())
+                    .dominates(spill_block.with_repr32()),
+                "the walk never climbs above the defining block",
+            );
 
-            if self.is_legal_spill_block(spill_block, def_block) {
+            // Keep climbing the dominator tree until we a legal spill location
+            // that is also in the definition's region (i.e. outside of a loop).
+            if self.is_legal_spill_block(spill_block, def_block)
+                && spill_block.region(region_tree) == def_region
+            {
                 return spill_block;
             }
 
             let parent = idom(input, spill_block).expect(
-                "the defining block is a legal placement and dominates every block the value \
-                 is live in, so the walk stops before the dominator tree's root",
+                "the defining block is a legal placement in its own region and dominates every \
+                 block the value is live in, so the walk stops before the dominator tree's root",
             );
 
             self.union_find.union(parent, spill_block);
@@ -621,8 +667,7 @@ where
     /// Keep pushing the spill block up the dominator tree until pushing any
     /// more would introduce partial redundancy.
     ///
-    /// Doing this costs nothing and potentially lifts spills out of loops and
-    /// deduplicates them.
+    /// Doing this costs nothing and potentially deduplicates spills.
     fn push_up_dom_tree_without_redundancy(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -866,6 +911,7 @@ mod tests {
     struct Seen {
         spills: usize,
         merge_param_spills: usize,
+        spills_hoisted_out_of_a_region: usize,
     }
 
     /// The inputs the property check starts from.
@@ -890,6 +936,7 @@ mod tests {
             TestInput::with_reuse_def(OperandConstraint::Any),
             TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
             TestInput::with_stack_param_and_arg(),
+            TestInput::with_a_value_spilled_inside_a_loop(),
         ]
     }
 
@@ -909,6 +956,13 @@ mod tests {
             let func = input.func;
             let live_ranges = &ctx.live_ranges;
             let dominators = test_input.func.dominators();
+            // Regions come from the region tree, which is a different pass's
+            // output rather than this one's bookkeeping repeated back at
+            // itself, and has property checks of its own.
+            let region_tree = &ctx.region_tree;
+
+            // How many spills the region guard actually lifted out of a loop.
+            let mut hoisted_out_of_a_region = 0;
 
             let stack_bundles: BTreeSet<LiveBundle<u32>> = ctx
                 .region_allocation
@@ -1046,6 +1100,18 @@ mod tests {
                              in {def_b:?}"
                         ));
                     }
+
+                    // Property 7: a spill is in the same region as the
+                    // definition of the value it spills, so it never sits
+                    // inside a loop the definition is outside of.
+                    let site_region = site.block(func, live_ranges).region(region_tree);
+                    if site_region != def_b.region(region_tree) {
+                        return Err(format!(
+                            "the spill {site:?} for {val:?} is in {site_region:?}, but its \
+                             definition in {def_b:?} is in {:?}",
+                            def_b.region(region_tree),
+                        ));
+                    }
                 }
 
                 // Property 6: every point where the value is read from its
@@ -1070,6 +1136,14 @@ mod tests {
                             span.start(live_ranges),
                         ));
                     }
+
+                    // The value is on the stack inside a region its definition
+                    // is outside of, and Property 7 just said the spill is out
+                    // there with the definition: the region guard earned its
+                    // keep here.
+                    if block.region(region_tree) != def_b.region(region_tree) {
+                        hoisted_out_of_a_region += 1;
+                    }
                 }
             }
 
@@ -1078,6 +1152,7 @@ mod tests {
             let mut seen = Seen {
                 spills: ctx.spill_placement.spills().len(),
                 merge_param_spills: 0,
+                spills_hoisted_out_of_a_region: hoisted_out_of_a_region,
             };
             for &site in ctx.spill_placement.spills() {
                 let val = site.val(live_ranges);
@@ -1123,8 +1198,10 @@ mod tests {
     fn spill_placement_properties() -> CheckResult<TestInput> {
         static SPILLS: AtomicUsize = AtomicUsize::new(0);
         static MERGE_PARAM_SPILLS: AtomicUsize = AtomicUsize::new(0);
+        static HOISTED_OUT_OF_A_REGION: AtomicUsize = AtomicUsize::new(0);
         SPILLS.store(0, Ordering::Relaxed);
         MERGE_PARAM_SPILLS.store(0, Ordering::Relaxed);
+        HOISTED_OUT_OF_A_REGION.store(0, Ordering::Relaxed);
 
         let result = Check::new().iters(10_000).run_with(
             m::default::<TestInput>(),
@@ -1133,6 +1210,8 @@ mod tests {
                 let seen = check_placement(test_input)?;
                 SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
                 MERGE_PARAM_SPILLS.fetch_add(seen.merge_param_spills, Ordering::Relaxed);
+                HOISTED_OUT_OF_A_REGION
+                    .fetch_add(seen.spills_hoisted_out_of_a_region, Ordering::Relaxed);
                 Ok(())
             },
         );
@@ -1141,6 +1220,10 @@ mod tests {
             for (what, counter) in [
                 ("spill", &SPILLS),
                 ("spilled parameter of a merge block", &MERGE_PARAM_SPILLS),
+                (
+                    "spill hoisted out of the region it is read in",
+                    &HOISTED_OUT_OF_A_REGION,
+                ),
             ] {
                 assert!(
                     counter.load(Ordering::Relaxed) > 0,
@@ -1199,6 +1282,80 @@ mod tests {
                 site.point(),
                 LivePoint::new(block_first_inst(&func.block(merge)), Position::Early),
                 "the spill belongs at the merge block\'s entry, not on an edge into it",
+            );
+        });
+    }
+
+    /// A value defined outside a loop and read off the stack inside it is
+    /// spilled outside the loop, not once per iteration.
+    ///
+    /// The loop header is a legal placement and is the first one the walk up
+    /// the dominator tree meets, and the defining block's branch has a second
+    /// successor, so the single-successor hoist cannot lift the spill out on
+    /// its own. Only the region guard does.
+    #[test]
+    fn a_spill_is_hoisted_out_of_a_loop() {
+        let test_input = TestInput::with_a_value_spilled_inside_a_loop();
+        let context = place(&test_input).unwrap().unwrap();
+
+        test_input.with_input(|input| {
+            let ctx = &context.context32;
+            let func = input.func;
+            let live_ranges = &ctx.live_ranges;
+
+            let val = Val::<u32>::try_new(0).unwrap();
+            let def_block = Block::<u32>::try_new(0).unwrap();
+            let header = Block::<u32>::try_new(1).unwrap();
+            let body = Block::<u32>::try_new(2).unwrap();
+
+            assert!(ctx.spill_slots.spilled().contains(val));
+
+            // The premise of the test: the loop really is a region of its own,
+            // and the definition is outside it.
+            let region_tree = &ctx.region_tree;
+            assert_eq!(header.region(region_tree), body.region(region_tree));
+            assert_ne!(
+                def_block.region(region_tree),
+                header.region(region_tree),
+                "the loop has to be its own region for the guard to have anything to say",
+            );
+
+            // And the loop header really is a legal placement, so that the
+            // walk has something to climb past. Without this the test would
+            // pass for the wrong reason.
+            let stack_bundles: BTreeSet<LiveBundle<u32>> = ctx
+                .region_allocation
+                .stack_bundles()
+                .iter()
+                .copied()
+                .collect();
+            let header_is_legal = live_ranges.spans().any(|span| {
+                span.val(live_ranges) == val
+                    && span.block(func, live_ranges) == header
+                    && span.start(live_ranges) == header.start_point(input)
+                    && !span
+                        .bundle(live_ranges)
+                        .is_some_and(|bundle| stack_bundles.contains(&bundle))
+            });
+            assert!(
+                header_is_legal,
+                "the loop header has to be a legal placement for the guard to have to skip it",
+            );
+
+            let sites = ctx.spill_placement.spills();
+            assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
+            let site = sites[0];
+            assert_eq!(site.val(live_ranges), val);
+            assert_eq!(
+                site.block(func, live_ranges),
+                def_block,
+                "the spill belongs outside the loop, in the defining block",
+            );
+            assert_eq!(
+                site.point(),
+                LivePoint::new(block_first_inst(&func.block(def_block)), Position::Late)
+                    .inst_boundary_after(),
+                "and as early in that block as the definition allows",
             );
         });
     }

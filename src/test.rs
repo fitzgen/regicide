@@ -3761,6 +3761,103 @@ impl TestInput {
         input
     }
 
+    /// A value defined outside a loop that spends part of its live range on
+    /// the stack inside it: `block0` defines the value and conditionally
+    /// enters the loop `block1 <-> block2`, which reads the value in a
+    /// register and then off the stack.
+    pub fn with_a_value_spilled_inside_a_loop() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the value, then conditionally enter the loop. The
+            // second successor is what stops the single-successor hoist.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any),
+            branch(&[1, 3]),
+            // block1, the loop header: read the value in a register, so it is
+            // live in a register at the header's entry and the header is a
+            // legal spill placement.
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            branch(&[2, 3]),
+            // block2, the loop body: read the value off the stack, which is
+            // what puts it on the stack in the first place, then take the back
+            // edge.
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+            branch(&[1]),
+            // block3: the loop exit. `ensure_terminators` turns this into the
+            // block's return.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3)],
+            vec![inst(4), inst(5)],
+            vec![inst(6)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input whose entry block takes two parameters, each read
     /// once. One place for both would be a contract no caller could meet, and
     /// no other fixture has a block with two parameters to say so with.
