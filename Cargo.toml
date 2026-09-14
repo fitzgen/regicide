@@ -1,3 +1,6 @@
+[workspace]
+members = ["fuzz"]
+
 [package]
 edition = "2024"
 license = "Apache-2.0 WITH LLVM-exception"
@@ -62,7 +65,7 @@ deserialize = ["dep:serde"]
 # Enable the HTML visualizer.
 visualizer = ["std", "serialize", "dep:serde_json", "dep:mutatis"]
 # Internal feature.
-test-utils = []
+test-utils = ["dep:mutatis"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -82,8 +85,8 @@ unused_macro_rules = "warn"
 [workspace.lints.rust.unexpected_cfgs]
 level = "warn"
 check-cfg = [
-  # `cfg(fuzz)` is set by `cargo fuzz`.
-  "cfg(fuzz)",
+  # `cfg(fuzzing)` is set by `cargo fuzz`.
+  "cfg(fuzzing)",
 ]
 
 # The default set of lints in Clippy is too noisy, so allow them all by

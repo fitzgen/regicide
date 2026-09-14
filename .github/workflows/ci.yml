@@ -117,6 +117,37 @@ jobs:
           rustc --version
       - run: cargo doc --all-features
 
+  fuzz:
+    name: cargo fuzz
+    runs-on: ubuntu-latest
+    env:
+      CARGO_FUZZ_VERSION: 0.13.2
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup update nightly --no-self-update
+          rustup default nightly
+          rustup component add rust-src
+          rustc --version
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin
+            target
+          key: fuzz-${{ env.CARGO_FUZZ_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: fuzz-${{ env.CARGO_FUZZ_VERSION }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version ${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Check
+        run: cargo fuzz check -s none
+
   js:
     name: JS
     runs-on: ubuntu-latest
@@ -133,7 +164,7 @@ jobs:
     name: CI
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, build, doc, js]
+    needs: [fmt, build, doc, js, fuzz]
     steps:
       - name: Check that all jobs succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

@@ -2183,7 +2183,7 @@ mod tests {
         check::{Check, CheckResult},
         mutators as m,
     };
-    use std::{format, string::String, vec, vec::Vec};
+    use std::{format, string::String, vec::Vec};
 
     /// Allocate `allocated`, and check that allocation against `checked`.
     ///
@@ -2252,47 +2252,6 @@ mod tests {
         operands
     }
 
-    /// The inputs the property check starts from.
-    fn seeds() -> Vec<TestInput> {
-        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
-        let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
-        vec![
-            TestInput::default(),
-            TestInput::with_spilled_merge_param(),
-            TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
-            TestInput::with_use_constraints(&[OperandConstraint::Stack]),
-            TestInput::with_use_constraints(&[
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(class),
-            ]),
-            TestInput::with_group_use_constraints(&[
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(group_class),
-            ]),
-            TestInput::with_reuse_def(OperandConstraint::Any),
-            TestInput::with_reuse_of_a_surviving_value(),
-            TestInput::with_two_reads_and_a_reuse_of_a_surviving_value(),
-            TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
-            TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
-            TestInput::with_a_reuse_of_a_live_in_value(),
-            TestInput::with_two_reuses_at_one_point(),
-            TestInput::with_two_reuses_of_a_dying_value(),
-            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
-            TestInput::with_stack_param_and_arg(),
-            TestInput::with_a_rematerialized_block_arg(),
-            TestInput::with_two_uses_of_different_values(),
-            TestInput::with_a_critical_edge(),
-            TestInput::with_values_in_two_banks_spilled_and_reloaded(),
-            TestInput::with_an_entry_param_read_two_ways(),
-            TestInput::with_two_entry_params(),
-            TestInput::with_entry_params_in_two_banks(),
-            TestInput::with_a_self_looping_entry_block(),
-            TestInput::with_a_move_after_an_unconditional_branch(),
-            TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
-            TestInput::with_a_reuse_of_a_pinned_read(),
-        ]
-    }
-
     /// The allocator's output is a correct allocation of its input.
     ///
     /// The counters make sure the inputs reached the cases the checker is
@@ -2322,7 +2281,7 @@ mod tests {
 
                 let result = Check::new().iters(20_000).run_with(
                     m::default::<TestInput>(),
-                    seeds(),
+                    crate::test::corpus(),
                     |test_input: &TestInput| -> Result<(), String> {
                         let stats = check_allocation(test_input)?;
                         ITERS.fetch_add(1, Ordering::Relaxed);
@@ -2391,12 +2350,12 @@ mod tests {
     /// is worth having separately because a failure here is a much smaller
     /// reproducer.
     ///
-    /// A seed the allocator gives up on is a failure too: a seed that does not
+    /// A fixture the allocator gives up on is a failure too: one that does not
     /// fit on its own machine never puts the checker in front of the shape it
     /// exists for, and the mutations from it inherit the problem.
     #[test]
-    fn the_seeds_all_check_out() {
-        for (i, seed) in seeds().into_iter().enumerate() {
+    fn the_corpus_all_checks_out() {
+        for (i, seed) in crate::test::corpus().into_iter().enumerate() {
             let stats =
                 check_allocation(&seed).unwrap_or_else(|e| panic!("seed {i} failed to check: {e}"));
             assert_eq!(

@@ -11,7 +11,10 @@ use core::{
 };
 
 #[derive(Clone, Hash)]
-#[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
+#[cfg_attr(
+    any(test, fuzzing, feature = "visualizer", feature = "test-utils"),
+    derive(mutatis::Mutate)
+)]
 pub struct PrimaryMap<K, V> {
     elems: Vec<V>,
     _phantom: PhantomData<K>,
@@ -306,6 +309,23 @@ where
         S: serde::Serializer,
     {
         serializer.collect_seq(self.elems.iter())
+    }
+}
+
+#[cfg(feature = "deserialize")]
+impl<'de, K, V> serde::Deserialize<'de> for PrimaryMap<K, V>
+where
+    V: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let elems = <Vec<V> as serde::Deserialize<'de>>::deserialize(deserializer)?;
+        Ok(PrimaryMap {
+            elems,
+            _phantom: PhantomData,
+        })
     }
 }
 

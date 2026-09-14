@@ -240,12 +240,16 @@ where
 }
 
 #[derive(Clone, Default, Debug, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct BlockCall {
     target: Block,
     args: Vec<Val>,
 }
 
 #[derive(Clone, Debug, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub enum InstData {
     Op {
         operands: Vec<Operand>,
@@ -324,6 +328,8 @@ impl InstData {
 const MAX_REG_CLASSES: usize = TestMachine::MAX_BANKS * TestMachine::MAX_CLASSES_PER_BANK;
 
 #[derive(Clone, Default, Debug, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct ValData {
     /// An index into the machine's register classes, narrowed to a class the
     /// machine really defines by `TestInput::fixup`.
@@ -348,6 +354,8 @@ const REMAT_COSTS: [Option<RematCost>; 4] = [
 
 /// Where a value is defined.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub enum ValDef {
     /// The value is defined by an instruction, as its `i`th definition.
     InstResult { inst: Inst, i: usize },
@@ -366,6 +374,8 @@ impl Default for ValDef {
 }
 
 #[derive(Clone, Default, Debug, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct BlockData {
     pub params: Vec<Val>,
     pub insts: Vec<Inst>,
@@ -387,14 +397,46 @@ const BLOCK_FREQUENCIES: [BlockFrequency; 6] = [
 ];
 
 #[derive(Clone, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestFunction {
     mutated: bool,
     values: PrimaryMap<Val, ValData>,
     blocks: PrimaryMap<Block, BlockData>,
     insts: PrimaryMap<Inst, InstData>,
+
+    // The rest of these fields are derived state: `fixup` rebuilds them (and
+    // `fixup` must be called after deserialization).
+    #[cfg_attr(
+        any(feature = "serialize", feature = "deserialize"),
+        serde(skip, default = "empty_predecessors")
+    )]
     predecessors: SecondaryMap<Block, Vec<Block>>,
+    #[cfg_attr(
+        any(feature = "serialize", feature = "deserialize"),
+        serde(skip, default = "empty_inst_blocks")
+    )]
     inst_blocks: SecondaryMap<Inst, Option<Block>>,
+    #[cfg_attr(
+        any(feature = "serialize", feature = "deserialize"),
+        serde(skip, default = "empty_dominators")
+    )]
     dominators: DominatorTree,
+}
+
+#[cfg(feature = "deserialize")]
+fn empty_predecessors() -> SecondaryMap<Block, Vec<Block>> {
+    SecondaryMap::new(Vec::new())
+}
+
+#[cfg(feature = "deserialize")]
+fn empty_inst_blocks() -> SecondaryMap<Inst, Option<Block>> {
+    SecondaryMap::new(None)
+}
+
+#[cfg(feature = "deserialize")]
+fn empty_dominators() -> DominatorTree {
+    DominatorTree::default()
 }
 
 impl Default for TestFunction {
@@ -1448,6 +1490,8 @@ impl<'a> InputInst<'a> for TestInst<'a> {
 /// A description of a machine, in a form that `mutatis` can generate and
 /// mutate.
 #[derive(Clone, Debug, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestMachine {
     banks: Vec<TestBank>,
 
@@ -1466,6 +1510,8 @@ pub struct TestMachine {
 }
 
 #[derive(Clone, Debug, Default, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestBank {
     /// The base-two logarithm of this bank's registers' byte size.
     ///
@@ -1489,12 +1535,16 @@ pub struct TestBank {
 }
 
 #[derive(Clone, Debug, Default, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestGroup {
     /// Indices into the bank's `regs`, in the group's order.
     members: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Default, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestClass {
     members: TestClassMembers,
 
@@ -1506,6 +1556,8 @@ pub struct TestClass {
 /// What a class holds: either individual registers or whole register groups,
 /// never a mix of the two.
 #[derive(Clone, Debug, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub enum TestClassMembers {
     /// Indices into the bank's registers, in preference order: `0..regs.len()`
     /// are the registers the allocator owns, and the
@@ -2089,6 +2141,8 @@ impl DefaultMutate for TestMachine {
 /// A whole register allocation problem for testing: a machine and a function to
 /// allocate registers in.
 #[derive(Clone, Debug, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestInput {
     pub options: InputOptions,
     pub machine: TestMachine,
@@ -4749,6 +4803,85 @@ impl DefaultMutate for TestInput {
     type DefaultMutate = TestInputMutator;
 }
 
+/// The fixtures that the property check, the fuzz target's corpus, and
+/// `the_corpus_all_checks_out` all start from.
+///
+/// Each entry is a shape the allocator has to get right: a critical edge, a
+/// reuse of a value that survives its definition, a register group, a
+/// rematerialized block argument, and so on. Mutating outwards from these
+/// reaches interesting functions far sooner than mutating outwards from an
+/// empty one.
+pub fn corpus() -> Vec<TestInput> {
+    let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+    let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
+    vec![
+        TestInput::default(),
+        TestInput::with_spilled_merge_param(),
+        TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
+        TestInput::with_use_constraints(&[OperandConstraint::Stack]),
+        TestInput::with_use_constraints(&[OperandConstraint::Stack, OperandConstraint::Reg(class)]),
+        TestInput::with_group_use_constraints(&[
+            OperandConstraint::Stack,
+            OperandConstraint::Reg(group_class),
+        ]),
+        TestInput::with_reuse_def(OperandConstraint::Any),
+        TestInput::with_reuse_of_a_surviving_value(),
+        TestInput::with_two_reads_and_a_reuse_of_a_surviving_value(),
+        TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
+        TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
+        TestInput::with_a_reuse_of_a_live_in_value(),
+        TestInput::with_two_reuses_at_one_point(),
+        TestInput::with_two_reuses_of_a_dying_value(),
+        TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
+        TestInput::with_stack_param_and_arg(),
+        TestInput::with_a_rematerialized_block_arg(),
+        TestInput::with_two_uses_of_different_values(),
+        TestInput::with_a_critical_edge(),
+        TestInput::with_values_in_two_banks_spilled_and_reloaded(),
+        TestInput::with_an_entry_param_read_two_ways(),
+        TestInput::with_two_entry_params(),
+        TestInput::with_entry_params_in_two_banks(),
+        TestInput::with_a_self_looping_entry_block(),
+        TestInput::with_a_move_after_an_unconditional_branch(),
+        TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
+        TestInput::with_a_reuse_of_a_pinned_read(),
+    ]
+}
+
+/// Run the register allocator on `test_input` and check the allocation it
+/// produces against the function it allocated.
+///
+/// This is the property the fuzz target fuzzes, kept here rather than in the
+/// fuzz crate so that the fuzzer and `cargo test` are kept in sync.
+///
+/// `Err` is a bug in the allocator; `Ok` covers both "the allocation checks
+/// out" and "the allocator gave up because the function does not fit on its
+/// machine", since not every function fits on every machine.
+#[cfg(any(test, feature = "checker"))]
+pub fn check_allocation(test_input: &TestInput) -> Result<(), alloc::string::String> {
+    use alloc::format;
+
+    let mut context = crate::Context::new();
+    assert!(context.is_reset());
+
+    let result = test_input.with_input(|input| -> Result<(), alloc::string::String> {
+        let output = match crate::run(&mut context, input) {
+            Ok(output) => output,
+            // Not the checker's problem: this function needs more registers
+            // than this machine has.
+            Err(crate::Error::TooManyLiveRegs) => return Ok(()),
+            Err(e) => return Err(format!("allocation failed: {e:?}")),
+        };
+        crate::checker::check(input, &output).map_err(|e| format!("{e:?}"))
+    });
+
+    // The pipeline leaves nothing behind that a reset does not clean up.
+    context.reset();
+    assert!(context.is_reset());
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6150,5 +6283,45 @@ mod tests {
         };
 
         assert_invalid!(&lying, Error::InconsistentInst { inst: i } if i == lie_about);
+    }
+
+    /// Seed the fuzz target's corpus from [`corpus`].
+    ///
+    /// Keeping this in `cargo test` rather than in a separate step means a new
+    /// fixture reaches the fuzzer without a second edit. The write is
+    /// idempotent, and `fuzz/corpus/` is gitignored.
+    #[test]
+    fn write_fuzz_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz")
+            .join("corpus")
+            .join("allocate");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (i, input) in corpus().into_iter().enumerate() {
+            let encoded = postcard::to_allocvec(&input).unwrap();
+
+            let (mut decoded, rest) = postcard::take_from_bytes::<TestInput>(&encoded)
+                .unwrap_or_else(|e| {
+                    panic!("corpus entry {i} does not decode: {e}");
+                });
+            assert!(
+                rest.is_empty(),
+                "corpus entry {i} left {} bytes over",
+                rest.len()
+            );
+
+            // `fixup` is what rebuilds the derived state that the encoding
+            // deliberately omits; it is exactly what the fuzz target does
+            // after decoding.
+            decoded.fixup();
+            assert_eq!(
+                postcard::to_allocvec(&decoded).unwrap(),
+                encoded,
+                "corpus entry {i} does not survive a postcard round trip",
+            );
+
+            std::fs::write(dir.join(std::format!("{i}.postcard")), &encoded).unwrap();
+        }
     }
 }
