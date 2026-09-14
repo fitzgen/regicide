@@ -161,8 +161,10 @@ fn check_block_references<'a>(
     }
 
     for_each_operand(input_block, |_inst, _i, operand| {
-        if operand.val().index() >= num_values {
-            return Err(Error::ValOutOfBounds { val: operand.val() });
+        if let Some(val) = operand.val() {
+            if val.index() >= num_values {
+                return Err(Error::ValOutOfBounds { val });
+            }
         }
         Ok(())
     })?;
@@ -504,6 +506,12 @@ fn validate_reg_classes<E>(
 where
     E: EntityRepr,
 {
+    for (val, input_val) in func.values() {
+        if !input_val.reg_class().has_an_allocatable_member(machine) {
+            return output.error(Error::NonAllocatableRegInValClass { val });
+        }
+    }
+
     for (block, _) in func.blocks() {
         if let Err(e) = check_block_reg_classes(func, machine, &func.block(block), block) {
             return output.error(e);
@@ -523,26 +531,53 @@ fn check_block_reg_classes<'a>(
 
     for (inst, input_inst) in input_block.insts() {
         for (i, operand) in input_inst.operands().enumerate() {
-            match operand.constraint() {
-                // The register class we are constraining a value to must be a
-                // subset of the value's register class.
-                OperandConstraint::Reg(class) => {
-                    if class.intersect(machine, class_of(operand.val())) != Some(class) {
-                        return Err(Error::IncompatibleRegClass { inst, operand: i });
-                    }
+            // A class holding nothing but registers the allocator does not
+            // own is how an operand names one of them, and an operand names
+            // one exactly when it names no value: there is nothing there for
+            // the allocator to place, so what the register holds is the
+            // client's own business. See
+            // `MachineBuilder::define_non_allocatable_reg`.
+            let pinned = match operand.constraint() {
+                OperandConstraint::Reg(class) => !class.has_an_allocatable_member(machine),
+                _ => false,
+            };
 
-                    // And a definition pinned to registers the allocator does
-                    // not own has nowhere to go.
-                    if operand.kind() == DefUse::Def && !class.has_an_allocatable_member(machine) {
-                        return Err(Error::DefInNonAllocatableRegClass { inst, operand: i });
+            // Naming no value any other way asks the allocator to choose a
+            // home for something that does not exist.
+            let Some(val) = operand.val() else {
+                if operand.kind() != DefUse::Use || !pinned {
+                    return Err(Error::OperandWithoutValIsNotAFixedUse { inst, operand: i });
+                }
+                continue;
+            };
+
+            // And the converse: a value pinned there has nowhere to go that
+            // the allocator may give it. Diagnosed ahead of the class rules
+            // below, which it also breaks, because this is the more specific
+            // thing to say about it.
+            if pinned {
+                return Err(Error::OperandWithValInNonAllocatableRegClass { inst, operand: i });
+            }
+
+            match operand.constraint() {
+                OperandConstraint::Reg(class) => {
+                    // The register class we are constraining a value to must
+                    // be a subset of the value's register class.
+                    if class.intersect(machine, class_of(val)) != Some(class) {
+                        return Err(Error::IncompatibleRegClass { inst, operand: i });
                     }
                 }
 
                 // `validate_entity_references` has already shown that `target`
                 // names a real operand of this instruction.
                 OperandConstraint::Reuse(target) => {
-                    let target = input_inst.operand(target);
-                    if class_of(operand.val()) != class_of(target.val()) {
+                    // A reuse is defined in the register its target reads its
+                    // value from, so a target that reads no value leaves the
+                    // definition tied to nothing.
+                    let Some(target) = input_inst.operand(target).val() else {
+                        return Err(Error::ReuseOfOperandWithoutVal { inst, operand: i });
+                    };
+                    if class_of(val) != class_of(target) {
                         return Err(Error::ReuseRegClassMismatch { inst, operand: i });
                     }
                 }
@@ -637,9 +672,10 @@ where
         }
 
         let result = for_each_operand(&func.block(block), |_inst, i, operand| {
-            match operand.kind() {
-                DefUse::Def => define(operand.val(), ProgramPoint::inst(block, i)),
-                DefUse::Use => Ok(()),
+            match (operand.kind(), operand.val()) {
+                (DefUse::Def, Some(val)) => define(val, ProgramPoint::inst(block, i)),
+                // An operand naming no value defines nothing.
+                (DefUse::Def, None) | (DefUse::Use, _) => Ok(()),
             }
         });
         if let Err(e) = result {
@@ -671,15 +707,17 @@ where
             if operand.kind() != DefUse::Use {
                 return Ok(());
             }
-            let def = defs[operand.val()].unwrap();
+            // An operand naming no value reads nothing that has to be in
+            // scope here.
+            let Some(val) = operand.val() else {
+                return Ok(());
+            };
+            let def = defs[val].unwrap();
             let use_ = ProgramPoint::inst(block, i);
             if def.dominates(use_, dominators) {
                 Ok(())
             } else {
-                Err(Error::InvalidSsa {
-                    val: operand.val(),
-                    inst,
-                })
+                Err(Error::InvalidSsa { val, inst })
             }
         });
         if let Err(e) = result {

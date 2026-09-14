@@ -204,7 +204,7 @@ struct OperandInfo<E>
 where
     E: EntityRepr,
 {
-    val: Val<E>,
+    val: Option<Val<E>>,
     def_use: DefUse,
     pos: Position,
     constraint: OperandConstraint,
@@ -374,7 +374,7 @@ where
             InstInfo {
                 block: widen(input_inst.block()),
                 operands: Vec::from_iter(input_inst.operands().map(|operand| OperandInfo {
-                    val: widen_val(operand.val()),
+                    val: operand.val().map(widen_val),
                     def_use: operand.kind(),
                     pos: operand.pos(),
                     constraint: operand.constraint(),

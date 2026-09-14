@@ -630,11 +630,14 @@ where
             for op in input_inst.operands() {
                 debug_assert_eq!(op.kind(), DefUse::Def);
 
-                if func.value(op.val()).remat_cost().is_none() {
+                // Every operand here is a definition, and an operand naming no
+                // value is always a use.
+                let op_val = op.val().unwrap();
+                if func.value(op_val).remat_cost().is_none() {
                     continue;
                 }
 
-                let val = output.with_repr::<E, _>(op.val())?;
+                let val = output.with_repr::<E, _>(op_val)?;
                 self.rematerializable.insert(val);
             }
         }
@@ -843,7 +846,9 @@ where
                     debug_assert!(
                         func.inst(start.inst().with_repr32())
                             .operands()
-                            .filter(|op| op.kind() == DefUse::Def && op.val() == val.with_repr32())
+                            .filter(|op| {
+                                op.kind() == DefUse::Def && op.val() == Some(val.with_repr32())
+                            })
                             .any(|op| {
                                 let def = LivePoint::new(start.inst(), op.pos());
                                 start == def || start == def.inst_boundary_at_or_before()
@@ -2071,7 +2076,7 @@ mod tests {
                 let defines = |val| {
                     input_inst
                         .operands()
-                        .any(|op| op.kind() == DefUse::Def && op.val() == val)
+                        .any(|op| op.kind() == DefUse::Def && op.val() == Some(val))
                 };
                 spans
                     .iter()
@@ -2088,7 +2093,7 @@ mod tests {
                 let uses = |val| {
                     input_inst
                         .operands()
-                        .any(|op| op.kind() == DefUse::Use && op.val() == val)
+                        .any(|op| op.kind() == DefUse::Use && op.val() == Some(val))
                 };
                 needed_at(inst)
                     .into_iter()

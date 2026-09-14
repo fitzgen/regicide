@@ -158,6 +158,17 @@ function valueParts(val, allocation) {
   return parts;
 }
 
+// What an operand naming no value shows where `v3[r1]` would go: the class it
+// is pinned to, which is the register it names. Nothing is allocated for such
+// an operand -- the allocator does not own the register -- so the class is the
+// whole of what there is to say.
+function pinnedParts(constraint) {
+  if (constraint && constraint.reg !== undefined) return [entity("RegClass", constraint.reg)];
+  // Not a shape validation lets through, but say what came in rather than
+  // leaving the line looking like an operand that is simply missing.
+  return [text(String(constraint))];
+}
+
 // `move r2 to stack0`, `remat v0[r3]`. A critical edge's edit is drawn as the
 // edit it carries; the edge itself is already a line.
 function editParts(edit) {
@@ -354,7 +365,9 @@ function buildOutline(func) {
       // The word itself is the link: an operand is where a use is, and there
       // is nothing else on the line to hang it off.
       parts.push(use === undefined ? text(operand.defUse) : entityAs(operand.defUse, "Use", use));
-      parts.push(text(" "), ...valueParts(operand.val, allocation));
+      const named =
+        operand.val === null ? pinnedParts(operand.constraint) : valueParts(operand.val, allocation);
+      parts.push(text(" "), ...named);
     });
     return parts;
   }
@@ -490,7 +503,9 @@ function buildDetails(json, entityEvents) {
   let valCount = 0;
   const note = (val) => (valCount = Math.max(valCount, val + 1));
   for (const span of spans) note(span.val);
-  for (const inst of insts) for (const operand of inst.operands) note(operand.val);
+  // An operand naming no value says nothing about how many there are.
+  for (const inst of insts)
+    for (const operand of inst.operands) if (operand.val !== null) note(operand.val);
   for (const block of blocks) {
     for (const val of block.params) note(val);
     for (const args of block.callArgs) for (const val of args) note(val);
@@ -520,7 +535,7 @@ function buildDetails(json, entityEvents) {
   });
   insts.forEach((inst, i) => {
     inst.operands.forEach((operand) => {
-      if (operand.defUse !== "def" || defOf.has(operand.val)) return;
+      if (operand.val === null || operand.defUse !== "def" || defOf.has(operand.val)) return;
       defOf.set(operand.val, [entity("Inst", i), text(" " + operand.pos)]);
     });
   });
@@ -780,7 +795,7 @@ function buildDetails(json, entityEvents) {
             text(n + ": "),
             use === undefined ? text(operand.defUse) : entityAs(operand.defUse, "Use", use),
             text(" " + operand.pos + " "),
-            entity("Val", operand.val),
+            ...(operand.val === null ? none() : [entity("Val", operand.val)]),
             text(" "),
             ...constraintParts(operand.constraint),
           ];

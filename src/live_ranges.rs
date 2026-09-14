@@ -1964,7 +1964,39 @@ fn reuse_aware_constraint(
 ) -> OperandConstraint {
     let input_inst = input.func.inst(inst);
     let constraint = input_inst.operand(operand).constraint();
-    let resolved = constraint.resolved(|j| input_inst.operand(j).constraint());
+    let mut resolved = constraint.resolved(|j| input_inst.operand(j).constraint());
+
+    // A `Reuse` is defined in the register its target is read from, and every
+    // operand reading that value in a register at that point reads it from the
+    // same one: `Piece::fold` folds them all into one span. So a sibling that
+    // names a narrower class than the target's own operand does constrains the
+    // definition too, and folding those in here is what lets the definition's
+    // span see the resulting conflict and split, rather than the tie being
+    // quietly broken.
+    if let OperandConstraint::Reuse(target) = constraint {
+        let target = input_inst.operand(target);
+        for other in input_inst.operands() {
+            if other.kind() != DefUse::Use
+                || other.val() != target.val()
+                || other.pos() != target.pos()
+            {
+                continue;
+            }
+            let OperandConstraint::Reg(other) = other
+                .constraint()
+                .resolved(|j| input_inst.operand(j).constraint())
+            else {
+                continue;
+            };
+            resolved = match resolved {
+                OperandConstraint::Any => OperandConstraint::Reg(other),
+                OperandConstraint::Reg(rc) => rc
+                    .intersect(input.machine, other)
+                    .map_or(resolved, OperandConstraint::Reg),
+                resolved => resolved,
+            };
+        }
+    }
 
     let is_tied = matches!(constraint, OperandConstraint::Reuse(_))
         || input_inst
@@ -1972,7 +2004,7 @@ fn reuse_aware_constraint(
             .any(|op| op.constraint() == OperandConstraint::Reuse(operand));
     match resolved {
         OperandConstraint::Any if is_tied => {
-            let val = input_inst.operand(operand).val();
+            let val = input_inst.operand(operand).val().unwrap();
             OperandConstraint::Reg(input.func.value(val).reg_class())
         }
         resolved => resolved,
@@ -2758,18 +2790,25 @@ mod tests {
         )
     }
 
-    /// Every operand in `func`, as `(block, point, operand index, kind, value)`.
+    /// Every operand in `func` that names a value, as `(block, point, operand
+    /// index, kind, value)`.
+    ///
+    /// An operand naming no value names a register the allocator does not own,
+    /// which no span covers, so there is nothing here to compare it against.
     fn all_operands(func: &TestFunction) -> Vec<(Block, LivePoint<u32>, usize, DefUse, Val)> {
         let mut operands = Vec::new();
         for (block, input_block) in func.blocks() {
             for (inst, input_inst) in input_block.insts() {
                 for (i, operand) in input_inst.operands().enumerate() {
+                    let Some(val) = operand.val() else {
+                        continue;
+                    };
                     operands.push((
                         block,
                         LivePoint::new(inst, operand.pos()),
                         i,
                         operand.kind(),
-                        operand.val(),
+                        val,
                     ));
                 }
             }
@@ -2970,7 +3009,8 @@ mod tests {
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         // The reuse names operand 0 of `inst1`, the value that outlives it.
-        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
         let spans: Vec<LiveSpan> = live_ranges
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)
@@ -3017,7 +3057,8 @@ mod tests {
         // The control: with no later read the value dies at the tie.
         let test_input = TestInput::with_reuse_def(OperandConstraint::Any);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
-        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
         assert_eq!(
             live_ranges
                 .spans()
@@ -3038,10 +3079,11 @@ mod tests {
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         // The reuse names operand 1 of `inst1`; operand 0 reads it too.
-        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val().unwrap());
         assert_eq!(
             survivor,
-            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val()),
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap()),
             "the fixture reads one value twice",
         );
 
@@ -3095,7 +3137,8 @@ mod tests {
         let test_input = TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
-        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val().unwrap());
         let spans: Vec<LiveSpan> = live_ranges
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)
@@ -3144,13 +3187,18 @@ mod tests {
 
         // The reuse names operand 2 of `inst2`; operands 0 and 1 read it too,
         // at the same point, and `inst1` reads it at an earlier one.
-        let survivor = test_input.with_input(|input| input.func.inst(inst(2)).operand(2).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(2)).operand(2).val().unwrap());
         test_input.with_input(|input| {
             let inst2 = input.func.inst(inst(2));
             for i in [0, 1] {
-                assert_eq!(inst2.operand(i).val(), survivor, "operand {i} reads it too");
+                assert_eq!(
+                    inst2.operand(i).val(),
+                    Some(survivor),
+                    "operand {i} reads it too"
+                );
             }
-            assert_eq!(input.func.inst(inst(1)).operand(0).val(), survivor);
+            assert_eq!(input.func.inst(inst(1)).operand(0).val(), Some(survivor));
 
             // The pinned read and the tie want disjoint classes, so the piece
             // before the tie cannot satisfy both --- which is the whole point.
@@ -3210,7 +3258,8 @@ mod tests {
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         // The reuse names operand 0 of `inst2`, the block's first instruction.
-        let survivor = test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val().unwrap());
         let spans: Vec<LiveSpan> = live_ranges
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)
@@ -3256,10 +3305,11 @@ mod tests {
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         // Both ties name reads of the same value, at the same point.
-        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
         assert_eq!(
             survivor,
-            test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val()),
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(1).val().unwrap()),
         );
 
         let spans: Vec<LiveSpan> = live_ranges
@@ -3304,7 +3354,8 @@ mod tests {
         let test_input = TestInput::with_two_reuses_of_a_dying_value();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
-        let survivor = test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val());
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
         let spans: Vec<LiveSpan> = live_ranges
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)

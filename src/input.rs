@@ -133,6 +133,13 @@ pub enum OperandConstraint {
     /// If an instruction requires an operand in one particular, fixed register,
     /// then create a singleton [`RegClass`] containing only that register and
     /// use it here.
+    ///
+    /// An operand with a register class made up of one or more non-allocatable
+    /// registers must have no [`val`][Operand::val]. An operand with a `val`
+    /// that is constrained to a register class must only name allocatable
+    /// registers. See
+    /// [`MachineBuilder::define_non_allocatable_reg`][crate::MachineBuilder::define_non_allocatable_reg]
+    /// for details.
     Reg(RegClass),
 
     /// This operand must be placed on the stack.
@@ -142,9 +149,9 @@ pub enum OperandConstraint {
     /// operand's associated instruction.
     ///
     /// A `Reuse` may only appear on a [`Position::Late`] definition, and must
-    /// name a [`Position::Early`] use, constrained to [`Self::Any`] or
-    /// [`Self::Reg`], that no other `Reuse` names. The two are then live over
-    /// disjoint halves of the instruction, which is what lets them share a
+    /// name a [`Position::Early`] use of a value, constrained to [`Self::Any`]
+    /// or [`Self::Reg`], that no other `Reuse` names. The two are then live
+    /// over disjoint halves of the instruction, which is what lets them share a
     /// location, and the target never carries a `Reuse` itself.
     Reuse(usize),
 }
@@ -301,6 +308,7 @@ where
 const VAL_BITS: u32 = 32;
 const VAL_SHIFT: u32 = 0;
 const VAL_MAX: u64 = (1 << VAL_BITS) - 1;
+const VAL_NONE: u64 = VAL_MAX;
 
 const POS_BITS: u32 = 1;
 const POS_SHIFT: u32 = VAL_SHIFT + VAL_BITS;
@@ -348,17 +356,39 @@ where
 {
     /// Create an operand.
     ///
+    /// Passing `val == None` means this operand is part of an instruction that
+    /// reads a non-allocatable register, such as a volatile register, the stack
+    /// pointer, or an otherwise untracked register (see
+    /// [`MachineBuilder::define_non_allocatable_reg`][crate::MachineBuilder::define_non_allocatable_reg]
+    /// for details). Such an operand must be constrained to
+    /// [`OperandConstraint::Reg`] naming a class of nothing but non-allocatable
+    /// registers and must have `kind == DefUse::Use` (this doesn't mean the
+    /// instruction cannot write the non-allocatable register, it is free to do
+    /// whatever it wants with the register as `regicide` will not manage the
+    /// register at all, just that it does not define a value).
+    ///
+    /// Similarly, operands where `val.is_some()` must not name a register class
+    /// containing non-allocatable registers.
+    ///
     /// # Panics
     ///
     /// Panics when `constraint` is `Reuse(i)` and `i` is too large to be a
-    /// valid operand index.
+    /// valid operand index (at most `u16::MAX`).
     #[inline]
-    pub fn new(pos: Position, kind: DefUse, constraint: OperandConstraint, val: Val<E>) -> Self {
+    pub fn new(
+        pos: Position,
+        kind: DefUse,
+        constraint: OperandConstraint,
+        val: Option<Val<E>>,
+    ) -> Self {
         let (tag, payload) = constraint.to_bits();
         assert!(payload <= PAYLOAD_MAX);
 
-        let val = u64::try_from(val.index()).unwrap();
-        debug_assert!(val <= VAL_MAX);
+        let val = val.map_or(VAL_NONE, |val| {
+            let val = u64::try_from(val.index()).unwrap();
+            debug_assert!(val < VAL_NONE);
+            val
+        });
 
         Self {
             bits: (val << VAL_SHIFT)
@@ -400,15 +430,18 @@ where
         )
     }
 
-    /// The value that is defined or used by this operand.
+    /// The value that is defined or used by this operand, if any.
     #[inline]
-    pub fn val(self) -> Val<E> {
-        let index = usize::try_from((self.bits >> VAL_SHIFT) & VAL_MAX).unwrap();
-        Val::try_new(index).unwrap()
+    pub fn val(self) -> Option<Val<E>> {
+        let val = (self.bits >> VAL_SHIFT) & VAL_MAX;
+        if val == VAL_NONE {
+            return None;
+        }
+        Some(Val::try_new(usize::try_from(val).unwrap()).unwrap())
     }
 
     #[cfg(any(test, fuzz, feature = "test-utils"))]
-    pub(crate) fn set_val(&mut self, val: Val<E>) {
+    pub(crate) fn set_val(&mut self, val: Option<Val<E>>) {
         *self = Self::new(self.pos(), self.kind(), self.constraint(), val);
     }
 
@@ -463,7 +496,7 @@ mod operand_serde {
         pos: Position,
         kind: DefUse,
         constraint: OperandConstraint,
-        val: Val<E>,
+        val: Option<Val<E>>,
     }
 
     #[cfg(feature = "serialize")]
@@ -501,11 +534,12 @@ mod operand_serde {
                     repr.constraint,
                 )));
             }
-            if u64::try_from(repr.val.index()).unwrap_or(u64::MAX) > VAL_MAX {
-                return Err(D::Error::custom(format_args!(
-                    "operand value {:?} does not fit in {VAL_BITS} bits",
-                    repr.val,
-                )));
+            if let Some(val) = repr.val {
+                if u64::try_from(val.index()).unwrap_or(u64::MAX) >= VAL_NONE {
+                    return Err(D::Error::custom(format_args!(
+                        "operand value {val:?} does not fit in {VAL_BITS} bits",
+                    )));
+                }
             }
 
             Ok(Operand::new(repr.pos, repr.kind, repr.constraint, repr.val))
@@ -1150,7 +1184,12 @@ mod tests {
             OperandConstraint::Reuse(0),
             OperandConstraint::Reuse(MAX_OPERANDS_PER_INST - 1),
         ];
-        let vals = [0, 1, Val::<E>::MAX_REPRESENTABLE.index()];
+        let vals = [
+            None,
+            Some(0),
+            Some(1),
+            Some(Val::<E>::MAX_REPRESENTABLE.index()),
+        ];
 
         [Position::Early, Position::Late]
             .into_iter()
@@ -1160,7 +1199,8 @@ mod tests {
                     .flat_map(move |kind| {
                         constraints.into_iter().flat_map(move |constraint| {
                             vals.into_iter().map(move |val| {
-                                Operand::new(pos, kind, constraint, Val::try_new(val).unwrap())
+                                let val = val.map(|val| Val::try_new(val).unwrap());
+                                Operand::new(pos, kind, constraint, val)
                             })
                         })
                     })
@@ -1199,13 +1239,16 @@ mod tests {
             assert_eq!(operand.to_bits() >> TOTAL_BITS, 0, "{operand:?}");
             assert_eq!(Operand::<E>::from_bits(operand.to_bits()), operand);
 
-            // `set_val` is the one mutator, and it changes only the value.
-            let mut replaced = operand;
-            replaced.set_val(Val::try_new(0).unwrap());
-            assert_eq!(replaced.val(), Val::try_new(0).unwrap());
-            assert_eq!(replaced.pos(), pos);
-            assert_eq!(replaced.kind(), kind);
-            assert_eq!(replaced.constraint(), constraint);
+            // `set_val` is the one mutator, and it changes only the value ---
+            // including all the way to no value at all, and back.
+            for replacement in [Val::try_new(0), None] {
+                let mut replaced = operand;
+                replaced.set_val(replacement);
+                assert_eq!(replaced.val(), replacement);
+                assert_eq!(replaced.pos(), pos);
+                assert_eq!(replaced.kind(), kind);
+                assert_eq!(replaced.constraint(), constraint);
+            }
         }
     }
 
@@ -1221,7 +1264,7 @@ mod tests {
     /// leave the payload at zero rather than at whatever was there before.
     #[test]
     fn constraints_without_a_payload_encode_canonically() {
-        let val = Val::<u32>::try_new(3).unwrap();
+        let val = Val::<u32>::try_new(3);
         for constraint in [OperandConstraint::Any, OperandConstraint::Stack] {
             let operand = Operand::new(Position::Early, DefUse::Def, constraint, val);
             assert_eq!((operand.to_bits() >> PAYLOAD_SHIFT) & PAYLOAD_MAX, 0);
@@ -1523,12 +1566,9 @@ mod tests {
 
             for pos in [Position::Early, Position::Late] {
                 for kind in [DefUse::Def, DefUse::Use] {
-                    round_trip(Operand::<u32>::new(
-                        pos,
-                        kind,
-                        constraint,
-                        Val::try_new(7).unwrap(),
-                    ));
+                    for val in [Val::try_new(7), None] {
+                        round_trip(Operand::<u32>::new(pos, kind, constraint, val));
+                    }
                 }
             }
         }
@@ -1560,10 +1600,22 @@ mod tests {
                 Position::Late,
                 DefUse::Def,
                 OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
-                Val::try_new(5).unwrap(),
+                Val::try_new(5),
             ))
             .unwrap(),
             r#"{"pos":"late","kind":"def","constraint":{"reg":1},"val":5}"#,
+        );
+
+        // An operand naming a register but no value leaves `val` null.
+        assert_eq!(
+            serde_json::to_string(&Operand::<u32>::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+                None,
+            ))
+            .unwrap(),
+            r#"{"pos":"early","kind":"use","constraint":{"reg":1},"val":null}"#,
         );
     }
 

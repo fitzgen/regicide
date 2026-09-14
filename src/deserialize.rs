@@ -351,7 +351,9 @@ impl DeserializedFunction {
         for (_inst, inst) in self.insts.iter() {
             check_block(inst.block)?;
             for operand in &inst.operands {
-                check_val(operand.val())?;
+                if let Some(val) = operand.val() {
+                    check_val(val)?;
+                }
             }
         }
 
@@ -1068,7 +1070,7 @@ mod round_trip_tests {
         let in_class = builder.define_non_allocatable_reg(bank).unwrap();
         builder.define_non_allocatable_reg(bank).unwrap();
         builder.define_reg_class(bank, 1.0, [r0, r1]).unwrap();
-        builder.define_reg_class(bank, 1.0, [r0, in_class]).unwrap();
+        builder.define_reg_class(bank, 1.0, [in_class]).unwrap();
         builder.finish().unwrap()
     }
 
@@ -1315,12 +1317,12 @@ mod corrupt_tests {
         let cases: Vec<(&str, fn(&mut Value), &str)> = vec![
             (
                 "machine version",
-                |j| j["machine"]["version"] = json!(2),
+                |j| j["machine"]["version"] = json!(3),
                 "version",
             ),
             (
                 "function version",
-                |j| j["func"]["version"] = json!(2),
+                |j| j["func"]["version"] = json!(3),
                 "version",
             ),
             (

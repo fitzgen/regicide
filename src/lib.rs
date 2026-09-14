@@ -99,7 +99,7 @@ mod hash_map {
 }
 
 #[cfg(any(feature = "serialize", feature = "deserialize"))]
-const ENCODING_FORMAT_VERSION: u32 = 1;
+const ENCODING_FORMAT_VERSION: u32 = 2;
 
 /// TODO FITZGEN
 pub fn run<'a>(context: &'a mut Context, input: &Input<impl InputFunction>) -> Result<Output<'a>> {
@@ -217,7 +217,7 @@ where
             output,
             ..
         } = &mut *context;
-        output.construct(input.func, rpo, live_ranges, spill_slots)?;
+        output.construct(input.func, input.machine, rpo, live_ranges, spill_slots)?;
     }
 
     trace!(

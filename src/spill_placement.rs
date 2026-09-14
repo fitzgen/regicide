@@ -993,11 +993,11 @@ mod tests {
                 }
                 for (inst, input_inst) in input_block.insts() {
                     for operand in input_inst.operands() {
-                        if operand.kind() == DefUse::Def {
+                        if let (DefUse::Def, Some(val)) = (operand.kind(), operand.val()) {
                             let point = LivePoint::new(inst, operand.pos());
-                            def_block.insert(operand.val(), block);
-                            def_point.insert(operand.val(), point);
-                            def_spill.insert(operand.val(), point.inst_boundary_after());
+                            def_block.insert(val, block);
+                            def_point.insert(val, point);
+                            def_spill.insert(val, point.inst_boundary_after());
                         }
                     }
                 }

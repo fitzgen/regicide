@@ -271,6 +271,33 @@ pub enum Error {
         class: RegClass,
     },
 
+    /// A register class mixes registers the allocator owns with registers it
+    /// does not.
+    ///
+    /// A class is wholly one or wholly the other: see
+    /// [`MachineBuilder::define_non_allocatable_reg`][crate::MachineBuilder::define_non_allocatable_reg].
+    MixedRegClassAllocatability {
+        /// The [`RegClass`] holding both kinds.
+        class: RegClass,
+
+        /// The first member that disagrees with the class's first member.
+        reg: Reg,
+    },
+
+    /// A register class of registers the allocator does not own has more than
+    /// one member.
+    ///
+    /// Such a class names the one register an operand reads, and the allocator
+    /// chooses nothing within it: see
+    /// [`MachineBuilder::define_non_allocatable_reg`][crate::MachineBuilder::define_non_allocatable_reg].
+    NonAllocatableRegClassIsNotASingleton {
+        /// The [`RegClass`] with too many members.
+        class: RegClass,
+
+        /// How many registers, or register groups, it holds.
+        len: usize,
+    },
+
     /// A register class lists the same register more than once.
     DuplicateRegClassMember {
         /// The [`RegClass`] with the repeat.
@@ -365,13 +392,42 @@ pub enum Error {
         operand: usize,
     },
 
-    /// A definition's `Reg` constraint names a register class in which the
-    /// allocator owns nothing.
-    DefInNonAllocatableRegClass {
+    /// A value's register class holds a register the allocator does not own.
+    NonAllocatableRegInValClass {
+        /// The value whose class is too wide.
+        val: Val,
+    },
+
+    /// An operand names no value but is not a use pinned to registers the
+    /// allocator does not own.
+    OperandWithoutValIsNotAFixedUse {
         /// The instruction with the offending operand.
         inst: Inst,
 
-        /// The index of the definition that cannot be placed.
+        /// The index of that operand.
+        operand: usize,
+    },
+
+    /// An operand's `Reg` constraint names a register class in which the
+    /// allocator owns nothing, but the operand also names a value.
+    ///
+    /// The other half of [`Self::OperandWithoutValIsNotAFixedUse`]: such a
+    /// class is how an operand names a register the allocator does not own,
+    /// and naming one means naming no value.
+    OperandWithValInNonAllocatableRegClass {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of that operand.
+        operand: usize,
+    },
+
+    /// A `Reuse` constraint targets an operand that names no value.
+    ReuseOfOperandWithoutVal {
+        /// The instruction with the offending operand.
+        inst: Inst,
+
+        /// The index of the `Reuse` operand.
         operand: usize,
     },
 
@@ -510,6 +566,16 @@ impl fmt::Debug for Error {
             Self::MixedRegGroupSizes { class } => {
                 write!(f, "{class:?}'s register groups are not all the same size")
             }
+            Self::MixedRegClassAllocatability { class, reg } => write!(
+                f,
+                "{class:?} holds both registers the allocator owns and registers it does not; \
+                 {reg:?} is the first member to disagree with the class's first member"
+            ),
+            Self::NonAllocatableRegClassIsNotASingleton { class, len } => write!(
+                f,
+                "{class:?} holds registers the allocator does not own, so it must have exactly \
+                 one member, but it has {len}"
+            ),
             Self::DuplicateRegClassMember { class, reg } => {
                 write!(f, "{class:?} lists {reg:?} more than once")
             }
@@ -548,10 +614,24 @@ impl fmt::Debug for Error {
                 "operand {operand} of {inst:?} names a register class that is not contained in \
                  its value's register class"
             ),
-            Self::DefInNonAllocatableRegClass { inst, operand } => write!(
+            Self::NonAllocatableRegInValClass { val } => write!(
                 f,
-                "operand {operand} of {inst:?} is a definition constrained to a register class \
-                 that holds no register the allocator may hand out"
+                "{val:?} is in a register class that holds a register the allocator does not \
+                 own, so it could be defined in one"
+            ),
+            Self::OperandWithoutValIsNotAFixedUse { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} names no value, so it must be a use constrained \
+                 to a register class holding nothing but registers the allocator does not own"
+            ),
+            Self::OperandWithValInNonAllocatableRegClass { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} is constrained to a register class holding \
+                 nothing but registers the allocator does not own, so it must name no value"
+            ),
+            Self::ReuseOfOperandWithoutVal { inst, operand } => write!(
+                f,
+                "operand {operand} of {inst:?} reuses an operand that names no value"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

@@ -1073,8 +1073,8 @@ where
         ) {
             for (inst, input_inst) in input_block.insts() {
                 for op in input_inst.operands() {
-                    if op.kind() == DefUse::Def {
-                        defs[op.val()] = Some(inst);
+                    if let (DefUse::Def, Some(val)) = (op.kind(), op.val()) {
+                        defs[val] = Some(inst);
                     }
                 }
             }
@@ -1751,11 +1751,11 @@ where
                 let OperandConstraint::Reuse(target) = op.constraint() else {
                     continue;
                 };
-                let Some(target_op) = operands.get(target) else {
+                let Some(target_val) = operands.get(target).and_then(|op| op.val()) else {
                     continue;
                 };
                 let survives = state.locs.iter().any(|(loc, parts)| {
-                    !scalars[i].contains(loc) && parts.iter().any(|p| p.val == target_op.val())
+                    !scalars[i].contains(loc) && parts.iter().any(|p| p.val == target_val)
                 });
                 if survives {
                     self.stats.surviving_reuse_targets += 1;
@@ -1803,11 +1803,8 @@ where
         mode: Mode,
     ) {
         let machine = self.input.machine;
-        let val = op.val();
         let alloc = allocs[i];
         let site = Site::Operand { inst, operand: i };
-
-        self.check_alloc_legality(site, val, alloc, scalars, mode);
 
         match alloc {
             Allocation::Reg(RegAllocation::Reg(_)) => {}
@@ -1818,6 +1815,27 @@ where
                 self.stats.slot_group_operands += 1;
             }
         }
+
+        // An operand naming no value names a register the allocator does not
+        // own, and validation has already rejected every other shape. There is
+        // no value here whose class, size, or liveness could be wrong, so all
+        // that is left to check is that the allocation is the register the
+        // operand asked for.
+        let Some(val) = op.val() else {
+            if let OperandConstraint::Reg(class) = op.constraint() {
+                if class.is_singleton(machine) {
+                    self.stats.fixed_operands += 1;
+                }
+                if matches!(alloc, Allocation::Reg(_)) {
+                    self.check_reg_class(site, class, alloc, mode);
+                } else {
+                    self.error(mode, CheckerError::NotAReg { inst, operand: i });
+                }
+            }
+            return;
+        };
+
+        self.check_alloc_legality(site, val, alloc, scalars, mode);
 
         match op.constraint() {
             OperandConstraint::Any => {
@@ -2038,7 +2056,12 @@ where
         scalars: &[ScalarAllocation],
         mode: Mode,
     ) {
-        let val = op.val();
+        // An operand naming no value reads a register the allocator does not
+        // own, so what it holds is the client's own business and there is
+        // nothing here to compare against.
+        let Some(val) = op.val() else {
+            return;
+        };
 
         for (index, &loc) in scalars.iter().enumerate() {
             self.use_locs.push((i, loc));
@@ -2081,7 +2104,8 @@ where
         mode: Mode,
     ) {
         let machine = self.input.machine;
-        let val = op.val();
+        // Validation rejects a definition that names no value.
+        let val = op.val().unwrap();
 
         self.check_def_is_allocatable(Site::Operand { inst, operand: i }, scalars, mode);
 
@@ -2151,7 +2175,7 @@ mod tests {
         context::{Context, WhichContext},
         error::Error,
         input::{Position, RematCost},
-        machine::RegGroup,
+        machine::{RegClassMembers, RegGroup},
         test::{TestInput, TestMachine},
     };
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -2264,6 +2288,8 @@ mod tests {
             TestInput::with_entry_params_in_two_banks(),
             TestInput::with_a_self_looping_entry_block(),
             TestInput::with_a_move_after_an_unconditional_branch(),
+            TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
+            TestInput::with_a_reuse_of_a_pinned_read(),
         ]
     }
 
@@ -2669,7 +2695,7 @@ mod tests {
             .expect("the fixture has a tie");
 
         let allocated = test_input.clone();
-        test_input.func.set_reg_class(reuse.val(), 1);
+        test_input.func.set_reg_class(reuse.val().unwrap(), 1);
 
         let error = check_against(&allocated, &test_input).unwrap_err();
         assert!(error.contains("which is not in"), "{error}");
@@ -2838,7 +2864,7 @@ mod tests {
             Position::Early,
             DefUse::Use,
             OperandConstraint::Any,
-            arg,
+            Some(arg),
         ));
 
         let error = check_against(&allocated, &test_input).unwrap_err();
@@ -3453,19 +3479,20 @@ mod tests {
 
         // Another value the operand could name without changing the shape of
         // its allocation, and which is therefore not the one that is there.
+        let read = op.val().expect("the fixture's uses all name a value");
         let other = test_input.with_input(|input| {
-            let class = input.func.value(op.val()).reg_class();
+            let class = input.func.value(read).reg_class();
             input
                 .func
                 .values()
-                .find(|&(val, ref data)| val != op.val() && data.reg_class() == class)
+                .find(|&(val, ref data)| val != read && data.reg_class() == class)
                 .map(|(val, _)| val)
                 .expect("the fixture has a second value of the same class")
         });
 
         let allocated = test_input.clone();
         *test_input.func.operand_mut(inst, i) =
-            Operand::new(op.pos(), op.kind(), op.constraint(), other);
+            Operand::new(op.pos(), op.kind(), op.constraint(), Some(other));
 
         let error = check_against(&allocated, &test_input).unwrap_err();
         assert!(error.contains("reads register"), "{error}");
@@ -3644,6 +3671,47 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("reads register"), "{error}");
+    }
+
+    /// A definition tied to a read is put where that read is, even when the
+    /// read's own operand says nothing and a sibling operand reading the same
+    /// value is what pins it down.
+    #[test]
+    fn a_reuse_lands_where_its_target_is_actually_read() {
+        let test_input = TestInput::with_a_reuse_of_a_pinned_read();
+        check_allocation(&test_input).unwrap();
+    }
+
+    /// An operand that names a register the allocator does not own, and no
+    /// value, checks out --- and reports that register back, which is what a
+    /// client reads the operand's allocation for.
+    #[test]
+    fn a_val_less_read_reports_the_register_it_names() {
+        let test_input = TestInput::with_a_val_less_read_of_a_non_allocatable_reg();
+        check_allocation(&test_input).unwrap();
+
+        let inst = Inst::try_new(0).unwrap();
+        let mut context = Context::new();
+        test_input.with_input(|input| {
+            let operand = input.func.inst(inst).operand(0);
+            assert_eq!(operand.val(), None);
+            let OperandConstraint::Reg(class) = operand.constraint() else {
+                unreachable!("the fixture pins its val-less read to a class")
+            };
+
+            // `p`, the class's one member, and so the only place this operand
+            // could possibly be said to live.
+            let RegClassMembers::Regs(regs) = class.members(input.machine) else {
+                unreachable!("the fixture's classes hold single registers")
+            };
+            assert_eq!(regs.len(), 1);
+
+            let output = crate::run(&mut context, input).unwrap();
+            assert_eq!(
+                output.inst_allocs(inst)[0],
+                Allocation::Reg(RegAllocation::Reg(regs[0])),
+            );
+        });
     }
 
     /// `Position` is what orders the reads and writes within an instruction,

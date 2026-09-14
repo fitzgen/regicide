@@ -149,19 +149,30 @@ where
         mutations: &mut mutatis::Candidates<'_>,
         operand: &mut Operand<E>,
     ) -> mutatis::Result<()> {
-        mutations.mutation(|ctx| {
-            let val = if ctx.shrink() {
-                let old_index = operand.val().index();
-                if old_index == 0 {
-                    return Err(mutatis::error::Error::exhausted());
-                }
-                Val::<E>::try_new(ctx.rng().gen_usize() % old_index).unwrap()
-            } else {
-                EntityMutator::<Val<E>>::default().generate(ctx)?
-            };
-            *operand = Operand::new(operand.pos(), operand.kind(), operand.constraint(), val);
-            Ok(())
-        })?;
+        let old_index = operand.val().map(|val| val.index());
+        if !mutations.shrink() || old_index.is_some() {
+            mutations.mutation(|ctx| {
+                let val = if ctx.shrink() {
+                    let old_index = old_index.expect("only offered when there is a value");
+                    if old_index == 0 {
+                        None
+                    } else {
+                        Some(Val::<E>::try_new(ctx.rng().gen_usize() % old_index).unwrap())
+                    }
+                } else {
+                    Some(EntityMutator::<Val<E>>::default().generate(ctx)?)
+                };
+                *operand = Operand::new(operand.pos(), operand.kind(), operand.constraint(), val);
+                Ok(())
+            })?;
+        }
+
+        if !mutations.shrink() && old_index.is_some() {
+            mutations.mutation(|_ctx| {
+                *operand = Operand::new(operand.pos(), operand.kind(), operand.constraint(), None);
+                Ok(())
+            })?;
+        }
 
         mutations.mutation(|_ctx| {
             let pos = match operand.pos() {
@@ -211,7 +222,12 @@ where
             DefUse::Use
         };
         let constraint = gen_operand_constraint(ctx)?;
-        let val = EntityMutator::<Val<E>>::default().generate(ctx)?;
+        // Mostly ordinary operands.
+        let val = if ctx.rng().gen_usize() % 32 == 0 {
+            None
+        } else {
+            Some(EntityMutator::<Val<E>>::default().generate(ctx)?)
+        };
         Ok(Operand::new(pos, kind, constraint, val))
     }
 }
@@ -541,6 +557,7 @@ impl TestFunction {
     pub fn fixup(&mut self) {
         let mut output = OutputInner::<u32>::new();
         self.ensure_non_empty(&mut output);
+        self.ensure_val_less_operands_are_reads();
         self.ensure_unique_insts_in_layout(&mut output);
         self.ensure_terminators();
         self.ensure_all_blocks_are_reachable(&mut output);
@@ -552,6 +569,17 @@ impl TestFunction {
         self.ensure_uses_dominated_by_defs();
         self.ensure_operand_constraints();
         self.ensure_reg_classes_agree();
+    }
+
+    /// Make every operand that names no value a use.
+    fn ensure_val_less_operands_are_reads(&mut self) {
+        for (_inst, inst_data) in self.insts.iter_mut() {
+            for operand in inst_data.operands_mut() {
+                if operand.val().is_none() && operand.kind() != DefUse::Use {
+                    *operand = Operand::new(operand.pos(), DefUse::Use, operand.constraint(), None);
+                }
+            }
+        }
     }
 
     /// Make sure that this function has at least one block, instruction, and
@@ -579,7 +607,7 @@ impl TestFunction {
                             Position::Early,
                             DefUse::Def,
                             OperandConstraint::Any,
-                            Val::try_new(0).unwrap(),
+                            Some(Val::try_new(0).unwrap()),
                         )],
                         side_effects: true,
                     },
@@ -796,10 +824,12 @@ impl TestFunction {
                 // The block calls' arguments count as uses, because
                 // `ensure_block_call_arity` is about to give each of them one
                 // argument per parameter of its target block.
+                // An operand naming no value reads nothing that has to be
+                // in scope, so it is not a use for this purpose.
                 let uses = inst_data
                     .operands()
                     .iter()
-                    .filter(|op| op.kind() == DefUse::Use)
+                    .filter(|op| op.kind() == DefUse::Use && op.val().is_some())
                     .count()
                     + inst_data
                         .block_calls()
@@ -814,7 +844,7 @@ impl TestFunction {
                 scope_len += inst_data
                     .operands()
                     .iter()
-                    .filter(|op| op.kind() == DefUse::Def)
+                    .filter(|op| op.kind() == DefUse::Def && op.val().is_some())
                     .count();
             }
 
@@ -876,8 +906,8 @@ impl TestFunction {
                 let inst = *inst;
                 let mut i = 0;
                 for op in insts[inst].operands_mut() {
-                    if op.kind() == DefUse::Def {
-                        op.set_val(fresh_val(values, op.val(), ValDef::InstResult { inst, i }));
+                    if let (DefUse::Def, Some(val)) = (op.kind(), op.val()) {
+                        op.set_val(Some(fresh_val(values, val, ValDef::InstResult { inst, i })));
                         i += 1;
                     }
                 }
@@ -913,9 +943,11 @@ impl TestFunction {
 
             reusable.clear();
             reusable.extend(operands.iter().enumerate().filter_map(|(i, op)| {
+                // An operand naming no value has none to tie a definition to.
                 let ok = op.kind() == DefUse::Use
                     && op.pos() == Position::Early
-                    && op.constraint() != OperandConstraint::Stack;
+                    && op.constraint() != OperandConstraint::Stack
+                    && op.val().is_some();
                 ok.then_some(i)
             }));
 
@@ -979,7 +1011,10 @@ impl TestFunction {
                     let OperandConstraint::Reuse(i) = op.constraint() else {
                         continue;
                     };
-                    sets.union(op.val(), operands[i].val());
+                    let (Some(val), Some(target)) = (op.val(), operands[i].val()) else {
+                        continue;
+                    };
+                    sets.union(val, target);
                 }
             }
         }
@@ -1024,8 +1059,8 @@ impl TestFunction {
                 let inst = *inst;
 
                 for op in insts[inst].operands_mut() {
-                    if op.kind() == DefUse::Use {
-                        op.set_val(in_scope(&scope, op.val()));
+                    if let (DefUse::Use, Some(val)) = (op.kind(), op.val()) {
+                        op.set_val(Some(in_scope(&scope, val)));
                     }
                 }
                 for call in insts[inst].block_calls_mut() {
@@ -1035,8 +1070,8 @@ impl TestFunction {
                 }
 
                 for op in insts[inst].operands() {
-                    if op.kind() == DefUse::Def {
-                        scope.push(op.val());
+                    if let (DefUse::Def, Some(val)) = (op.kind(), op.val()) {
+                        scope.push(val);
                     }
                 }
             }
@@ -1472,7 +1507,13 @@ pub struct TestClass {
 /// never a mix of the two.
 #[derive(Clone, Debug, Hash, Mutate)]
 pub enum TestClassMembers {
-    /// Indices into the bank's `regs`, in preference order.
+    /// Indices into the bank's registers, in preference order: `0..regs.len()`
+    /// are the registers the allocator owns, and the
+    /// `regs.len()..regs.len() + non_allocatable` after them the ones it does
+    /// not.
+    ///
+    /// A class may hold either kind, which is how an operand pins a read to a
+    /// register the allocator does not own.
     Regs(Vec<u8>),
 
     /// Indices into the bank's `groups`, in preference order.
@@ -1674,6 +1715,54 @@ impl TestMachine {
         machine
     }
 
+    /// [`TestMachine::with_a_non_allocatable_reg`]'s `rc0`: both of the
+    /// registers the allocator owns, and nothing else, and so the only one of
+    /// this machine's classes a value may belong to.
+    pub const ALLOCATABLE_CLASS: u8 = 0;
+
+    /// [`TestMachine::with_a_non_allocatable_reg`]'s `rc1`: its
+    /// non-allocatable register alone, and so the way an operand demands that
+    /// register.
+    ///
+    /// An operand pinned here names no value: `p` holds nothing the allocator
+    /// is tracking.
+    pub const PINNED_CLASS: u8 = 1;
+
+    /// A machine of one bank with two registers the allocator owns, `r0` and
+    /// `r1`, and one it does not, `p`.
+    ///
+    /// Its two classes are [`TestMachine::ALLOCATABLE_CLASS`] (`{r0, r1}`) and
+    /// [`TestMachine::PINNED_CLASS`] (`{p}`). A class holding `p` alongside
+    /// either of the others is not one a [`Machine`] can be built with, so
+    /// these two are every class this bank's registers have between them.
+    ///
+    /// Only [`TestMachine::ALLOCATABLE_CLASS`] may hold a value, and
+    /// [`TestMachine::PINNED_CLASS`] is nameable only by an operand naming no
+    /// value.
+    pub fn with_a_non_allocatable_reg() -> Self {
+        let mut machine = TestMachine {
+            banks: vec![TestBank {
+                log2_size: 3,
+                regs: vec![1, 1],
+                non_allocatable: 1,
+                groups: Vec::new(),
+                classes: vec![
+                    TestClass {
+                        members: TestClassMembers::Regs(vec![0, 1]),
+                        spill_cost: 0,
+                    },
+                    TestClass {
+                        members: TestClassMembers::Regs(vec![2]),
+                        spill_cost: 0,
+                    },
+                ],
+            }],
+            regs_per_bank: None,
+        };
+        machine.fixup();
+        machine
+    }
+
     /// Give `bank` one more register that the allocator does not own, and
     /// answer which [`Reg`] it will be once the machine is built.
     ///
@@ -1763,6 +1852,7 @@ impl TestMachine {
             bank.non_allocatable %= Self::MAX_NON_ALLOCATABLE_PER_BANK + 1;
 
             let num_regs = bank.regs.len();
+            let num_all_regs = num_regs + usize::from(bank.non_allocatable);
 
             // A group holds at least two distinct registers, so a bank with
             // only one register has no groups at all.
@@ -1799,13 +1889,33 @@ impl TestMachine {
 
                 match &mut class.members {
                     TestClassMembers::Regs(regs) => {
+                        // Over every register in the bank, the ones the
+                        // allocator does not own included: a class holds one of
+                        // those when an operand pins a read to it.
                         for member in regs.iter_mut() {
-                            *member %= u8::try_from(num_regs).unwrap();
+                            *member %= u8::try_from(num_all_regs).unwrap();
                         }
                         dedupe_keeping_first(regs);
                         if regs.is_empty() {
                             regs.push(0);
                         }
+                        // A class is wholly the allocator's or wholly the
+                        // function's, so keep the members agreeing with the
+                        // first one's kind and drop the rest, the same way one
+                        // class holds groups of one size just below. Keyed on
+                        // the first member, so that the generator can ask for
+                        // either kind of class and gets the one it asked for.
+                        let pinned = usize::from(regs[0]) >= num_regs;
+                        regs.retain(|&member| (usize::from(member) >= num_regs) == pinned);
+
+                        // And such a class holds exactly one register: it
+                        // names the one register an operand reads, with
+                        // nothing for the allocator to choose between. The
+                        // first is the one the generator asked for first.
+                        if pinned {
+                            regs.truncate(1);
+                        }
+
                         // A widened bank's new registers have to reach a
                         // class, or they are registers the allocator can see
                         // and never use: the repair above only reduces member
@@ -1817,8 +1927,10 @@ impl TestMachine {
                         // the front and its preference order survives. Classes
                         // of groups are left alone: one class holds groups of
                         // one size, and there is no group to put a lone new
-                        // register in.
-                        if self.regs_per_bank.is_some() {
+                        // register in. So is a class of registers the
+                        // allocator does not own, which is not somewhere it
+                        // could put a value anyway.
+                        if self.regs_per_bank.is_some() && !pinned {
                             for reg in 0..u8::try_from(num_regs).unwrap() {
                                 if !regs.contains(&reg) {
                                     regs.push(reg);
@@ -1844,6 +1956,34 @@ impl TestMachine {
                     }
                 }
             }
+
+            let has_a_wholly_allocatable_class =
+                bank.classes.iter().any(|class| match &class.members {
+                    TestClassMembers::Regs(regs) => regs.iter().all(|&m| usize::from(m) < num_regs),
+                    // A group holds only registers the allocator owns.
+                    TestClassMembers::Groups(_) => true,
+                });
+            if !has_a_wholly_allocatable_class {
+                // Every block parameter has to be in a class like this ---
+                // a parameter arrives where the allocator puts it, so it may
+                // not be in a class holding anywhere the allocator does not
+                // own --- and so does every value that is ever defined, since
+                // a class of nothing the allocator owns has nowhere to put
+                // one. Narrow a class rather than adding one, so that the
+                // number of classes stays the generator's to choose.
+                let regs = bank
+                    .classes
+                    .iter_mut()
+                    .find_map(|class| match &mut class.members {
+                        TestClassMembers::Regs(regs) => Some(regs),
+                        TestClassMembers::Groups(_) => None,
+                    })
+                    .expect("a bank whose every class held groups would already have one");
+                regs.retain(|&m| usize::from(m) < num_regs);
+                if regs.is_empty() {
+                    regs.push(0);
+                }
+            }
         }
     }
 
@@ -1867,8 +2007,12 @@ impl TestMachine {
                 })
                 .collect();
 
+            // The registers a class may name: the ones the allocator owns
+            // first, then the ones it does not, matching how
+            // `TestClassMembers::Regs` indices are numbered.
+            let mut all_regs = regs.clone();
             for _ in 0..bank.non_allocatable {
-                builder.define_non_allocatable_reg(reg_bank).unwrap();
+                all_regs.push(builder.define_non_allocatable_reg(reg_bank).unwrap());
             }
 
             let groups: Vec<RegGroup> = bank
@@ -1884,7 +2028,7 @@ impl TestMachine {
                 let spill_cost = f32::from(class.spill_cost) + 1.0;
                 match &class.members {
                     TestClassMembers::Regs(members) => {
-                        let members = members.iter().map(|&m| regs[usize::from(m)]);
+                        let members = members.iter().map(|&m| all_regs[usize::from(m)]);
                         builder
                             .define_reg_class(reg_bank, spill_cost, members)
                             .unwrap();
@@ -1967,7 +2111,6 @@ impl TestInput {
     /// Repair this test input.
     pub fn fixup(&mut self) {
         self.machine.fixup();
-        self.func.fixup();
 
         let num_classes = self.machine.num_classes();
         for (_inst, inst_data) in self.func.insts.iter_mut() {
@@ -1985,24 +2128,102 @@ impl TestInput {
             }
         }
 
-        // One modulus applied uniformly, so the classes that
-        // `TestFunction::ensure_reg_classes_agree` made equal stay equal.
-        let num_classes = u8::try_from(num_classes).unwrap();
-        for (_val, val_data) in self.func.values.iter_mut() {
-            val_data.reg_class %= num_classes;
+        let machine = self.machine.build();
+
+        // An operand naming no value names a register the allocator does not
+        // own, and nothing else: a read pinned to a class with no allocatable
+        // member. Give every val-less operand that shape --- or, on a machine
+        // where no class is wholly the function's own, give it a value
+        // instead. `Val(0)` always exists once `ensure_non_empty` has run, and
+        // `ensure_uses_dominated_by_defs` puts it in scope wherever it is
+        // read; both run in `TestFunction::fixup` below, which is why this
+        // repair comes first.
+        let pinned_class = (0..num_classes)
+            .map(|class| RegClass::try_new(class).unwrap())
+            .find(|class| !class.has_an_allocatable_member(&machine));
+        for (_inst, inst_data) in self.func.insts.iter_mut() {
+            for operand in inst_data.operands_mut() {
+                if operand.val().is_some() {
+                    continue;
+                }
+                *operand = match pinned_class {
+                    Some(class) => Operand::new(
+                        operand.pos(),
+                        DefUse::Use,
+                        OperandConstraint::Reg(class),
+                        None,
+                    ),
+                    None => Operand::new(
+                        operand.pos(),
+                        operand.kind(),
+                        operand.constraint(),
+                        Some(Val::try_new(0).unwrap()),
+                    ),
+                };
+            }
         }
 
+        self.func.fixup();
+
+        // Where a class the allocator owns nothing in sends a value that would
+        // otherwise belong to it: the next class the allocator does own,
+        // wrapping around. A value goes wherever the allocator decides to put
+        // it, so a class it owns nothing in is nowhere to put one.
+        //
+        // A pure function of the class index, so classes that
+        // `TestFunction::ensure_reg_classes_agree` made equal stay equal.
+        let value_class: Vec<u8> = (0..num_classes)
+            .map(|class| {
+                let found = (0..num_classes)
+                    .map(|offset| (class + offset) % num_classes)
+                    .find(|&candidate| {
+                        RegClass::try_new(candidate)
+                            .unwrap()
+                            .has_an_allocatable_member(&machine)
+                    })
+                    .expect("`TestMachine::fixup` gives every bank one such class");
+                u8::try_from(found).unwrap()
+            })
+            .collect();
+
+        // One modulus applied uniformly, so the classes that
+        // `TestFunction::ensure_reg_classes_agree` made equal stay equal.
+        let num_classes_u8 = u8::try_from(num_classes).unwrap();
+        for (_val, val_data) in self.func.values.iter_mut() {
+            val_data.reg_class %= num_classes_u8;
+            val_data.reg_class = value_class[usize::from(val_data.reg_class)];
+        }
+
+        let val_class = |values: &PrimaryMap<Val, ValData>, val| {
+            RegClass::try_new(usize::from(values[val].reg_class)).unwrap()
+        };
+
+        // An operand names no value exactly when it is pinned to a class in
+        // which the allocator owns nothing. One direction is the repair above,
+        // and nothing in `TestFunction::fixup` moves an operand off the class
+        // it put there; the other is an operand that *does* name a value being
+        // pinned there, which the subset repair below also covers.
+        //
         // An operand constraint must name a subset of its value's register
-        // class.
-        let machine = self.machine.build();
+        // class. Every value's class holds nothing but registers the allocator
+        // owns, by the remap above, so falling back to it repairs both at
+        // once: a class is a subset of itself, and one holding a register the
+        // allocator owns is not one it owns nothing in.
         for (_inst, inst_data) in self.func.insts.iter_mut() {
             for operand in inst_data.operands_mut() {
                 let OperandConstraint::Reg(class) = operand.constraint() else {
                     continue;
                 };
-                let val_class =
-                    RegClass::try_new(usize::from(self.func.values[operand.val()].reg_class))
-                        .unwrap();
+                let Some(val) = operand.val() else {
+                    debug_assert_eq!(operand.kind(), DefUse::Use);
+                    debug_assert!(
+                        !class.has_an_allocatable_member(&machine),
+                        "an operand naming no value is pinned to a class the allocator \
+                         owns nothing in",
+                    );
+                    continue;
+                };
+                let val_class = val_class(&self.func.values, val);
                 if class.intersect(&machine, val_class) == Some(class) {
                     continue;
                 }
@@ -2010,7 +2231,7 @@ impl TestInput {
                     operand.pos(),
                     operand.kind(),
                     OperandConstraint::Reg(val_class),
-                    operand.val(),
+                    Some(val),
                 );
             }
         }
@@ -2084,7 +2305,7 @@ impl TestInput {
                         Position::Late,
                         DefUse::Def,
                         def_constraint,
-                        val,
+                        Some(val),
                     )],
                     side_effects: true,
                 },
@@ -2095,7 +2316,12 @@ impl TestInput {
                 .push(
                     &mut output,
                     InstData::Op {
-                        operands: vec![Operand::new(Position::Early, DefUse::Use, constraint, val)],
+                        operands: vec![Operand::new(
+                            Position::Early,
+                            DefUse::Use,
+                            constraint,
+                            Some(val),
+                        )],
                         side_effects: true,
                     },
                 )
@@ -2174,7 +2400,7 @@ impl TestInput {
                 Position::Late,
                 DefUse::Def,
                 OperandConstraint::Any,
-                val,
+                Some(val),
             )],
             side_effects: true,
         };
@@ -2189,13 +2415,13 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Reg(r0),
-                        first,
+                        Some(first),
                     ),
                     Operand::new(
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Reg(r1),
-                        second,
+                        Some(second),
                     ),
                 ],
                 side_effects: true,
@@ -2226,6 +2452,193 @@ impl TestInput {
         let mut input = TestInput {
             options: InputOptions::default(),
             machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A single-block input on [`TestMachine::two_registers`] whose one
+    /// instruction reads a value twice (once pinned to `r0`, once
+    /// unconstrained) and ties a definition to the unconstrained read, which is
+    /// then itself read from `r1`.
+    pub fn with_a_reuse_of_a_pinned_read() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let r0 = RegClass::try_new(usize::from(TestMachine::FIRST_REG_CLASS)).unwrap();
+        let r1 = RegClass::try_new(usize::from(TestMachine::SECOND_REG_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        for (inst, i) in [(0, 0), (1, 2)] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(inst).unwrap(),
+                            i,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(first),
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(r0),
+                        Some(first),
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(first),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(1),
+                        Some(second),
+                    ),
+                ],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Reg(r1),
+                    Some(second),
+                )],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        Self::single_block(TestMachine::two_registers(), func, output)
+    }
+
+    /// A single-block input on [`TestMachine::with_a_non_allocatable_reg`]
+    /// whose first instruction reads `p` --- naming the register and no value
+    /// at all --- and defines a value that a later instruction reads.
+    ///
+    /// This is the only way anything may name a register the allocator does
+    /// not own, and the shape a client uses for an instruction that reads the
+    /// stack pointer or a flags register.
+    pub fn with_a_val_less_read_of_a_non_allocatable_reg() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let pinned = RegClass::try_new(TestMachine::PINNED_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    // Nothing but registers the allocator owns: no value may
+                    // belong to a class holding `p`.
+                    reg_class: TestMachine::ALLOCATABLE_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(pinned),
+                        None,
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Any,
+                        Some(val),
+                    ),
+                ],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(val),
+                )],
+                side_effects: true,
+            },
+            // Give the block a terminator of its own, so that
+            // `ensure_terminators` does not rewrite the reads.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        Self::single_block(TestMachine::with_a_non_allocatable_reg(), func, output)
+    }
+
+    /// Wrap `func`'s instructions in one block, in order, and fix the result
+    /// up into a valid [`TestInput`] on `machine`.
+    fn single_block(
+        machine: TestMachine,
+        mut func: TestFunction,
+        mut output: OutputInner<u32>,
+    ) -> Self {
+        let num_insts = func.insts.len();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..num_insts).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine,
             func,
         };
         input.fixup();
@@ -2276,18 +2689,23 @@ impl TestInput {
                 Position::Late,
                 DefUse::Def,
                 OperandConstraint::Reg(class),
-                val,
+                Some(val),
             )],
             side_effects: true,
         };
         let reads = |constraint: fn(RegClass) -> OperandConstraint| InstData::Op {
             operands: vec![
-                Operand::new(Position::Early, DefUse::Use, constraint(wide_regs), wide),
+                Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    constraint(wide_regs),
+                    Some(wide),
+                ),
                 Operand::new(
                     Position::Early,
                     DefUse::Use,
                     constraint(narrow_regs),
-                    narrow,
+                    Some(narrow),
                 ),
             ],
             side_effects: true,
@@ -2368,18 +2786,18 @@ impl TestInput {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![
-                    Operand::new(Position::Early, DefUse::Use, use_constraint, defined),
+                    Operand::new(Position::Early, DefUse::Use, use_constraint, Some(defined)),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(0),
-                        tied,
+                        Some(tied),
                     ),
                 ],
                 side_effects: true,
@@ -2450,7 +2868,7 @@ impl TestInput {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2460,13 +2878,13 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(0),
-                        tied,
+                        Some(tied),
                     ),
                 ],
                 side_effects: true,
@@ -2477,7 +2895,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2566,25 +2984,25 @@ impl TestInput {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![
                     // The plain read, at the same point as the tied one.
-                    Operand::new(Position::Early, DefUse::Use, plain_read, defined),
+                    Operand::new(Position::Early, DefUse::Use, plain_read, Some(defined)),
                     Operand::new(
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(1),
-                        tied,
+                        Some(tied),
                     ),
                 ],
                 side_effects: true,
@@ -2595,7 +3013,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2673,7 +3091,7 @@ impl TestInput {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2684,7 +3102,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Reg(first_reg),
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2696,13 +3114,13 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     // The tie's target, which the pinned read cannot share a
                     // register with.
@@ -2710,13 +3128,13 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Reg(second_reg),
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(2),
-                        tied,
+                        Some(tied),
                     ),
                 ],
                 side_effects: true,
@@ -2727,7 +3145,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2799,7 +3217,7 @@ impl TestInput {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2818,13 +3236,13 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(0),
-                        tied,
+                        Some(tied),
                     ),
                 ],
                 side_effects: true,
@@ -2837,9 +3255,14 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
-                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, tied),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(tied),
+                    ),
                 ],
                 side_effects: true,
             },
@@ -2944,7 +3367,7 @@ impl TestInput {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    defined,
+                    Some(defined),
                 )],
                 side_effects: true,
             },
@@ -2954,25 +3377,25 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(0),
-                        first_tied,
+                        Some(first_tied),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(1),
-                        second_tied,
+                        Some(second_tied),
                     ),
                 ],
                 side_effects: true,
@@ -2984,7 +3407,7 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Any,
-                        defined,
+                        Some(defined),
                     )]
                 } else {
                     vec![]
@@ -3095,7 +3518,7 @@ impl TestInput {
         }
 
         let op = |pos, kind, constraint, val| InstData::Op {
-            operands: vec![Operand::new(pos, kind, constraint, val)],
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
             side_effects: true,
         };
 
@@ -3205,7 +3628,7 @@ impl TestInput {
         }
 
         let op = |pos, kind, constraint, val| InstData::Op {
-            operands: vec![Operand::new(pos, kind, constraint, val)],
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
             side_effects: true,
         };
         let call = |target, args: &[Val]| BlockCall {
@@ -3324,7 +3747,7 @@ impl TestInput {
             RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
         );
         let op = |pos, kind, constraint, val| InstData::Op {
-            operands: vec![Operand::new(pos, kind, constraint, val)],
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
             side_effects: true,
         };
         let branch = |target, args| InstData::Branch {
@@ -3457,7 +3880,7 @@ impl TestInput {
         }
 
         let op = |pos, kind, constraint, val| InstData::Op {
-            operands: vec![Operand::new(pos, kind, constraint, val)],
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
             side_effects: true,
         };
         let branch = |target, args| InstData::Branch {
@@ -3593,9 +4016,14 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Reg(class),
-                        param,
+                        Some(param),
                     ),
-                    Operand::new(Position::Late, DefUse::Def, OperandConstraint::Any, next),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Any,
+                        Some(next),
+                    ),
                 ],
                 side_effects: true,
             },
@@ -3619,7 +4047,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Stack,
-                    param,
+                    Some(param),
                 )],
                 side_effects: true,
             },
@@ -3707,13 +4135,13 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Reg(pinned),
-                        param,
+                        Some(param),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(0),
-                        clobber,
+                        Some(clobber),
                     ),
                 ],
                 side_effects: true,
@@ -3724,7 +4152,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Reg(pinned),
-                    param,
+                    Some(param),
                 )],
                 side_effects: true,
             },
@@ -3789,7 +4217,7 @@ impl TestInput {
             .unwrap();
 
         let op = |pos, kind, constraint| InstData::Op {
-            operands: vec![Operand::new(pos, kind, constraint, val)],
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
             side_effects: true,
         };
         let branch = |targets: &[usize]| InstData::Branch {
@@ -3887,8 +4315,18 @@ impl TestInput {
         for inst in [
             InstData::Op {
                 operands: vec![
-                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, first),
-                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, second),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(first),
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(second),
+                    ),
                 ],
                 side_effects: true,
             },
@@ -3965,7 +4403,7 @@ impl TestInput {
                             Position::Early,
                             DefUse::Use,
                             OperandConstraint::Stack,
-                            Val::try_new(i).unwrap(),
+                            Some(Val::try_new(i).unwrap()),
                         )
                     })
                     .collect(),
@@ -4038,19 +4476,19 @@ impl TestInput {
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Reg(narrow),
-                        param,
+                        Some(param),
                     ),
                     Operand::new(
                         Position::Early,
                         DefUse::Use,
                         OperandConstraint::Stack,
-                        param,
+                        Some(param),
                     ),
                     Operand::new(
                         Position::Late,
                         DefUse::Use,
                         OperandConstraint::Reg(narrow),
-                        param,
+                        Some(param),
                     ),
                 ],
                 side_effects: true,
@@ -4060,7 +4498,7 @@ impl TestInput {
                     Position::Early,
                     DefUse::Use,
                     OperandConstraint::Stack,
-                    param,
+                    Some(param),
                 )],
                 side_effects: true,
             },
@@ -4138,7 +4576,7 @@ impl TestInput {
         }
 
         let op = |pos, kind, constraint, val| InstData::Op {
-            operands: vec![Operand::new(pos, kind, constraint, val)],
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
             side_effects: true,
         };
 
@@ -4354,16 +4792,15 @@ mod tests {
             for &inst in &block_data.insts {
                 let mut i = 0;
                 for op in func.insts[inst].operands() {
-                    if !matches!(op.kind(), DefUse::Def) {
+                    let (DefUse::Def, Some(val)) = (op.kind(), op.val()) else {
                         continue;
-                    }
+                    };
                     let expected = ValDef::InstResult { inst, i };
-                    let actual = &func.values[op.val()].def;
+                    let actual = &func.values[val].def;
                     if *actual != expected {
                         return Err(format!(
-                            "{:?} is definition {i} of {inst:?}, but its `ValData::def` \
+                            "{val:?} is definition {i} of {inst:?}, but its `ValData::def` \
                              says {actual:?}",
-                            op.val(),
                         ));
                     }
                     i += 1;
@@ -4507,7 +4944,8 @@ mod tests {
     }
 
     /// A register count set with `set_regs_per_bank` survives every later
-    /// mutation, and every register it adds reaches a class.
+    /// mutation, and every register it adds reaches every class the allocator
+    /// owns.
     ///
     /// This is the whole reason the count lives on `TestMachine` rather than
     /// being applied by the caller: `TestInputMutator` runs `fixup` after
@@ -4529,12 +4967,25 @@ mod tests {
                 );
                 for class in &bank.classes {
                     if let TestClassMembers::Regs(regs) = &class.members {
-                        assert_eq!(
-                            regs.len(),
-                            REGS,
-                            "a class of bank {i} holds {} of its {REGS} registers {when}",
-                            regs.len(),
-                        );
+                        // A class of registers the allocator does not own is
+                        // not somewhere a new register could go: it holds the
+                        // one register an operand reads, and widening the bank
+                        // gives the allocator nothing there. The padding pass
+                        // leaves such a class alone, so skip it here too.
+                        if usize::from(regs[0]) >= REGS {
+                            continue;
+                        }
+
+                        // Membership rather than a count: a class the
+                        // allocator does own may have been written down with
+                        // its members in any order, and padding appends.
+                        for reg in 0..u8::try_from(REGS).unwrap() {
+                            assert!(
+                                regs.contains(&reg),
+                                "a class of bank {i} is missing register {reg} of its {REGS} \
+                                 {when}",
+                            );
+                        }
                     }
                 }
             }
@@ -4613,7 +5064,7 @@ mod tests {
             let operands: Vec<Operand> = input.func.inst(inst).operands().collect();
             assert_eq!(operands.len(), 1);
             assert_eq!(operands[0].kind(), DefUse::Use);
-            assert_eq!(operands[0].val(), val);
+            assert_eq!(operands[0].val(), Some(val));
             assert_eq!(operands[0].constraint(), expected);
         }
     }
@@ -4799,7 +5250,7 @@ mod tests {
         // them to the other leaves the operand with nowhere to go.
         let machine = TestMachine::two_registers().build();
         let operand = &mut func.insts[inst].operands_mut()[0];
-        func.values[operand.val()].reg_class = 0;
+        func.values[operand.val().unwrap()].reg_class = 0;
         *operand = Operand::new(
             operand.pos(),
             operand.kind(),
@@ -4850,7 +5301,7 @@ mod tests {
 
         let machine = TestMachine::two_registers().build();
         let operand = &mut func.insts[inst].operands_mut()[0];
-        func.values[operand.val()].reg_class = 0;
+        func.values[operand.val().unwrap()].reg_class = 0;
         *operand = Operand::new(
             operand.pos(),
             operand.kind(),
@@ -4868,12 +5319,15 @@ mod tests {
     }
 
     /// A machine with one register the allocator owns and one it does not,
-    /// plus the two classes that let an operand name either the pair or the
-    /// non-allocatable register alone.
+    /// plus the two classes that name each of them alone.
     ///
-    /// `TestMachine` cannot describe this: it only ever puts allocatable
-    /// registers in a class, so the shape these checks are about has to be
-    /// built by hand.
+    /// Class 0 is the only one a value may belong to, and class 1 is the only
+    /// one a val-less operand may name. There is no class holding both, a
+    /// class being wholly one kind or the other.
+    ///
+    /// [`TestMachine::with_a_non_allocatable_reg`] describes the same shape
+    /// for the tests that need a whole `TestInput`; this one stays because the
+    /// checks below want a bare `Machine` and nothing else.
     fn machine_with_a_non_allocatable_class() -> Machine {
         let mut builder = MachineBuilder::new();
         let bank = builder
@@ -4888,11 +5342,7 @@ mod tests {
             .unwrap();
         let non_allocatable = builder.define_non_allocatable_reg(bank).unwrap();
 
-        // Class 0 holds both, and is what a value in this machine lives in.
-        // Class 1 holds only the register the allocator may not hand out.
-        builder
-            .define_reg_class(bank, 1.0, [reg, non_allocatable])
-            .unwrap();
+        builder.define_reg_class(bank, 1.0, [reg]).unwrap();
         builder
             .define_reg_class(bank, 1.0, [non_allocatable])
             .unwrap();
@@ -4900,10 +5350,9 @@ mod tests {
         builder.finish().unwrap()
     }
 
-    /// A use may name a non-allocatable register --- that is what those
-    /// registers are for --- but a definition constrained to a class with no
-    /// register the allocator owns has nowhere to go, so it is the input that
-    /// is wrong and not any allocation of it.
+    /// A definition constrained to a class with no register the allocator owns
+    /// has nowhere to go, so it is the input that is wrong and not any
+    /// allocation of it.
     #[test]
     fn reject_a_definition_pinned_to_a_non_allocatable_register() {
         let mut func = valid_func(1, 1);
@@ -4913,7 +5362,6 @@ mod tests {
         let machine = machine_with_a_non_allocatable_class();
         let operand = &mut func.insts[inst].operands_mut()[0];
         assert_eq!(operand.kind(), DefUse::Def);
-        func.values[operand.val()].reg_class = 0;
         *operand = Operand::new(
             operand.pos(),
             operand.kind(),
@@ -4925,47 +5373,178 @@ mod tests {
         assert!(
             matches!(
                 actual,
-                Error::DefInNonAllocatableRegClass { inst: i, operand: 0 } if i == inst,
+                Error::OperandWithValInNonAllocatableRegClass { inst: i, operand: 0 }
+                    if i == inst,
             ),
-            "expected a `DefInNonAllocatableRegClass`, got {actual:?}",
+            "expected an `OperandWithValInNonAllocatableRegClass`, got {actual:?}",
         );
     }
 
-    /// The same constraint on a use of that value, which is exactly how an
-    /// instruction says it reads the stack pointer.
+    /// A *use* cannot name one either, so long as it names a value: such a
+    /// class is how an operand reads a register the allocator does not own,
+    /// and an operand that does so names no value at all.
     #[test]
-    fn accept_a_use_pinned_to_a_non_allocatable_register() {
-        let machine = machine_with_a_non_allocatable_class();
-        let mut input = TestInput::with_use_constraints(&[OperandConstraint::Reg(
-            RegClass::try_new(1).unwrap(),
-        )]);
-        for (_val, val_data) in input.func.values.iter_mut() {
-            val_data.reg_class = 0;
-        }
+    fn reject_a_use_of_a_value_pinned_to_a_non_allocatable_register() {
+        let mut func = valid_func(1, 2);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[1];
 
-        assert_eq!(check_ssa(&machine, &input.func), Ok(()));
+        let machine = machine_with_a_non_allocatable_class();
+        let operand = &mut func.operands_mut(inst)[0];
+        assert_eq!(operand.kind(), DefUse::Def);
+        *operand = Operand::new(
+            operand.pos(),
+            DefUse::Use,
+            OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+            Some(Val::try_new(0).unwrap()),
+        );
+
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(
+                actual,
+                Error::OperandWithValInNonAllocatableRegClass { inst: i, operand: 0 }
+                    if i == inst,
+            ),
+            "expected an `OperandWithValInNonAllocatableRegClass`, got {actual:?}",
+        );
     }
 
-    /// ... and so is a definition in a class that holds a register the
-    /// allocator owns as well, which is the whole point of checking the class
-    /// rather than the mere presence of a non-allocatable member.
+    /// Reading a register the allocator does not own is spelled by naming no
+    /// value at all, which is exactly how an instruction says it reads the
+    /// stack pointer.
     #[test]
-    fn accept_a_definition_in_a_class_that_also_holds_an_allocatable_register() {
+    fn accept_a_val_less_use_pinned_to_a_non_allocatable_register() {
         let mut func = valid_func(1, 1);
         let block = Block::try_new(0).unwrap();
         let inst = func.blocks[block].insts[0];
 
+        func.operands_mut(inst).push(Operand::new(
+            Position::Early,
+            DefUse::Use,
+            OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+            None,
+        ));
+
         let machine = machine_with_a_non_allocatable_class();
-        let operand = &mut func.insts[inst].operands_mut()[0];
-        func.values[operand.val()].reg_class = 0;
+        assert_eq!(check_ssa(&machine, &func), Ok(()));
+    }
+
+    /// An operand naming no value asks the allocator for nothing, so anything
+    /// but a read of a register the allocator does not own leaves it asking
+    /// for a home for something that does not exist.
+    #[test]
+    fn reject_val_less_operands_that_are_not_fixed_reads() {
+        let non_allocatable = OperandConstraint::Reg(RegClass::try_new(1).unwrap());
+        let allocatable = OperandConstraint::Reg(RegClass::try_new(0).unwrap());
+
+        for (kind, constraint, why) in [
+            (DefUse::Def, non_allocatable, "a definition of no value"),
+            (DefUse::Use, OperandConstraint::Any, "unconstrained"),
+            (DefUse::Use, OperandConstraint::Stack, "on the stack"),
+            (DefUse::Use, allocatable, "pinned to the allocator's own"),
+        ] {
+            let mut func = valid_func(1, 1);
+            let block = Block::try_new(0).unwrap();
+            let inst = func.blocks[block].insts[0];
+            func.operands_mut(inst)
+                .push(Operand::new(Position::Early, kind, constraint, None));
+
+            let machine = machine_with_a_non_allocatable_class();
+            let actual = expect_invalid_with(&machine, &func);
+            assert!(
+                matches!(
+                    actual,
+                    Error::OperandWithoutValIsNotAFixedUse { inst: i, operand: 1 } if i == inst,
+                ),
+                "expected an `OperandWithoutValIsNotAFixedUse` for an operand {why}, \
+                 got {actual:?}",
+            );
+        }
+    }
+
+    /// A `Reuse` is defined in the register its target reads its value from,
+    /// so a target that reads no value leaves the definition tied to nothing.
+    #[test]
+    fn reject_a_reuse_of_an_operand_without_a_value() {
+        let mut func = valid_func(1, 1);
+        let block = Block::try_new(0).unwrap();
+        let inst = func.blocks[block].insts[0];
+
+        // Operand 1 reads a register the allocator does not own; operand 0,
+        // the definition, ties itself to it.
+        func.operands_mut(inst).push(Operand::new(
+            Position::Early,
+            DefUse::Use,
+            OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+            None,
+        ));
+        let operand = &mut func.operands_mut(inst)[0];
+        assert_eq!(operand.kind(), DefUse::Def);
         *operand = Operand::new(
-            operand.pos(),
+            Position::Late,
             operand.kind(),
-            OperandConstraint::Reg(RegClass::try_new(0).unwrap()),
+            OperandConstraint::Reuse(1),
             operand.val(),
         );
 
-        assert_eq!(check_ssa(&machine, &func), Ok(()));
+        let machine = machine_with_a_non_allocatable_class();
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(
+                actual,
+                Error::ReuseOfOperandWithoutVal { inst: i, operand: 0 } if i == inst,
+            ),
+            "expected a `ReuseOfOperandWithoutVal`, got {actual:?}",
+        );
+    }
+
+    /// A value belongs wherever the allocator decides to put it, so a class
+    /// the allocator owns nothing in is nowhere a value can belong: there is
+    /// no home in it for the allocator to give out.
+    #[test]
+    fn reject_a_value_in_a_class_the_allocator_owns_nothing_in() {
+        let mut func = valid_func(1, 1);
+        for (_val, val_data) in func.values.iter_mut() {
+            val_data.reg_class = 1;
+        }
+
+        let machine = machine_with_a_non_allocatable_class();
+        let actual = expect_invalid_with(&machine, &func);
+        assert!(
+            matches!(actual, Error::NonAllocatableRegInValClass { val } if val.index() == 0),
+            "expected a `NonAllocatableRegInValClass`, got {actual:?}",
+        );
+    }
+
+    /// A parameter arrives wherever the allocator decides to put it, so a
+    /// class that holds a register the allocator does not own would let it
+    /// arrive in one --- a definition there spelled a longer way --- however
+    /// the arguments passed to it are themselves constrained. Which is just
+    /// the rule every value obeys, parameters included.
+    #[test]
+    fn reject_a_block_parameter_in_a_class_holding_a_non_allocatable_register() {
+        let mut input =
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Any);
+        input.machine = TestMachine::with_a_non_allocatable_reg();
+
+        let param = Val::try_new(1).unwrap();
+        assert!(matches!(
+            input.func.values[param].def,
+            ValDef::BlockParam { .. }
+        ));
+
+        // Both values, so that the argument still agrees with the parameter it
+        // is passed to and it is the class rule alone that is broken.
+        for (_val, val_data) in input.func.values.iter_mut() {
+            val_data.reg_class = TestMachine::PINNED_CLASS;
+        }
+
+        let actual = expect_invalid_with(&input.machine.build(), &input.func);
+        assert!(
+            matches!(actual, Error::NonAllocatableRegInValClass { .. }),
+            "expected a `NonAllocatableRegInValClass`, got {actual:?}",
+        );
     }
 
     #[test]
@@ -5044,18 +5623,23 @@ mod tests {
                     Position::Late,
                     DefUse::Def,
                     OperandConstraint::Any,
-                    val(0),
+                    Some(val(0)),
                 )],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![
-                    Operand::new(Position::Early, DefUse::Use, OperandConstraint::Any, val(0)),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(val(0)),
+                    ),
                     Operand::new(
                         Position::Late,
                         DefUse::Def,
                         OperandConstraint::Reuse(0),
-                        val(1),
+                        Some(val(1)),
                     ),
                 ],
                 side_effects: true,
@@ -5207,7 +5791,7 @@ mod tests {
         let operands = match &mut func.insts[inst] {
             InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
         };
-        operands.push(Operand::new(Position::Late, DefUse::Def, reuse, val));
+        operands.push(Operand::new(Position::Late, DefUse::Def, reuse, Some(val)));
         let second = operands.len() - 1;
 
         let actual = expect_invalid_with(&TestMachine::two_registers().build(), &func);
@@ -5230,7 +5814,7 @@ mod tests {
             OperandConstraint::Reuse(target) => target,
             c => panic!("`the_reuse` found a reuse, got {c:?}"),
         };
-        let reused = input.func.insts[inst].operands()[target].val();
+        let reused = input.func.insts[inst].operands()[target].val().unwrap();
 
         // Read the reused value once more, from the terminator, so that it
         // outlives the instruction that wanted to overwrite it.
@@ -5245,7 +5829,7 @@ mod tests {
             Position::Early,
             DefUse::Use,
             OperandConstraint::Any,
-            reused,
+            Some(reused),
         ));
         input.fixup();
 
@@ -5320,7 +5904,7 @@ mod tests {
         let OperandConstraint::Reuse(target) = operands[j].constraint() else {
             unreachable!("just found this operand by its `Reuse` constraint")
         };
-        let (reusing, reused) = (operands[j].val(), operands[target].val());
+        let (reusing, reused) = (operands[j].val().unwrap(), operands[target].val().unwrap());
         assert_ne!(reusing, reused);
 
         // `fixup` put both in one class; take the reusing operand's value out

@@ -342,15 +342,7 @@ impl RegClass {
     /// Does this class hold anywhere the allocator may actually put a value?
     #[inline]
     pub(crate) fn has_an_allocatable_member(self, machine: &Machine) -> bool {
-        match self.members(machine) {
-            RegClassMembers::Regs(regs) => regs.iter().any(|reg| reg.is_allocatable(machine)),
-            RegClassMembers::Groups(groups) => groups.iter().any(|group| {
-                group
-                    .members(machine)
-                    .iter()
-                    .all(|reg| reg.is_allocatable(machine))
-            }),
-        }
+        machine.classes[self].has_an_allocatable_member
     }
 
     /// How many registers a value of this register-group class occupies, or
@@ -478,6 +470,10 @@ pub(crate) struct RegClassDef {
     /// The same set of registers inside `self.members`, but as a `RegSet` for
     /// fast interference testing, rather than in allocation-preferrence order.
     pub member_set: RegSet,
+
+    /// Whether this class holds anywhere the allocator may actually put a
+    /// value.
+    pub has_an_allocatable_member: bool,
 
     /// This register class's associated register bank.
     pub bank: RegBank,
@@ -841,21 +837,23 @@ impl MachineBuilder {
     /// pointer, link register, hardware zero register, etc... which are
     /// manually-managed by explicit instructions by the function.
     ///
-    /// A non-allocatable register may still be a member of a [`RegClass`]. A
-    /// class holding one such register is how an operand says it must go in
-    /// that particular register and nowhere else.
-    ///
     /// **Non-allocatable registers must be disjoint from all allocatable
     /// registers, regardless of register bank.**
     ///
-    /// **Values cannot be defined in non-allocatable registers.** An
-    /// [`Operand`][crate::Operand] of kind [`Def`][crate::DefUse::Def] may not
-    /// be [constrained][crate::OperandConstraint] to a [`RegClass`] that
-    /// contains only non-allocatable registers (and, therefore, no allocatable
-    /// registers). It also follows that, because
-    /// [`OperandConstraint::Reuse`][crate::OperandConstraint::Reuse] can only
-    /// appear on definitions, non-allocatable registers may not be used with
-    /// reuse constraints.
+    /// **The allocator never puts a value in a non-allocatable register.**
+    /// Nothing tracks what such a register might hold and the function is
+    /// managing the register itself. Therefore, a [`Val`][crate::Val] may not
+    /// belong to a [`RegClass`] that holds a non-allocatable register at all.
+    ///
+    /// An [`Operand`][crate::Operand] names such a register by naming no value
+    /// at all. It must be a [`Use`][crate::DefUse::Use],
+    /// [constrained][crate::OperandConstraint::Reg] to a class containing
+    /// nothing but a non-allocatable register, and its
+    /// [`val`][crate::Operand::val] must be `None`. The allocation reported for
+    /// it is that class's register.
+    ///
+    /// **A [`RegClass`] containing a non-allocatable register holds exactly
+    /// that one register**, or exactly one register group.
     pub fn define_non_allocatable_reg(&mut self, bank: RegBank) -> Result<Reg> {
         self.define_reg_impl(
             bank,
@@ -947,10 +945,17 @@ impl MachineBuilder {
     /// order, so put the registers that are cheaper to use (e.g. have smaller
     /// encoding) first.
     ///
+    /// Classes may overlap: you can, for example, define a class containing the
+    /// machine's even-numbered registers, another containing its odd-numbered
+    /// registers, and another containing both even- and odd-numbered registers.
+    ///
     /// A class of exactly one register is how an operand demands that register
     /// and no other.
     ///
-    /// `registers` must be non-empty.
+    /// `registers` must be non-empty, and must be either all allocatable
+    /// registers or all non-allocatable registers. A class of non-allocatable
+    /// registers must hold exactly one of them. See also
+    /// [`MachineBuilder::define_non_allocatable_reg`].
     pub fn define_reg_class(
         &mut self,
         bank: RegBank,
@@ -966,15 +971,40 @@ impl MachineBuilder {
         }
 
         let mut member_set = RegSet::new();
+
+        // Whether this class is the allocator's to hand out or the function's
+        // to manage itself, which every member has to agree on. Read off the
+        // first member, but not before the loop has checked that there is such
+        // a register to read it off.
+        let mut allocatable = None;
+
         for &reg in &members {
             self.check_class_member(class, reg, bank)?;
             if !member_set.insert(reg) {
                 return Err(Error::DuplicateRegClassMember { class, reg });
             }
+            match allocatable {
+                None => allocatable = Some(self.reg_is_allocatable(reg)),
+                Some(a) if a != self.reg_is_allocatable(reg) => {
+                    return Err(Error::MixedRegClassAllocatability { class, reg });
+                }
+                Some(_) => {}
+            }
+        }
+
+        // A class of registers the allocator does not own names the one
+        // register an operand reads, and there is nothing in it for the
+        // allocator to choose between.
+        if allocatable == Some(false) && members.len() > 1 {
+            return Err(Error::NonAllocatableRegClassIsNotASingleton {
+                class,
+                len: members.len(),
+            });
         }
 
         Ok(self.classes.push_unwrap(RegClassDef {
             spill_cost,
+            has_an_allocatable_member: self.has_an_allocatable_member(&members),
             members: RegClassMembers::Regs(members),
             member_set,
             bank,
@@ -986,9 +1016,9 @@ impl MachineBuilder {
     /// All of the groups must belong to `bank` and have the same size.
     ///
     /// As with [`MachineBuilder::define_reg_class`], the order given is the
-    /// preferred allocation order.
-    ///
-    /// `groups` must be non-empty.
+    /// preferred allocation order, every register of every group must agree on
+    /// whether the allocator owns it, and a class of registers the allocator
+    /// does not own must hold exactly one group.
     pub fn define_reg_group_class(
         &mut self,
         bank: RegBank,
@@ -1005,6 +1035,12 @@ impl MachineBuilder {
 
         let mut member_set = RegSet::new();
         let mut size = None;
+
+        // As in `define_reg_class`, but a group class's registers come a group
+        // at a time, so there is no first one to read it off until the first
+        // group has been checked to exist.
+        let mut allocatable = None;
+
         for &group in &members {
             if group.index() >= self.groups.len() || self.groups[group].bank != bank {
                 return Err(Error::RegGroupInWrongBank {
@@ -1026,11 +1062,28 @@ impl MachineBuilder {
                 let reg = self.groups[group].members[i];
                 self.check_class_member(class, reg, bank)?;
                 member_set.insert(reg);
+                match allocatable {
+                    None => allocatable = Some(self.reg_is_allocatable(reg)),
+                    Some(a) if a != self.reg_is_allocatable(reg) => {
+                        return Err(Error::MixedRegClassAllocatability { class, reg });
+                    }
+                    Some(_) => {}
+                }
             }
+        }
+
+        // As in `define_reg_class`: one group, holding the registers the
+        // operand reads, and no choice to make.
+        if allocatable == Some(false) && members.len() > 1 {
+            return Err(Error::NonAllocatableRegClassIsNotASingleton {
+                class,
+                len: members.len(),
+            });
         }
 
         Ok(self.classes.push_unwrap(RegClassDef {
             spill_cost,
+            has_an_allocatable_member: self.groups_have_an_allocatable_member(&members),
             members: RegClassMembers::Groups(members),
             member_set,
             bank,
@@ -1213,9 +1266,37 @@ impl MachineBuilder {
             // expensive to spill as either of them.
             spill_cost: x.spill_cost.max(y.spill_cost),
             member_set: self.member_set(&members),
+            has_an_allocatable_member: match &members {
+                RegClassMembers::Regs(regs) => self.has_an_allocatable_member(regs),
+                RegClassMembers::Groups(groups) => self.groups_have_an_allocatable_member(groups),
+            },
             members,
             bank: x.bank,
         })
+    }
+
+    /// Does any of `regs` cover a unit, and so name somewhere the allocator
+    /// may actually put a value?
+    fn has_an_allocatable_member(&self, regs: &[Reg]) -> bool {
+        regs.iter().any(|reg| self.reg_is_allocatable(*reg))
+    }
+
+    /// The same question for a class of register groups: a value goes in a
+    /// group only as a whole, so a group is somewhere it can go only when
+    /// every one of its registers is.
+    fn groups_have_an_allocatable_member(&self, groups: &[RegGroup]) -> bool {
+        groups.iter().any(|group| {
+            self.groups[*group]
+                .members
+                .iter()
+                .all(|reg| self.reg_is_allocatable(*reg))
+        })
+    }
+
+    /// `Reg::is_allocatable`, before there is a `Machine` to ask.
+    fn reg_is_allocatable(&self, reg: Reg) -> bool {
+        let units = &self.registers[reg].units;
+        units.start != units.end
     }
 
     /// The registers that `members` covers, as a set.
@@ -1472,12 +1553,17 @@ mod tests {
             .unwrap();
         let r0 = builder.define_reg(bank, unit(0)..unit(1)).unwrap();
         let flags = builder.define_non_allocatable_reg(bank).unwrap();
+        let other_flags = builder.define_non_allocatable_reg(bank).unwrap();
 
         let general = builder.define_reg_class(bank, 1.0, [r0]).unwrap();
         let fixed = builder.define_reg_class(bank, 1.0, [flags]).unwrap();
 
-        // And by way of a group, which is the other route into a class.
-        let group = builder.define_reg_group(bank, [r0, flags]).unwrap();
+        // And by way of a group, which is the other route into a class. Of
+        // two non-allocatable registers, because the class a group lands in
+        // is wholly one kind or the other just the same.
+        let group = builder
+            .define_reg_group(bank, [flags, other_flags])
+            .unwrap();
         let group_class = builder.define_reg_group_class(bank, 2.0, [group]).unwrap();
 
         let machine = builder.finish().expect("this machine is well formed");
@@ -1489,6 +1575,89 @@ mod tests {
         // Being in a class does not put it back in the scratch pool.
         assert!(!bank.stack_to_stack_move_regs(&machine).contains(flags));
         assert!(bank.stack_to_stack_move_regs(&machine).contains(r0));
+    }
+
+    /// A class is the allocator's to hand out or the function's to manage
+    /// itself, and there is no third thing for a class holding both kinds of
+    /// register to be, so it is rejected where it is defined.
+    #[test]
+    fn reject_a_reg_class_mixing_allocatable_and_non_allocatable_regs() {
+        let mut builder = MachineBuilder::new();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
+        let r0 = builder.define_reg(bank, unit(0)..unit(1)).unwrap();
+        let r1 = builder.define_reg(bank, unit(1)..unit(2)).unwrap();
+        let flags = builder.define_non_allocatable_reg(bank).unwrap();
+
+        // Either way around: the class's first member says which kind the
+        // class is, and every other member has to agree with it.
+        assert!(matches!(
+            builder.define_reg_class(bank, 1.0, [r0, flags]).unwrap_err(),
+            Error::MixedRegClassAllocatability { reg, .. } if reg == flags
+        ));
+        assert!(matches!(
+            builder.define_reg_class(bank, 1.0, [flags, r0]).unwrap_err(),
+            Error::MixedRegClassAllocatability { reg, .. } if reg == r0
+        ));
+
+        // And by way of a group, where the two kinds can be a member apart
+        // rather than a group apart.
+        let allocatable = builder.define_reg_group(bank, [r0, r1]).unwrap();
+        let mixed = builder.define_reg_group(bank, [r0, flags]).unwrap();
+        assert!(matches!(
+            builder
+                .define_reg_group_class(bank, 2.0, [allocatable, mixed])
+                .unwrap_err(),
+            Error::MixedRegClassAllocatability { reg, .. } if reg == flags
+        ));
+        assert!(matches!(
+            builder
+                .define_reg_group_class(bank, 2.0, [mixed])
+                .unwrap_err(),
+            Error::MixedRegClassAllocatability { reg, .. } if reg == flags
+        ));
+    }
+
+    /// An operand pinned to a class of registers the allocator does not own
+    /// is naming the one register it reads, and the allocator chooses nothing
+    /// within the class, so there is nothing a second member could mean.
+    #[test]
+    fn reject_a_non_allocatable_reg_class_with_several_members() {
+        let mut builder = MachineBuilder::new();
+        let bank = builder
+            .declare_reg_bank(SpillSlotSize::new(8).unwrap())
+            .unwrap();
+        builder.define_reg(bank, unit(0)..unit(1)).unwrap();
+        let flags: Vec<Reg> = (0..4)
+            .map(|_| builder.define_non_allocatable_reg(bank).unwrap())
+            .collect();
+
+        assert!(matches!(
+            builder
+                .define_reg_class(bank, 1.0, [flags[0], flags[1]])
+                .unwrap_err(),
+            Error::NonAllocatableRegClassIsNotASingleton { len: 2, .. }
+        ));
+
+        // One of them is fine, which is the whole point of such a class.
+        builder.define_reg_class(bank, 1.0, [flags[0]]).unwrap();
+
+        // And by way of groups, where the class counts groups rather than
+        // registers: one group of several registers is a class of one member.
+        let low = builder
+            .define_reg_group(bank, [flags[0], flags[1]])
+            .unwrap();
+        let high = builder
+            .define_reg_group(bank, [flags[2], flags[3]])
+            .unwrap();
+        assert!(matches!(
+            builder
+                .define_reg_group_class(bank, 2.0, [low, high])
+                .unwrap_err(),
+            Error::NonAllocatableRegClassIsNotASingleton { len: 2, .. }
+        ));
+        builder.define_reg_group_class(bank, 2.0, [low]).unwrap();
     }
 
     #[test]

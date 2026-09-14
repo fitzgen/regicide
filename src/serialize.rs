@@ -582,7 +582,7 @@ mod tests {
     "move_elimination_level": "global"
   },
   "machine": {
-    "version": 1,
+    "version": 2,
     "banks": [
       {
         "size": 8
@@ -637,7 +637,7 @@ mod tests {
     ]
   },
   "func": {
-    "version": 1,
+    "version": 2,
     "entry_block": 0,
     "values": [
       {

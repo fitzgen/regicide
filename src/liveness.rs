@@ -686,7 +686,11 @@ where
                 if operand.pos() != pos {
                     continue;
                 }
-                let val = output.with_repr(operand.val())?;
+                let Some(val) = operand.val() else {
+                    // An operand naming no value has no liveness to record.
+                    continue;
+                };
+                let val = output.with_repr(val)?;
                 f(output, point, i, operand.kind(), val)?;
             }
         }
@@ -791,8 +795,8 @@ mod tests {
             }
             for (_inst, input_inst) in input_block.insts() {
                 for operand in input_inst.operands() {
-                    if operand.kind() == DefUse::Def {
-                        defs.insert(operand.val(), block);
+                    if let (DefUse::Def, Some(val)) = (operand.kind(), operand.val()) {
+                        defs.insert(val, block);
                     }
                 }
             }
@@ -806,8 +810,8 @@ mod tests {
         for (block, input_block) in func.blocks() {
             for (_inst, input_inst) in input_block.insts() {
                 for operand in input_inst.operands() {
-                    if operand.kind() == DefUse::Use {
-                        uses.entry(operand.val()).or_default().insert(block);
+                    if let (DefUse::Use, Some(val)) = (operand.kind(), operand.val()) {
+                        uses.entry(val).or_default().insert(block);
                     }
                 }
             }
@@ -847,8 +851,11 @@ mod tests {
         for (_block, input_block) in func.blocks() {
             for (_inst, input_inst) in input_block.insts() {
                 for operand in input_inst.operands() {
-                    if operand.kind() == DefUse::Use && needed.insert(operand.val()) {
-                        worklist.push(operand.val());
+                    let Some(val) = operand.val() else {
+                        continue;
+                    };
+                    if operand.kind() == DefUse::Use && needed.insert(val) {
+                        worklist.push(val);
                     }
                 }
             }

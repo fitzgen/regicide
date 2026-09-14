@@ -232,6 +232,32 @@ test("every `def` and `use` in the outline links to its own use", () => {
   }
 });
 
+test("an operand naming no value renders as the class it is pinned to", () => {
+  // Such an operand names a register the allocator does not own: there is no
+  // value, no span, and no use behind it, so the line has to come from the
+  // constraint alone rather than from anything the allocation produced.
+  const blob = fixture("val-less-read");
+  const outline = outlineOf(blob);
+  const line = outline.lines.find((l) => text(l).includes("use rc1"));
+  assert.ok(line !== undefined, "the val-less read is not in the outline:\n" + render(outline));
+  assert.equal(text(line), "inst0 early: use rc1");
+
+  // And the word is not a link, because there is no use to link it to.
+  const word = line.parts.find((part) => part.text === "use");
+  assert.equal(word.entity, undefined);
+
+  // The pane says `none` where the value would be, and still spells out the
+  // class, which is the answer the operand is being read for.
+  const details = modelOf(blob).details({ kind: "Inst", index: 0 });
+  const reads = "0: use early none reg rc1 { r2 }, 1: def late v0 any";
+  assert.equal(shown(details)["Operands"], reads);
+
+  // It does not invent a value, either: v0 is the only one the function has.
+  assert.equal(blob.function.insts[0].operands[0].val, null);
+  assert.notEqual(modelOf(blob).details({ kind: "Val", index: 0 }), null);
+  assert.equal(modelOf(blob).details({ kind: "Val", index: 1 }), null);
+});
+
 test("an instruction's operands link their `def` and `use` to the use", () => {
   // The same link in the pane, and the line reads exactly as it did before.
   const blob = fixture("spills-and-reloads");

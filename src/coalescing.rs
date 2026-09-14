@@ -668,12 +668,19 @@ where
                 let OperandConstraint::Reuse(i) = input_inst.operand(j).constraint() else {
                     continue;
                 };
-                debug_assert_eq!(
-                    input.func.value(input_inst.operand(j).val()).reg_class(),
-                    input.func.value(input_inst.operand(i).val()).reg_class()
-                );
                 let target = input_inst.operand(i);
-                let target_val = output.with_repr(target.val())?;
+                // Validation rejects a `Reuse` of an operand that names no
+                // value, and a `Reuse` is itself a definition, so both of
+                // these have one.
+                let target_val = target.val().unwrap();
+                debug_assert_eq!(
+                    input
+                        .func
+                        .value(input_inst.operand(j).val().unwrap())
+                        .reg_class(),
+                    input.func.value(target_val).reg_class()
+                );
+                let target_val = output.with_repr(target_val)?;
                 let inst = output.with_repr(inst)?;
                 let (Some(a), Some(b)) = (
                     inst.operand_span(live_ranges, block, j),
@@ -1183,7 +1190,7 @@ mod tests {
 
                     // And the pieces on either side of the reuse split. See
                     // `Coalescing::coalesce_across_reuse_split`.
-                    let val = input_inst.operand(i).val();
+                    let val = input_inst.operand(i).val().unwrap();
                     let at = LivePoint::new(inst, Position::Early);
                     let Some(span1) = block
                         .spans(live_ranges)
@@ -1774,7 +1781,10 @@ mod tests {
         // The tie is on `inst1`: operand 1 defines over operand 0's place.
         let (survivor, defined) = input.with_input(|input| {
             let inst = input.func.inst(Inst::try_new(1).unwrap());
-            (inst.operand(0).val(), inst.operand(1).val())
+            (
+                inst.operand(0).val().unwrap(),
+                inst.operand(1).val().unwrap(),
+            )
         });
 
         let context = coalesce_input(&input).unwrap();
