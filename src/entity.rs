@@ -276,6 +276,27 @@ macro_rules! define_entities {
                 }
             }
 
+            #[cfg(feature = "deserialize")]
+            impl<'de, T: crate::entity::EntityRepr> serde::Deserialize<'de> for $name<T> {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    use crate::entity::Entity;
+                    use serde::de::Error;
+                    let index = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(Self::try_new)
+                        .ok_or_else(|| {
+                            D::Error::custom(format_args!(
+                                "{} index {index} is out of range",
+                                stringify!($name),
+                            ))
+                        })
+                }
+            }
+
             #[cfg(feature = "visualizer")]
             impl<T: crate::entity::EntityRepr> crate::entity::VisualizedEntity for $name<T> {
                 const KIND: &'static str = stringify!($name);
@@ -362,6 +383,27 @@ macro_rules! define_fixed_size_entities {
                 {
                     use crate::entity::Entity;
                     serializer.serialize_u64(self.index() as u64)
+                }
+            }
+
+            #[cfg(feature = "deserialize")]
+            impl<'de> serde::Deserialize<'de> for $name {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: serde::Deserializer<'de>,
+                {
+                    use crate::entity::Entity;
+                    use serde::de::Error;
+                    let index = <u64 as serde::Deserialize>::deserialize(deserializer)?;
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(Self::try_new)
+                        .ok_or_else(|| {
+                            D::Error::custom(format_args!(
+                                "{} index {index} is out of range",
+                                stringify!($name),
+                            ))
+                        })
                 }
             }
 

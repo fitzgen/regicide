@@ -679,8 +679,7 @@ impl<'a> Output<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if these results do not contain `slot`. Use
-    /// [`Output::try_spill_slot`] to ask without asserting.
+    /// Panics if these results do not contain `slot`.
     pub fn spill_slot(&self, slot: SpillSlot) -> SpillSlotSize {
         self.try_spill_slot(slot)
             .expect("no such spill slot in these results")

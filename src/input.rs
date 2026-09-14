@@ -12,6 +12,14 @@ use crate::{
 };
 
 /// The input to register allocation.
+///
+/// # Serializing and Deserializing Register Allocation Input
+///
+/// Register allocation input can be serialized and deserialized for offline
+/// replay, profiling, analysis, visualization, etc...
+///
+/// See [`serialize`][crate::serialize] and [`deserialize`][crate::deserialize]
+/// for details.
 pub struct Input<'a, F>
 where
     F: InputFunction,
@@ -27,7 +35,30 @@ where
 }
 
 /// Register allocation options.
-#[derive(Clone, Debug, Hash)]
+///
+/// # Example: Serializing and Deserializing Input Options
+///
+/// Requires the `"serialize"` and `"deserialize"` cargo features to be enabled.
+///
+/// ```
+/// use regicide::{InputOptions, MoveEliminationLevel};
+///
+/// let options = InputOptions {
+///     validate_input: true,
+///     move_elimination_level: MoveEliminationLevel::Global,
+/// };
+///
+/// // Use whatever serialization format you like; here, we're using JSON.
+/// let json = serde_json::to_string(&options)?;
+///
+/// // After deserializing, we get the same options.
+/// let options2: InputOptions = serde_json::from_str(&json)?;
+/// assert_eq!(options, options2);
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct InputOptions {
     /// Should the register allocator check that the given input is valid?
     ///
@@ -64,7 +95,13 @@ impl InputOptions {
 }
 
 /// The level of redundant-move elimination to perform.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[cfg_attr(
+    any(feature = "serialize", feature = "deserialize"),
+    serde(rename_all = "lowercase")
+)]
 pub enum MoveEliminationLevel {
     /// Do not spend time identifying and eliminating redundant moves.
     None,
@@ -81,7 +118,11 @@ pub enum MoveEliminationLevel {
 /// The constraints describing where an operand may be located.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
-#[cfg_attr(feature = "serialize", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[cfg_attr(
+    any(feature = "serialize", feature = "deserialize"),
+    serde(rename_all = "lowercase")
+)]
 pub enum OperandConstraint {
     /// This operand may be placed in any location: register or stack.
     Any,
@@ -407,11 +448,80 @@ where
     }
 }
 
+#[cfg(any(feature = "serialize", feature = "deserialize"))]
+mod operand_serde {
+    use super::*;
+
+    /// The wire form of an `Operand`: the four fields it packs.
+    #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+    #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+    #[cfg_attr(
+        any(feature = "serialize", feature = "deserialize"),
+        serde(rename = "Operand", deny_unknown_fields, bound = "")
+    )]
+    struct OperandRepr<E: EntityRepr> {
+        pos: Position,
+        kind: DefUse,
+        constraint: OperandConstraint,
+        val: Val<E>,
+    }
+
+    #[cfg(feature = "serialize")]
+    impl<E: EntityRepr> serde::Serialize for Operand<E> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            OperandRepr {
+                pos: self.pos(),
+                kind: self.kind(),
+                constraint: self.constraint(),
+                val: self.val(),
+            }
+            .serialize(serializer)
+        }
+    }
+
+    #[cfg(feature = "deserialize")]
+    impl<'de, E: EntityRepr> serde::Deserialize<'de> for Operand<E> {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            use serde::de::Error;
+
+            let repr = OperandRepr::<E>::deserialize(deserializer)?;
+
+            // `Operand::new` asserts both of these, and one of them only under
+            // `debug_assertions`, so check them here rather than panic.
+            let (_tag, payload) = repr.constraint.to_bits();
+            if payload > PAYLOAD_MAX {
+                return Err(D::Error::custom(format_args!(
+                    "operand constraint {:?} does not fit in {PAYLOAD_BITS} bits",
+                    repr.constraint,
+                )));
+            }
+            if u64::try_from(repr.val.index()).unwrap_or(u64::MAX) > VAL_MAX {
+                return Err(D::Error::custom(format_args!(
+                    "operand value {:?} does not fit in {VAL_BITS} bits",
+                    repr.val,
+                )));
+            }
+
+            Ok(Operand::new(repr.pos, repr.kind, repr.constraint, repr.val))
+        }
+    }
+}
+
 /// The position of an operand's definition or use of its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
-#[cfg_attr(feature = "serialize", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[cfg_attr(
+    any(feature = "serialize", feature = "deserialize"),
+    serde(rename_all = "lowercase")
+)]
 #[repr(u8)]
 pub enum Position {
     /// The operand is accessed early, just after entering the instruction.
@@ -436,7 +546,11 @@ impl Position {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(test, fuzz, feature = "visualizer"), derive(mutatis::Mutate))]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
-#[cfg_attr(feature = "serialize", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[cfg_attr(
+    any(feature = "serialize", feature = "deserialize"),
+    serde(rename_all = "lowercase")
+)]
 #[repr(u8)]
 pub enum DefUse {
     /// A definition.
@@ -491,7 +605,7 @@ pub trait InputFunction {
     /// Get the given input block.
     fn block(&self, block: Block) -> Self::InputBlock<'_>;
 
-    /// The iterator type returned by [`Function::blocks`].
+    /// The iterator type returned by [`InputFunction::blocks`].
     type BlocksIter<'a>: Iterator<Item = (Block, Self::InputBlock<'a>)>
     where
         Self: 'a;
@@ -737,6 +851,12 @@ pub trait InputInst<'a> {
 /// The cost of rematerializing a value, rather than shuffling it between
 /// registers or reloading it from a spill slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
+#[cfg_attr(
+    any(feature = "serialize", feature = "deserialize"),
+    serde(rename_all = "lowercase")
+)]
 pub enum RematCost {
     /// Always rematerialize this value on demand; that is cheaper than keeping
     /// it in a register.
@@ -1347,5 +1467,127 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Round-trip every leaf type that carries its own serde impls, in a
+    /// self-describing format and a compact one, and pin the names on the wire:
+    /// the `rename_all` attributes must cover both features, or the two halves
+    /// disagree in a build that enables only one of them.
+    #[cfg(all(feature = "serialize", feature = "deserialize"))]
+    #[test]
+    fn leaf_types_round_trip() {
+        use crate::entity::Entity;
+
+        fn round_trip<T>(value: T)
+        where
+            T: core::fmt::Debug + PartialEq + serde::Serialize + serde::de::DeserializeOwned,
+        {
+            let json = serde_json::to_string(&value).unwrap();
+            assert_eq!(serde_json::from_str::<T>(&json).unwrap(), value, "{json}");
+
+            let bytes = postcard::to_allocvec(&value).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<T>(&bytes).unwrap(),
+                value,
+                "{value:?}"
+            );
+        }
+
+        for pos in [Position::Early, Position::Late] {
+            round_trip(pos);
+        }
+        for kind in [DefUse::Def, DefUse::Use] {
+            round_trip(kind);
+        }
+        for remat in [
+            RematCost::AlwaysRemat,
+            RematCost::CheaperThanMove,
+            RematCost::CheaperThanReload,
+        ] {
+            round_trip(remat);
+        }
+        for level in [
+            MoveEliminationLevel::None,
+            MoveEliminationLevel::Local,
+            MoveEliminationLevel::Global,
+        ] {
+            round_trip(level);
+        }
+        for constraint in [
+            OperandConstraint::Any,
+            OperandConstraint::Reg(RegClass::try_new(3).unwrap()),
+            OperandConstraint::Stack,
+            OperandConstraint::Reuse(2),
+        ] {
+            round_trip(constraint);
+
+            for pos in [Position::Early, Position::Late] {
+                for kind in [DefUse::Def, DefUse::Use] {
+                    round_trip(Operand::<u32>::new(
+                        pos,
+                        kind,
+                        constraint,
+                        Val::try_new(7).unwrap(),
+                    ));
+                }
+            }
+        }
+
+        round_trip(Val::<u32>::try_new(0).unwrap());
+        round_trip(Block::<u32>::try_new(9).unwrap());
+        round_trip(RegClass::try_new(4).unwrap());
+
+        // The names themselves, not just the round trip.
+        assert_eq!(
+            serde_json::to_string(&Position::Early).unwrap(),
+            "\"early\""
+        );
+        assert_eq!(serde_json::to_string(&DefUse::Use).unwrap(), "\"use\"");
+        assert_eq!(
+            serde_json::to_string(&RematCost::CheaperThanMove).unwrap(),
+            "\"cheaperthanmove\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&MoveEliminationLevel::None).unwrap(),
+            "\"none\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&OperandConstraint::Stack).unwrap(),
+            "\"stack\"",
+        );
+        assert_eq!(
+            serde_json::to_string(&Operand::<u32>::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Reg(RegClass::try_new(1).unwrap()),
+                Val::try_new(5).unwrap(),
+            ))
+            .unwrap(),
+            r#"{"pos":"late","kind":"def","constraint":{"reg":1},"val":5}"#,
+        );
+    }
+
+    /// `InputOptions` is two public scalars; round-trip it separately because it
+    /// is not `PartialEq`.
+    #[cfg(all(feature = "serialize", feature = "deserialize"))]
+    #[test]
+    fn input_options_round_trips() {
+        let options = InputOptions {
+            validate_input: true,
+            move_elimination_level: MoveEliminationLevel::Local,
+        };
+        let json = serde_json::to_string(&options).unwrap();
+        assert_eq!(
+            json,
+            r#"{"validate_input":true,"move_elimination_level":"local"}"#,
+        );
+
+        let back: InputOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.validate_input, options.validate_input);
+        assert_eq!(back.move_elimination_level, options.move_elimination_level);
+
+        let bytes = postcard::to_allocvec(&options).unwrap();
+        let back: InputOptions = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(back.move_elimination_level, options.move_elimination_level);
     }
 }

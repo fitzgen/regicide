@@ -428,6 +428,11 @@ impl RegBank {
     pub(crate) fn stack_to_stack_move_regs(self, machine: &Machine) -> RegSet {
         let bank = &machine.banks[self];
         debug_assert!(bank.non_allocatable.is_subset_of(&bank.registers));
+        debug_assert!(
+            bank.registers
+                .iter()
+                .all(|r| r.is_non_allocatable(machine) == bank.non_allocatable.contains(r))
+        );
         bank.registers.difference(&bank.non_allocatable)
     }
 }
@@ -550,6 +555,31 @@ impl Interfere for Range<RegUnit> {
 /// The model of the machine whose registers we are allocating.
 ///
 /// Construct a `Machine` via a [`MachineBuilder`].
+///
+/// # Example: Serializing and Deserializing a Machine
+///
+/// Requires the `"serialize"` and `"deserialize"` cargo features to be enabled.
+///
+/// ```
+/// use regicide::{Entity, Machine, MachineBuilder, RegUnit, SpillSlotSize};
+///
+/// // One bank of two registers, in one class.
+/// let mut builder = MachineBuilder::new();
+/// let bank = builder.declare_reg_bank(SpillSlotSize::new(8).unwrap())?;
+/// let unit = |i: usize| RegUnit::try_new(i).unwrap();
+/// let regs = [
+///     builder.define_reg(bank, unit(0)..unit(1))?,
+///     builder.define_reg(bank, unit(1)..unit(2))?,
+/// ];
+/// builder.define_reg_class(bank, 1.0, regs)?;
+/// let machine = builder.finish()?;
+///
+/// // A `Machine` implements `Serialize` and `Deserialize`, so use any
+/// // encoding format you like; here, we're using JSON.
+/// let json = serde_json::to_string(&machine)?;
+/// let machine2: Machine = serde_json::from_str(&json)?;
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Debug)]
 pub struct Machine {
     registers: PrimaryMap<Reg, RegDef>,
@@ -788,9 +818,9 @@ impl MachineBuilder {
 
     /// Define a register that the allocator owns.
     ///
-    /// Registers within the same bank must be disjoint. A register that covers no
-    /// units at all is one that exists only to be named, never allocated, and so
-    /// must belong to no class.
+    /// Registers within the same bank must be disjoint, and must cover at least
+    /// one unit; for a register that covers none, see
+    /// [`MachineBuilder::define_non_allocatable_reg`].
     ///
     /// The order registers are given in a [`RegClass`] is what expresses
     /// preference between them; defining one here says only that it exists. To
@@ -838,7 +868,11 @@ impl MachineBuilder {
         let reg = self.registers.next_key_unwrap();
         match allocatable {
             Allocatable::Yes => {
-                if units.start > units.end || units.end.index() > RegUnit::MAX {
+                // An empty range is a register that is modeled not to hold
+                // anything, i.e. is not allocatable, so
+                // `define_non_allocatable_reg` must be used to explicitly
+                // define such a register.
+                if units.start >= units.end || units.end.index() > RegUnit::MAX {
                     return Err(Error::BadRegUnitRange { reg });
                 }
             }
@@ -1483,6 +1517,12 @@ mod tests {
         ));
         assert!(matches!(
             builder.define_reg(x, unit(2)..unit(1)).unwrap_err(),
+            Error::BadRegUnitRange { .. }
+        ));
+        // A register covering no units must go through
+        // `define_non_allocatable_reg`, which also marks it as such.
+        assert!(matches!(
+            builder.define_reg(x, unit(1)..unit(1)).unwrap_err(),
             Error::BadRegUnitRange { .. }
         ));
     }

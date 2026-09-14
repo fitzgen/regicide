@@ -8,12 +8,20 @@
 
 use regicide::{
     Context, Error, Input, InputFunction,
+    deserialize::DeserializedInput,
+    serialize::SerializeInput,
     test::{TestInput, TestMachine},
 };
-use std::{env, process};
+use std::{
+    env,
+    fs::File,
+    io::{BufReader, BufWriter},
+    process,
+};
 
 const USAGE: &str = "\
-usage: visualize [-s SEED] [-i ITERS] [-r REGS] <path.html>
+usage: visualize [-s SEED] [-i ITERS] [-r REGS] [-d FILE] <path.html>
+       visualize --input FILE <path.html>
 
   -s, --seed SEED    seed the `mutatis::Session` that mutates the input
                      (default 21)
@@ -23,6 +31,9 @@ usage: visualize [-s SEED] [-i ITERS] [-r REGS] <path.html>
                      the machine's shape; 1 to 64, and a two-bank machine
                      ends up with twice as many (default: whatever the
                      mutations produced, which is at most four per bank)
+  -d, --dump FILE    write the input to FILE, as JSON, before allocating
+      --input FILE   read the input from FILE instead of generating one,
+                     which rules out -s, -i and -r
   -h, --help         print this message";
 
 const DEFAULT_SEED: u64 = 21;
@@ -36,6 +47,14 @@ fn main() {
             process::exit(2);
         }
     };
+
+    if let Some(path) = &args.input {
+        let input = load(path);
+        // No closure, unlike the generated path: a `DeserializedInput` owns
+        // its machine, so `as_input` can borrow everything from it.
+        emit(&input.as_input(), &args.path);
+        return;
+    }
 
     let seed = args.seed.unwrap_or(DEFAULT_SEED);
     let iters = args.iters.unwrap_or(DEFAULT_ITERS);
@@ -57,7 +76,41 @@ fn main() {
             process::exit(1);
         }
     }
-    input.with_input(|input| emit(input, &args.path));
+    input.with_input(|input| {
+        if let Some(path) = &args.dump {
+            dump(input, path);
+        }
+        emit(input, &args.path);
+    });
+}
+
+/// Write `input` to `path` as JSON, for a later `--input` run.
+fn dump(input: &Input<'_, impl InputFunction>, path: &str) {
+    let write = || -> Result<(), String> {
+        let file = File::create(path).map_err(|e| e.to_string())?;
+        serde_json::to_writer(BufWriter::new(file), &SerializeInput::new(input))
+            .map_err(|e| e.to_string())
+    };
+    if let Err(e) = write() {
+        eprintln!("could not write {path}: {e}");
+        process::exit(1);
+    }
+    println!("wrote {path}");
+}
+
+/// Read back what `dump` wrote.
+fn load(path: &str) -> DeserializedInput {
+    let read = || -> Result<DeserializedInput, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        serde_json::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
+    };
+    match read() {
+        Ok(input) => input,
+        Err(e) => {
+            eprintln!("could not read {path}: {e}");
+            process::exit(1);
+        }
+    }
 }
 
 /// Allocate registers for `input` and write the page.
@@ -91,6 +144,8 @@ struct Args {
     seed: Option<u64>,
     iters: Option<u64>,
     regs: Option<usize>,
+    dump: Option<String>,
+    input: Option<String>,
 }
 
 impl Args {
@@ -99,6 +154,8 @@ impl Args {
         let mut seed = None;
         let mut iters = None;
         let mut regs = None;
+        let mut dump = None;
+        let mut input = None;
         let mut args = args.peekable();
 
         while let Some(arg) = args.next() {
@@ -134,9 +191,23 @@ impl Args {
                     }
                     regs = Some(usize::try_from(n).unwrap());
                 }
+                "-d" | "--dump" => dump = Some(value(&name)?),
+                "--input" => input = Some(value(&name)?),
                 _ if name.starts_with('-') => return Err(format!("unknown flag {name}")),
                 _ if path.is_some() => return Err(format!("more than one path: {name}")),
                 _ => path = Some(name),
+            }
+        }
+
+        // Rejected rather than ignored: a generation flag beside --input
+        // asks for an input that is not the one being read.
+        if input.is_some() {
+            let generating = [("-s", seed.is_some()), ("-i", iters.is_some())]
+                .into_iter()
+                .chain([("-r", regs.is_some())])
+                .find_map(|(name, given)| given.then_some(name));
+            if let Some(name) = generating {
+                return Err(format!("--input reads an input, so it rules out {name}"));
             }
         }
 
@@ -146,6 +217,8 @@ impl Args {
                 seed,
                 iters,
                 regs,
+                dump,
+                input,
             }),
             None => Err("no output path".to_string()),
         }

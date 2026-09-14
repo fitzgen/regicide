@@ -1,13 +1,22 @@
 [package]
+edition = "2024"
+license = "Apache-2.0 WITH LLVM-exception"
 name = "regicide"
 version = "0.1.0"
-edition = "2024"
 
 [dependencies]
 log = "0.4.33"
 rustc-hash = { version = "2.1.3", default-features = false }
 hashbrown = { version = "0.17.1", default-features = false, optional = true }
-serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde = {
+  version = "1.0.228",
+  optional = true,
+  default-features = false,
+  features = [
+    "alloc",
+    "derive",
+  ]
+}
 serde_json = { version = "1.0.145", optional = true }
 mutatis = { version = "0.5.2", features = ["check", "derive"], optional = true }
 
@@ -15,15 +24,23 @@ mutatis = { version = "0.5.2", features = ["check", "derive"], optional = true }
 regicide = {
   version = "0.1.0", path = ".",
   features = [
-    "std", "checker", "timing", "trace-log", "entity-repr-8", "entity-repr-16",
+    "std",
+    "checker",
+    "timing",
+    "trace-log",
+    "entity-repr-8",
+    "entity-repr-16",
     "visualizer",
+    "serialize",
+    "deserialize",
   ],
 }
 mutatis = { version = "0.5.2", features = ["check", "derive"] }
+postcard = { version = "1.1.3", default-features = false, features = ["alloc"] }
 
 [[example]]
 name = "visualize"
-required-features = ["visualizer", "test-utils"]
+required-features = ["visualizer", "test-utils", "deserialize"]
 
 [features]
 # Use Rust's `std` crate (instead of just `core` and `alloc`).
@@ -40,10 +57,15 @@ entity-repr-8 = []
 entity-repr-16 = []
 # Enable serialization via `serde`.
 serialize = ["dep:serde"]
+# Enable deserialization via `serde`.
+deserialize = ["dep:serde"]
 # Enable the HTML visualizer.
 visualizer = ["std", "serialize", "dep:serde_json", "dep:mutatis"]
 # Internal feature.
 test-utils = []
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true

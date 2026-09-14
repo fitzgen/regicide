@@ -218,8 +218,8 @@ pub enum Error {
         bank: RegBank,
     },
 
-    /// A register's range of register units is backwards, or reaches beyond the
-    /// unit index space.
+    /// A register's range of register units is empty or backwards, or reaches
+    /// beyond the unit index space.
     BadRegUnitRange {
         /// The [`Reg`] with the bad range.
         reg: Reg,

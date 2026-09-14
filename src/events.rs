@@ -70,10 +70,11 @@ pub enum ScratchReason {
 /// Something the register allocator did.
 #[derive(Debug)]
 #[cfg_attr(
-    not(feature = "visualizer"),
+    not(any(feature = "visualizer", feature = "serialize")),
     expect(
         dead_code,
-        reason = "without the visualizer an event is only ever `Debug`-formatted for `trace!`"
+        reason = "without the visualizer or serialization an event is only ever \
+                  `Debug`-formatted for `trace!`"
     )
 )]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize))]

@@ -1,19 +1,11 @@
-//! `regicide` is a register allocator.
-//!
-//! TODO FITZGEN
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![no_std]
 
 extern crate alloc;
 #[cfg(feature = "std")]
 extern crate std;
-
-// `alloc` has no hash map, and `src/move_generation.rs` needs one.
-#[cfg(not(any(feature = "std", feature = "hashbrown")))]
-compile_error!(
-    "regicide needs a hash map: enable either the `std` feature or the `hashbrown` feature"
-);
 
 #[doc(hidden)]
 #[macro_export]
@@ -60,6 +52,10 @@ mod visualizer;
 
 #[cfg(any(test, feature = "checker"))]
 pub mod checker;
+#[cfg(feature = "deserialize")]
+pub mod deserialize;
+#[cfg(feature = "serialize")]
+pub mod serialize;
 
 #[cfg(any(test, fuzz, feature = "test-utils"))]
 #[doc(hidden)]
@@ -69,8 +65,9 @@ pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Inst, Val};
 pub use error::{Error, Result};
 pub use input::{
-    BlockFrequency, DefUse, Input, InputBlock, InputFunction, InputInst, InputOptions, InputValue,
-    Operand, OperandConstraint, Position, RematCost,
+    BlockFrequency, DefUse, DisplayInputBlock, DisplayInputFunction, Input, InputBlock,
+    InputFunction, InputInst, InputOptions, InputValue, MoveEliminationLevel, Operand,
+    OperandConstraint, Position, RematCost,
 };
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{
@@ -84,15 +81,25 @@ use error::{IResult, InternalError};
 use input::DisplayWithContext;
 
 mod hash_map {
-    #[cfg(not(feature = "std"))]
-    pub use hashbrown::{HashMap, hash_map::Entry};
     #[cfg(feature = "std")]
     pub use std::collections::{HashMap, hash_map::Entry};
+
+    #[cfg(not(feature = "std"))]
+    pub use hashbrown::{HashMap, hash_map::Entry};
+
+    #[cfg(not(any(feature = "std", feature = "hashbrown")))]
+    compile_error!(
+        "regicide needs a hash map: enable either the `std` cargo feature or \
+         the `hashbrown` cargo feature"
+    );
 
     use rustc_hash::FxBuildHasher;
 
     pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 }
+
+#[cfg(any(feature = "serialize", feature = "deserialize"))]
+const ENCODING_FORMAT_VERSION: u32 = 1;
 
 /// TODO FITZGEN
 pub fn run<'a>(context: &'a mut Context, input: &Input<impl InputFunction>) -> Result<Output<'a>> {
