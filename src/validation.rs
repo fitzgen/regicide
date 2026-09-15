@@ -8,7 +8,8 @@
 //! * the function is in valid SSA form,
 //! * control-flow edges and block parameters agree,
 //! * every register class named is one the machine defines, and can hold the
-//!   value it is named for, and
+//!   value it is named for,
+//! * every value the input says may be rematerialized really can be, and
 //! * the dominance relation the input reports really is the dominance relation
 //!   of the control-flow graph it reports.
 
@@ -57,6 +58,7 @@ where
     validate_reachability(func, &dominators, output)?;
     validate_block_args(func, output)?;
     validate_reg_classes(func, input.machine, output)?;
+    validate_remat_costs(input, output)?;
     validate_dominance(func, &dominators, output)?;
 
     let defs = validate_definitions(func, output)?;
@@ -638,6 +640,69 @@ where
         }
         if let Err(e) = result {
             return output.error(e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Check that every value the input says may be rematerialized really can be.
+fn validate_remat_costs<E>(
+    input: &Input<'_, impl InputFunction>,
+    output: &mut OutputInner<E>,
+) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    let func = input.func;
+
+    for (val, input_val) in func.values() {
+        if input_val.remat_cost().is_none() {
+            continue;
+        }
+        if input_val.reg_class().group_size(input.machine).unwrap_or(1) != 1 {
+            return output.error(Error::RematOfRegGroup { val });
+        }
+    }
+
+    for (block, _) in func.blocks() {
+        let result = check_block_remat_costs(func, &func.block(block));
+        if let Err(e) = result {
+            return output.error(e);
+        }
+    }
+
+    Ok(())
+}
+
+fn check_block_remat_costs<'a>(
+    func: &impl InputFunction,
+    input_block: &impl InputBlock<'a>,
+) -> Result<()> {
+    for param in input_block.params() {
+        if func.value(param).remat_cost().is_some() {
+            return Err(Error::RematOfDerivedValue {
+                val: param,
+                def: None,
+            });
+        }
+    }
+
+    for (inst, input_inst) in input_block.insts() {
+        if !input_inst.operands().any(|op| op.kind() == DefUse::Use) {
+            continue;
+        }
+        for op in input_inst.operands() {
+            // An operand naming no value defines nothing.
+            let (DefUse::Def, Some(val)) = (op.kind(), op.val()) else {
+                continue;
+            };
+            if func.value(val).remat_cost().is_some() {
+                return Err(Error::RematOfDerivedValue {
+                    val,
+                    def: Some(inst),
+                });
+            }
         }
     }
 

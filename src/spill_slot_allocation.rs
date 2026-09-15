@@ -965,25 +965,54 @@ mod tests {
         result.map_err(|()| format!("analysis failed: {:?}", output.take_error()))
     }
 
-    /// Each spilled value's live range, as a list of half-open intervals.
-    ///
-    /// Read back out of the live spans that the rest of the allocator works
-    /// with, rather than by repeating the walk under test, so that a bug in the
-    /// walk cannot hide itself here.
+    /// Where each spilled value's slot has to be reserved, as one range per
+    /// block the value is live in.
     fn live_ranges_of(
+        input: &Input<'_, impl InputFunction>,
         context: &ContextInner<u32>,
     ) -> BTreeMap<Val<u32>, Vec<(LivePoint<u32>, LivePoint<u32>)>> {
+        let func = input.func;
         let live_ranges = &context.live_ranges;
+        let liveness = &context.liveness;
         let spill_slots = &context.spill_slots;
 
-        let mut ranges: BTreeMap<Val<u32>, Vec<_>> = BTreeMap::new();
+        let mut per_block: BTreeMap<(Val<u32>, Block<u32>), (LivePoint<u32>, LivePoint<u32>)> =
+            BTreeMap::new();
         for span in live_ranges.spans() {
             let val = span.val(live_ranges);
-            if spill_slots.spilled.contains(val) {
-                ranges
-                    .entry(val)
-                    .or_default()
-                    .push((span.start(live_ranges), span.end(live_ranges)));
+            if !spill_slots.spilled.contains(val) {
+                continue;
+            }
+            let block = span.block(func, live_ranges);
+            let (start, end) = (span.start(live_ranges), span.end(live_ranges));
+            per_block
+                .entry((val, block))
+                .and_modify(|range| {
+                    range.0 = range.0.min(start);
+                    range.1 = range.1.max(end);
+                })
+                .or_insert((start, end));
+        }
+
+        let mut ranges: BTreeMap<Val<u32>, Vec<_>> = BTreeMap::new();
+        for (block, _) in func.blocks() {
+            let (block_start, block_end) = (block.start_point(input), block.end_point(input));
+            for val in spill_slots.spilled.iter() {
+                let live_in = block.is_live_in(liveness, val);
+                let live_out = block.is_live_out(liveness, val);
+                let (start, end) = match per_block.get(&(val, block)) {
+                    Some(&(start, end)) => (
+                        if live_in { block_start } else { start },
+                        if live_out { block_end } else { end },
+                    ),
+                    // No span here at all: the value is only in its slot, and
+                    // only while it is live, which is the whole block or
+                    // nothing. A value live-in and not live-out is used
+                    // somewhere here, and a use has a span.
+                    None if live_in && live_out => (block_start, block_end),
+                    None => continue,
+                };
+                ranges.entry(val).or_default().push((start, end));
             }
         }
         ranges
@@ -1067,7 +1096,7 @@ mod tests {
                 ));
             }
 
-            let ranges = live_ranges_of(context);
+            let ranges = live_ranges_of(input, context);
             let size_of = |val: Val<u32>| val.reg_bank(input).size(input.machine);
 
             // A value in a register group has one slot per member, so compare

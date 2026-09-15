@@ -838,6 +838,16 @@ pub trait InputValue<'a> {
     fn val(&self) -> Val;
 
     /// Get the cost of rematerializing this value, if possible.
+    ///
+    /// This method should only return `Some` when the value is rematerializable
+    /// and when:
+    ///
+    /// * Its natural register class places it in a register, not a register
+    ///   group
+    ///
+    /// * It is defined by an instruction that does not read any operands
+    ///
+    /// * It is not a block parameter
     fn remat_cost(&self) -> Option<RematCost>;
 
     /// Get the register class that this value naturally belongs within.

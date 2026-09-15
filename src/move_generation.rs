@@ -52,7 +52,7 @@ use crate::{
     Block, Entity as _, Inst, Val,
     context::ContextInner,
     counts::Counts,
-    entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
+    entity::{EntityRange, EntityRepr, PrimaryMap, SecondaryMap},
     error::{Error, IResult, InternalError},
     events::{EventsLog, ScratchReason},
     hash_map::{Entry, FxHashMap},
@@ -395,10 +395,6 @@ where
     /// block's parameter list.
     param_of: SecondaryMap<Val<E>, Option<(Block<E>, usize)>>,
 
-    /// The values we may choose to rematerialize instead of reload from the
-    /// stack or move from another register.
-    rematerializable: EntitySet<Val<E>>,
-
     /// Scratch for the pass's walk over every value's spans.
     spans: Vec<LiveSpan<E>>,
 
@@ -441,7 +437,6 @@ where
             dests: Vec::new(),
             edges: PrimaryMap::new(),
             param_of: SecondaryMap::new(None),
-            rematerializable: EntitySet::new(),
             spans: Vec::new(),
             batch_moves: Vec::new(),
             expanded: Vec::new(),
@@ -458,7 +453,6 @@ where
             dests,
             edges,
             param_of,
-            rematerializable,
             spans,
             batch_moves: batch,
             expanded,
@@ -471,7 +465,6 @@ where
         dests.clear();
         edges.reset();
         param_of.reset();
-        rematerializable.reset();
         spans.clear();
         batch.clear();
         expanded.clear();
@@ -487,7 +480,6 @@ where
             dests,
             edges,
             param_of,
-            rematerializable,
             spans,
             batch_moves: batch,
             expanded,
@@ -500,7 +492,6 @@ where
             && dests.is_empty()
             && edges.is_reset()
             && param_of.is_reset()
-            && rematerializable.is_reset()
             && spans.is_empty()
             && batch.is_empty()
             && expanded.is_empty()
@@ -624,8 +615,6 @@ where
                     },
                 )?;
             }
-
-            self.index_remats(func, &input_block, output)?;
         }
 
         // `incoming_edges` hands out half-open ranges of edge keys, so the key
@@ -633,38 +622,6 @@ where
         self.edges.next_key(output)?;
 
         self.edges.as_mut_slice().sort_unstable();
-        Ok(())
-    }
-
-    /// Record which of `input_block`'s values we may choose to recompute
-    /// instead of reloading or moving.
-    fn index_remats<'a>(
-        &mut self,
-        func: &impl InputFunction,
-        input_block: &impl InputBlock<'a>,
-        output: &mut OutputInner<E>,
-    ) -> IResult<()> {
-        for (_, input_inst) in input_block.insts() {
-            // We currently only support rematerializing values defined by
-            // instructions that do not read any other values.
-            if input_inst.operands().any(|op| op.kind() == DefUse::Use) {
-                continue;
-            }
-
-            for op in input_inst.operands() {
-                debug_assert_eq!(op.kind(), DefUse::Def);
-
-                // Every operand here is a definition, and an operand naming no
-                // value is always a use.
-                let op_val = op.val().unwrap();
-                if func.value(op_val).remat_cost().is_none() {
-                    continue;
-                }
-
-                let val = output.with_repr::<E, _>(op_val)?;
-                self.rematerializable.insert(val);
-            }
-        }
         Ok(())
     }
 
@@ -838,13 +795,21 @@ where
                     .iter()
                     .rev()
                     .take_while(|prev| prev.block(func, live_ranges) == block)
-                    .find(|prev| prev.start(live_ranges) < start)
+                    .filter(|prev| prev.start(live_ranges) < start)
+                    .find(|prev| {
+                        let reaches = start <= prev.end(live_ranges);
+                        debug_assert!(
+                            reaches
+                                || input.func.value(val.with_repr32()).remat_cost()
+                                    == Some(RematCost::AlwaysRemat),
+                            "{val:?}'s spans must overlap or abut, but {prev:?} ends at {:?}, \
+                             before {start:?}",
+                            prev.end(live_ranges),
+                        );
+                        reaches
+                    })
                     .copied();
                 if let Some(prev) = incoming {
-                    debug_assert!(
-                        start <= prev.end(live_ranges),
-                        "a value's spans must overlap or abut"
-                    );
                     let prev_alloc = prev.allocation(live_ranges, spill_slots);
                     if prev_alloc != alloc {
                         debug_assert!(
@@ -862,22 +827,27 @@ where
                             }
                         }
                     }
+                } else if defines_val_at(func, val, start) {
+                    // This span defines its value, so the instruction it starts
+                    // at puts the value in place. Nothing to do.
                 } else {
-                    // If nothing earlier in this block flows into this span,
-                    // and because we also know it is not live-in to this block,
-                    // then this span must define its value and start at the
-                    // def's instruction boundary.
-                    debug_assert!(
-                        func.inst(start.inst().with_repr32())
-                            .operands()
-                            .filter(|op| {
-                                op.kind() == DefUse::Def && op.val() == Some(val.with_repr32())
-                            })
-                            .any(|op| {
-                                let def = LivePoint::new(start.inst(), op.pos());
-                                start == def || start == def.inst_boundary_at_or_before()
-                            }),
-                    );
+                    // Otherwise nothing in this block flows into this span, and
+                    // the value is not live-in either, so the only thing that
+                    // can put it in place is recomputing it.
+                    debug_assert!(input.func.value(val.with_repr32()).remat_cost().is_some());
+                    debug_assert!(start.pos().is_early());
+                    let pos = PackedMovePosition::point(start);
+
+                    match alloc {
+                        // No source: `resolve` sees a destination it cannot
+                        // fill from anywhere and rematerializes it.
+                        Allocation::Reg(_) => self.emit_dest(counts, events, pos, val, alloc),
+                        Allocation::Stack(_) => {
+                            // Handled by spill placement, as above: a value
+                            // with any span on the stack has a slot, stored
+                            // into once just after its definition.
+                        }
+                    }
                 }
             }
 
@@ -1163,7 +1133,7 @@ where
             let src = self.sources.get(&key).copied();
             let HalfMoveKey { pos, val } = key;
 
-            if self.should_remat(input, dst, src, val) {
+            if Self::should_remat(input, dst, src, val) {
                 let Allocation::Reg(RegAllocation::Reg(dest)) = dst else {
                     unreachable!("we only ever remat into single reg")
                 };
@@ -1191,24 +1161,22 @@ where
 
     /// Should we rematerialize `val` into `dst`, rather than move it from `src`?
     fn should_remat(
-        &mut self,
         input: &Input<'_, impl InputFunction>,
         dst: Allocation<E>,
         src: Option<Allocation<E>>,
         val: Val<E>,
     ) -> bool {
         // We only support rematerializing into a single register.
-        if !matches!(dst, Allocation::Reg(RegAllocation::Reg(_)))
-            // And if the value is not rematerializable, then it we cannot
-            // rematerialize it.
-            || !self.rematerializable.contains(val)
-        {
+        if !matches!(dst, Allocation::Reg(RegAllocation::Reg(_))) {
             return false;
         }
 
+        let Some(cost) = input.func.value(val.with_repr32()).remat_cost() else {
+            return false;
+        };
+
+        // Without a source, our only option is rematerialization.
         let Some(src) = src else {
-            // Without a source, our only option is rematerialization.
-            debug_assert!(input.func.value(val.with_repr32()).remat_cost().is_some());
             return true;
         };
 
@@ -1217,11 +1185,6 @@ where
             return false;
         }
 
-        let cost = input
-            .func
-            .value(val.with_repr32())
-            .remat_cost()
-            .expect("already checked the value is rematerializable");
         match src {
             Allocation::Reg(_) => cost <= RematCost::CheaperThanMove,
             Allocation::Stack(_) => cost <= RematCost::CheaperThanReload,
@@ -1523,6 +1486,21 @@ fn remap_move_emitted_events<E>(
             *index = i;
         }
     }
+}
+
+/// Does the instruction at `start` define `val`, with `start` at the point the
+/// definition takes effect or at that instruction's boundary?
+fn defines_val_at<E>(func: &impl InputFunction, val: Val<E>, start: LivePoint<E>) -> bool
+where
+    E: EntityRepr,
+{
+    func.inst(start.inst().with_repr32())
+        .operands()
+        .filter(|op| op.kind() == DefUse::Def && op.val() == Some(val.with_repr32()))
+        .any(|op| {
+            let def = LivePoint::new(start.inst(), op.pos());
+            start == def || start == def.inst_boundary_at_or_before()
+        })
 }
 
 /// Is a span for `val` that ends at `end` live-out of the given `block`?
@@ -2571,6 +2549,7 @@ mod tests {
             TestInput::with_entry_params_in_two_banks(),
             TestInput::with_a_self_looping_entry_block(),
             TestInput::with_a_spilled_self_looping_entry_param(),
+            TestInput::with_a_recomputed_read_before_a_spill_and_a_reload(),
         ]
     }
 
@@ -2823,7 +2802,12 @@ mod tests {
                              logged as a destination",
                         ));
                     }
-                    if !ctx.move_generation.rematerializable.contains(val) {
+                    if test_input
+                        .func
+                        .value(val.with_repr32())
+                        .remat_cost()
+                        .is_none()
+                    {
                         return Err(format!(
                             "{val:?} is rematerialized but not rematerializable"
                         ));

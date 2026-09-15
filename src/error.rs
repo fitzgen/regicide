@@ -58,6 +58,23 @@ pub enum Error {
         val: Val,
     },
 
+    /// A value that occupies more than one register was given a
+    /// rematerialization cost.
+    RematOfRegGroup {
+        /// The [`Val`] that cannot be rematerialized.
+        val: Val,
+    },
+
+    /// A value that is not computed from nothing was given a rematerialization
+    /// cost.
+    RematOfDerivedValue {
+        /// The [`Val`] that cannot be rematerialized.
+        val: Val,
+        /// The [`Inst`] that defines it, or `None` when it is a block
+        /// parameter, whose definition is the argument its predecessors pass.
+        def: Option<Inst>,
+    },
+
     /// A reference to a block outside of the function's block index space.
     BlockOutOfBounds {
         /// The out-of-bounds [`Block`].
@@ -464,6 +481,23 @@ impl fmt::Debug for Error {
                 write!(f, "invalid SSA: {val:?} is defined more than once")
             }
             Self::UndefinedValue { val } => write!(f, "{val:?} is never defined"),
+            Self::RematOfRegGroup { val } => write!(
+                f,
+                "{val:?} has a rematerialization cost, but occupies more than one register"
+            ),
+            Self::RematOfDerivedValue {
+                val,
+                def: Some(def),
+            } => write!(
+                f,
+                "{val:?} has a rematerialization cost, but {def:?} computes it from values it \
+                 reads"
+            ),
+            Self::RematOfDerivedValue { val, def: None } => write!(
+                f,
+                "{val:?} has a rematerialization cost, but is a block parameter and so no \
+                 instruction computes it"
+            ),
             Self::ValOutOfBounds { val } => {
                 write!(f, "{val:?} is outside the function's value index space")
             }

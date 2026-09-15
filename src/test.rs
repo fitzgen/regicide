@@ -342,6 +342,33 @@ const REMAT_COSTS: [Option<RematCost>; 4] = [
     Some(RematCost::CheaperThanReload),
 ];
 
+/// The index in [`REMAT_COSTS`] of "not rematerializable".
+const NO_REMAT: u8 = 0;
+
+/// May `val` carry a rematerialization cost?
+///
+/// A rematerialization computes its value from nothing, into a single
+/// register, so validation only accepts a cost on a value that occupies one
+/// register and is defined by an instruction reading no operands. That rules
+/// out block parameters: a parameter's definition is the argument its
+/// predecessors pass.
+fn can_remat(func: &TestFunction, machine: &Machine, val: Val) -> bool {
+    let val_data = &func.values[val];
+
+    let class = RegClass::try_new(usize::from(val_data.reg_class)).unwrap();
+    if class.group_size(machine).unwrap_or(1) != 1 {
+        return false;
+    }
+
+    match val_data.def {
+        ValDef::BlockParam { .. } => false,
+        ValDef::InstResult { inst, .. } => func.insts[inst]
+            .operands()
+            .iter()
+            .all(|op| op.kind() != DefUse::Use),
+    }
+}
+
 /// Where a value is defined.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Mutate)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
@@ -2267,6 +2294,24 @@ impl TestInput {
                 );
             }
         }
+
+        // Only a value a `Remat` could actually stand in for may carry a
+        // rematerialization cost. This comes last: it reads the definition
+        // sites `TestFunction::fixup` settled and the classes the remap above
+        // settled.
+        let cannot: Vec<Val> = self
+            .func
+            .values
+            .iter()
+            .filter(|(val, val_data)| {
+                val_data.remat % u8::try_from(REMAT_COSTS.len()).unwrap() != NO_REMAT
+                    && !can_remat(&self.func, &machine, *val)
+            })
+            .map(|(val, _)| val)
+            .collect();
+        for val in cannot {
+            self.func.values[val].remat = NO_REMAT;
+        }
     }
 
     /// A single-block input whose one value is defined by the first
@@ -3615,15 +3660,27 @@ impl TestInput {
         self.func.blocks[block].frequency = u8::try_from(index).unwrap();
     }
 
-    /// Report `remat` for every value in this function.
+    /// Report `remat` for every value in this function that may legally carry
+    /// it; the rest keep no cost at all.
+    ///
+    /// See [`can_remat`]: a block parameter, or a value that occupies a
+    /// register group, cannot be rematerialized whatever a caller asks for,
+    /// and validation rejects an input that claims otherwise.
     pub fn set_remat_costs(&mut self, remat: Option<RematCost>) {
         let index = REMAT_COSTS
             .iter()
             .position(|r| *r == remat)
             .expect("not a remat cost a `TestFunction` can report");
         let index = u8::try_from(index).unwrap();
-        for (_val, val_data) in self.func.values.iter_mut() {
-            val_data.remat = index;
+
+        let machine = self.machine.build();
+        let vals: Vec<Val> = self.func.values.iter().map(|(val, _)| val).collect();
+        for val in vals {
+            self.func.values[val].remat = if can_remat(&self.func, &machine, val) {
+                index
+            } else {
+                NO_REMAT
+            };
         }
     }
 
@@ -3726,6 +3783,371 @@ impl TestInput {
             OperandConstraint::Reg(class),
         );
         input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        input
+    }
+
+    /// A value recomputed at a read, and another value spilled and reloaded
+    /// after it: a rematerialization at an earlier position than a move.
+    ///
+    /// ```ignore
+    /// block0: inst0  late def v0 (any)              // v0 is always recomputed
+    ///         inst1  mentions nothing               // the gap in v0's live range
+    ///         inst2  early use v0, late def v1      // v0 recomputed here
+    ///         inst3  early use v1 (stack)           // v1 lands in a slot
+    ///         inst4  early use v1 (reg)             // and is reloaded out of it
+    ///         inst5  terminator
+    /// ```
+    ///
+    /// The instruction that mentions nothing is what leaves a gap between two
+    /// of v0's spans, so the read after it has nothing to receive the value
+    /// from and is filled by a rematerialization. v1 is read on the stack and
+    /// then in a register, so it is reloaded, and its definition reads an
+    /// operand, so no remat cost of [`TestInput::set_remat_costs`] lands on it
+    /// and that reload stays a move. The rematerialization comes at the earlier
+    /// position of the two, which is the only shape in which the index a move
+    /// is emitted with is not the index it ends up at.
+    pub fn with_a_recomputed_read_before_a_spill_and_a_reload() -> Self {
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let recomputed = Val::try_new(0).unwrap();
+        let spilled = Val::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        for i in [0, 2] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            side_effects: true,
+        };
+        let nothing = || InstData::Op {
+            operands: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                recomputed,
+            ),
+            nothing(),
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(recomputed),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Any,
+                        Some(spilled),
+                    ),
+                ],
+                side_effects: true,
+            },
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                spilled,
+            ),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(class),
+                spilled,
+            ),
+            nothing(),
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..6).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        input
+    }
+
+    /// A chain of four blocks defining one value in the first and reading it in
+    /// two of the others, so that it is live across all of them and every block
+    /// after the definition holds it differently: read at its first point and
+    /// live out of it, never mentioned at all, and read only below its entry.
+    ///
+    /// ```ignore
+    /// block0: inst0  late def v0
+    ///         inst1  --> block1
+    /// block1: inst2  early use v0      // read at the block's first point
+    ///         inst3  --> block2
+    /// block2: inst4                    // never mentioned
+    ///         inst5  --> block3
+    /// block3: inst6                    // live-in, read only below
+    ///         inst7  early use v0
+    ///         inst8  --> returns
+    /// ```
+    ///
+    /// Nothing passes the value as a block-call argument, so every block after
+    /// the first is free to hold it wherever it likes.
+    pub fn with_a_value_read_in_two_distant_blocks() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let block = |i| Block::try_new(i).unwrap();
+        let branch = |target| InstData::Branch {
+            operands: vec![],
+            targets: vec![BlockCall {
+                target: block(target),
+                args: vec![],
+            }],
+        };
+        let read = || InstData::Op {
+            operands: vec![Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Any,
+                Some(val),
+            )],
+            side_effects: true,
+        };
+        let nothing = || InstData::Op {
+            operands: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0` defines the value.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(val),
+                )],
+                side_effects: true,
+            },
+            branch(1),
+            // `block1` reads it at its very first point.
+            read(),
+            branch(2),
+            // `block2` never mentions it.
+            nothing(),
+            branch(3),
+            // `block3` reads it, but not until its second instruction.
+            nothing(),
+            read(),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3)],
+            vec![inst(4), inst(5)],
+            vec![inst(6), inst(7), inst(8)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A value defined in one block, read in a much later one both in a
+    /// register and on the stack, with a block in between that never mentions
+    /// it and needs every register for itself.
+    ///
+    /// ```ignore
+    /// block0: inst0  early def v0 (reg)
+    ///         inst1  --> block1, block2
+    /// block1: inst2  early def v1 (reg)      // v0 is live through here, but
+    ///         inst3  early def v2 (reg)      // never mentioned, and v1 and v2
+    ///         inst4  early use v1, use v2    // want both registers
+    ///         inst5  --> block3
+    /// block2: inst6  returns
+    /// block3: inst7  early use v0 (reg)
+    ///         inst8  early use v0 (stack)    // forces a spill slot for v0
+    ///         inst9  returns
+    /// ```
+    ///
+    /// The stack read gives the value a slot and so a store to place, and the
+    /// crowded block in between means anything the value is presumed to be
+    /// holding across it is really holding something else. Give the value a
+    /// remat cost and the two together are what a spill site outside the
+    /// defining block would get wrong.
+    pub fn with_a_value_read_on_the_stack_past_a_crowded_block() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let reg = OperandConstraint::Reg(
+            RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+        );
+
+        func.values = PrimaryMap::new();
+        for def_inst in [0, 2, 3] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: inst(def_inst),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand =
+            |kind, constraint, v| Operand::new(Position::Early, kind, constraint, Some(v));
+        let def = |v| InstData::Op {
+            operands: vec![operand(DefUse::Def, reg, v)],
+            side_effects: true,
+        };
+        let read = |constraint, v| InstData::Op {
+            operands: vec![operand(DefUse::Use, constraint, v)],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0` defines the value.
+            def(val(0)),
+            branch(&[1, 2]),
+            // `block1` never mentions it, and wants both registers itself.
+            def(val(1)),
+            def(val(2)),
+            InstData::Op {
+                operands: vec![
+                    operand(DefUse::Use, reg, val(1)),
+                    operand(DefUse::Use, reg, val(2)),
+                ],
+                side_effects: true,
+            },
+            branch(&[3]),
+            // `block2` is the other way out of `block0`.
+            branch(&[]),
+            // `block3` reads the value twice, the second time on the stack.
+            read(reg, val(0)),
+            read(OperandConstraint::Stack, val(0)),
+            branch(&[]),
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3), inst(4), inst(5)],
+            vec![inst(6)],
+            vec![inst(7), inst(8), inst(9)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
         input
     }
 
@@ -4936,6 +5358,23 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_move_before_an_unconditional_branch(),
         TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
         TestInput::with_a_reuse_of_a_pinned_read(),
+        // A value live across four blocks and read in two of them. Given a
+        // remat cost, its spans are cut at every instruction and absent from
+        // the block that never mentions it, which is the shape gaps have to be
+        // crossed in.
+        {
+            let mut input = TestInput::with_a_value_read_in_two_distant_blocks();
+            input.set_remat_costs(Some(RematCost::AlwaysRemat));
+            input
+        },
+        // The same gaps, crossed under register pressure and with a store to
+        // place: a value we always recompute, read on the stack past a block
+        // that keeps every register busy without ever mentioning it.
+        {
+            let mut input = TestInput::with_a_value_read_on_the_stack_past_a_crowded_block();
+            input.set_remat_costs(Some(RematCost::AlwaysRemat));
+            input
+        },
     ]
 }
 
@@ -5462,6 +5901,89 @@ mod tests {
             u8::try_from(machine.num_user_classes()).unwrap();
 
         assert_invalid!(&func, Error::InvalidValRegClass { val } if val.index() == 0);
+    }
+
+    /// A rematerialization computes its value from nothing, so a block
+    /// parameter --- whose definition is the argument its predecessors pass
+    /// --- can never carry a cost.
+    #[test]
+    fn reject_a_remat_cost_on_a_block_parameter() {
+        let mut input =
+            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Any);
+        let param = input
+            .func
+            .values
+            .iter()
+            .find(|(_, val_data)| matches!(val_data.def, ValDef::BlockParam { .. }))
+            .map(|(val, _)| val)
+            .expect("this fixture passes a value as a block argument");
+
+        // Not `set_remat_costs`, which honors `can_remat` and so would refuse
+        // to build the input this checks we reject.
+        input.func.values[param].remat = 1;
+
+        let actual = expect_invalid_with(&input.machine.build(), &input.func);
+        assert!(
+            matches!(actual, Error::RematOfDerivedValue { val, def: None } if val == param),
+            "expected a parameter `RematOfDerivedValue`, got {actual:?}",
+        );
+    }
+
+    /// A `Remat` names one destination register, so a value that occupies a
+    /// whole register group can never carry a cost.
+    #[test]
+    fn reject_a_remat_cost_on_a_register_group() {
+        let mut input = TestInput::with_group_use_constraints(&[OperandConstraint::Any]);
+        let val = Val::try_new(0).unwrap();
+        input.func.values[val].remat = 1;
+
+        let actual = expect_invalid_with(&input.machine.build(), &input.func);
+        assert!(
+            matches!(actual, Error::RematOfRegGroup { val: v } if v == val),
+            "expected a `RematOfRegGroup`, got {actual:?}",
+        );
+    }
+
+    /// A rematerialization recomputes its value wherever it is placed, from
+    /// whatever happens to be lying around there, so a value whose definition
+    /// reads something can never carry a cost.
+    #[test]
+    fn reject_a_remat_cost_on_a_value_whose_definition_reads() {
+        let mut output = OutputInner::<u32>::new();
+        let mut input = TestInput::with_use_constraints(&[OperandConstraint::Any]);
+
+        // `inst1` reads the value `inst0` defines. Give it a definition of its
+        // own, so that a value is defined by an instruction that reads.
+        let reader = Inst::try_new(1).unwrap();
+        let reg_class = input.func.values[Val::try_new(0).unwrap()].reg_class;
+        let derived = input
+            .func
+            .values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class,
+                    def: ValDef::InstResult { inst: reader, i: 0 },
+                    remat: 1,
+                },
+            )
+            .unwrap();
+        input.func.operands_mut(reader).push(Operand::new(
+            Position::Late,
+            DefUse::Def,
+            OperandConstraint::Any,
+            Some(derived),
+        ));
+
+        let actual = expect_invalid_with(&input.machine.build(), &input.func);
+        assert!(
+            matches!(
+                actual,
+                Error::RematOfDerivedValue { val, def: Some(def) }
+                    if val == derived && def == reader
+            ),
+            "expected an instruction `RematOfDerivedValue`, got {actual:?}",
+        );
     }
 
     #[test]

@@ -2409,6 +2409,22 @@ mod tests {
         }
     }
 
+    /// Each fixture still allocates correctly when every value that can be
+    /// rematerialized is, which is one switch that changes the shape of every
+    /// value's live ranges at once.
+    #[test]
+    fn the_corpus_all_checks_out_when_everything_is_rematerializable() {
+        for (i, mut seed) in crate::test::corpus().into_iter().enumerate() {
+            seed.set_remat_costs(Some(RematCost::AlwaysRemat));
+            let stats = check_allocation(&seed)
+                .unwrap_or_else(|e| panic!("seed {i} failed to check with remat costs: {e}"));
+            assert_eq!(
+                stats.too_many_live_regs, 0,
+                "seed {i} does not fit on its own machine, so nothing about it was checked",
+            );
+        }
+    }
+
     /// Tying a definition to a read of a value that survives the instruction
     /// costs no register beyond the two the value and the definition need.
     ///

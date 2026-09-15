@@ -2158,6 +2158,17 @@ where
     }
 }
 
+/// Does a piece being cut off reach the use that cut it?
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reach {
+    /// Yes: the two pieces abut, so a move between them has a source to read.
+    Yes,
+
+    /// No: the piece stops just past its own last point, leaving a gap that
+    /// whoever wants the value next fills by recomputing it.
+    No,
+}
+
 /// A piece of a span being accumulated, and the run of uses at its end.
 ///
 /// A run is the group of uses at one program point. When a definition ties
@@ -2185,6 +2196,9 @@ where
     /// The point of the earliest read folded in, if the piece holds any.
     first_read: Option<LivePoint<E>>,
 
+    /// Whether the piece holds the value's definition.
+    holds_def: bool,
+
     /// Where its run on uses starts.
     run_start: Use<E>,
 
@@ -2211,6 +2225,7 @@ where
             has_fixed_use: false,
             point: start,
             first_read: None,
+            holds_def: false,
             run_start: uses_start,
             run_constraint: OperandConstraint::Any,
             run_has_fixed_use: false,
@@ -2227,6 +2242,7 @@ where
             has_fixed_use: u.is_fixed,
             point: u.point,
             first_read: u.is_read.then_some(u.point),
+            holds_def: !u.is_read,
             run_start: u.use_,
             run_constraint: u.constraint,
             run_has_fixed_use: u.is_fixed,
@@ -2259,6 +2275,7 @@ where
         if self.first_read.is_none() && u.is_read {
             self.first_read = Some(u.point);
         }
+        self.holds_def |= !u.is_read;
         self.point = u.point;
     }
 
@@ -2287,6 +2304,51 @@ where
         }
     }
 
+    /// Push the piece so far as its own span, stopping short of `u`, and log
+    /// the cut.
+    ///
+    /// The caller is left to decide what accumulates `u` itself.
+    fn push_before(
+        &self,
+        spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
+        output: &mut OutputInner<E>,
+        events: &mut EventsLog<E>,
+        val: Val<E>,
+        block: Block<E>,
+        u: &ResolvedUse<E>,
+        reaches_u: Reach,
+    ) -> IResult<()> {
+        let end = match reaches_u {
+            Reach::Yes => core::cmp::max(u.point, self.point.next_point()),
+            // A piece holding the definition keeps its register until the
+            // instruction boundary, where a spill of the value would store it.
+            Reach::No if self.holds_def => self.point.inst_boundary_after(),
+            Reach::No => self.point.next_point(),
+        };
+        let before = push_span(
+            spans,
+            output,
+            events,
+            val,
+            (self.start, end),
+            (self.uses_start, u.use_),
+            self.constraint,
+            self.has_fixed_use,
+            block,
+        )?;
+        event!(
+            events,
+            EagerSplit {
+                val,
+                at: u.point,
+                before,
+                constraint: self.constraint,
+                conflicting: u.constraint,
+            }
+        );
+        Ok(())
+    }
+
     /// Cut the span just before `u`, which cannot join this piece.
     ///
     /// The piece so far becomes its own span, reaching far enough to cover its
@@ -2304,28 +2366,9 @@ where
         val: Val<E>,
         block: Block<E>,
         u: &ResolvedUse<E>,
+        reaches_u: Reach,
     ) -> IResult<Self> {
-        let before = push_span(
-            spans,
-            output,
-            events,
-            val,
-            (self.start, core::cmp::max(u.point, self.point.next_point())),
-            (self.uses_start, u.use_),
-            self.constraint,
-            self.has_fixed_use,
-            block,
-        )?;
-        event!(
-            events,
-            EagerSplit {
-                val,
-                at: u.point,
-                before,
-                constraint: self.constraint,
-                conflicting: u.constraint,
-            }
-        );
+        self.push_before(spans, output, events, val, block, u, reaches_u)?;
         Ok(Piece::restarting_at(
             u.point.inst_boundary_at_or_before(),
             u,
@@ -2437,10 +2480,13 @@ where
 ///
 /// * nothing can satisfy all of the uses constraints simultaneously,
 ///
-/// * a value is named as a `Reuse` target and outlives its instruction, or
+/// * a value is named as a `Reuse` target and outlives its instruction,
 ///
 /// * a use that could be in a register would unnecessarily be constrained to
-///   the stack.
+///   the stack, or
+///
+/// * the value is `RematCost::AlwaysRemat` and the next use is at a different
+///   instruction.
 fn push_span_and_split_conflicts<E>(
     input: &Input<'_, impl InputFunction>,
     uses: &PrimaryMap<Use<E>, UseData<E>>,
@@ -2455,9 +2501,31 @@ fn push_span_and_split_conflicts<E>(
 where
     E: EntityRepr,
 {
+    // A value we will always recompute holds a register only at the
+    // instructions that actually mention it, so each one gets its own piece.
+    let always_remat =
+        input.func.value(val.with_repr32()).remat_cost() == Some(RematCost::AlwaysRemat);
+
+    // And a block that never mentions such a value holds it nowhere at all:
+    // whoever wants it next recomputes it, so there is nothing to carry
+    // through, not even when the value is live on both sides.
+    if always_remat && span_uses.is_empty() && !is_passed_to_a_successor(input.func, block, val) {
+        return Ok(());
+    }
+
     let mut piece = Piece::empty(start, span_uses.start);
     for use_ in span_uses {
         let u = ResolvedUse::new(input, uses, use_);
+
+        // A value we will always recompute begins a fresh piece at every
+        // instruction that mentions it.
+        if always_remat && u.point.inst() != piece.point.inst() {
+            if piece.uses_start != use_ {
+                counts.eager_splits.inc();
+                piece.push_before(spans, output, events, val, block, &u, Reach::No)?;
+            }
+            piece = Piece::empty(u.point.inst_boundary_at_or_before(), use_);
+        }
 
         if u.needs_a_span_of_its_own(input, end) {
             debug_assert_eq!(u.point.pos(), Position::Early);
@@ -2480,7 +2548,7 @@ where
             // thing that does is a stack slot that a read on one side would
             // rather not be pinned to. Split the span, either way.
             _ => {
-                piece = piece.split_before(spans, output, events, val, block, &u)?;
+                piece = piece.split_before(spans, output, events, val, block, &u, Reach::Yes)?;
                 counts.eager_splits.inc();
             }
         }
@@ -2503,6 +2571,17 @@ where
         block,
     )?;
     Ok(())
+}
+
+/// Does `block` pass `val` as an argument to any of its successors?
+fn is_passed_to_a_successor<E>(func: &impl InputFunction, block: Block<E>, val: Val<E>) -> bool
+where
+    E: EntityRepr,
+{
+    let input_block = func.block(block.with_repr32());
+    let val = val.with_repr32();
+    (0..input_block.len_successors())
+        .any(|i| input_block.successor_block_args(i).any(|arg| arg == val))
 }
 
 /// Does a later operand tie a definition to another read of `index`'s value?
@@ -2892,6 +2971,19 @@ mod tests {
         operands
     }
 
+    /// Which values each block passes to a successor as a block-call argument.
+    fn all_block_args(func: &TestFunction) -> Set<(Block, Val)> {
+        let mut args = Set::new();
+        for (block, input_block) in func.blocks() {
+            for i in 0..input_block.len_successors() {
+                for val in input_block.successor_block_args(i) {
+                    args.insert((block, val));
+                }
+            }
+        }
+        args
+    }
+
     /// Which block each instruction belongs to.
     fn inst_blocks(func: &TestFunction) -> HashMap<Inst, Block> {
         let mut map = HashMap::new();
@@ -2925,7 +3017,202 @@ mod tests {
                 OperandConstraint::Any,
                 OperandConstraint::Any,
             ]),
+            // A value the allocator would always recompute, whose spans are
+            // therefore cut at every instruction and missing altogether from a
+            // block that never mentions it. Mutating outward from the broken
+            // shape is the only way the properties above see it.
+            {
+                let mut input = TestInput::with_a_value_read_in_two_distant_blocks();
+                input.set_remat_costs(Some(RematCost::AlwaysRemat));
+                input
+            },
+            // The same shape with a stack read and a block in between that
+            // needs every register, so that mutations reach the gaps with
+            // something at stake in them.
+            {
+                let mut input = TestInput::with_a_value_read_on_the_stack_past_a_crowded_block();
+                input.set_remat_costs(Some(RematCost::AlwaysRemat));
+                input
+            },
         ]
+    }
+
+    /// A value we will always recompute holds a register for one instruction
+    /// at a time: every instruction that mentions it gets its own piece, and
+    /// the stretches in between are nobody's.
+    #[test]
+    fn an_always_remat_value_gets_one_span_per_instruction() {
+        let any = OperandConstraint::Any;
+        let mut test_input = TestInput::with_use_constraints(&[any, any, any]);
+
+        // The control first: with no remat cost, one unbroken run from the def
+        // to the last use, since every gap would need a move to cross it.
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        assert_eq!(spans.len(), 1, "{spans:#?}");
+        assert_eq!(
+            spans[0].start(&live_ranges),
+            LivePoint::new(inst(0), Position::Late)
+        );
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            LivePoint::new(inst(3), Position::Late)
+        );
+
+        test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        let spans: Vec<LiveSpan> = live_ranges.spans().collect();
+        let geometry: Vec<(LivePoint<u32>, LivePoint<u32>)> = spans
+            .iter()
+            .map(|s| (s.start(&live_ranges), s.end(&live_ranges)))
+            .collect();
+
+        let early = |i| LivePoint::new(inst(i), Position::Early);
+        let late = |i| LivePoint::new(inst(i), Position::Late);
+        assert_eq!(
+            geometry,
+            vec![
+                // The def keeps its own start, and runs to the instruction
+                // boundary rather than stopping at its own point: a spill of
+                // the value stores it there, out of the register the definition
+                // wrote.
+                (late(0), early(1)),
+                // Then one piece per reading instruction, each ending at its
+                // use. The value is dead after the last one, so that piece
+                // stops there too.
+                (early(1), late(1)),
+                (early(2), late(2)),
+                (early(3), late(3)),
+            ],
+            "{spans:#?}"
+        );
+
+        // Each use is recorded by the piece that covers it, and none is lost to
+        // a gap.
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![late(0)]);
+        assert_eq!(points(spans[1]), vec![early(1)]);
+        assert_eq!(points(spans[2]), vec![early(2)]);
+        assert_eq!(points(spans[3]), vec![early(3)]);
+    }
+
+    /// A value we will always recompute is not handed to a block that has no
+    /// use for it yet: its span there begins at the instruction that reads it,
+    /// however long the value has been live.
+    #[test]
+    fn an_always_remat_span_starts_at_its_first_use_not_the_block_entry() {
+        let mut test_input = TestInput::with_a_value_read_in_two_distant_blocks();
+        test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+
+        let (liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let val = Val::try_new(0).unwrap();
+
+        // `block3` reads the value at its second instruction, and is live-in
+        // because of that read.
+        let block = Block::<u32>::try_new(3).unwrap();
+        assert!(block.is_live_in(&liveness, val));
+
+        test_input.with_input(|input| {
+            let in_block: Vec<LiveSpan> = live_ranges
+                .spans()
+                .filter(|s| s.block(input.func, &live_ranges) == block)
+                .collect();
+            assert_eq!(in_block.len(), 1, "{in_block:#?}");
+
+            let read = LivePoint::new(inst(7), Position::Early);
+            assert_eq!(in_block[0].start(&live_ranges), read);
+            assert!(
+                block.start_point(input) < read,
+                "the read is not the block's first point, so starting there is a \
+                 trim and not a coincidence"
+            );
+        });
+    }
+
+    /// A value we will always recompute keeps the tail of its last span in a
+    /// block it is live out of, even though nothing there reads it that late.
+    ///
+    /// Gaps elsewhere are free because a destination missing its source
+    /// recomputes the value instead. That escape is closed for one destination:
+    /// a successor's parameter that lives in a spill slot, filled across the
+    /// edge from the argument passed to it, since a `Remat` writes a register
+    /// and never a slot. Such an edge would reach the `unreachable!` in
+    /// `move_generation::MoveGenerator::resolve`, so the block's exit has to
+    /// have a span to read the value out of.
+    #[test]
+    fn an_always_remat_value_keeps_its_live_out_tail() {
+        let mut test_input = TestInput::with_a_value_read_in_two_distant_blocks();
+        test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+
+        let (liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let val = Val::try_new(0).unwrap();
+
+        // `block1` reads the value at its first instruction and nowhere else,
+        // and `block3` reads it again, so it is live out of `block1`.
+        let block = Block::<u32>::try_new(1).unwrap();
+        assert!(block.is_live_out(&liveness, val));
+
+        test_input.with_input(|input| {
+            let in_block: Vec<LiveSpan> = live_ranges
+                .spans()
+                .filter(|s| s.block(input.func, &live_ranges) == block)
+                .collect();
+            assert_eq!(in_block.len(), 1, "{in_block:#?}");
+
+            let read = LivePoint::new(inst(2), Position::Early);
+            assert_eq!(in_block[0].start(&live_ranges), read);
+            assert_eq!(
+                in_block[0].end(&live_ranges),
+                block.end_point(input),
+                "the span runs past its only use, all the way to the exit"
+            );
+        });
+    }
+
+    /// A block that never mentions a value we will always recompute holds it
+    /// nowhere, however live it is on both sides: nothing there wants it in a
+    /// register, and whoever wants it next recomputes it.
+    #[test]
+    fn an_always_remat_value_that_flows_through_a_block_gets_no_span() {
+        let mut test_input = TestInput::with_a_value_read_in_two_distant_blocks();
+        test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+
+        let (liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let val = Val::try_new(0).unwrap();
+
+        // `block2` is between the two reads, mentions neither the value nor any
+        // block argument, and the value is live across all of it.
+        let block = Block::<u32>::try_new(2).unwrap();
+        assert!(block.is_live_in(&liveness, val));
+        assert!(block.is_live_out(&liveness, val));
+
+        test_input.with_input(|input| {
+            let in_block: Vec<LiveSpan> = live_ranges
+                .spans()
+                .filter(|s| s.block(input.func, &live_ranges) == block)
+                .collect();
+            assert!(in_block.is_empty(), "{in_block:#?}");
+        });
+
+        // The control: without a remat cost the value has to be carried across
+        // the block, so it gets a span tiling the whole of it.
+        let test_input = TestInput::with_a_value_read_in_two_distant_blocks();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        test_input.with_input(|input| {
+            let in_block: Vec<LiveSpan> = live_ranges
+                .spans()
+                .filter(|s| s.block(input.func, &live_ranges) == block)
+                .collect();
+            assert_eq!(in_block.len(), 1, "{in_block:#?}");
+            assert_eq!(in_block[0].start(&live_ranges), block.start_point(input));
+            assert_eq!(in_block[0].end(&live_ranges), block.end_point(input));
+        });
     }
 
     /// The point of eager splitting, stated directly: a value whose uses want
@@ -3136,6 +3423,60 @@ mod tests {
             ],
             "{splits:#?}"
         );
+    }
+
+    /// The cut at every instruction is logged like any other eager split, once
+    /// per instruction that mentions the value.
+    #[test]
+    #[cfg(feature = "visualizer")]
+    fn per_instruction_splits_of_an_always_remat_value_are_logged() {
+        use crate::events::Event;
+
+        let any = OperandConstraint::Any;
+        let mut test_input = TestInput::with_use_constraints(&[any, any, any]);
+        test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
+
+        let val = live_ranges.spans().next().unwrap().val(&live_ranges);
+        let splits: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::EagerSplit {
+                    val,
+                    at,
+                    constraint,
+                    conflicting,
+                    ..
+                } => Some((*val, *at, *constraint, *conflicting)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            splits,
+            vec![
+                (val, LivePoint::new(inst(1), Position::Early), any, any),
+                (val, LivePoint::new(inst(2), Position::Early), any, any),
+                (val, LivePoint::new(inst(3), Position::Early), any, any),
+            ],
+            "{splits:#?}"
+        );
+
+        // And each piece the cuts left behind is itself logged, so the
+        // visualizer sees the whole broken shape and not just the last piece.
+        let constructed: Vec<_> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                Event::SpanConstructed {
+                    span, start, end, ..
+                } => Some((*span, *start, *end)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(constructed.len(), 4, "{constructed:#?}");
+        for (span, start, end) in constructed {
+            assert_eq!(start, span.start(&live_ranges));
+            assert_eq!(end, span.end(&live_ranges));
+        }
     }
 
     /// A reuse split names the use it was made for and the one-point span the
@@ -4460,6 +4801,15 @@ mod tests {
 
                 let num_values = func.len_values();
                 let operands = all_operands(func);
+                let block_args = all_block_args(func);
+
+                // A value we will always recompute is cut into one piece per
+                // instruction that mentions it, leaving gaps between them, so
+                // several of the properties below hold only in the unbroken
+                // shape every other value's live range has. See
+                // `push_span_and_split_conflicts`.
+                let always_remat =
+                    |val: Val| func.value(val).remat_cost() == Some(RematCost::AlwaysRemat);
                 let inst_block = inst_blocks(func);
                 let bounds: HashMap<Block, (LivePoint<u32>, LivePoint<u32>)> = func
                     .blocks()
@@ -4659,27 +5009,39 @@ mod tests {
                     }
                 }
 
-                // 2. A value has at most one span per block, and its spans
-                // barely overlap.
+                // 2. A value's pieces in a block ascend, and they barely
+                // overlap.
                 //
-                // Splitting a conflict is what makes it "at most one": a
-                // value's pieces in a block ascend and leave no gap, and may
-                // overlap only within the instruction the later one begins at,
-                // which it always does at that instruction's boundary. Anything
-                // wider, or a piece starting mid-instruction, would need a move
-                // where there is no gap to put one.
+                // Splitting is what makes several pieces out of one range. They
+                // may overlap only within the instruction the later one begins
+                // at, which it always does at that instruction's boundary.
+                // Anything wider, or a piece starting mid-instruction, would
+                // need a move where there is no gap to put one.
+                //
+                // Nor do they usually leave a gap, since the move out of one
+                // piece and into the next has to read the value from
+                // somewhere. The exception is a value we will always recompute,
+                // which is cut at every instruction precisely so that the
+                // stretches in between are registers nobody has to hold: the
+                // piece across such a gap recomputes the value rather than
+                // receiving it, so it begins at an instruction boundary and
+                // holds that instruction's uses.
                 for ((val, block), spans) in &spans_of {
                     for pair in spans.windows(2) {
                         let (previous, next) = (pair[0], pair[1]);
-                        if next.start(&live_ranges) < previous.start(&live_ranges)
-                            || next.start(&live_ranges) > previous.end(&live_ranges)
-                        {
+                        let (previous_start, previous_end) =
+                            (previous.start(&live_ranges), previous.end(&live_ranges));
+                        let next_start = next.start(&live_ranges);
+
+                        let ascends = previous_start <= next_start;
+                        let gap_is_legal = next_start <= previous_end
+                            || (always_remat(*val) && next_start.pos() == Position::Early);
+
+                        if !ascends || !gap_is_legal {
                             return Err(format!(
-                                "{val:?}'s spans in {block:?} are out of order or leave a gap: \
-                                 {:?}..{:?} is followed by {:?}..{:?}",
-                                previous.start(&live_ranges),
-                                previous.end(&live_ranges),
-                                next.start(&live_ranges),
+                                "{val:?}'s spans in {block:?} are out of order or leave a gap it \
+                                 has no way to fill: {previous_start:?}..{previous_end:?} is \
+                                 followed by {next_start:?}..{:?}",
                                 next.end(&live_ranges),
                             ));
                         }
@@ -4733,17 +5095,61 @@ mod tests {
 
                 for (block, input_block) in func.blocks() {
                     let (block_start, block_end) = bounds[&block];
+                    let first_inst = input_block.insts().next().unwrap().0;
                     let last_inst = input_block.insts().next_back().unwrap().0;
+
+                    // Does this block mention `val` at `inst`, or anywhere at
+                    // all?
+                    let mentioned_at = |inst: Inst, val: Val| {
+                        operands
+                            .iter()
+                            .any(|&(b, p, _i, _k, v)| b == block && p.inst() == inst && v == val)
+                    };
+                    let mentioned_anywhere = |val: Val| {
+                        operands
+                            .iter()
+                            .any(|&(b, _p, _i, _k, v)| b == block && v == val)
+                    };
+
+                    // Does this block hold the value anywhere at all?
+                    //
+                    // It always does for a value it mentions, and for any value
+                    // live across it -- except one we will always recompute,
+                    // which a block that never mentions it holds nowhere:
+                    // nothing here wants it in a register, and whoever wants it
+                    // next recomputes it. Passing it to a successor is the
+                    // exception, because a parameter that lands in a spill slot
+                    // is filled from the argument across the edge, and a
+                    // rematerialization writes a register and never a slot.
+                    let carried_through = |val: Val| {
+                        !always_remat(val)
+                            || mentioned_anywhere(val)
+                            || block_args.contains(&(block, val))
+                    };
 
                     // 3. A span starts at the block's entry exactly when its
                     // value is live-in there, or is defined by the very first
                     // program point in the block.
+                    //
+                    // A value we will always recompute is the exception, since
+                    // its pieces begin where its uses do: being live-in only
+                    // starts it at the entry when the first instruction is one
+                    // of the ones mentioning it, or when the block never
+                    // mentions it at all and the one piece carried through for
+                    // its successors is never cut.
                     let starting_at_entry: Set<Val> = spans_in[&block]
                         .iter()
                         .filter(|&&span| span.start(&live_ranges) == block_start)
                         .map(|&span| span.val(&live_ranges))
                         .collect();
-                    let mut expected: Set<Val> = block.live_in(&liveness).collect();
+                    let mut expected: Set<Val> = block
+                        .live_in(&liveness)
+                        .filter(|&val| {
+                            !always_remat(val)
+                                || mentioned_at(first_inst, val)
+                                || (!mentioned_anywhere(val) && carried_through(val))
+                        })
+                        .collect();
                     for &(b, point, _i, kind, val) in &operands {
                         if b == block && point == block_start && matches!(kind, DefUse::Def) {
                             expected.insert(val);
@@ -4778,7 +5184,10 @@ mod tests {
                         .filter(|&&span| span.end(&live_ranges) == block_end)
                         .map(|&span| span.val(&live_ranges))
                         .collect();
-                    let mut expected: Set<Val> = block.live_out(&liveness).collect();
+                    let mut expected: Set<Val> = block
+                        .live_out(&liveness)
+                        .filter(|&val| carried_through(val))
+                        .collect();
                     for &(b, point, _i, kind, val) in &operands {
                         if b != block || point.inst() != last_inst {
                             continue;
@@ -4852,27 +5261,48 @@ mod tests {
 
                     // 7. A value that flows straight through a block has a span
                     // that tiles the whole block, with no gap at either end.
+                    //
+                    // A value we will always recompute tiles only the far end.
+                    // Where it starts is property 3's business and the gaps its
+                    // pieces leave are property 2's, but its last piece still
+                    // has to reach the block's exit: a `Remat` writes a register
+                    // and never a slot, so an outgoing edge filling a
+                    // stack-allocated parameter has to find a source to read
+                    // rather than the `unreachable!` in `resolve`. And a block
+                    // that neither mentions such a value nor passes it on holds
+                    // it nowhere, however live it is on both sides.
                     for val_index in 0..num_values {
                         let val = Val::try_new(val_index).unwrap();
                         if !block.is_live_in(&liveness, val) || !block.is_live_out(&liveness, val) {
                             continue;
                         }
-                        let Some(spans) = spans_of.get(&(val, block)).filter(|s| !s.is_empty())
-                        else {
+                        let spans = spans_of.get(&(val, block)).filter(|s| !s.is_empty());
+                        let Some(spans) = spans else {
+                            if !carried_through(val) {
+                                continue;
+                            }
                             return Err(format!(
                                 "{val:?} is live across all of {block:?}, but does not have any \
                                  span there",
                             ));
                         };
+                        if !carried_through(val) {
+                            return Err(format!(
+                                "{block:?} neither mentions {val:?} nor passes it to a successor, \
+                                 and it is a value we would always recompute, so the block should \
+                                 hold it nowhere; it got {spans:?}",
+                            ));
+                        }
+
                         // Property 2 has already established that the pieces
-                        // are ascending and leave no gap, so tiling the block is
-                        // the first one starting at its entry and the last one
-                        // ending at its exit.
+                        // are ascending and, remat aside, leave no gap, so
+                        // tiling the block is the first one starting at its
+                        // entry and the last one ending at its exit.
                         let first = *spans.first().unwrap();
                         let last = *spans.last().unwrap();
-                        if first.start(&live_ranges) != block_start
-                            || last.end(&live_ranges) != block_end
-                        {
+                        let starts_at_entry =
+                            always_remat(val) || first.start(&live_ranges) == block_start;
+                        if !starts_at_entry || last.end(&live_ranges) != block_end {
                             return Err(format!(
                                 "{val:?} is live across all of {block:?}, but its spans cover \
                                  only {:?}..{:?} of {block_start:?}..{block_end:?}",

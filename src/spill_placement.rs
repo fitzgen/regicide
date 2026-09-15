@@ -55,7 +55,10 @@ use crate::{
     entity::{EntityRepr, EntitySet, Region, SecondaryMap},
     error::IResult,
     events::EventsLog,
-    input::{DefUse, Input, InputBlock as _, InputFunction, InputInst as _, Position},
+    input::{
+        DefUse, Input, InputBlock as _, InputFunction, InputInst as _, InputValue as _, Position,
+        RematCost,
+    },
     live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, Use},
     liveness::block_first_inst,
     output::OutputInner,
@@ -544,6 +547,15 @@ where
         live_ranges: &LiveRanges<E>,
         val_spans: &[LiveSpan<E>],
     ) {
+        let val = val_spans[0].val(live_ranges);
+
+        // Values that we can always rematerialize can be spilled whever we
+        // want, so don't waste time or space on recording their legal spill
+        // blocks.
+        if input.func.value(val.with_repr32()).remat_cost() == Some(RematCost::AlwaysRemat) {
+            return;
+        }
+
         let mut num_candidates = 0;
         let mut prev_block = None;
         for &span in val_spans {
@@ -568,7 +580,6 @@ where
             debug_assertions,
             feature = "visualizer",
         )) {
-            let val = val_spans[0].val(live_ranges);
             let mut prev_block = None;
             for &span in val_spans {
                 let block = span.block(input.func, live_ranges);
