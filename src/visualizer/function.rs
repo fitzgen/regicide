@@ -385,7 +385,13 @@ where
                         .block_point_edits(wide, wide)
                         .iter()
                         .map(|&(pos, edit)| {
-                            let MovePosition::Point(at) = pos.unpack() else {
+                            // A departure is a point too: it sits in the same
+                            // gap as `Point(at)`, just last within it, and the
+                            // visualizer draws the gap rather than the order
+                            // inside it.
+                            let (MovePosition::Point(at) | MovePosition::Departure(at)) =
+                                pos.unpack()
+                            else {
                                 unreachable!("`block_point_edits` only yields point positions")
                             };
                             PointEditInfo { at, edit }

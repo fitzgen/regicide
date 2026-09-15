@@ -887,8 +887,8 @@ mod tests {
             ("a_critical_edge", TestInput::with_a_critical_edge()),
             ("spilled_merge_param", TestInput::with_spilled_merge_param()),
             (
-                "a_move_after_an_unconditional_branch",
-                TestInput::with_a_move_after_an_unconditional_branch(),
+                "a_move_before_an_unconditional_branch",
+                TestInput::with_a_move_before_an_unconditional_branch(),
             ),
             (
                 "a_self_looping_entry_block",

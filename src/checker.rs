@@ -499,11 +499,10 @@ pub enum CheckerError {
     /// A move or rematerialization sits after a block's terminator, where the
     /// machine would never run it.
     ///
-    /// Running an edit there is the same as running it on the block's outgoing
-    /// edge, but only when the terminator is the whole of that edge: the block
-    /// must have a single successor, and the terminator must have no operands
-    /// of its own for the edit to disturb. Anything else belongs on the edge,
-    /// as a [`CriticalEdgeEdit`].
+    /// Move generation always places such an edit before the terminator
+    /// instead, so anything left over once a block's instructions are exhausted
+    /// is a bug. An edit that genuinely belongs on the outgoing edge is a
+    /// [`CriticalEdgeEdit`], which comes after every instruction by design.
     EditAfterTerminator {
         /// The [`Block`] whose edits contain it.
         block: Block,
@@ -811,8 +810,8 @@ impl fmt::Debug for CheckerError {
                 edit,
             } => write!(
                 f,
-                "{edit:?} in {block:?} comes after {terminator:?}, which is not an edge this \
-                 edit may be placed on"
+                "{edit:?} in {block:?} comes after its terminator {terminator:?}, where the \
+                 machine would never run it"
             ),
             Self::BadCriticalEdgeSuccessor {
                 block,
@@ -992,7 +991,7 @@ struct Stats {
     shrunk_entry_states: usize,
     entry_block_edges: usize,
     block_param_allocs: usize,
-    edits_after_terminator: usize,
+    unpinnable_param_arrivals: usize,
 }
 
 /// The abstract interpreter itself.
@@ -1155,6 +1154,11 @@ where
             .clone()
             .expect("only a block that the analysis reached is ever visited");
 
+        // The state as the block is entered, kept only when the block's
+        // parameters arrive in a gap it also departs from.
+        let entry_state =
+            (mode == Mode::Report && self.departs_from_its_first_gap(block)).then(|| state.clone());
+
         let mut insts_and_edits = output.block_insts_and_edits(func, block).peekable();
 
         // Apply the edits placed atop the block.
@@ -1192,19 +1196,15 @@ where
         // Now that the renaming and the top-of-block edits have happened, and
         // we are about to execute the block's instructions, check the block's
         // parameters.
-        self.check_block_params(&state, block, mode);
+        self.check_block_params(&state, entry_state.as_ref(), block, mode);
 
         // Now go through the block's instructions and any other edits in the
         // middle of the block.
         //
-        // Edits may follow the terminator, but only where running them there
-        // is the same as running them on the block's outgoing edge: one
-        // successor to take, and a terminator with no operands of its own to
-        // come between the edit and the edge. This is the contract
-        // `move_generation::edge_position` places them under.
+        // A move or rematerialization never follows the terminator. Only
+        // critical-edge edits come after them, and the loop below leaves those
+        // to the one that follows it.
         let terminator = crate::liveness::block_last_inst(&input_block);
-        let terminator_is_the_whole_edge =
-            input_block.len_successors() == 1 && func.inst(terminator).operands_len() == 0;
         let mut past_terminator = false;
         while insts_and_edits.peek().is_some_and(|item| {
             matches!(
@@ -1225,17 +1225,14 @@ where
                 }
             };
             if past_terminator {
-                self.stats.edits_after_terminator += 1;
-                if !terminator_is_the_whole_edge {
-                    self.error(
-                        mode,
-                        CheckerError::EditAfterTerminator {
-                            block,
-                            terminator,
-                            edit,
-                        },
-                    );
-                }
+                self.error(
+                    mode,
+                    CheckerError::EditAfterTerminator {
+                        block,
+                        terminator,
+                        edit,
+                    },
+                );
             }
             self.apply_edit(&mut state, block, edit, mode);
         }
@@ -1292,9 +1289,44 @@ where
         }
     }
 
+    /// Do the edits before `block`'s first instruction include the moves for an
+    /// edge *leaving* it?
+    ///
+    /// Move generation puts an edge's moves at the top of the successor when it
+    /// can, and otherwise last in the gap before the predecessor's terminator.
+    /// When a block's terminator is its only instruction those are the same gap,
+    /// so a block can both receive its parameters there and hand its own
+    /// arguments on from there.
+    fn departs_from_its_first_gap(&self, block: Block) -> bool {
+        let func = self.input.func;
+        let input_block = func.block(block);
+
+        // The two gaps are one gap only in a block of a single instruction, and
+        // the departing moves only go there when the edge could not put them at
+        // the top of the successor instead.
+        let (first, terminator) = crate::liveness::block_inst_bounds(&input_block);
+        if first != terminator || input_block.len_successors() != 1 {
+            return false;
+        }
+        if func.inst(terminator).operands_len() != 0 {
+            return false;
+        }
+        let Some(succ) = input_block.successors().next() else {
+            return false;
+        };
+        let succ_block = func.block(succ);
+        !(succ_block.len_predecessors() == 1 && succ != func.entry_block())
+    }
+
     /// Check that each of `block`'s parameters really is where
     /// `Output::block_param_allocs` says it arrives.
-    fn check_block_params(&mut self, state: &State, block: Block, mode: Mode) {
+    fn check_block_params(
+        &mut self,
+        state: &State,
+        entry_state: Option<&State>,
+        block: Block,
+        mode: Mode,
+    ) {
         if mode != Mode::Report {
             return;
         }
@@ -1320,6 +1352,16 @@ where
         // be checked against them.
         let mut param_locs: Vec<(Val, ScalarAllocation)> = Vec::new();
 
+        // What still witnesses the arrival: `state`, unless the block departs
+        // from the gap it arrives in, which leaves `entry_state`. That pins the
+        // arrival only with two or more predecessors, since `edge_position`
+        // hosts an edge's moves atop a single-predecessor successor only.
+        let arrival = match entry_state {
+            None => Some(state),
+            Some(entry_state) if func.block(block).len_predecessors() > 1 => Some(entry_state),
+            Some(_) => None,
+        };
+
         for (param, &alloc) in func
             .block(block)
             .params()
@@ -1341,15 +1383,17 @@ where
             self.check_def_is_allocatable(site, &scalars, mode);
 
             for (index, loc) in scalars.into_iter().enumerate() {
-                if !state.holds(loc, Part { val: param, index }) {
-                    self.error(
+                match arrival {
+                    None => self.stats.unpinnable_param_arrivals += 1,
+                    Some(arrival) if !arrival.holds(loc, Part { val: param, index }) => self.error(
                         mode,
                         CheckerError::MisplacedBlockParam {
                             block,
                             param,
                             alloc,
                         },
-                    );
+                    ),
+                    Some(_) => {}
                 }
 
                 // Exclusivity, which the check above does not give: however
@@ -2341,8 +2385,8 @@ mod tests {
             ENTRY_BLOCK_EDGES: entry_block_edges = "an edge arriving at the entry block",
             BLOCK_PARAM_ALLOCS: block_param_allocs =
                 "a block parameter the results give a location",
-            EDITS_AFTER_TERMINATOR: edits_after_terminator =
-                "an edit placed after a block's terminator",
+            UNPINNABLE_PARAM_ARRIVALS: unpinnable_param_arrivals =
+                "a block parameter arriving in a gap the block also departs from",
         }
     }
 
@@ -2994,34 +3038,61 @@ mod tests {
         assert!(error.contains("rather than the 1 byte(s)"), "{error}");
     }
 
-    /// A move or rematerialization placed after a block's terminator is only
-    /// where the machine will run it when the terminator is the whole of the
-    /// block's outgoing edge.
+    /// The position of the late half of `inst`, where an edit would sit after
+    /// that instruction rather than before it.
     ///
-    /// Nothing else asks this: such an edit is applied to the block's state
+    /// Generic over the entity representation because the negative-test macros
+    /// run their perturbation once per representation the crate was built
+    /// with; the position being assigned to picks `E`.
+    fn late_point_of<E: crate::EntityRepr>(
+        inst: usize,
+    ) -> crate::move_generation::PackedMovePosition<E> {
+        let inst = crate::entity::Inst::<E>::try_new(inst).unwrap();
+        crate::move_generation::PackedMovePosition::point(crate::live_ranges::LivePoint::new(
+            inst,
+            Position::Late,
+        ))
+    }
+
+    /// A move or rematerialization never comes after a block's terminator,
+    /// where the machine would jump away before reaching it.
+    ///
+    /// An edge whose moves its predecessor's terminator can host gets them
+    /// placed immediately *before* that terminator, so that a block's edits
+    /// always run among the block's own instructions. Anything that truly
+    /// belongs on the edge is a `CriticalEdgeEdit`, which comes after every
+    /// instruction by design and is checked separately.
+    ///
+    /// Nothing else catches this: such an edit is applied to the block's state
     /// like any other, and the state cannot tell that the machine jumped away
     /// before reaching it.
     #[test]
-    fn checks_that_an_edit_after_a_terminator_is_on_an_edge_it_may_be_on() {
-        let mut test_input = TestInput::with_a_move_after_an_unconditional_branch();
+    fn checks_that_no_edit_comes_after_a_terminator() {
+        // The fixture exists to make move generation host an edge's move on an
+        // operandless unconditional branch, which is the one shape that could
+        // put an edit after a terminator. Allocating it cleanly is the
+        // assertion that the move landed before the branch instead.
+        let test_input = TestInput::with_a_move_before_an_unconditional_branch();
         let stats = check_allocation(&test_input).unwrap();
         assert!(
-            stats.edits_after_terminator > 0,
-            "the fixture should place an edit after one of its unconditional branches",
+            stats.reg_reg_moves > 0,
+            "the fixture should move the block parameter between registers",
         );
 
-        // Give the branch that hosts the edit a second outgoing edge, going
-        // to the same place with the same argument. Nothing about where the
-        // machine goes changes, but the block no longer leaves along the one
-        // edge, so the code after its terminator is no longer that edge's.
-        let allocated = test_input.clone();
-        test_input
-            .func
-            .duplicate_block_call(Inst::try_new(4).unwrap(), 0);
-
-        let error = check_against(&allocated, &test_input).unwrap_err();
+        // Now push that move to the late half of `block1`'s terminator, which
+        // is where it would go if move generation stopped placing it before
+        // the branch. Re-sort, since the edits are kept in program order.
+        let error = check_with_broken_edits!(&test_input, |edits| {
+            for (pos, edit) in edits.iter_mut() {
+                if matches!(edit, Edit::Move(_)) {
+                    *pos = late_point_of(4);
+                }
+            }
+            edits.sort_by_key(|&(pos, _)| pos);
+        })
+        .unwrap_err();
         assert!(
-            error.contains("which is not an edge this edit may be placed on"),
+            error.contains("comes after its terminator inst4"),
             "{error}",
         );
     }
@@ -3093,7 +3164,7 @@ mod tests {
     #[test]
     fn checks_that_a_definition_is_not_put_in_a_non_allocatable_register() {
         // An instruction's definition.
-        let mut test_input = TestInput::with_a_move_after_an_unconditional_branch();
+        let mut test_input = TestInput::with_a_move_before_an_unconditional_branch();
         let sp = test_input.machine.push_non_allocatable_reg(0);
         check_allocation(&test_input).unwrap();
 
@@ -3138,7 +3209,7 @@ mod tests {
     /// source holding nothing the checker can name justifies nothing at all.
     #[test]
     fn checks_what_a_move_into_a_non_allocatable_register_carries() {
-        let mut test_input = TestInput::with_a_move_after_an_unconditional_branch();
+        let mut test_input = TestInput::with_a_move_before_an_unconditional_branch();
         let sp = test_input.machine.push_non_allocatable_reg(0);
         let stats = check_allocation(&test_input).unwrap();
         assert!(

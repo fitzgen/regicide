@@ -302,16 +302,6 @@ impl InstData {
         }
     }
 
-    /// This instruction's block-call list itself, mutably, so that outgoing
-    /// edges can be added and removed.
-    #[cfg(test)]
-    fn block_call_list_mut(&mut self) -> Option<&mut Vec<BlockCall>> {
-        match self {
-            InstData::Op { .. } => None,
-            InstData::Branch { targets, .. } => Some(targets),
-        }
-    }
-
     /// This instruction's operand list itself, mutably, so that operands can
     /// be added and removed.
     #[cfg(test)]
@@ -576,18 +566,6 @@ impl TestFunction {
     #[cfg(test)]
     pub(crate) fn set_block_call_target(&mut self, inst: Inst, call: usize, target: Block) {
         self.insts[inst].block_calls_mut()[call].target = target;
-    }
-
-    /// Give a branch a second copy of one of its outgoing edges, so that the
-    /// block has more successors than before without changing where any of
-    /// them go or what they carry. Without repair.
-    #[cfg(test)]
-    pub(crate) fn duplicate_block_call(&mut self, inst: Inst, call: usize) {
-        let calls = self.insts[inst]
-            .block_call_list_mut()
-            .expect("only a branch has outgoing edges");
-        let call = calls[call].clone();
-        calls.push(call);
     }
 
     /// Repair this function until it is well formed: a terminated,
@@ -3883,7 +3861,7 @@ impl TestInput {
         input
     }
 
-    /// An input with a move placed after a block's terminator.
+    /// An input with a move placed just before a block's terminator.
     ///
     /// Two predecessors of a merge block pass *different* values for its one
     /// parameter, so at least one of the two edges needs a move to put the
@@ -3894,9 +3872,10 @@ impl TestInput {
     /// `block1 -> block3` edge.
     ///
     /// `block1` ends in an unconditional branch with no operands of its own,
-    /// which is the one shape that lets move generation place that move after
-    /// the predecessor's terminator rather than splitting the edge.
-    pub fn with_a_move_after_an_unconditional_branch() -> Self {
+    /// which is the one shape that lets move generation host that move on the
+    /// predecessor's terminator rather than splitting the edge. The move goes
+    /// immediately before that terminator, never after it.
+    pub fn with_a_move_before_an_unconditional_branch() -> Self {
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
 
@@ -4842,7 +4821,7 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_two_entry_params(),
         TestInput::with_entry_params_in_two_banks(),
         TestInput::with_a_self_looping_entry_block(),
-        TestInput::with_a_move_after_an_unconditional_branch(),
+        TestInput::with_a_move_before_an_unconditional_branch(),
         TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
         TestInput::with_a_reuse_of_a_pinned_read(),
     ]

@@ -655,7 +655,11 @@ impl<'a> Output<'a> {
     /// rematerialization, or a request to split a critical edge, to be inserted
     /// at the point the iterator yields it.
     ///
-    /// Edits leaving the block on a critical edge come last, after every
+    /// A move or a rematerialization never comes after the block's terminator,
+    /// where the machine would jump away before reaching it: the moves for an
+    /// outgoing edge that the terminator could host go in the gap immediately
+    /// *before* it. An edit that has no such home inside the block is an
+    /// [`Edit::CriticalEdge`] instead, and those come last, after every
     /// instruction.
     pub fn block_insts_and_edits(&self, func: &impl InputFunction, block: Block) -> OutputIter<'_> {
         let inner = with_inner_wrapped!(self, OutputIterInner, |inner| block_iter(

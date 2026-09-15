@@ -1251,7 +1251,7 @@ mod viz_enabled {
         E: EntityRepr,
     {
         match pos.unpack() {
-            MovePosition::Point(point) => visit_point(point, f),
+            MovePosition::Point(point) | MovePosition::Departure(point) => visit_point(point, f),
             MovePosition::CriticalEdge { pred, succ: _ } => f(EntityRef::Block(pred)),
         }
     }

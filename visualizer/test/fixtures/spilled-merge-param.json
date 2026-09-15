@@ -279,9 +279,9 @@
       },
       "kind": "HalfMoveSource",
       "pos": {
-        "point": {
+        "departure": {
           "inst": 2,
-          "pos": "late"
+          "pos": "early"
         }
       },
       "replaced": null,
@@ -306,9 +306,9 @@
       },
       "kind": "HalfMoveSource",
       "pos": {
-        "point": {
+        "departure": {
           "inst": 3,
-          "pos": "late"
+          "pos": "early"
         }
       },
       "replaced": null,
@@ -320,9 +320,9 @@
       },
       "kind": "HalfMoveDest",
       "pos": {
-        "point": {
+        "departure": {
           "inst": 2,
-          "pos": "late"
+          "pos": "early"
         }
       },
       "val": 0
@@ -333,9 +333,9 @@
       },
       "kind": "HalfMoveDest",
       "pos": {
-        "point": {
+        "departure": {
           "inst": 3,
-          "pos": "late"
+          "pos": "early"
         }
       },
       "val": 0
@@ -403,9 +403,9 @@
       },
       "kind": "MoveResolved",
       "pos": {
-        "point": {
+        "departure": {
           "inst": 2,
-          "pos": "late"
+          "pos": "early"
         }
       },
       "src": {
@@ -435,9 +435,9 @@
       },
       "kind": "MoveResolved",
       "pos": {
-        "point": {
+        "departure": {
           "inst": 3,
-          "pos": "late"
+          "pos": "early"
         }
       },
       "src": {
@@ -477,9 +477,9 @@
       "num_input_moves": 1,
       "num_solved_moves": 0,
       "pos": {
-        "point": {
+        "departure": {
           "inst": 2,
-          "pos": "late"
+          "pos": "early"
         }
       }
     },
@@ -499,9 +499,9 @@
       "num_input_moves": 1,
       "num_solved_moves": 0,
       "pos": {
-        "point": {
+        "departure": {
           "inst": 3,
-          "pos": "late"
+          "pos": "early"
         }
       }
     },

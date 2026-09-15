@@ -69,6 +69,7 @@ pub use input::{
     InputFunction, InputInst, InputOptions, InputValue, MoveEliminationLevel, Operand,
     OperandConstraint, Position, RematCost,
 };
+pub use live_ranges::MAX_OPERANDS_PER_INST;
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
 pub use output::{
     Allocation, CriticalEdgeEdit, EdgeEdit, Edit, InstOrEdit, Move, Output, OutputIter,

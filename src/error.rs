@@ -333,7 +333,10 @@ pub enum Error {
     /// Too many live registers were requested at a single program point.
     TooManyLiveRegs,
 
-    /// An instruction has more operands than supported.
+    /// An instruction has more operands than [`MAX_OPERANDS_PER_INST`], the
+    /// most this allocator supports.
+    ///
+    /// [`MAX_OPERANDS_PER_INST`]: crate::MAX_OPERANDS_PER_INST
     TooManyOperands {
         /// The [`Inst`] instruction with too many operands.
         inst: Inst,

@@ -646,6 +646,13 @@ mod tests {
                 TestInput::with_an_entry_param_read_two_ways,
             ),
             ("stack_param_and_arg", TestInput::with_stack_param_and_arg),
+            // This one hosts an edge's moves in the gap before an operandless
+            // unconditional branch, which is the only way a `Departure` edit
+            // reaches `block_point_edits`. Rendering it at all is the check.
+            (
+                "a_move_before_an_unconditional_branch",
+                TestInput::with_a_move_before_an_unconditional_branch,
+            ),
         ];
 
         let mut largest = ("", 0);

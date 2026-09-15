@@ -41,7 +41,8 @@
 //!
 //! 2. Before `P`'s terminator, when `P` has one successor and that terminator
 //!    has no operands, so the move can neither run on another edge nor clobber
-//!    a register the terminator reads or defines.
+//!    a register the terminator reads or defines. It goes last in that gap,
+//!    after `P`'s own moves, since it reads what they leave behind.
 //!
 //! 3. Otherwise the edge is *critical* and the move goes on the edge itself, as
 //!    an `Edit::CriticalEdge`. This delays critical-edge splitting until
@@ -131,9 +132,14 @@ pub(crate) enum MovePosition<E>
 where
     E: EntityRepr,
 {
-    /// In the gap before `point.inst()`, ordered within that gap by
-    /// `point.pos()`.
+    /// At `point`: before `point.inst()` when the point is that instruction's
+    /// early half, and after it when the point is its late half.
     Point(LivePoint<E>),
+
+    /// In the same gap between instructions as `Point(point)`, but these moves
+    /// happen after `Point` moves. This is used to resolve inter-block moves
+    /// just before the terminator without conflicting with intra-block moves.
+    Departure(LivePoint<E>),
 
     /// On the critical edge that is `pred`'s `succ`th outgoing edge.
     CriticalEdge {
@@ -156,7 +162,8 @@ where
     /// +--------+--------+--------+
     ///
     /// `tag = 0` is a point inside a block: `hi` is a `LivePoint`'s bits and
-    /// `lo` is zero.
+    /// `lo` orders the batches sharing that point, `IN_THE_GAP` before
+    /// `DEPARTING`.
     ///
     /// `tag = 1` is a critical edge: `hi` is the predecessor's index and `lo`
     /// is which of the predecessor's outgoing edges it is. The predecessor
@@ -194,9 +201,21 @@ where
     const TAG_SHIFT: u32 = Self::HI_SHIFT + Self::HI_BITS;
     const TAG_BITS: u32 = 1;
 
+    /// A block's own moves at a point, which run first.
+    const IN_THE_GAP: usize = 0;
+
+    /// The moves for an edge leaving the block, which run last.
+    const DEPARTING: usize = 1;
+
     /// Create a move in the gap at `point`.
-    fn point(point: LivePoint<E>) -> Self {
-        Self::pack(0, point.to_bits(), 0)
+    pub(crate) fn point(point: LivePoint<E>) -> Self {
+        Self::pack(0, point.to_bits(), Self::IN_THE_GAP)
+    }
+
+    /// Create a move in the gap at `point` for an edge leaving the block, after
+    /// everything else there.
+    fn departure(point: LivePoint<E>) -> Self {
+        Self::pack(0, point.to_bits(), Self::DEPARTING)
     }
 
     /// Create a move on `pred`'s `succ`th outgoing edge.
@@ -250,8 +269,13 @@ where
 
     pub(crate) fn unpack(self) -> MovePosition<E> {
         if self.is_point() {
-            debug_assert_eq!(self.lo(), 0);
-            MovePosition::Point(LivePoint::from_bits(self.hi()))
+            let point = LivePoint::from_bits(self.hi());
+            if self.lo() == Self::IN_THE_GAP {
+                MovePosition::Point(point)
+            } else {
+                debug_assert_eq!(self.lo(), Self::DEPARTING);
+                MovePosition::Departure(point)
+            }
         } else {
             let pred = Block::try_new(self.hi()).unwrap();
             let succ = self.lo();
@@ -272,7 +296,7 @@ where
     /// free over.
     pub(crate) fn range(self, input: &Input<'_, impl InputFunction>) -> Range<LivePoint<E>> {
         let point = match self {
-            MovePosition::Point(point) => point,
+            MovePosition::Point(point) | MovePosition::Departure(point) => point,
             MovePosition::CriticalEdge { pred, .. } => pred.end_point(input).prev_point(),
         };
         point..point.next_point()
@@ -1553,7 +1577,7 @@ where
     E: EntityRepr,
 {
     match pos.unpack() {
-        MovePosition::Point(_) => Ok(match edit {
+        MovePosition::Point(_) | MovePosition::Departure(_) => Ok(match edit {
             EdgeEdit::Move(mv) => Edit::Move(mv),
             EdgeEdit::Remat(remat) => Edit::Remat(remat),
         }),
@@ -1598,10 +1622,10 @@ where
         return Ok(PackedMovePosition::point(edge.succ.start_point(input)));
     }
 
-    // Can we place the move at the end of the predecessor? The predecessor must
-    // have a single successor (or else we might clobber other edges' values)
-    // and its terminator must not read or write a register (or else the
-    // terminator could clobber our move or we could clobber one of its
+    // Can we place the move just before the predecessor's terminator? The
+    // predecessor must have a single successor (or else we might clobber other
+    // edges' values) and its terminator must not read or write a register (or
+    // else the terminator could clobber our move or we could clobber one of its
     // operands).
     let pred_block = input.func.block(edge.pred.with_repr32());
     if pred_block.len_successors() == 1 {
@@ -1610,9 +1634,12 @@ where
             let last = last
                 .with_repr::<E>()
                 .expect("every instruction index already fit in `E` in the earlier passes");
-            return Ok(PackedMovePosition::point(LivePoint::new(
+            return Ok(PackedMovePosition::departure(LivePoint::new(
                 last,
-                Position::Late,
+                // The move goes at the terminator's early point, i.e. before
+                // the terminator, because control jumps away from this block
+                // once the terminator executes.
+                Position::Early,
             )));
         }
     }
@@ -2152,35 +2179,29 @@ mod tests {
                     // checked per edge below.
                     check(&state, &stored_at(early, &|val| val), &(block, inst))?;
 
-                    // The gap before a terminator also holds moves for the
+                    // Everything the instruction reads must be in place by
+                    // now. Nothing runs between here and the instruction: a
+                    // point edit is only ever at an early point, since
+                    // `LivePoint::inst_boundary_after` always lands on one and
+                    // `emit_half_moves` asserts it.
+                    check(&state, &needed_at(inst), &(block, inst))?;
+
+                    // The gap before a terminator ends with the moves for the
                     // outgoing edges, checked per edge below; everything else
-                    // must be in place before the instruction runs.
-                    let departure = inst == last && has_successors;
-                    if departure {
-                        check(&state, &needed_at(inst), &(block, inst))?;
+                    // had to be in place before them, since they read it.
+                    if inst == last && has_successors {
                         apply(
                             &mut state,
                             input,
-                            &batch(PackedMovePosition::point(LivePoint::new(
+                            &batch(PackedMovePosition::departure(LivePoint::new(
                                 inst,
-                                Position::Late,
+                                Position::Early,
                             ))),
                             &mut seen,
                         );
                         // An edge's moves must not clobber what the terminator
                         // still reads.
                         check(&state, &read_by(inst), &(block, inst))?;
-                    } else {
-                        apply(
-                            &mut state,
-                            input,
-                            &batch(PackedMovePosition::point(LivePoint::new(
-                                inst,
-                                Position::Late,
-                            ))),
-                            &mut seen,
-                        );
-                        check(&state, &needed_at(inst), &(block, inst))?;
                     }
                 }
             }
@@ -2258,7 +2279,7 @@ mod tests {
 
                     // The three places this edge's moves can go.
                     let before_pos =
-                        PackedMovePosition::point(LivePoint::new(last, Position::Late));
+                        PackedMovePosition::departure(LivePoint::new(last, Position::Early));
                     let edge_pos =
                         PackedMovePosition::critical_edge(pred, u16::try_from(index).unwrap());
                     let arrival_pos = PackedMovePosition::point(entry);
@@ -2307,8 +2328,9 @@ mod tests {
                         }
                     }
 
-                    // Everything between the two blocks, in order: before the
-                    // terminator, on the edge, then atop the successor.
+                    // Everything between the two blocks, in order: the end of
+                    // the gap before the terminator, the edge itself, then the
+                    // top of the successor.
                     let before = batch(before_pos);
                     let arrival = batch(arrival_pos);
                     let moved = !before.is_empty() || !on_edge.is_empty() || !arrival.is_empty();
