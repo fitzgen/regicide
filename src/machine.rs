@@ -206,7 +206,7 @@ define_fixed_size_entities! {
     /// All registers in a `RegClass` must be associated with the same
     /// [`RegBank`].
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct RegClass: u8 = "rc";
+    pub struct RegClass: u16 = "rc";
 
 
     /// A set of registers of the same "kind".
@@ -312,7 +312,7 @@ impl RegGroup {
 
 impl RegClass {
     /// The maximum number of `RegClass`es that the user may define.
-    pub const MAX: usize = 64;
+    pub const MAX: usize = 512;
 
     /// The maximum number of `RegClass`es supported, including the ones that
     /// `MachineBuilder::finish` derives.
@@ -1837,21 +1837,36 @@ mod tests {
     }
 
     /// Closing the class list under intersection can blow up, and when it does
-    /// `finish` must say so rather than derive its way past `RegClass::MAX`.
+    /// `finish` must say so rather than derive its way past
+    /// `RegClass::MAX_INCLUDING_DERIVED`.
     ///
-    /// Eight classes of the form "every register except `r_i`" have all 256
-    /// "every register except `S`" subsets in their closure.
+    /// `k` classes of the form "every register except `r_i`" have all `2^k - 1`
+    /// "every register except `S`" subsets in their closure, so the smallest
+    /// `k` that overflows the cap is `log2(cap) + 1`: eight when the cap was
+    /// 128, eleven now that it is 1024.
     #[test]
     fn reject_too_many_derived_classes() {
+        let k = RegClass::MAX_INCLUDING_DERIVED.ilog2() as usize + 1;
+        assert!(
+            (1_usize << k) - 1 > RegClass::MAX_INCLUDING_DERIVED,
+            "the closure has to overflow the cap for this test to test anything",
+        );
+        assert!(
+            k <= RegClass::MAX,
+            "and the user must be allowed to define it"
+        );
+
         let mut builder = MachineBuilder::new();
         let bank = builder
             .declare_reg_bank(SpillSlotSize::new(8).unwrap())
             .unwrap();
-        let r: Vec<Reg> = (0..16)
+        // One more register than there are classes, so that intersecting all of
+        // them still leaves a member and no intersection is empty.
+        let r: Vec<Reg> = (0..k + 1)
             .map(|i| builder.define_reg(bank, unit(i)..unit(i + 1)).unwrap())
             .collect();
 
-        for i in 0..8 {
+        for i in 0..k {
             let members: Vec<Reg> = r
                 .iter()
                 .copied()

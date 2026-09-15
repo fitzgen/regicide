@@ -594,12 +594,13 @@ mod tests {
     /// can never hold.
     #[test]
     fn fixed_entities_are_as_small_as_they_claim() {
-        assert_eq!(mem::size_of::<RegClass>(), 1);
+        assert_eq!(mem::size_of::<RegClass>(), 2);
         assert_eq!(mem::size_of::<RegUnit>(), 2);
 
         // Being a `NonZero` inside is what makes the niche available, which is
-        // what keeps `Machine`'s intersection table one byte per entry.
-        assert_eq!(mem::size_of::<Option<RegClass>>(), 1);
+        // what keeps `Machine`'s intersection table two bytes per entry rather
+        // than four.
+        assert_eq!(mem::size_of::<Option<RegClass>>(), 2);
         assert_eq!(mem::size_of::<Option<RegUnit>>(), 2);
     }
 
