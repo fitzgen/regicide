@@ -13,6 +13,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::ops::Range;
 use mutatis::{DefaultMutate, Generate, Mutate};
 
 /// A location a generated move can read or write.
@@ -42,12 +43,16 @@ pub struct TestMove {
 /// A batch of parallel moves to solve, and the model machine to solve it on.
 ///
 /// Moves name registers through `regs`, a table of names several of which may
-/// name one physical register the way `x0` and `w0` do, so that the solver's
-/// `overlaps` closure does real work. Aliasing is all-or-nothing, never
-/// partial, which is all the solver supports and all move generation hands it.
+/// cover the same register units the way `x0` and `w0` do, so that the
+/// solver's `overlaps` closure does real work. Aliasing may be *partial*: a
+/// two-unit name can cover two one-unit names that do not cover each other,
+/// the way a wide vector register covers two narrow ones in another bank.
+/// `overlaps` is then reflexive and symmetric but not transitive, which is all
+/// the solver may assume of it.
 #[derive(Clone, Debug, Hash)]
 pub struct TestParallelMoves {
-    /// For each register name, which physical register it names.
+    /// For each register name, the range of register units it covers, as a
+    /// width of one or two units and a start. See [`TestParallelMoves::decode`].
     regs: Vec<u8>,
 
     /// The moves in the batch.
@@ -79,6 +84,14 @@ pub struct TestParallelMovesOutcome {
     /// for had to be a different one than the cycle was already using?
     pub nested_scratch: bool,
 
+    /// Did it route one whose two ends are *wide*, so that the scratch it
+    /// asked for had to be wide too?
+    pub routed_wide_stack_to_stack: bool,
+
+    /// Did the solver break a cycle while another cycle's value was still
+    /// parked, so that two scratch locations held a value at once?
+    pub concurrent_scratches: bool,
+
     /// Did the solver give up because no scratch location was available?
     pub refused: bool,
 }
@@ -96,29 +109,42 @@ impl Default for TestParallelMoves {
 }
 
 impl TestParallelMoves {
-    /// How many physical registers the model machine has, besides the scratch.
-    /// Few, so that generated batches collide and cycles arise on their own.
-    pub(crate) const NUM_PHYS_REGS: u8 = 4;
+    /// How many register units the model machine has. Few, so that generated
+    /// batches collide and cycles arise on their own.
+    const NUM_UNITS: usize = 4;
+
+    /// The widest a register name, scratch or spill slot is.
+    const MAX_WIDTH: usize = 2;
 
     /// How many spill slots the model machine has.
-    const NUM_SLOTS: u8 = 3;
+    const NUM_SLOTS: u8 = 4;
 
-    /// The ceiling on register names; more than there are physical registers,
-    /// so that aliasing happens.
+    /// The ceiling on register names; more than there are register units, so
+    /// that aliasing happens.
     const MAX_REG_NAMES: usize = 6;
 
     /// The ceiling on how many moves a batch holds.
     const MAX_MOVES: usize = 8;
 
-    /// The scratch registers' names: outside the generated name table, and
-    /// naming registers no generated move can reach. Two of them, because a
-    /// move from one slot to another needs somewhere to pass through even
-    /// when it sits inside a cycle that is already using a scratch.
-    const SCRATCH_NAMES: [usize; 2] = [Self::MAX_REG_NAMES, Self::MAX_REG_NAMES + 1];
+    /// How many scratches of each width the model machine has, named outside
+    /// the generated name table so that no generated move can reach them.
+    ///
+    /// A cycle break parks a value in one until its move is emitted, and
+    /// partial overlap lets one batch have several parked at once, so one per
+    /// move in the batch is always enough.
+    const NUM_SCRATCHES: usize = Self::MAX_MOVES;
 
-    /// How many distinct locations the model machine has.
-    const NUM_LOCATIONS: usize =
-        Self::NUM_PHYS_REGS as usize + Self::SCRATCH_NAMES.len() + Self::NUM_SLOTS as usize;
+    /// Where the scratches' cells begin, after the register units that
+    /// generated names cover.
+    const SCRATCH_CELLS: usize = Self::NUM_UNITS;
+
+    /// Where the spill slots' cells begin, after the scratches'.
+    const SLOT_CELLS: usize =
+        Self::SCRATCH_CELLS + Self::NUM_SCRATCHES * Self::MAX_WIDTH * Self::MAX_WIDTH;
+
+    /// How many cells the model machine has in all: one per register unit,
+    /// plus private cells for each scratch and each spill slot.
+    const NUM_CELLS: usize = Self::SLOT_CELLS + Self::NUM_SLOTS as usize * Self::MAX_WIDTH;
 
     /// A batch of moves on a model machine with the given register names,
     /// repaired to satisfy the solver's preconditions.
@@ -133,15 +159,15 @@ impl TestParallelMoves {
     }
 
     /// Clamp the model machine's size, bring every name and index in range,
-    /// and drop moves that would leave the batch undefined: a location may be
-    /// written by only one move.
+    /// and drop moves the solver's preconditions do not allow.
     fn fixup(&mut self) {
         self.regs.truncate(Self::MAX_REG_NAMES);
         if self.regs.is_empty() {
-            self.regs.push(0);
+            self.regs.push(Self::encode(0, 1));
         }
         for reg in &mut self.regs {
-            *reg %= Self::NUM_PHYS_REGS;
+            let (start, width) = Self::decode(*reg);
+            *reg = Self::encode(start, width);
         }
 
         self.moves.truncate(Self::MAX_MOVES);
@@ -157,10 +183,21 @@ impl TestParallelMoves {
 
         let mut kept: Vec<TestMove> = Vec::with_capacity(self.moves.len());
         for m in &self.moves {
-            let dst = self.location_index(self.allocation(m.dst));
+            let src = self.cells(self.allocation(m.src));
+            let dst = self.cells(self.allocation(m.dst));
+
+            // A move carries one value, so both its ends are the same width,
+            // and they either are the very same location or are disjoint: in
+            // the allocator both ends are in the value's own bank, and
+            // registers within one bank never partially overlap.
+            if src.len() != dst.len() || (src != dst && Self::intersect(&src, &dst)) {
+                continue;
+            }
+
+            // Two moves writing one location leave the batch undefined.
             let dst_written_twice = kept
                 .iter()
-                .any(|other| self.location_index(self.allocation(other.dst)) == dst);
+                .any(|other| Self::intersect(&self.cells(self.allocation(other.dst)), &dst));
             if dst_written_twice {
                 continue;
             }
@@ -169,10 +206,58 @@ impl TestParallelMoves {
         self.moves = kept;
     }
 
+    /// The unit range a `regs` entry names: a width of one or two units, and a
+    /// start that keeps the whole range inside the machine.
+    fn decode(byte: u8) -> (usize, usize) {
+        let width = 1 + usize::from(byte & 1);
+        let start = (usize::from(byte) >> 1) % (Self::NUM_UNITS - width + 1);
+        (start, width)
+    }
+
+    /// The canonical `regs` entry for a unit range, so that [`Self::fixup`]
+    /// leaves equal ranges spelled the same way.
+    fn encode(start: usize, width: usize) -> u8 {
+        u8::try_from((start << 1) | (width - 1)).unwrap()
+    }
+
+    /// A `regs` table naming every register unit once, so that no two names
+    /// overlap.
+    #[cfg(test)]
+    pub(crate) fn disjoint_regs() -> Vec<u8> {
+        (0..Self::NUM_UNITS).map(|s| Self::encode(s, 1)).collect()
+    }
+
+    fn intersect(a: &Range<usize>, b: &Range<usize>) -> bool {
+        a.start < b.end && b.start < a.end
+    }
+
     /// The moves in this batch.
     #[cfg(test)]
     pub(crate) fn moves(&self) -> &[TestMove] {
         &self.moves
+    }
+
+    /// Is some move's source covered by two destinations that do not overlap
+    /// each other?
+    ///
+    /// That is the shape a machine whose banks alias partially produces, and
+    /// the one a solver that records a single "must happen after me" successor
+    /// per move cannot represent. A model in which overlap is all-or-nothing
+    /// can never build it, so this is what says the search is not vacuous.
+    pub fn has_a_source_covered_twice(&self) -> bool {
+        self.moves.iter().any(|m| {
+            let src = self.allocation(m.src);
+            let covering: Vec<ScalarAllocation<u32>> = self
+                .moves
+                .iter()
+                .map(|other| self.allocation(other.dst))
+                .filter(|&dst| self.overlaps(src, dst))
+                .collect();
+            covering
+                .iter()
+                .enumerate()
+                .any(|(i, &a)| covering[..i].iter().any(|&b| !self.overlaps(a, b)))
+        })
     }
 
     /// The allocation a generated location stands for.
@@ -187,31 +272,59 @@ impl TestParallelMoves {
         }
     }
 
-    /// The scratch locations, which no generated move can name.
-    fn scratches(&self) -> [ScalarAllocation<u32>; 2] {
-        Self::SCRATCH_NAMES.map(|name| ScalarAllocation::Reg(Reg::try_new(name).unwrap()))
+    /// The scratch locations of a given width, which no generated move names.
+    fn scratches(&self, width: usize) -> impl Iterator<Item = ScalarAllocation<u32>> {
+        let base = Self::MAX_REG_NAMES + (width - 1) * Self::NUM_SCRATCHES;
+        (base..base + Self::NUM_SCRATCHES)
+            .map(|name| ScalarAllocation::Reg(Reg::try_new(name).unwrap()))
     }
 
-    /// Which of the model machine's locations is this allocation? Aliasing
-    /// names answer the same index, making this the location's identity.
-    fn location_index(&self, alloc: ScalarAllocation<u32>) -> usize {
+    /// How wide a spill slot is. Fixed per slot, so that a batch cannot move
+    /// one value through a slot at one width and another value at another.
+    ///
+    /// Only the last two slots are wide, so that most slots pair with most
+    /// register names and batches moving to and from memory stay easy to
+    /// write, while a two-unit name still has somewhere to spill to. *Two* of
+    /// them, because a move's two ends are the same width: with only one wide
+    /// slot, a wide move from one slot to another could not be written at all,
+    /// and the routing that such a move needs would go untested at any width
+    /// but one.
+    fn slot_width(slot: usize) -> usize {
+        if slot + Self::MAX_WIDTH >= Self::NUM_SLOTS as usize {
+            Self::MAX_WIDTH
+        } else {
+            1
+        }
+    }
+
+    /// The model machine's cells that this allocation covers.
+    ///
+    /// Two allocations overlap exactly when their cells do, so overlap can be
+    /// partial: a two-unit name covers two one-unit names that do not cover
+    /// each other. Scratches and spill slots get cells of their own, so they
+    /// overlap nothing but themselves.
+    fn cells(&self, alloc: ScalarAllocation<u32>) -> Range<usize> {
         match alloc {
-            ScalarAllocation::Reg(reg) => {
-                let name = reg.index();
-                match Self::SCRATCH_NAMES.iter().position(|&s| s == name) {
-                    Some(i) => usize::from(Self::NUM_PHYS_REGS) + i,
-                    None => usize::from(self.regs[name]),
+            ScalarAllocation::Reg(reg) => match reg.index().checked_sub(Self::MAX_REG_NAMES) {
+                Some(scratch) => {
+                    let base = Self::SCRATCH_CELLS + scratch * Self::MAX_WIDTH;
+                    base..base + 1 + scratch / Self::NUM_SCRATCHES
                 }
-            }
+                None => {
+                    let (start, width) = Self::decode(self.regs[reg.index()]);
+                    start..start + width
+                }
+            },
             ScalarAllocation::Stack(slot) => {
-                usize::from(Self::NUM_PHYS_REGS) + Self::SCRATCH_NAMES.len() + slot.index()
+                let base = Self::SLOT_CELLS + slot.index() * Self::MAX_WIDTH;
+                base..base + Self::slot_width(slot.index())
             }
         }
     }
 
-    /// Are these two allocations the same location of the model machine?
+    /// Do these two allocations share any of the model machine's cells?
     fn overlaps(&self, a: ScalarAllocation<u32>, b: ScalarAllocation<u32>) -> bool {
-        self.location_index(a) == self.location_index(b)
+        Self::intersect(&self.cells(a), &self.cells(b))
     }
 
     /// Solve this batch and interpret the result on the model machine: every
@@ -233,6 +346,8 @@ impl TestParallelMoves {
         let mut wanted_scratch = false;
         let mut routed_stack_to_stack = false;
         let mut nested_scratch = false;
+        let mut routed_wide_stack_to_stack = false;
+        let mut concurrent_scratches = false;
         let result = solver.solve(
             batch.iter().copied(),
             |a, b| self.overlaps(a, b),
@@ -243,17 +358,22 @@ impl TestParallelMoves {
                     (ScalarAllocation::Stack(_), ScalarAllocation::Stack(_))
                 ) {
                     routed_stack_to_stack = true;
-                    nested_scratch |= avoid.is_some();
+                    nested_scratch |= !avoid.is_empty();
+                    routed_wide_stack_to_stack |= self.cells(mv.dst).len() > 1;
+                } else {
+                    // Not a routed move, so this is a cycle break; anything
+                    // already parked belongs to a cycle this one did not free.
+                    concurrent_scratches |= !avoid.is_empty();
                 }
                 if !self.provide_scratch {
                     return None;
                 }
-                // Whichever scratch is not already spoken for: the move may
-                // sit inside a cycle that parked a value in the other one.
+                // Whichever scratch of the right width is not already spoken
+                // for: other cycle breaks in this batch may still have values
+                // parked, and a move may sit inside one of them.
                 let scratch = self
-                    .scratches()
-                    .into_iter()
-                    .find(|&s| avoid.is_none_or(|a| !self.overlaps(s, a)));
+                    .scratches(self.cells(mv.dst).len())
+                    .find(|&s| avoid.iter().all(|&a| !self.overlaps(s, a)));
                 assert!(
                     scratch.is_some(),
                     "the solver wants more scratch locations at once than the model has",
@@ -312,9 +432,9 @@ impl TestParallelMoves {
             }
         };
 
-        // Run the sequence, starting each location off holding its own
-        // distinct value.
-        let mut state: Vec<usize> = (0..Self::NUM_LOCATIONS).collect();
+        // Run the sequence, starting each cell off holding its own distinct
+        // value.
+        let mut state: Vec<usize> = (0..Self::NUM_CELLS).collect();
         for m in &out {
             if matches!(
                 (m.src, m.dst),
@@ -322,39 +442,50 @@ impl TestParallelMoves {
             ) {
                 return Err(format!("the solver emitted the stack-to-stack move {m:?}"));
             }
-            let src = self.location_index(m.src);
-            let dst = self.location_index(m.dst);
-            state[dst] = state[src];
+            let src = self.cells(m.src);
+            let dst = self.cells(m.dst);
+            if src.len() != dst.len() {
+                return Err(format!(
+                    "the solver emitted {m:?}, whose two ends are {} and {} units wide",
+                    src.len(),
+                    dst.len(),
+                ));
+            }
+            for (i, cell) in dst.enumerate() {
+                state[cell] = state[src.start + i];
+            }
         }
 
         // Every move in the batch must have happened, as if all at once.
         for m in &batch {
-            let src = self.location_index(m.src);
-            let dst = self.location_index(m.dst);
-            if state[dst] != src {
-                return Err(format!(
-                    "after solving {:?} into {out:?}, location {dst} holds the value that \
-                     started in location {}, but the move {m:?} should have left it holding \
-                     the one that started in location {src}",
-                    self.moves, state[dst],
-                ));
+            let src = self.cells(m.src);
+            let dst = self.cells(m.dst);
+            for (i, cell) in dst.enumerate() {
+                if state[cell] != src.start + i {
+                    return Err(format!(
+                        "after solving {:?} into {out:?}, cell {cell} holds the value that \
+                         started in cell {}, but the move {m:?} should have left it holding \
+                         the one that started in cell {}",
+                        self.moves,
+                        state[cell],
+                        src.start + i,
+                    ));
+                }
             }
         }
 
         // Nothing else may be disturbed, except the scratches.
-        let mut written = vec![false; Self::NUM_LOCATIONS];
-        for scratch in self.scratches() {
-            written[self.location_index(scratch)] = true;
-        }
+        let mut written = vec![false; Self::NUM_CELLS];
+        written[Self::SCRATCH_CELLS..Self::SLOT_CELLS].fill(true);
         for m in &batch {
-            written[self.location_index(m.dst)] = true;
+            written[self.cells(m.dst)].fill(true);
         }
-        for (loc, &written) in written.iter().enumerate() {
-            if !written && state[loc] != loc {
+        for (cell, &written) in written.iter().enumerate() {
+            if !written && state[cell] != cell {
                 return Err(format!(
-                    "after solving {:?} into {out:?}, location {loc} holds the value that \
-                     started in location {}, but no move in the batch writes it",
-                    self.moves, state[loc],
+                    "after solving {:?} into {out:?}, cell {cell} holds the value that \
+                     started in cell {}, but no move in the batch writes it",
+                    self.moves, state[cell],
                 ));
             }
         }
@@ -370,6 +501,8 @@ impl TestParallelMoves {
             wanted_scratch,
             routed_stack_to_stack,
             nested_scratch,
+            routed_wide_stack_to_stack,
+            concurrent_scratches,
             refused,
         })
     }

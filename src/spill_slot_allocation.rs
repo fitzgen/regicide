@@ -246,9 +246,9 @@ where
     /// The spilled values live at the walk's current point.
     live: EntitySet<Val<E>>,
 
-    /// The emergency slot of each size, created on demand by
-    /// [`Self::emergency_slot`] and indexed by that size's base-two log.
-    emergency: [Option<SpillSlot<E>>; RegBank::NUM_SIZES],
+    /// The emergency slots of each size, created on demand by
+    /// [`Self::emergency_slot`] and bucketed by that size's base-two log.
+    emergency: [Vec<SpillSlot<E>>; RegBank::NUM_SIZES],
 }
 
 impl<E> SpillSlots<E>
@@ -268,7 +268,7 @@ where
             free_slots: [const { Vec::new() }; RegBank::NUM_SIZES],
             events: Vec::new(),
             live: EntitySet::new(),
-            emergency: [None; RegBank::NUM_SIZES],
+            emergency: [const { Vec::new() }; RegBank::NUM_SIZES],
         }
     }
 
@@ -298,7 +298,9 @@ where
         debug_assert!(free_slots.iter().all(|free| free.is_empty()));
         debug_assert!(events.is_empty());
         debug_assert!(live.is_empty());
-        *emergency = [None; RegBank::NUM_SIZES];
+        for slots in emergency {
+            slots.clear();
+        }
     }
 
     pub fn is_reset(&self) -> bool {
@@ -327,7 +329,7 @@ where
             && free_slots.iter().all(|free| free.is_empty())
             && events.is_empty()
             && live.is_empty()
-            && emergency.iter().all(|slot| slot.is_none())
+            && emergency.iter().all(|slots| slots.is_empty())
     }
 
     /// How many stack slots did we create?
@@ -346,7 +348,7 @@ where
     /// rather than one a value was assigned?
     #[cfg(feature = "visualizer")]
     pub(crate) fn is_emergency(&self, slot: SpillSlot<E>) -> bool {
-        self.emergency.contains(&Some(slot))
+        self.emergency.iter().flatten().any(|&s| s == slot)
     }
 
     /// The size of every slot we created, indexed by slot.
@@ -364,26 +366,27 @@ where
         &self.spilled
     }
 
-    /// Get a spill slot of the given size that no value is assigned to, for
-    /// move generation to borrow when it must break a cycle of parallel moves
-    /// and no register is free.
+    /// Get a spill slot for breaking a cycle of parallel moves when no register is free.
     ///
-    /// A value stays there only across one batch, and batches are
-    /// sequentialized independently, so one slot per size class is enough
-    /// however many cycles we break.
+    /// The slot must be of the given `size` and one for which `in_use` returns
+    /// `false`.
     pub(crate) fn emergency_slot(
         &mut self,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
-        size: SpillSlotSize,
         output: &mut OutputInner<E>,
+        size: SpillSlotSize,
+        mut in_use: impl FnMut(SpillSlot<E>) -> bool,
     ) -> IResult<SpillSlot<E>> {
-        if let Some(slot) = self.emergency[size.index()] {
+        if let Some(&slot) = self.emergency[size.index()]
+            .iter()
+            .find(|&&slot| !in_use(slot))
+        {
             return Ok(slot);
         }
 
         let slot = self.slots.push(output, size)?;
-        self.emergency[size.index()] = Some(slot);
+        self.emergency[size.index()].push(slot);
         counts.emergency_spill_slots.inc();
         counts.spill_slots.inc();
         event!(

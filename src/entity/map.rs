@@ -385,7 +385,6 @@ where
         self.inner.elems.get(index)
     }
 
-    #[allow(dead_code, reason = "will probably need it")]
     pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
         let index = key.index();
         self.inner.elems.get_mut(index)

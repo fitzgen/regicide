@@ -71,7 +71,7 @@ use crate::{
     region_allocation::RegionAllocation,
     rpo::Rpo,
     spill_placement::SpillPlacement,
-    spill_slot_allocation::SpillSlots,
+    spill_slot_allocation::{SpillSlot, SpillSlots},
     timing::Timing,
 };
 use alloc::vec::Vec;
@@ -1326,7 +1326,7 @@ where
 
             let mut scratch_failed = false;
             let scratch = |mv: ParallelMove<E>,
-                           avoid: Option<ScalarAllocation<E>>|
+                           avoid: &[ScalarAllocation<E>]|
              -> Option<ScalarAllocation<E>> {
                 // Get the move's value's register bank
                 let i = expanded.binary_search_by_key(&mv, |&(m, _)| m).unwrap();
@@ -1364,7 +1364,9 @@ where
                     span.clone(),
                     bank,
                     |reg: Reg<E>| {
-                        avoid.is_some_and(|a| ScalarAllocation::interfere(machine, reg.into(), a))
+                        avoid
+                            .iter()
+                            .any(|&a| ScalarAllocation::interfere(machine, reg.into(), a))
                             // TODO: investigate whether lazily caching a
                             // `RegSet` of all the registers used in this batch
                             // improves perf.
@@ -1397,15 +1399,20 @@ where
                     return None;
                 }
 
-                let size = bank.size(machine);
-                let Ok(slot) = spill_slots.emergency_slot(counts, events, size, output) else {
+                let Ok(slot) = spill_slots.emergency_slot(
+                    counts,
+                    events,
+                    output,
+                    bank.size(machine),
+                    |slot: SpillSlot<E>| avoid.contains(&ScalarAllocation::Stack(slot)),
+                ) else {
                     scratch_failed = true;
                     event!(events, ScratchRegUnavailable { pos, mv });
                     return None;
                 };
 
-                counts.move_cycles_broken.inc();
                 let scratch = ScalarAllocation::Stack(slot);
+                counts.move_cycles_broken.inc();
                 // An emergency slot is only ever reached from a cycle: a
                 // stack-to-stack move returned above.
                 event!(

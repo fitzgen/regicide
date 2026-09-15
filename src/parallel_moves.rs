@@ -15,6 +15,7 @@
 use crate::entity::{Entity as _, EntityRepr, EntitySet, PrimaryMap, SecondaryMap};
 use crate::output::ScalarAllocation;
 use alloc::vec::Vec;
+use core::mem;
 
 define_entities! {
     /// A move within the batch currently being solved.
@@ -58,19 +59,20 @@ pub enum SolveError {
     EntityReprTooSmall,
 }
 
-/// How far along a move is in the depth-first walk.
+/// How far along a move is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    /// Not visited yet.
+    /// Not emitted yet.
     Todo,
 
-    /// On the stack: being visited, but not placed.
+    /// On the path of the search for a move that sits on a cycle.
     ///
-    /// Reaching a `Pending` move again means we have gone all the way around a
-    /// cycle.
+    /// Reaching a `Pending` move again means the search has gone all the way
+    /// around a cycle. Only set while that search runs, and cleared again as
+    /// soon as it finishes.
     Pending,
 
-    /// Placed in the output.
+    /// Emitted.
     Done,
 }
 
@@ -166,12 +168,53 @@ where
     /// How far along each move is.
     state: MoveStates,
 
-    /// The move, if any, that overwrites another move's `src` and so has to
-    /// happen after it.
-    clobberer: SecondaryMap<SeqMove<E>, Option<SeqMove<E>>>,
+    /// How many moves that have not been emitted yet still need to read the
+    /// location each move writes.
+    ///
+    /// A move can only be emitted once this reaches zero.
+    ///
+    /// We need to support multiple readers waiting, not just one, because our
+    /// `overlaps` predicate is not transitive. Consider when we have `r0` and
+    /// `r1` in the same bank, each covering one unit, and `r2` in a different
+    /// bank, covering both units (this is similar to aarch64's `d0`, `d1`, and
+    /// `s0` registers):
+    ///
+    /// ```text
+    /// +---------+
+    /// |    r2   |
+    /// +---------+
+    /// | r0 | r1 |
+    /// +---------+
+    /// ```
+    ///
+    /// In this case, we have `r0 overlaps r2` and `r2 overlaps r1`, but we do
+    /// not have `r0 overlaps r1`.
+    ///
+    /// This means that, even though a whole destination is only named as a
+    /// destination at most once in a move batch, its underlying units might be
+    /// part of multiple destinations, and so we must perform all the moves that
+    /// read those units before writing to a register that clobbers them.
+    readers: SecondaryMap<SeqMove<E>, u32>,
 
-    /// The depth-first stack.
+    /// Where each move's last search for a blocker left off.
+    ///
+    /// This keeps `find_blocker` running in `O(n)` over `n` calls for a
+    /// particular move, rather than `O(n)` each time.
+    ///
+    /// Only ever touched while breaking a cycle, so this only grows its
+    /// storage for the batches that actually need one.
+    blocker_cursor: SecondaryMap<SeqMove<E>, u32>,
+
+    /// Scratch space for the search for a move that sits on a cycle.
     stack: Vec<SeqMove<E>>,
+
+    /// The scratch location holding the source of each move that a cycle break
+    /// has parked and that has not read it back out yet.
+    parked: SecondaryMap<SeqMove<E>, Option<ScalarAllocation<E>>>,
+
+    /// Scratch space for just the locations in `parked`, in the form the
+    /// `get_scratch` callback wants them.
+    scratches: Vec<ScalarAllocation<E>>,
 }
 
 impl<E> Default for ParallelMoveSolver<E>
@@ -191,8 +234,11 @@ where
         ParallelMoveSolver {
             moves: PrimaryMap::new(),
             state: MoveStates::new(),
-            clobberer: SecondaryMap::new(None),
+            readers: SecondaryMap::new(0),
+            blocker_cursor: SecondaryMap::new(0),
             stack: Vec::new(),
+            parked: SecondaryMap::new(None),
+            scratches: Vec::new(),
         }
     }
 
@@ -200,23 +246,38 @@ where
         let Self {
             moves,
             state,
-            clobberer,
+            readers,
+            blocker_cursor,
             stack,
+            parked,
+            scratches,
         } = self;
         moves.reset();
         state.reset();
-        clobberer.reset();
+        readers.reset();
+        blocker_cursor.reset();
         stack.clear();
+        parked.reset();
+        scratches.clear();
     }
 
     pub fn is_reset(&self) -> bool {
         let Self {
             moves,
             state,
-            clobberer,
+            readers,
+            blocker_cursor,
             stack,
+            parked,
+            scratches,
         } = self;
-        moves.is_reset() && state.is_reset() && clobberer.is_reset() && stack.is_empty()
+        moves.is_reset()
+            && state.is_reset()
+            && readers.is_reset()
+            && blocker_cursor.is_reset()
+            && stack.is_empty()
+            && parked.is_reset()
+            && scratches.is_empty()
     }
 
     /// Sequentialize `moves`, appending them to `out` in emission order.
@@ -229,15 +290,14 @@ where
     /// cycle or stack-to-stack move. It must return a location that can hold
     /// the given move's value, which is not used as a source or destination in
     /// the current batch of moves being solved, and must not create a new
-    /// stack-to-stack move.
+    /// stack-to-stack move. Its second argument lists the scratch locations
+    /// that are already holding a value for this batch; the location it
+    /// returns must not overlap any of them.
     pub fn solve(
         &mut self,
         moves: impl IntoIterator<Item = ParallelMove<E>>,
         overlaps: impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
-        get_scratch: impl FnMut(
-            ParallelMove<E>,
-            Option<ScalarAllocation<E>>,
-        ) -> Option<ScalarAllocation<E>>,
+        get_scratch: impl FnMut(ParallelMove<E>, &[ScalarAllocation<E>]) -> Option<ScalarAllocation<E>>,
         out: &mut Vec<ParallelMove<E>>,
     ) -> Result<(), SolveError> {
         let result = self.solve_inner(moves, overlaps, get_scratch, out);
@@ -249,16 +309,19 @@ where
         &mut self,
         moves: impl IntoIterator<Item = ParallelMove<E>>,
         mut overlaps: impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
-        get_scratch: impl FnMut(
-            ParallelMove<E>,
-            Option<ScalarAllocation<E>>,
-        ) -> Option<ScalarAllocation<E>>,
+        get_scratch: impl FnMut(ParallelMove<E>, &[ScalarAllocation<E>]) -> Option<ScalarAllocation<E>>,
         out: &mut Vec<ParallelMove<E>>,
     ) -> Result<(), SolveError> {
         debug_assert!(self.is_reset());
 
         for m in moves {
             // Ignore self-moves.
+            //
+            // Under partial overlap "overlaps" is weaker than "is the same
+            // location". However! A value is associated with a single bank, so
+            // we never move between banks, and registers within a bank never
+            // partially overlap, so this check is sufficient for ignoring
+            // self-moves.
             if overlaps(m.src, m.dst) {
                 continue;
             }
@@ -274,135 +337,291 @@ where
             self.moves.push_unwrap(m);
         }
 
-        // The walk places a move only once its clobberer is placed, so it
-        // yields the batch backwards; reverse our own tail of `out` at the end.
-        let start = out.len();
-
-        self.find_clobbers(overlaps);
-        self.walk(get_scratch, out)?;
-
-        out[start..].reverse();
-        Ok(())
+        self.count_readers(&mut overlaps);
+        self.emit_moves(overlaps, get_scratch, out)
     }
 
-    fn find_clobbers(
+    /// Count, for each move, how many moves read the location it writes.
+    fn count_readers(
         &mut self,
-        mut overlaps: impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
     ) {
-        for (src, src_mv) in self.moves.iter() {
-            let mut clobberer = None;
-            for (dst, dst_mv) in self.moves.iter() {
-                if dst == src {
+        for (m, mv) in self.moves.iter() {
+            let mut readers = 0;
+            for (other, other_mv) in self.moves.iter() {
+                if other == m {
                     continue;
                 }
                 debug_assert!(
-                    !(dst > src && overlaps(src_mv.dst, dst_mv.dst)),
+                    !(other > m && overlaps(mv.dst, other_mv.dst)),
                     "each location in a parallel move batch must be written by at most one \
-                     move, but {src_mv:?} and {dst_mv:?} both write it",
+                     move, but {mv:?} and {other_mv:?} both write it",
                 );
-                if overlaps(dst_mv.dst, src_mv.src) {
-                    debug_assert!(
-                        clobberer.is_none(),
-                        "each location in a parallel move batch must be written by at most one \
-                         move, but more than one writes {src_mv:?}'s source",
-                    );
-                    clobberer = Some(dst);
+                if overlaps(other_mv.src, mv.dst) {
+                    readers += 1;
                 }
             }
-            self.clobberer[src] = clobberer;
+            self.readers[m] = readers;
         }
     }
 
-    fn walk(
+    /// Record that `reader` is finished.
+    ///
+    /// It will never read `src` again, so every move waiting to overwrite it is
+    /// one reader closer to being free to do so.
+    fn retire_read(
         &mut self,
-        mut get_scratch: impl FnMut(
+        reader: SeqMove<E>,
+        src: ScalarAllocation<E>,
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+    ) {
+        for mv in self.moves.keys() {
+            if mv == reader || self.state.get(mv) == State::Done {
+                continue;
+            }
+            if overlaps(src, self.moves[mv].dst) {
+                self.readers[mv] -= 1;
+            }
+        }
+    }
+
+    /// Emit `m` and retire the read it was holding.
+    fn place(
+        &mut self,
+        m: SeqMove<E>,
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+        scratches: &[ScalarAllocation<E>],
+        get_scratch: &mut impl FnMut(
             ParallelMove<E>,
-            Option<ScalarAllocation<E>>,
+            &[ScalarAllocation<E>],
         ) -> Option<ScalarAllocation<E>>,
         out: &mut Vec<ParallelMove<E>>,
     ) -> Result<(), SolveError> {
-        for root in self.moves.keys() {
-            if self.state.get(root) != State::Todo {
+        debug_assert_eq!(self.readers[m], 0);
+
+        let mv = self.moves[m];
+        self.state.set(m, State::Done);
+
+        if let Some(via) = push_move(mv, scratches, get_scratch, out)? {
+            self.debug_assert_scratch_is_free(via, scratches, overlaps);
+        }
+
+        self.retire_read(m, mv.src, overlaps);
+        Ok(())
+    }
+
+    /// Debug assert that a scratch the caller just handed us really is free.
+    fn debug_assert_scratch_is_free(
+        &self,
+        scratch: ScalarAllocation<E>,
+        scratches: &[ScalarAllocation<E>],
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+    ) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        for (m, mv) in self.moves.iter() {
+            debug_assert!(
+                !overlaps(scratch, mv.dst),
+                "a scratch location must not be written by the batch, but {scratch:?} \
+                 overlaps the destination of {mv:?}",
+            );
+            debug_assert!(
+                self.state.get(m) == State::Done || !overlaps(scratch, mv.src),
+                "a scratch location must not hold a value the batch has yet to read, but \
+                 {scratch:?} overlaps the source of {mv:?}",
+            );
+        }
+        for &other in scratches {
+            debug_assert!(
+                !overlaps(scratch, other),
+                "a scratch location must not overlap one that is already holding a value, \
+                 but {scratch:?} overlaps {other:?}",
+            );
+        }
+    }
+
+    /// Find a move that has not yet been emitted and still needs to read what
+    /// `m` writes.
+    fn find_blocker(
+        &mut self,
+        m: SeqMove<E>,
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+    ) -> Option<SeqMove<E>> {
+        let dst = self.moves[m].dst;
+
+        let i = self.blocker_cursor[m];
+        let mut i = usize::try_from(i).unwrap();
+
+        let found = loop {
+            if i == self.moves.len() {
+                break None;
+            }
+
+            let other = SeqMove::try_new(i).unwrap();
+            if other != m
+                && self.state.get(other) != State::Done
+                && overlaps(self.moves[other].src, dst)
+            {
+                break Some(other);
+            }
+
+            i += 1;
+        };
+
+        // Stop at the blocker, not past it: it is still a blocker until it
+        // retires.
+        self.blocker_cursor[m] = u32::try_from(i).unwrap();
+
+        found
+    }
+
+    fn emit_moves(
+        &mut self,
+        overlaps: impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+        get_scratch: impl FnMut(ParallelMove<E>, &[ScalarAllocation<E>]) -> Option<ScalarAllocation<E>>,
+        out: &mut Vec<ParallelMove<E>>,
+    ) -> Result<(), SolveError> {
+        let mut scratches = mem::take(&mut self.scratches);
+
+        let result = self.emit_moves_inner(&mut scratches, overlaps, get_scratch, out);
+
+        scratches.clear();
+        self.scratches = scratches;
+
+        result
+    }
+
+    /// Emit all unblocked moves, break the next extant cycle, and repeat until
+    /// all moves have been emitted.
+    fn emit_moves_inner(
+        &mut self,
+        scratches: &mut Vec<ScalarAllocation<E>>,
+        mut overlaps: impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+        mut get_scratch: impl FnMut(
+            ParallelMove<E>,
+            &[ScalarAllocation<E>],
+        ) -> Option<ScalarAllocation<E>>,
+        out: &mut Vec<ParallelMove<E>>,
+    ) -> Result<(), SolveError> {
+        debug_assert!(self.parked.is_reset());
+        debug_assert!(scratches.is_empty());
+
+        let mut remaining = self.moves.len();
+        while remaining > 0 {
+            // Emit everything nothing is waiting on, and keep going while that
+            // works: emitting a move retires its own read, which might free the
+            // move that was waiting to overwrite what it read, etc...
+            let placed = self.place_unblocked(scratches, &mut overlaps, &mut get_scratch, out)?;
+            if placed > 0 {
+                remaining -= placed;
                 continue;
             }
 
-            self.stack.push(root);
-            self.state.set(root, State::Pending);
+            // Nothing could be emitted, so every move still pending is part of
+            // some cycle.
+            self.break_cycle(scratches, &mut overlaps, &mut get_scratch, out)?;
+        }
 
-            while let Some(top) = self.stack.last().copied() {
-                // The only move that must happen after `top` is the one that
-                // clobbers its source.
-                let next = self.clobberer[top].filter(|&next| self.state.get(next) != State::Done);
+        Ok(())
+    }
 
-                match next {
-                    // No move needs to happen after `top`, so we can push it
-                    // into `out` now.
-                    None => {
-                        self.stack.pop();
-                        self.state.set(top, State::Done);
-                        push_move(self.moves[top], None, &mut get_scratch, out)?;
-                    }
+    /// Emit every move that nothing is waiting on any more, and report how many
+    /// that was.
+    fn place_unblocked(
+        &mut self,
+        scratches: &mut Vec<ScalarAllocation<E>>,
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+        get_scratch: &mut impl FnMut(
+            ParallelMove<E>,
+            &[ScalarAllocation<E>],
+        ) -> Option<ScalarAllocation<E>>,
+        out: &mut Vec<ParallelMove<E>>,
+    ) -> Result<usize, SolveError> {
+        let mut placed = 0;
 
-                    // There is a clobberer that must come after `top` and this
-                    // is our first time seeing it, so it isn't part of a cycle,
-                    // yet, at least. Push the clobberer so we place it first.
-                    Some(next) if self.state.get(next) == State::Todo => {
-                        self.stack.push(next);
-                        self.state.set(next, State::Pending);
-                    }
+        for m in self.moves.keys() {
+            if self.state.get(m) == State::Done || self.readers[m] != 0 {
+                continue;
+            }
 
-                    // The clobberer is has already been discovered, so we have
-                    // a cycle. Break the `cycle` at `top` by getting a scratch
-                    // location and emitting `scratch := top.src`, then the rest
-                    // of the cycle's moves, and then `top.dst = scratch`.
-                    Some(next) => {
-                        debug_assert_eq!(self.state.get(next), State::Pending);
-                        debug_assert_ne!(next, top, "a move cannot clobber its own source");
+            self.place(m, overlaps, scratches, get_scratch, out)?;
+            placed += 1;
 
-                        let top_move = self.moves[top];
-                        let Some(cycle_scratch) = get_scratch(top_move, None) else {
-                            return Err(SolveError::NoScratch);
-                        };
-
-                        self.stack.pop();
-                        self.state.set(top, State::Done);
-
-                        // `top` is the move that goes through the scratch, so
-                        // these two need no expansion: whichever side of it
-                        // touches memory is paired with the scratch, which is
-                        // not in memory when it is.
-                        out.push(ParallelMove {
-                            src: cycle_scratch,
-                            dst: top_move.dst,
-                        });
-
-                        loop {
-                            let c = self
-                                .stack
-                                .pop()
-                                .expect("the whole cycle is on the stack below `top`");
-
-                            self.state.set(c, State::Done);
-
-                            // `cycle_scratch` holds `top`'s value across the
-                            // whole cycle, so anything these moves go through
-                            // must stay clear of it.
-                            let avoid = Some(cycle_scratch);
-                            push_move(self.moves[c], avoid, &mut get_scratch, out)?;
-
-                            if c == next {
-                                break;
-                            }
-                        }
-
-                        out.push(ParallelMove {
-                            src: top_move.src,
-                            dst: cycle_scratch,
-                        });
-                    }
-                }
+            // If this was a parked move, it has just read its value back out of
+            // the scratch, which is free again.
+            //
+            // Go through `get_mut` rather than indexing, so that the batches
+            // that never park anything never grow the map.
+            if let Some(scratch) = self.parked.get_mut(m).and_then(Option::take) {
+                scratches.retain(|&s| s != scratch);
             }
         }
+
+        Ok(placed)
+    }
+
+    /// Break a cycle among the moves that have not been emitted yet.
+    ///
+    /// Parks one cycle member's source in a scratch location, which retires its
+    /// read without emitting it, freeing the move that was waiting to overwrite
+    /// the source. The parked move is emitted later, reading the scratch
+    /// instead.
+    fn break_cycle(
+        &mut self,
+        scratches: &mut Vec<ScalarAllocation<E>>,
+        overlaps: &mut impl FnMut(ScalarAllocation<E>, ScalarAllocation<E>) -> bool,
+        get_scratch: &mut impl FnMut(
+            ParallelMove<E>,
+            &[ScalarAllocation<E>],
+        ) -> Option<ScalarAllocation<E>>,
+        out: &mut Vec<ParallelMove<E>>,
+    ) -> Result<(), SolveError> {
+        // Find a stuck move that is part of a cycle.
+        let stuck = self
+            .moves
+            .keys()
+            .find(|&m| self.state.get(m) != State::Done)
+            .expect("only called while moves are left to emit");
+
+        // Walk the cycle until we hit a back edge to maximize the tail of moves
+        // we are unblocking.
+        let mut cur = self
+            .find_blocker(stuck, overlaps)
+            .expect("a move that is waiting has something to wait for");
+        debug_assert!(self.stack.is_empty());
+        while self.state.get(cur) != State::Pending {
+            self.state.set(cur, State::Pending);
+            self.stack.push(cur);
+            cur = self
+                .find_blocker(cur, overlaps)
+                .expect("every move in a batch that is stuck has a blocker");
+        }
+        while let Some(m) = self.stack.pop() {
+            self.state.set(m, State::Todo);
+        }
+
+        // Break the cycle at `cur`.
+        let mv = self.moves[cur];
+        let Some(scratch) = get_scratch(mv, scratches) else {
+            return Err(SolveError::NoScratch);
+        };
+
+        self.debug_assert_scratch_is_free(scratch, scratches, overlaps);
+        debug_assert!(!matches!(
+            (scratch, mv.dst),
+            (ScalarAllocation::Stack(_), ScalarAllocation::Stack(_))
+        ));
+
+        out.push(ParallelMove {
+            src: mv.src,
+            dst: scratch,
+        });
+        self.retire_read(cur, mv.src, overlaps);
+        self.moves[cur].src = scratch;
+        self.parked[cur] = Some(scratch);
+        scratches.push(scratch);
+
         Ok(())
     }
 }
@@ -410,17 +629,16 @@ where
 /// Append `mv` to `out`, routing it through a scratch location when it moves
 /// memory to memory, which no machine can do in one instruction.
 ///
-/// `avoid` is a location that is already holding a value, which the scratch may
-/// not overlap.
+/// `avoid` are the locations that are already holding a value, which the
+/// scratch may not overlap.
+///
+/// Returns the scratch the move was routed through, when it needed one.
 fn push_move<E>(
     mv: ParallelMove<E>,
-    avoid: Option<ScalarAllocation<E>>,
-    get_scratch: &mut impl FnMut(
-        ParallelMove<E>,
-        Option<ScalarAllocation<E>>,
-    ) -> Option<ScalarAllocation<E>>,
+    avoid: &[ScalarAllocation<E>],
+    get_scratch: &mut impl FnMut(ParallelMove<E>, &[ScalarAllocation<E>]) -> Option<ScalarAllocation<E>>,
     out: &mut Vec<ParallelMove<E>>,
-) -> Result<(), SolveError>
+) -> Result<Option<ScalarAllocation<E>>, SolveError>
 where
     E: EntityRepr,
 {
@@ -429,25 +647,23 @@ where
         (ScalarAllocation::Stack(_), ScalarAllocation::Stack(_))
     ) {
         out.push(mv);
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(via) = get_scratch(mv, avoid) else {
         return Err(SolveError::NoScratch);
     };
 
-    // Push in reverse, since the walk must push in reverse, and therefore we
-    // reverse the moves before returning them.
-    out.push(ParallelMove {
-        src: via,
-        dst: mv.dst,
-    });
     out.push(ParallelMove {
         src: mv.src,
         dst: via,
     });
+    out.push(ParallelMove {
+        src: via,
+        dst: mv.dst,
+    });
 
-    Ok(())
+    Ok(Some(via))
 }
 
 #[cfg(test)]
@@ -457,7 +673,10 @@ mod tests {
         Reg, SpillSlot,
         test::{TestLocation, TestMove, TestParallelMoves},
     };
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::{
+        ops::Range,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     use mutatis::{
         check::{Check, CheckResult},
         mutators as m,
@@ -476,9 +695,9 @@ mod tests {
         TestMove { src, dst }
     }
 
-    /// A model machine with no aliasing: name `i` is register `i`.
+    /// A model machine with no aliasing: every name covers a unit of its own.
     fn distinct_regs() -> Vec<u8> {
-        (0..TestParallelMoves::NUM_PHYS_REGS).collect()
+        TestParallelMoves::disjoint_regs()
     }
 
     fn batch(moves: Vec<TestMove>) -> TestParallelMoves {
@@ -629,7 +848,7 @@ mod tests {
     #[test]
     fn aliased_swap() {
         let moves = TestParallelMoves::new(
-            vec![0, 0, 1],
+            vec![0, 0, 2],
             vec![mv(reg(0), reg(2)), mv(reg(2), reg(1))],
             true,
         );
@@ -712,6 +931,137 @@ mod tests {
         solve_raw(&[parallel_move(reg(0), reg(2)), parallel_move(reg(1), reg(2))]);
     }
 
+    /// How many scratch registers `cells` leaves room for, and how many cells
+    /// it lays out in all.
+    const NUM_MODEL_SCRATCHES: usize = 2;
+    const NUM_MODEL_CELLS: usize = 3 + NUM_MODEL_SCRATCHES * 2 + 3 * 2;
+
+    /// A model machine whose banks alias *partially*, one cell per register
+    /// unit: `r0` is units `0..1`, `r1` is `1..3` and `r2` is `0..2`, so `r2`
+    /// overlaps both `r0` and `r1` while those two, being in one bank, are
+    /// disjoint. Registers above `r2` are scratches, and they and the spill
+    /// slots sit off on their own, overlapping nothing else.
+    fn cells(loc: ScalarAllocation<u32>) -> Range<usize> {
+        match loc {
+            ScalarAllocation::Reg(reg) => match reg.index() {
+                0 => 0..1,
+                1 => 1..3,
+                2 => 0..2,
+                n => 3 + (n - 3) * 2..5 + (n - 3) * 2,
+            },
+            ScalarAllocation::Stack(slot) => {
+                let base = 3 + NUM_MODEL_SCRATCHES * 2 + slot.index() * 2;
+                base..base + 2
+            }
+        }
+    }
+
+    fn partially_aliasing(a: ScalarAllocation<u32>, b: ScalarAllocation<u32>) -> bool {
+        let (a, b) = (cells(a), cells(b));
+        a.start < b.end && b.start < a.end
+    }
+
+    /// A source can be covered by two destinations that do not overlap each
+    /// other: `r2` spans both `r0` and `r1`, so the move reading `r2` has to
+    /// come before both of the writes. Nothing here is circular, so it needs
+    /// no scratch to do it.
+    #[test]
+    fn a_source_covered_by_two_disjoint_destinations() {
+        let mut out = Vec::new();
+        let mut asked = 0;
+        ParallelMoveSolver::new()
+            .solve(
+                [
+                    parallel_move(reg(2), slot(0)),
+                    parallel_move(slot(1), reg(0)),
+                    parallel_move(slot(2), reg(1)),
+                ],
+                partially_aliasing,
+                |_, _| {
+                    asked += 1;
+                    None
+                },
+                &mut out,
+            )
+            .unwrap();
+
+        assert_eq!(asked, 0, "this batch needs no scratch");
+        assert_eq!(
+            out,
+            [
+                parallel_move(reg(2), slot(0)),
+                parallel_move(slot(1), reg(0)),
+                parallel_move(slot(2), reg(1)),
+            ],
+            "reading `r2` must come before both of the writes that cover it",
+        );
+    }
+
+    /// Partial overlap lets two cycles share a move, and then breaking one of
+    /// them does not free the other: both scratch locations are holding a
+    /// value at the same time, so the second must not be the first.
+    ///
+    /// `r2` covers `r0` and `r1`, so `slot1 := r0` and `slot0 := r2` are each
+    /// half of what `r0 := slot1` and `r1 := slot0` overwrite.
+    #[test]
+    fn two_cycle_breaks_are_live_at_once() {
+        let mut out = Vec::new();
+        let mut scratches = vec![reg(3), reg(4)];
+        let mut asked = Vec::new();
+        ParallelMoveSolver::new()
+            .solve(
+                [
+                    parallel_move(reg(0), slot(1)),
+                    parallel_move(slot(1), reg(1)),
+                    parallel_move(reg(2), slot(0)),
+                    parallel_move(slot(0), reg(0)),
+                ],
+                partially_aliasing,
+                |mv, avoid| {
+                    asked.push((mv, avoid.to_vec()));
+                    let scratch = allocation(scratches.remove(0));
+                    assert!(
+                        avoid.iter().all(|&a| !partially_aliasing(scratch, a)),
+                        "the solver must not hand out a scratch that is already in use",
+                    );
+                    Some(scratch)
+                },
+                &mut out,
+            )
+            .unwrap();
+
+        assert_eq!(asked.len(), 2, "two cycles, two breaks");
+        assert!(
+            asked[0].1.is_empty() && asked[1].1.len() == 1,
+            "the first break is still parked when the second is asked for: {asked:?}",
+        );
+
+        // Run the emitted sequence on the model machine to check the order
+        // really does deliver every value.
+        let mut state: Vec<usize> = (0..NUM_MODEL_CELLS).collect();
+        for m in &out {
+            let (src, dst) = (cells(m.src), cells(m.dst));
+            for (i, cell) in dst.enumerate() {
+                state[cell] = state[src.start + i];
+            }
+        }
+        for m in [
+            parallel_move(reg(0), slot(1)),
+            parallel_move(slot(1), reg(1)),
+            parallel_move(reg(2), slot(0)),
+            parallel_move(slot(0), reg(0)),
+        ] {
+            let (src, dst) = (cells(m.src), cells(m.dst));
+            for (i, cell) in dst.enumerate() {
+                assert_eq!(
+                    state[cell],
+                    src.start + i,
+                    "{m:?} lost its value in {out:?}"
+                );
+            }
+        }
+    }
+
     /// A move from one slot to another comes back as a reload and a store
     /// through the scratch, in that order.
     #[test]
@@ -725,7 +1075,7 @@ mod tests {
                 |mv, avoid| {
                     asked += 1;
                     assert_eq!(mv, parallel_move(slot(0), slot(1)));
-                    assert!(avoid.is_none(), "nothing else is live across this move");
+                    assert!(avoid.is_empty(), "nothing else is live across this move");
                     Some(allocation(reg(3)))
                 },
                 &mut out,
@@ -849,11 +1199,104 @@ mod tests {
                 false,
             ),
             TestParallelMoves::new(
-                vec![0, 0, 1],
+                vec![0, 0, 2],
                 vec![mv(reg(0), reg(2)), mv(reg(2), reg(1))],
                 true,
             ),
+            partially_aliasing_names(),
+            two_concurrent_cycle_breaks(),
+            with(vec![mv(slot(2), slot(3))]),
         ]
+    }
+
+    /// Names that alias *partially*: name 0 covers unit `0..1`, name 1 covers
+    /// `1..2`, and name 2 spans both, so name 2's value is destroyed by two
+    /// writes that do not touch each other. Slot 2 is one of the wide ones,
+    /// and so is where a two-unit value spills.
+    ///
+    /// A seed rather than only a test, because this is the corner the search
+    /// will not stumble into on its own: every other seed's names either alias
+    /// exactly or not at all, and no mutation of one of those reaches here.
+    fn partially_aliasing_names() -> TestParallelMoves {
+        TestParallelMoves::new(
+            vec![0, 2, 1],
+            vec![
+                mv(reg(2), slot(2)),
+                mv(slot(0), reg(0)),
+                mv(slot(1), reg(1)),
+            ],
+            true,
+        )
+    }
+
+    /// Two cycles that share a source covered by two disjoint writes, so that
+    /// breaking one of them does not free the other: the solver holds two
+    /// scratches at once, the behavior `two_cycle_breaks_are_live_at_once`
+    /// pins down by hand.
+    ///
+    /// Names 0, 1 and 2 cover units `0..1`, `1..2` and `0..2`, so name 2's
+    /// value is destroyed by two writes that do not touch each other, and
+    /// names 3 and 4 cover `2..4` and `2..3` to give the second cycle
+    /// somewhere to put a two-unit value.
+    ///
+    /// A seed rather than only a test: the shape is vanishingly rare under
+    /// random mutation — of the batches the search reaches on its own,
+    /// essentially none breaks a second cycle while the first is still
+    /// parked — so without this the whole behavior that `parked`, `scratches`
+    /// and the multi-element `avoid` exist for would go unsearched.
+    fn two_concurrent_cycle_breaks() -> TestParallelMoves {
+        TestParallelMoves::new(
+            vec![0, 2, 1, 5, 4],
+            vec![
+                mv(reg(0), slot(1)),
+                mv(slot(1), reg(1)),
+                mv(reg(2), reg(3)),
+                mv(reg(4), reg(0)),
+            ],
+            true,
+        )
+    }
+
+    /// The seed above really does park two values at once.
+    #[test]
+    fn two_cycles_break_at_once() {
+        let moves = two_concurrent_cycle_breaks();
+        assert_eq!(moves.moves().len(), 4, "the fixup keeps all four moves");
+        assert!(moves.has_a_source_covered_twice());
+
+        let outcome = moves.check().unwrap();
+        assert!(
+            outcome.concurrent_scratches,
+            "breaking the first cycle should not free the second",
+        );
+        // Four moves and two breaks.
+        assert_eq!(outcome.emitted, 6);
+    }
+
+    /// A move between two *wide* slots routes through a wide scratch. Only
+    /// the widths make this different from `stack_to_stack`, and only they
+    /// are what the interpreter's width check is there to catch.
+    #[test]
+    fn wide_stack_to_stack() {
+        let moves = batch(vec![mv(slot(2), slot(3))]);
+        assert_eq!(moves.moves().len(), 1, "both slots are two units wide");
+
+        let outcome = moves.check().unwrap();
+        assert!(outcome.routed_wide_stack_to_stack);
+        assert_eq!(outcome.emitted, 2, "a store and a load through the scratch");
+    }
+
+    /// A source covered by two writes that do not cover each other has to be
+    /// read before both of them. The whole batch solves with no scratch.
+    #[test]
+    fn a_source_covered_by_two_disjoint_writes() {
+        let moves = partially_aliasing_names();
+        assert_eq!(moves.moves().len(), 3, "the fixup keeps all three moves");
+        assert!(
+            moves.has_a_source_covered_twice(),
+            "the model machine can express partial overlap",
+        );
+        assert_eq!(solve(&moves), (3, false));
     }
 
     /// Solving a batch has the same effect as performing it all at once.
@@ -870,6 +1313,9 @@ mod tests {
         static STACK: AtomicUsize = AtomicUsize::new(0);
         static ROUTED: AtomicUsize = AtomicUsize::new(0);
         static NESTED: AtomicUsize = AtomicUsize::new(0);
+        static PARTIAL: AtomicUsize = AtomicUsize::new(0);
+        static CONCURRENT: AtomicUsize = AtomicUsize::new(0);
+        static WIDE: AtomicUsize = AtomicUsize::new(0);
 
         let result = Check::new().iters(10_000).run_with(
             m::default::<TestParallelMoves>(),
@@ -889,6 +1335,12 @@ mod tests {
                 if outcome.nested_scratch {
                     NESTED.fetch_add(1, Ordering::Relaxed);
                 }
+                if outcome.routed_wide_stack_to_stack {
+                    WIDE.fetch_add(1, Ordering::Relaxed);
+                }
+                if outcome.concurrent_scratches {
+                    CONCURRENT.fetch_add(1, Ordering::Relaxed);
+                }
                 if outcome.refused {
                     REFUSED.fetch_add(1, Ordering::Relaxed);
                 }
@@ -901,6 +1353,9 @@ mod tests {
                     .any(|m| matches!(m.src, TestLocation::Slot(_)))
                 {
                     STACK.fetch_add(1, Ordering::Relaxed);
+                }
+                if moves.has_a_source_covered_twice() {
+                    PARTIAL.fetch_add(1, Ordering::Relaxed);
                 }
 
                 Ok(())
@@ -917,6 +1372,15 @@ mod tests {
             ("batches reloading from a spill slot", &STACK),
             ("batches moving one slot to another", &ROUTED),
             ("batches moving one slot to another inside a cycle", &NESTED),
+            ("batches moving one wide slot to another", &WIDE),
+            (
+                "batches whose source is covered by two disjoint writes",
+                &PARTIAL,
+            ),
+            (
+                "batches breaking a second cycle while the first is parked",
+                &CONCURRENT,
+            ),
         ] {
             assert!(
                 count.load(Ordering::Relaxed) > 0,
