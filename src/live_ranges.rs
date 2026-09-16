@@ -1354,7 +1354,11 @@ where
 
     pub(crate) fn num_vals(self, live_ranges: &LiveRanges<E>) -> usize {
         assert!(
-            cfg!(any(feature = "trace-log", feature = "visualizer")),
+            cfg!(any(
+                debug_assertions,
+                feature = "trace-log",
+                feature = "visualizer"
+            )),
             "this method is inefficient and only exists for diagnostics",
         );
         let mut vals = alloc::collections::BTreeSet::new();
