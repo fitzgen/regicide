@@ -1,11 +1,26 @@
 //! Coalescing live spans into bundles.
 //!
+//! Merging spans into bundles is generally optional, and only exists to
+//! optimistically try and reuse the same register across a number of related
+//! spans, which is good for both code quality (less spills and moves) and
+//! compile time (processes N spans all at once, instead of
+//! individually). However, there is one exception: two uses tied together by a
+//! `Reuse` constraint **must** be in the same bundle because they must be
+//! allocated to the same register. In this scenario, each use is of a different
+//! value (because `Reuse` must define a new value) and therefore each use has a
+//! different span -- these spans **must** be coalesced together (and, later on,
+//! must never be split from each other).
+//!
 //! There are four ways two spans can have *affinity*, meaning that a move
 //! between them is implied if they are not allocated to the same location:
 //!
-//! 1. a value flowing along a control-flow edge,
-//! 2. a block argument feeding the parameter it is passed to,
+//! 1. a value flowing along a control-flow edge (live-out of a predecessor and
+//!    live-in to a successor),
+//!
+//! 2. a block-call argument flowing into a block parameter,
+//!
 //! 3. a def that must reuse the register of one of its own operands, and
+//!
 //! 4. the pieces on either side of a reuse split, which hold the same value
 //!    across the definition that overwrites the copy between them.
 //!
@@ -1032,7 +1047,10 @@ mod tests {
         touch_mid_inst,
     };
     use crate::test::{TestFunction, TestInput};
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{
         collections::{HashMap, hash_map},
         format,
@@ -1252,9 +1270,10 @@ mod tests {
 
     #[test]
     fn coalescing_properties() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(10_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(10_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 let func = &test_input.func;
                 let mut context = coalesce_input(test_input)?;
                 let inner = &context.context32;
@@ -1435,6 +1454,35 @@ mod tests {
                     }
                     Ok(())
                 })?;
+
+                // 7b. And it did it for every reuse tie, with no excuses.
+                // Property 7 waives an affinity whose bundles' constraints
+                // conflict; a tie cannot be waived, because one bundle is the
+                // only thing that satisfies it and no later pass repairs one.
+                for (block, input_block) in func.blocks() {
+                    for (inst, input_inst) in input_block.insts() {
+                        for j in 0..input_inst.operands_len() {
+                            let OperandConstraint::Reuse(i) = input_inst.operand(j).constraint()
+                            else {
+                                continue;
+                            };
+                            let (Some(a), Some(b)) = (
+                                operand_span(live_ranges, block, inst, j),
+                                operand_span(live_ranges, block, inst, i),
+                            ) else {
+                                continue;
+                            };
+                            if a.bundle(live_ranges) != b.bundle(live_ranges) {
+                                return Err(format!(
+                                    "operand {j} of {inst:?} reuses operand {i}, but their \
+                                     spans {a:?} and {b:?} are in {:?} and {:?}",
+                                    a.bundle(live_ranges),
+                                    b.bundle(live_ranges),
+                                ));
+                            }
+                        }
+                    }
+                }
 
                 // 8. A register hint never widens what a bundle may be
                 // allocated to, and only a cross-region affinity can put one
@@ -1660,7 +1708,8 @@ mod tests {
                 }
 
                 Ok(())
-            })
+            },
+        )
     }
 
     /// The span of `val` in `block`, of which these hand-built functions only

@@ -22,7 +22,9 @@ where
 {
     #[inline]
     pub fn new(label: T) -> Self {
-        crate::trace!("Start timing: {label}");
+        if cfg!(feature = "timing") {
+            crate::trace!("Start timing: {label}");
+        }
 
         Self {
             #[cfg(feature = "timing")]

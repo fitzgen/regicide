@@ -2143,19 +2143,50 @@ where
         }
     }
 
-    /// Does a definition at this use's instruction reuse this operand's place
-    /// and does this use's value outlive this instruction? If so, this use
-    /// needs its own span.
-    fn needs_a_span_of_its_own(
+    /// Which split, if any, a definition reusing this operand's place demands
+    /// of the piece accumulated so far.
+    fn tie_split(
         &self,
         input: &Input<'_, impl InputFunction>,
         end: LivePoint<E>,
-    ) -> bool {
+        piece: &Piece<E>,
+    ) -> Option<TieSplit> {
         let input_inst = input.func.inst(self.point.inst().with_repr32());
-        self.is_read
-            && is_reuse_target(&input_inst, self.operand)
-            && (end > self.point.next_point() || another_tie_follows(&input_inst, self.operand))
+        if !(self.is_read && is_reuse_target(&input_inst, self.operand)) {
+            return None;
+        }
+
+        // The value outlives the tie, so it needs a second copy for its later
+        // uses; or a later tie names another read of it, which the definition
+        // overwriting that read cannot share a register with.
+        if end > self.point.next_point() || another_tie_follows(&input_inst, self.operand) {
+            return Some(TieSplit::AtReuse);
+        }
+
+        // The value dies here, but folding it in would narrow it below what
+        // the tie itself allows, pinning the definition tied to it to a
+        // register it may not be able to use.
+        let narrowed = piece
+            .constraint
+            .merge_resolved(&self.constraint, input.machine)
+            .is_none_or(|merged| merged != self.constraint);
+        if narrowed && !piece.is_empty(self) {
+            return Some(TieSplit::Before);
+        }
+
+        None
     }
+}
+
+/// Which split a reuse tie at a read demands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TieSplit {
+    /// The three-piece shape `Piece::split_at_reuse` draws.
+    AtReuse,
+
+    /// A plain cut just before the read, which the loop's tail push then
+    /// completes into a span holding the tied read alone.
+    Before,
 }
 
 /// Does a piece being cut off reach the use that cut it?
@@ -2248,6 +2279,12 @@ where
             run_has_fixed_use: u.is_fixed,
             before_run_has_fixed_use: false,
         }
+    }
+
+    /// Has nothing reached this piece yet, so that cutting before `u` would
+    /// cut off nothing at all?
+    fn is_empty(&self, u: &ResolvedUse<E>) -> bool {
+        self.start >= u.point && self.uses_start == u.use_
     }
 
     /// Fold the given use into this piece.
@@ -2482,6 +2519,9 @@ where
 ///
 /// * a value is named as a `Reuse` target and outlives its instruction,
 ///
+/// * a value is named as a `Reuse` target and the piece so far would narrow it
+///   below what the tie allows,
+///
 /// * a use that could be in a register would unnecessarily be constrained to
 ///   the stack, or
 ///
@@ -2527,11 +2567,20 @@ where
             piece = Piece::empty(u.point.inst_boundary_at_or_before(), use_);
         }
 
-        if u.needs_a_span_of_its_own(input, end) {
-            debug_assert_eq!(u.point.pos(), Position::Early);
-            piece = piece.split_at_reuse(spans, output, events, input.machine, val, block, &u)?;
-            counts.reuse_splits.inc();
-            continue;
+        match u.tie_split(input, end, &piece) {
+            Some(TieSplit::AtReuse) => {
+                debug_assert_eq!(u.point.pos(), Position::Early);
+                piece =
+                    piece.split_at_reuse(spans, output, events, input.machine, val, block, &u)?;
+                counts.reuse_splits.inc();
+                continue;
+            }
+            Some(TieSplit::Before) => {
+                piece = piece.split_before(spans, output, events, val, block, &u, Reach::Yes)?;
+                counts.eager_splits.inc();
+                continue;
+            }
+            None => {}
         }
 
         match piece
@@ -3003,6 +3052,7 @@ mod tests {
             TestInput::with_two_reads_and_a_reuse_of_a_surviving_value(),
             TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
             TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
+            TestInput::with_a_pinned_read_before_a_reuse_of_a_dying_value(),
             TestInput::with_a_reuse_of_a_live_in_value(),
             TestInput::with_two_reuses_at_one_point(),
             TestInput::with_two_reuses_of_a_dying_value(),
@@ -3825,6 +3875,82 @@ mod tests {
         // the two constraints merge, which is what coalescing needs.
         let tied =
             test_input.with_input(|input| input.func.inst(inst(2)).operand(2).val().unwrap());
+        let def_span = live_ranges
+            .spans()
+            .find(|span| span.val(&live_ranges) == tied)
+            .unwrap();
+        test_input.with_input(|input| {
+            let target = spans[1].constraint(&live_ranges, input);
+            let definition = def_span.constraint(&live_ranges, input);
+            assert!(
+                target.merge_resolved(&definition, input.machine).is_some(),
+                "the tie's halves must be coalescable: {target:?} and {definition:?}",
+            );
+        });
+    }
+
+    /// A tie's target that *dies* at it still needs its own span when an
+    /// earlier read pinned its piece to a narrower class: folding it in would
+    /// commit the tie to a register the definition cannot use, and coalescing
+    /// cannot undo that.
+    #[test]
+    fn split_a_span_around_a_reuse_of_a_dying_value_pinned_earlier() {
+        let test_input = TestInput::with_a_pinned_read_before_a_reuse_of_a_dying_value();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The reuse at `inst2` names operand 0, the value's last read; `inst1`
+        // read it earlier under a strictly narrower class.
+        let dying =
+            test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val().unwrap());
+        test_input.with_input(|input| {
+            assert_eq!(input.func.inst(inst(1)).operand(0).val(), Some(dying));
+            let pinned = reuse_aware_constraint(input, inst(1), 0);
+            let tie = reuse_aware_constraint(input, inst(2), 0);
+            assert_eq!(
+                pinned.merge_resolved(&tie, input.machine),
+                Some(pinned),
+                "the fixture must narrow the tie, not conflict with it: \
+                 {pinned:?} and {tie:?}",
+            );
+            assert_ne!(pinned, tie, "and narrow it strictly");
+        });
+
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == dying)
+            .collect();
+        assert_eq!(spans.len(), 2, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let pinned_read = LivePoint::new(inst(1), Position::Early);
+        let tie = LivePoint::new(inst(2), Position::Early);
+        let overwritten = LivePoint::new(inst(2), Position::Late);
+
+        // The pinned read's piece stops at the tie ...
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), tie);
+        // ... and the tied read gets the instruction's early half to itself,
+        // the same span a surviving target's doomed copy would have.
+        assert_eq!(spans[1].start(&live_ranges), tie);
+        assert_eq!(spans[1].end(&live_ranges), overwritten);
+
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def, pinned_read]);
+        assert_eq!(
+            points(spans[1]),
+            vec![tie],
+            "the tie's target did not stay behind in the pinned read's piece",
+        );
+
+        // Which is what lets the tie coalesce: the target's span keeps the
+        // tie's own class, not the earlier read's.
+        let tied =
+            test_input.with_input(|input| input.func.inst(inst(2)).operand(1).val().unwrap());
         let def_span = live_ranges
             .spans()
             .find(|span| span.val(&live_ranges) == tied)
