@@ -3126,6 +3126,326 @@ impl TestInput {
         input
     }
 
+    /// A single-block input in which each of `num_values` values is defined by
+    /// the instruction of the same index, the instructions carry `operands` in
+    /// order, and the block ends with a terminator of its own so that
+    /// `ensure_terminators` does not rewrite the reads before it.
+    fn around_an_overwritten_read(num_values: usize, operands: Vec<Vec<Operand>>) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        func.values = PrimaryMap::new();
+        for i in 0..num_values {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for operands in operands.into_iter().chain(core::iter::once(Vec::new())) {
+            func.insts
+                .push(
+                    &mut output,
+                    InstData::Op {
+                        operands,
+                        side_effects: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        Self::single_block(TestMachine::two_registers(), func, output)
+    }
+
+    /// A single-block input whose early read is pinned to the one register
+    /// that its own instruction's late definition overwrites, and whose value
+    /// survives that instruction.
+    pub fn with_a_read_overwritten_by_a_fixed_def() -> Self {
+        let defined = Val::try_new(0).unwrap();
+        let clobbering = Val::try_new(1).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+
+        Self::around_an_overwritten_read(
+            2,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+                vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(first_reg),
+                        Some(defined),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(clobbering),
+                    ),
+                ],
+                // The read that makes the pinned read's value a survivor.
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+            ],
+        )
+    }
+
+    /// Like `with_a_read_overwritten_by_a_fixed_def`, but nothing reads the
+    /// value again, so it dies at its pinned read.
+    ///
+    /// The control for the split: there is no later use to carry the value to,
+    /// so its span simply ends where the definition takes the register, and
+    /// construction has nothing to split. This allocated before the split
+    /// existed and must keep allocating, with one span and no copy.
+    pub fn with_a_dying_read_overwritten_by_a_fixed_def() -> Self {
+        let defined = Val::try_new(0).unwrap();
+        let clobbering = Val::try_new(1).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+
+        Self::around_an_overwritten_read(
+            2,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+                vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(first_reg),
+                        Some(defined),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(clobbering),
+                    ),
+                ],
+            ],
+        )
+    }
+
+    /// Like `with_a_read_overwritten_by_a_fixed_def`, but the overwriting
+    /// instruction reads the survivor *twice*, both times pinned to the
+    /// register it overwrites.
+    ///
+    /// Both reads are at one point and want one register, so one doomed copy
+    /// serves them both. Splitting at each in turn would build two copies
+    /// pinned to `r0` and overlapping, which asks for a register the machine
+    /// does not have --- so this is the fixture that keeps the split firing at
+    /// the *last* such read rather than the first.
+    pub fn with_two_reads_overwritten_by_a_fixed_def() -> Self {
+        let defined = Val::try_new(0).unwrap();
+        let clobbering = Val::try_new(1).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let pinned_read = || {
+            Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(first_reg),
+                Some(defined),
+            )
+        };
+
+        Self::around_an_overwritten_read(
+            2,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+                vec![
+                    pinned_read(),
+                    pinned_read(),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(clobbering),
+                    ),
+                ],
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+            ],
+        )
+    }
+
+    /// Like `with_a_read_overwritten_by_a_fixed_def`, but the second operand
+    /// *reads* `r0` late instead of defining it.
+    ///
+    /// Unsatisfiable, and must stay so: `r0` has to hold one value at the
+    /// instruction's early point and a different one at its late point, and no
+    /// move may be placed between the two halves of an instruction.
+    pub fn with_a_late_read_conflicting_with_an_early_read() -> Self {
+        let defined = Val::try_new(0).unwrap();
+        let conflicting = Val::try_new(1).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+
+        Self::around_an_overwritten_read(
+            2,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(conflicting),
+                )],
+                vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(first_reg),
+                        Some(defined),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Use,
+                        OperandConstraint::Reg(first_reg),
+                        Some(conflicting),
+                    ),
+                ],
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+            ],
+        )
+    }
+
+    /// Like `with_a_read_overwritten_by_a_fixed_def`, but the survivor is
+    /// *defined* into `r0` early rather than read from it.
+    ///
+    /// Unsatisfiable, and must stay so: the instruction itself writes the
+    /// value into `r0` at its early point, where the allocator cannot put it
+    /// anywhere else, and overwrites `r0` at its late point with no gap
+    /// between the two in which to move the value out.
+    pub fn with_an_early_def_overwritten_by_a_late_def() -> Self {
+        let defined = Val::try_new(0).unwrap();
+        let clobbering = Val::try_new(1).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+
+        Self::around_an_overwritten_read(
+            2,
+            vec![
+                vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(defined),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(clobbering),
+                    ),
+                ],
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+            ],
+        )
+    }
+
+    /// Two *different* values read from the one register at one point, with a
+    /// definition overwriting it.
+    ///
+    /// Unsatisfiable, and must stay so: each read splits independently, so the
+    /// two doomed copies are both pinned to `r0` and both cover the same early
+    /// half. One register cannot deliver two values at once.
+    pub fn with_two_values_read_from_one_register() -> Self {
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let clobbering = Val::try_new(2).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let pinned_read = |val| {
+            Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(first_reg),
+                Some(val),
+            )
+        };
+        let later_read = |val| {
+            Operand::new(
+                Position::Late,
+                DefUse::Use,
+                OperandConstraint::Any,
+                Some(val),
+            )
+        };
+
+        Self::around_an_overwritten_read(
+            3,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(first),
+                )],
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(second),
+                )],
+                vec![
+                    pinned_read(first),
+                    pinned_read(second),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(clobbering),
+                    ),
+                ],
+                vec![later_read(first), later_read(second)],
+            ],
+        )
+    }
+
     /// Like `with_two_reads_and_a_reuse_of_a_surviving_value`, but with an
     /// *earlier* read pinned to `r0` and the tie pinned to `r1`.
     ///
@@ -5771,6 +6091,9 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_move_before_an_unconditional_branch(),
         TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
         TestInput::with_a_reuse_of_a_pinned_read(),
+        TestInput::with_a_read_overwritten_by_a_fixed_def(),
+        TestInput::with_a_dying_read_overwritten_by_a_fixed_def(),
+        TestInput::with_two_reads_overwritten_by_a_fixed_def(),
         // A value live across four blocks and read in two of them. Given a
         // remat cost, its spans are cut at every instruction and absent from
         // the block that never mentions it, which is the shape gaps have to be

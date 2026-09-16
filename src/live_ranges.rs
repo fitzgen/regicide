@@ -2088,7 +2088,7 @@ fn remap_block_span_events<E, K>(
         match event {
             crate::events::Event::SpanConstructed { span, .. } => *span = remap(*span),
             crate::events::Event::EagerSplit { before, .. } => *before = remap(*before),
-            crate::events::Event::ReuseSplit { before, copy, .. } => {
+            crate::events::Event::OverwriteSplit { before, copy, .. } => {
                 *before = before.map(remap);
                 *copy = remap(*copy);
             }
@@ -2192,24 +2192,42 @@ where
         }
     }
 
-    /// Which split, if any, a definition reusing this operand's place demands
-    /// of the piece accumulated so far.
+    /// Which split, if any, a definition overwriting the register this operand
+    /// is read from demands of the piece accumulated so far.
+    ///
+    /// Two shapes ask for it: a definition tied to this read by a `Reuse`, and
+    /// a definition pinned to the one register this read is pinned to.
     fn tie_split(
         &self,
         input: &Input<'_, impl InputFunction>,
         end: LivePoint<E>,
         piece: &Piece<E>,
     ) -> Option<TieSplit> {
-        let input_inst = input.func.inst(self.point.inst().with_repr32());
-        if !(self.is_read && is_reuse_target(&input_inst, self.operand)) {
+        if !self.is_read {
             return None;
+        }
+        let inst = self.point.inst().with_repr32();
+        let input_inst = input.func.inst(inst);
+
+        // The value outlives this instruction, so it needs a second copy to
+        // carry it to its later uses.
+        let survives = end > self.point.next_point();
+
+        if !is_reuse_target(&input_inst, self.operand) {
+            // Nothing is tied to this read, but a read pinned to a register
+            // that one of this instruction's own definitions overwrites wants
+            // the very same three pieces. The definition takes the register at
+            // `Late` and no move may be placed in the middle of an
+            // instruction, so the value cannot stay there past the early half.
+            return (survives && is_overwritten_read_that_splits(input, inst, self.operand))
+                .then_some(TieSplit::AtOverwrite);
         }
 
         // The value outlives the tie, so it needs a second copy for its later
         // uses; or a later tie names another read of it, which the definition
         // overwriting that read cannot share a register with.
-        if end > self.point.next_point() || another_tie_follows(&input_inst, self.operand) {
-            return Some(TieSplit::AtReuse);
+        if survives || another_tie_follows(&input_inst, self.operand) {
+            return Some(TieSplit::AtOverwrite);
         }
 
         // The value dies here, but folding it in would narrow it below what
@@ -2227,11 +2245,11 @@ where
     }
 }
 
-/// Which split a reuse tie at a read demands.
+/// Which split a definition overwriting the register behind a read demands.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TieSplit {
-    /// The three-piece shape `Piece::split_at_reuse` draws.
-    AtReuse,
+    /// The three-piece shape `Piece::split_at_overwrite` draws.
+    AtOverwrite,
 
     /// A plain cut just before the read, which the loop's tail push then
     /// completes into a span holding the tied read alone.
@@ -2461,28 +2479,35 @@ where
         ))
     }
 
-    /// Split this piece around the reuse-tie at `u`.
+    /// Split this piece around the read at `u`, whose register a definition of
+    /// the same instruction overwrites.
     ///
-    /// A `Reuse` is a definition, so it overwrites the location it shares with its
-    /// target. A target that outlives the instruction needs a second copy for its
-    /// later uses, so it is split like this:
+    /// Two shapes arrive here. A `Reuse` is a definition, so it overwrites the
+    /// location it shares with its target; and a definition pinned to the one
+    /// register a read is pinned to overwrites that register just the same. In
+    /// both, the definition lands at `Late` and no move may be placed in the
+    /// middle of an instruction, so a value that outlives the instruction
+    /// needs a second copy for its later uses, and is split like this:
     ///
     /// ```ignore
-    ///        def               reuse                     use
+    ///        def               overwritten read           use
     /// span1: [d================)
     /// span2:                   [r==)
     /// span3:                   [==========================u)
     /// ```
     ///
-    /// `span2` holds only the tied use, and coalescing bundles it with the span
-    /// containing the other tied half. `span3` starts at the same point rather than
-    /// after it, since it exists to keep the value alive across the reuse
-    /// instruction for subsequent uses. Coalescing will also try bundling `span1`
-    /// with `span3`, when possible.
+    /// `span2` holds only the overwritten read and the early half of its
+    /// instruction. It is the copy the definition destroys, and nothing ever
+    /// reads its end. For a `Reuse`, coalescing bundles it with the span
+    /// containing the other tied half. `span3` starts at the same point,
+    /// overlapping `span2`, rather than after it, since it exists to keep the
+    /// value alive across the instruction for subsequent uses. Coalescing will
+    /// also try bundling `span1` with `span3`, when possible, so that the
+    /// survivor pays no move.
     ///
     /// This method pushes `span1` and `span2`, and returns `span3` so more uses
     /// can be accumulated into it.
-    fn split_at_reuse(
+    fn split_at_overwrite(
         &self,
         spans: &mut PrimaryMap<LiveSpan<E>, LiveSpanData<E>>,
         output: &mut OutputInner<E>,
@@ -2492,8 +2517,8 @@ where
         block: Block<E>,
         u: &ResolvedUse<E>,
     ) -> IResult<Self> {
-        // Earlier uses at this same point belong to the reuse's span rather
-        // than the piece, if they can share a location with the tie.
+        // Earlier uses at this same point belong to the overwritten read's
+        // span rather than the piece, if they can share a location with it.
         let run_at_this_point = self.point == u.point && self.run_start != u.use_;
         let run_joins_the_tie = run_at_this_point
             && self
@@ -2533,7 +2558,7 @@ where
         };
 
         // `span2`: the reads at this point and the early half of their
-        // instruction, existing only to be overwritten by the reuse def.
+        // instruction, existing only to be overwritten by the definition.
         let after = output.entity::<Use<E>>(u.use_.index() + 1)?;
         let copy = push_span(
             spans,
@@ -2548,7 +2573,7 @@ where
         )?;
         event!(
             events,
-            ReuseSplit {
+            OverwriteSplit {
                 val,
                 at: u.point,
                 target_use: u.use_,
@@ -2570,6 +2595,9 @@ where
 ///
 /// * a value is named as a `Reuse` target and the piece so far would narrow it
 ///   below what the tie allows,
+///
+/// * a value is read from the one register that a definition of the same
+///   instruction overwrites, and outlives that instruction,
 ///
 /// * a use that could be in a register would unnecessarily be constrained to
 ///   the stack, or
@@ -2617,11 +2645,18 @@ where
         }
 
         match u.tie_split(input, end, &piece) {
-            Some(TieSplit::AtReuse) => {
+            Some(TieSplit::AtOverwrite) => {
                 debug_assert_eq!(u.point.pos(), Position::Early);
-                piece =
-                    piece.split_at_reuse(spans, output, events, input.machine, val, block, &u)?;
-                counts.reuse_splits.inc();
+                piece = piece.split_at_overwrite(
+                    spans,
+                    output,
+                    events,
+                    input.machine,
+                    val,
+                    block,
+                    &u,
+                )?;
+                counts.overwrite_splits.inc();
                 continue;
             }
             Some(TieSplit::Before) => {
@@ -2692,6 +2727,70 @@ fn is_reuse_target<'a>(input_inst: &impl InputInst<'a>, index: usize) -> bool {
     input_inst
         .operands()
         .any(|op| op.constraint() == OperandConstraint::Reuse(index))
+}
+
+/// Does this instruction define a value into the one register an early read
+/// constrained to `read_class` is delivered in?
+fn a_late_def_overwrites(
+    input: &Input<'_, impl InputFunction>,
+    inst: Inst,
+    read_class: RegClass,
+) -> bool {
+    debug_assert!(read_class.is_singleton(input.machine));
+    let input_inst = input.func.inst(inst);
+    (0..input_inst.operands_len()).any(|j| {
+        let op = input_inst.operand(j);
+        if op.kind() != DefUse::Def || op.pos() != Position::Late {
+            return false;
+        }
+        let OperandConstraint::Reg(def_class) = reuse_aware_constraint(input, inst, j) else {
+            return false;
+        };
+        def_class.is_singleton(input.machine)
+            && !def_class
+                .member_set(input.machine)
+                .intersection(read_class.member_set(input.machine))
+                .is_empty()
+    })
+}
+
+/// Is the `index`th operand of `inst` an early read pinned to a register that a
+/// definition of this same instruction overwrites?
+fn is_an_overwritten_read(input: &Input<'_, impl InputFunction>, inst: Inst, index: usize) -> bool {
+    let op = input.func.inst(inst).operand(index);
+    if op.kind() != DefUse::Use || op.pos() != Position::Early {
+        return false;
+    }
+    let OperandConstraint::Reg(read_class) = reuse_aware_constraint(input, inst, index) else {
+        return false;
+    };
+    read_class.is_singleton(input.machine) && a_late_def_overwrites(input, inst, read_class)
+}
+
+/// Does a later operand read the same value from a register this instruction
+/// overwrites too?
+fn another_overwritten_read_follows(
+    input: &Input<'_, impl InputFunction>,
+    inst: Inst,
+    index: usize,
+) -> bool {
+    let input_inst = input.func.inst(inst);
+    let val = input_inst.operand(index).val();
+    (index + 1..input_inst.operands_len())
+        .any(|j| input_inst.operand(j).val() == val && is_an_overwritten_read(input, inst, j))
+}
+
+/// Should span construction split this operand's span around a definition that
+/// overwrites the register it is read from? And should coalescing try to glue
+/// the head and tail that surround the split back together?
+pub(crate) fn is_overwritten_read_that_splits(
+    input: &Input<'_, impl InputFunction>,
+    inst: Inst,
+    index: usize,
+) -> bool {
+    is_an_overwritten_read(input, inst, index)
+        && !is_reuse_target(&input.func.inst(inst), index)
+        && !another_overwritten_read_follows(input, inst, index)
 }
 
 #[cfg(test)]
@@ -3095,6 +3194,9 @@ mod tests {
             TestInput::with_a_reuse_of_a_live_in_value(),
             TestInput::with_two_reuses_at_one_point(),
             TestInput::with_two_reuses_of_a_dying_value(),
+            TestInput::with_a_read_overwritten_by_a_fixed_def(),
+            TestInput::with_a_dying_read_overwritten_by_a_fixed_def(),
+            TestInput::with_two_reads_overwritten_by_a_fixed_def(),
             TestInput::with_a_critical_edge(),
             TestInput::with_two_entry_params(),
             TestInput::with_an_entry_param_read_two_ways(),
@@ -3568,55 +3670,67 @@ mod tests {
         }
     }
 
-    /// A reuse split names the use it was made for and the one-point span the
-    /// definition overwrites.
+    /// An overwrite split names the use it was made for and the one-point span
+    /// the definition overwrites.
+    ///
+    /// Both triggers log the one event: a definition tied to the read by a
+    /// `Reuse`, and a definition pinned to the one register the read is pinned
+    /// to. `target_use` is what tells a reader of the log which of them it was.
     #[test]
     #[cfg(feature = "visualizer")]
-    fn reuse_splits_are_logged() {
+    fn overwrite_splits_are_logged() {
         use crate::events::Event;
 
-        let test_input = TestInput::with_reuse_of_a_surviving_value();
-        let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
+        for (i, test_input) in [
+            TestInput::with_reuse_of_a_surviving_value(),
+            TestInput::with_a_read_overwritten_by_a_fixed_def(),
+            TestInput::with_two_reads_overwritten_by_a_fixed_def(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
 
-        let splits: Vec<_> = events
-            .iter()
-            .filter_map(|(_, e)| match e {
-                Event::ReuseSplit {
-                    val,
-                    at,
-                    target_use,
-                    before,
-                    copy,
-                } => Some((*val, *at, *target_use, *before, *copy)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(splits.len(), 1, "{splits:#?}");
-        let (val, at, target_use, before, copy) = splits[0];
+            let splits: Vec<_> = events
+                .iter()
+                .filter_map(|(_, e)| match e {
+                    Event::OverwriteSplit {
+                        val,
+                        at,
+                        target_use,
+                        before,
+                        copy,
+                    } => Some((*val, *at, *target_use, *before, *copy)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(splits.len(), 1, "fixture {i}: {splits:#?}");
+            let (val, at, target_use, before, copy) = splits[0];
 
-        assert_eq!(val, copy.val(&live_ranges));
-        assert_eq!(at, target_use.point(&live_ranges));
-        assert_eq!(copy.start(&live_ranges), at);
-        assert_eq!(copy.end(&live_ranges), at.next_point());
-        let before = before.expect("the value is live before the tie");
-        assert_eq!(before.end(&live_ranges), at);
+            assert_eq!(val, copy.val(&live_ranges), "fixture {i}");
+            assert_eq!(at, target_use.point(&live_ranges), "fixture {i}");
+            assert_eq!(copy.start(&live_ranges), at, "fixture {i}");
+            assert_eq!(copy.end(&live_ranges), at.next_point(), "fixture {i}");
+            let before = before.expect("the value is live before the overwritten read");
+            assert_eq!(before.end(&live_ranges), at, "fixture {i}");
 
-        // The pieces were logged as they were pushed, before the split that
-        // explains them.
-        let kinds: Vec<_> = events
-            .iter()
-            .map(|(_, e)| match e {
-                Event::SpanConstructed { .. } => "span",
-                Event::ReuseSplit { .. } => "reuse",
-                _ => "other",
-            })
-            .collect();
-        let reuse = kinds.iter().position(|k| *k == "reuse").unwrap();
-        assert_eq!(kinds[reuse - 1], "span");
+            // The pieces were logged as they were pushed, before the split that
+            // explains them.
+            let kinds: Vec<_> = events
+                .iter()
+                .map(|(_, e)| match e {
+                    Event::SpanConstructed { .. } => "span",
+                    Event::OverwriteSplit { .. } => "split",
+                    _ => "other",
+                })
+                .collect();
+            let split = kinds.iter().position(|k| *k == "split").unwrap();
+            assert_eq!(kinds[split - 1], "span", "fixture {i}");
+        }
     }
 
     /// A `Reuse` whose target outlives the instruction gets the three-piece
-    /// shape `split_at_reuse` draws. The properties above say only that the
+    /// shape `split_at_overwrite` draws. The properties above say only that the
     /// pieces tile the value's range; this says where the cuts land and who
     /// owns the tied use.
     #[test]
@@ -3681,6 +3795,116 @@ mod tests {
                 .filter(|span| span.val(&live_ranges) == survivor)
                 .count(),
             1,
+        );
+    }
+
+    /// A read pinned to the one register its own instruction's late definition
+    /// overwrites gets the same three-piece shape a `Reuse` does, and for the
+    /// same reason: the definition takes the register at `Late`, so a value
+    /// that outlives the instruction needs a second copy to carry it onwards.
+    #[test]
+    fn split_a_span_around_a_read_overwritten_by_a_fixed_def() {
+        let test_input = TestInput::with_a_read_overwritten_by_a_fixed_def();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // Operand 0 of `inst1` is the pinned read, whose value outlives it.
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let def = LivePoint::new(inst(0), Position::Late);
+        let read = LivePoint::new(inst(1), Position::Early);
+        let overwritten = LivePoint::new(inst(1), Position::Late);
+        let later_use = LivePoint::new(inst(2), Position::Late);
+
+        // The run up to the pinned read ...
+        assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(
+            spans[0].end(&live_ranges),
+            read,
+            "the first piece stops at the instruction that overwrites its place",
+        );
+
+        // ... the copy the definition overwrites, the instruction's early half ...
+        assert_eq!(spans[1].start(&live_ranges), read);
+        assert_eq!(
+            spans[1].end(&live_ranges),
+            overwritten,
+            "the doomed piece covers just the early half, which is all the \
+             definition leaves it",
+        );
+
+        // ... and the survivor, starting alongside it so both share a source.
+        assert_eq!(spans[2].start(&live_ranges), read);
+        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
+
+        // The pinned read belongs to the overwritten piece, so that is what
+        // carries its `Reg` constraint and what `Inst::operand_span` resolves
+        // to; the survivor is left free to live anywhere.
+        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
+            span.uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.point(&live_ranges))
+                .collect()
+        };
+        assert_eq!(points(spans[0]), vec![def]);
+        assert_eq!(points(spans[1]), vec![read]);
+        assert_eq!(points(spans[2]), vec![later_use]);
+
+        // The control: with no later read the value dies at the pinned read,
+        // its span ends where the definition takes the register, and there is
+        // nothing to split.
+        let test_input = TestInput::with_a_dying_read_overwritten_by_a_fixed_def();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 1, "{spans:#?}");
+        assert_eq!(spans[0].end(&live_ranges), overwritten);
+    }
+
+    /// Two reads of one value pinned to the register their instruction
+    /// overwrites share a single doomed copy.
+    ///
+    /// Both are at one point and want the same register, so splitting at each
+    /// in turn would build one copy per read, all pinned to that register and
+    /// all overlapping --- a demand for registers that do not exist. The split
+    /// fires at the last of them, and the earlier ones fold into its span.
+    #[test]
+    fn split_a_span_around_two_reads_overwritten_by_a_fixed_def() {
+        let test_input = TestInput::with_two_reads_overwritten_by_a_fixed_def();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        let survivor =
+            test_input.with_input(|input| input.func.inst(inst(1)).operand(0).val().unwrap());
+        let spans: Vec<LiveSpan> = live_ranges
+            .spans()
+            .filter(|span| span.val(&live_ranges) == survivor)
+            .collect();
+        assert_eq!(spans.len(), 3, "{spans:#?}");
+
+        let read = LivePoint::new(inst(1), Position::Early);
+        assert_eq!(spans[1].start(&live_ranges), read);
+        assert_eq!(
+            spans[1].end(&live_ranges),
+            LivePoint::new(inst(1), Position::Late),
+        );
+
+        // Both reads landed in the one doomed copy.
+        assert_eq!(
+            spans[1]
+                .uses(&live_ranges)
+                .into_iter()
+                .map(|u| u.operand(&live_ranges))
+                .collect::<Vec<_>>(),
+            vec![0, 1],
         );
     }
 

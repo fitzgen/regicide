@@ -2462,6 +2462,59 @@ mod tests {
         }
     }
 
+    /// An early read pinned to the one register its own instruction's late
+    /// definition overwrites is satisfiable whenever the value outlives the
+    /// instruction, and construction's three-piece split is what expresses it:
+    /// the value keeps a register of its own across the instruction, and the
+    /// copy in the overwritten register lives only across the early half and
+    /// is destroyed by the definition.
+    #[test]
+    fn a_read_overwritten_by_a_fixed_def_costs_no_extra_register() {
+        for (i, test_input) in [
+            // The reproducer from the report.
+            TestInput::with_a_read_overwritten_by_a_fixed_def(),
+            // Two reads at one point, which one doomed copy must serve.
+            TestInput::with_two_reads_overwritten_by_a_fixed_def(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let stats = check_allocation(&test_input)
+                .unwrap_or_else(|e| panic!("fixture {i} failed to check: {e}"));
+            assert_eq!(
+                stats.too_many_live_regs, 0,
+                "fixture {i} should fit on its machine: the value can keep a \
+                 register of its own while a doomed copy satisfies the pinned \
+                 read",
+            );
+        }
+    }
+
+    /// The neighbouring shapes that really are unsatisfiable must stay that
+    /// way: the fix is a new span shape for one specific conflict, not a
+    /// blanket decision to stop reporting conflicts.
+    #[test]
+    fn unsatisfiable_neighbours_still_report_too_many_live_regs() {
+        for (i, test_input) in [
+            TestInput::with_a_late_read_conflicting_with_an_early_read(),
+            TestInput::with_an_early_def_overwritten_by_a_late_def(),
+            TestInput::with_two_values_read_from_one_register(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = test_input.with_input(|input| {
+                let mut context = crate::Context::new();
+                crate::run(&mut context, input).err()
+            });
+            assert!(
+                matches!(error, Some(crate::Error::TooManyLiveRegs)),
+                "fixture {i} is not satisfiable on its machine, so it should \
+                 still report `TooManyLiveRegs`; got {error:?}",
+            );
+        }
+    }
+
     /// The only value of `test_input`, which the single-value fixtures define
     /// first.
     fn first_val(test_input: &TestInput) -> Val {

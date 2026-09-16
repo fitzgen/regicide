@@ -1066,6 +1066,12 @@
         },
         "val": "Val"
       },
+      "OverwriteSplit": {
+        "before": "LiveSpan",
+        "copy": "LiveSpan",
+        "target_use": "Use",
+        "val": "Val"
+      },
       "ParallelMoveBatchSolved": {
         "pos": {
           "criticalEdge": {
@@ -1080,12 +1086,6 @@
             "pred": "Block"
           }
         },
-        "val": "Val"
-      },
-      "ReuseSplit": {
-        "before": "LiveSpan",
-        "copy": "LiveSpan",
-        "target_use": "Use",
         "val": "Val"
       },
       "ScratchRegChosen": {

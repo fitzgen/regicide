@@ -26,8 +26,8 @@ pub enum Affinity {
     /// A definition tied to one of its own operands.
     ReuseOperand,
 
-    /// The two pieces on either side of a reuse split.
-    ReuseSplit,
+    /// The two pieces on either side of an overwrite split.
+    OverwriteSplit,
 
     /// A value flowing along a control-flow edge.
     CrossEdge,
@@ -122,14 +122,17 @@ where
     },
 
     /// A span was split around a definition that overwrites one of its uses.
-    ReuseSplit {
+    ///
+    /// Either a definition tied to that use by a `Reuse`, or one pinned to the
+    /// single register the use is pinned to.
+    OverwriteSplit {
         /// The value being split.
         val: Val<E>,
-        /// The tied instruction's early half.
+        /// The overwriting instruction's early half.
         at: LivePoint<E>,
-        /// The use the definition ties itself to.
+        /// The use whose register the definition takes.
         target_use: Use<E>,
-        /// The piece running up to the tie, if it is not empty.
+        /// The piece running up to that use, if it is not empty.
         before: Option<LiveSpan<E>>,
         /// The one-point span that exists only to be overwritten.
         copy: LiveSpan<E>,
@@ -597,7 +600,7 @@ mod viz_enabled {
             match self {
                 Self::SpanConstructed { .. } => "SpanConstructed",
                 Self::EagerSplit { .. } => "EagerSplit",
-                Self::ReuseSplit { .. } => "ReuseSplit",
+                Self::OverwriteSplit { .. } => "OverwriteSplit",
                 Self::SpansCoalesced { .. } => "SpansCoalesced",
                 Self::CoalesceRefused { .. } => "CoalesceRefused",
                 Self::CrossRegionAffinity { .. } => "CrossRegionAffinity",
@@ -678,7 +681,7 @@ mod viz_enabled {
                     visit_constraint(*conflicting, f);
                 }
 
-                Self::ReuseSplit {
+                Self::OverwriteSplit {
                     val,
                     at,
                     target_use,
@@ -1068,7 +1071,7 @@ mod viz_enabled {
             constraint: (CONSTRAINT),
             conflicting: (CONSTRAINT),
         }
-        ReuseSplit {
+        OverwriteSplit {
             val: Val,
             at: _,
             target_use: Use,

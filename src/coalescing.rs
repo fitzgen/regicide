@@ -21,8 +21,8 @@
 //!
 //! 3. a def that must reuse the register of one of its own operands, and
 //!
-//! 4. the pieces on either side of a reuse split, which hold the same value
-//!    across the definition that overwrites the copy between them.
+//! 4. the pieces on either side of an overwrite split, which hold the same
+//!    value across the definition that overwrites the copy between them.
 //!
 //! When a span in one bundle has affinity with a span in another bundle, we say
 //! that the bundles have affinity.
@@ -668,7 +668,8 @@ where
     }
 
     /// Merge the sets of the operands tied together by a `Reuse` constraint,
-    /// and those of the pieces on either side of the reuse split.
+    /// and those of the pieces on either side of every split construction made
+    /// around a definition overwriting the register behind a read.
     fn coalesce_reuse_operands<'a>(
         &mut self,
         live_ranges: &LiveRanges<E>,
@@ -718,7 +719,7 @@ where
                 );
 
                 debug_assert_eq!(target.pos(), Position::Early);
-                self.coalesce_across_reuse_split(
+                self.coalesce_across_overwrite_split(
                     live_ranges,
                     input,
                     events,
@@ -727,11 +728,33 @@ where
                     LivePoint::new(inst, Position::Early),
                 );
             }
+
+            // A read pinned to the one register a definition of this same
+            // instruction overwrites is split into the same three pieces, and
+            // its outer two want rejoining just as much.
+            for j in 0..input_inst.operands_len() {
+                if !crate::live_ranges::is_overwritten_read_that_splits(input, inst, j) {
+                    continue;
+                }
+                // The predicate only holds for a read, and a read of no value
+                // is not one.
+                let val = input_inst.operand(j).val().unwrap();
+                let val = output.with_repr(val)?;
+                let inst = output.with_repr(inst)?;
+                self.coalesce_across_overwrite_split(
+                    live_ranges,
+                    input,
+                    events,
+                    block,
+                    val,
+                    LivePoint::new(inst, Position::Early),
+                );
+            }
         }
         Ok(())
     }
 
-    /// Merge the pieces on either side of a `Reuse` split at `at`.
+    /// Merge the pieces on either side of an overwrite split at `at`.
     ///
     /// Of the three pieces `push_span_and_split_conflicts` makes, only the
     /// middle one (the doomed copy that the definition overwrites)
@@ -739,7 +762,7 @@ where
     /// one bundle can avoid an additional, unnecessary copy.
     ///
     /// Always within one block, so always within one region.
-    fn coalesce_across_reuse_split(
+    fn coalesce_across_overwrite_split(
         &mut self,
         live_ranges: &LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
@@ -774,7 +797,7 @@ where
                     input.machine,
                     live_ranges,
                     events,
-                    Affinity::ReuseSplit,
+                    Affinity::OverwriteSplit,
                     head,
                     tail,
                 )
@@ -1186,12 +1209,41 @@ mod tests {
         })
     }
 
+    /// Record the affinity between the pieces on either side of the overwrite
+    /// split `inst` made in `val`: the one ending where the instruction begins
+    /// and every one starting there that outlives the instruction.
+    fn across_the_overwrite_split(
+        live_ranges: &LiveRanges<u32>,
+        block: Block,
+        inst: Inst,
+        val: Val,
+        affinities: &mut Vec<(LiveSpan, LiveSpan, bool)>,
+    ) {
+        let at = LivePoint::new(inst, Position::Early);
+        let Some(span1) = block
+            .spans(live_ranges)
+            .into_iter()
+            .find(|span| span.val(live_ranges) == val && span.end(live_ranges) == at)
+        else {
+            return;
+        };
+        for span3 in block.spans(live_ranges) {
+            if span3.val(live_ranges) == val
+                && span3.start(live_ranges) == at
+                && span3.end(live_ranges) > at.next_point()
+            {
+                affinities.push((span1, span3, true));
+            }
+        }
+    }
+
     /// Every pair of spans that coalescing should have tried to merge, derived
     /// from the function rather than from anything the pass recorded, as well
     /// as whether coalescing was allowed to take the affinity.
     fn all_affinities(
         live_ranges: &LiveRanges<u32>,
         func: &TestFunction,
+        input: &Input<'_, impl InputFunction>,
     ) -> Vec<(LiveSpan, LiveSpan, bool)> {
         let mut affinities = Vec::new();
 
@@ -1210,24 +1262,28 @@ mod tests {
                         affinities.push((a, b, true));
                     }
 
-                    // And the pieces on either side of the reuse split. See
-                    // `Coalescing::coalesce_across_reuse_split`.
-                    let val = input_inst.operand(i).val().unwrap();
-                    let at = LivePoint::new(inst, Position::Early);
-                    let Some(span1) = block
-                        .spans(live_ranges)
-                        .into_iter()
-                        .find(|span| span.val(live_ranges) == val && span.end(live_ranges) == at)
-                    else {
-                        continue;
-                    };
-                    for span3 in block.spans(live_ranges) {
-                        if span3.val(live_ranges) == val
-                            && span3.start(live_ranges) == at
-                            && span3.end(live_ranges) > at.next_point()
-                        {
-                            affinities.push((span1, span3, true));
-                        }
+                    // And the pieces on either side of the overwrite split.
+                    // See `Coalescing::coalesce_across_overwrite_split`.
+                    across_the_overwrite_split(
+                        live_ranges,
+                        block,
+                        inst,
+                        input_inst.operand(i).val().unwrap(),
+                        &mut affinities,
+                    );
+                }
+
+                // The same split, made for a read pinned to the one register
+                // a definition of this instruction overwrites.
+                for j in 0..input_inst.operands_len() {
+                    if crate::live_ranges::is_overwritten_read_that_splits(input, inst, j) {
+                        across_the_overwrite_split(
+                            live_ranges,
+                            block,
+                            inst,
+                            input_inst.operand(j).val().unwrap(),
+                            &mut affinities,
+                        );
                     }
                 }
             }
@@ -1423,7 +1479,7 @@ mod tests {
                 // reasons -- but it is only legitimate if it still shows up as a
                 // conflict now, since bundles only ever grow.
                 test_input.with_input(|input| -> Result<(), String> {
-                    for (a, b, mergeable) in all_affinities(live_ranges, func) {
+                    for (a, b, mergeable) in all_affinities(live_ranges, func, input) {
                         let (Some(ba), Some(bb)) = (a.bundle(live_ranges), b.bundle(live_ranges))
                         else {
                             return Err("an affinity's span has no bundle".to_string());
@@ -1488,7 +1544,7 @@ mod tests {
                 // allocated to, and only a cross-region affinity can put one
                 // there in the first place.
                 let cross_region: Vec<(LiveBundle, LiveBundle)> = test_input.with_input(|input| {
-                    all_affinities(live_ranges, func)
+                    all_affinities(live_ranges, func, input)
                         .into_iter()
                         .filter_map(|(a, b, _)| {
                             let (ba, bb) = (
@@ -1882,6 +1938,62 @@ mod tests {
             span2.bundle(live_ranges),
             "the surviving value and the definition that overwrites one copy of \
              it may not share a location",
+        );
+    }
+
+    /// The same three pieces, made for a read pinned to the one register its
+    /// own instruction's definition overwrites: the outer two go together, so
+    /// the surviving value pays no move to get back where it already was.
+    ///
+    /// The middle piece does *not* join the overwriting definition here, as it
+    /// would under a `Reuse`. That definition holds a different value, so the
+    /// two spans merely abut, and a bundle whose spans touch mid-instruction
+    /// without being tied has a gap a cut may go in --- which splitting would
+    /// take straight back apart. Both are pinned to the one register anyway.
+    #[test]
+    fn the_pieces_on_either_side_of_a_fixed_overwrite_are_coalesced() {
+        let input = TestInput::with_a_read_overwritten_by_a_fixed_def();
+
+        // `inst1` reads the survivor from the register its own operand 1
+        // defines into.
+        let (survivor, defined) = input.with_input(|input| {
+            let inst = input.func.inst(Inst::try_new(1).unwrap());
+            (
+                inst.operand(0).val().unwrap(),
+                inst.operand(1).val().unwrap(),
+            )
+        });
+
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+        let block = Block::try_new(0).unwrap();
+
+        let mut pieces: Vec<LiveSpan> = block
+            .spans(live_ranges)
+            .into_iter()
+            .filter(|&span| span.val(live_ranges) == survivor)
+            .collect();
+        pieces.sort_by_key(|span| (span.start(live_ranges), span.end(live_ranges)));
+        assert_eq!(pieces.len(), 3, "{pieces:#?}");
+        let (span1, span2, span3) = (pieces[0], pieces[1], pieces[2]);
+
+        assert_eq!(
+            span1.bundle(live_ranges),
+            span3.bundle(live_ranges),
+            "the pieces on either side of the overwritten read should share a \
+             bundle",
+        );
+        assert_ne!(
+            span1.bundle(live_ranges),
+            span2.bundle(live_ranges),
+            "the surviving value and the doomed copy of it may not share a \
+             location",
+        );
+        assert_ne!(
+            span2.bundle(live_ranges),
+            only_span(live_ranges, 0, defined.index()).bundle(live_ranges),
+            "the doomed copy holds another value than the definition that \
+             overwrites it, so the two only abut",
         );
     }
 
