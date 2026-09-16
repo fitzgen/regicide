@@ -9,7 +9,16 @@
 
 use libfuzzer_sys::{fuzz_mutator, fuzz_target, fuzzer_mutate};
 use mutatis::Session;
-use regicide::test::{TestInput, TestInputMutator};
+use regicide::{
+    serialize::SerializeInput,
+    test::{TestInput, TestInputMutator},
+};
+use std::{
+    fs::File,
+    hash::{DefaultHasher, Hash, Hasher},
+    io::BufWriter,
+    path::PathBuf,
+};
 
 /// Decode a corpus entry into a `TestInput`.
 fn decode(bytes: &[u8]) -> Option<TestInput> {
@@ -21,11 +30,42 @@ fn decode(bytes: &[u8]) -> Option<TestInput> {
     Some(input)
 }
 
+/// Write `input` out as JSON and report where it landed.
+///
+/// The name comes from a hash of the bytes we were handed, so re-running the
+/// same input overwrites its file rather than leaving another copy behind.
+fn dump(input: &TestInput, bytes: &[u8]) -> Result<PathBuf, String> {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let path = PathBuf::from(format!("input-{:016x}.json", hasher.finish()));
+    log::info!("serializing input as JSON to `{}`", path.display());
+
+    let file = File::create(&path).map_err(|e| e.to_string())?;
+    input.with_input(|input| {
+        serde_json::to_writer(BufWriter::new(file), &SerializeInput::new(input))
+            .map_err(|e| e.to_string())
+    })?;
+
+    // A relative path is no help when we don't know where libFuzzer left us.
+    Ok(path.canonicalize().unwrap_or(path))
+}
+
 fuzz_target!(|bytes: &[u8]| {
     let _ = env_logger::try_init();
     let Some(input) = decode(bytes) else { return };
     if let Err(e) = regicide::test::check_allocation(&input) {
-        panic!("{e}\n\ninput:\n\n{input:#?}");
+        let json = match dump(&input, bytes) {
+            Ok(path) => {
+                let path = path.display();
+                format!(
+                    "wrote the input to {path}; replay it with\n\n    \
+                     cargo run --example visualize --all-features -- --input {path} \
+                     /tmp/regicide.html"
+                )
+            }
+            Err(err) => format!("could not write the input out as JSON: {err}"),
+        };
+        panic!("{e}\n\n{json}\n\ninput:\n\n{input:#?}");
     }
 });
 

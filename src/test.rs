@@ -4720,6 +4720,143 @@ impl TestInput {
         input
     }
 
+    /// A value whose piece across the rest of its defining block holds it
+    /// nowhere, wanted in a register in the block right after -- where it
+    /// arrives from that piece -- and then read on the stack, which gives it a
+    /// slot and so a store to place.
+    ///
+    /// ```ignore
+    /// block0: inst0  late def v0 (any)     // v0 and v1 share a class of one
+    ///         inst1  late def v1 (rc0)     // register, so v0 is nowhere from
+    ///                --> block1, block2    // inst1 to the end of the block
+    /// block1: inst2  early use v0 (rc0)    // v0 arrives from nowhere here
+    ///         inst3  late use v0 (stack)   // and this asks it a slot of
+    ///                --> block2            // its own, and so a store
+    /// block2: inst4  returns
+    /// ```
+    ///
+    /// `block1` has the one predecessor, so its edge's moves and anything
+    /// stored at its start share a position, and the recomputation that puts
+    /// the value in a register runs after all of them. Give the value a remat
+    /// cost and a store placed at `block1`'s start reads a register that does
+    /// not hold the value yet.
+    ///
+    /// `block0` branches two ways so that the walk up the dominator tree stops
+    /// at `block1`: from a defining block with this block as its only
+    /// successor it would push the store up there anyway, and hide the bug.
+    pub fn with_a_value_stored_where_it_arrives_from_nowhere() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let one_reg = RegClass::try_new(usize::from(TestMachine::FIRST_REG_CLASS)).unwrap();
+
+        // Both values belong to the class of that one register, so the second
+        // definition leaves the first value with nowhere to be.
+        func.values = PrimaryMap::new();
+        for def_inst in [0, 1] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::FIRST_REG_CLASS,
+                        def: ValDef::InstResult {
+                            inst: inst(def_inst),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand = |pos, kind, constraint, v| Operand::new(pos, kind, constraint, Some(v));
+        let branch = |operands: Vec<Operand>, targets: &[usize]| InstData::Branch {
+            operands,
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0` defines the value, and then the register it could be in.
+            InstData::Op {
+                operands: vec![operand(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    val(0),
+                )],
+                side_effects: true,
+            },
+            branch(
+                vec![operand(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Reg(one_reg),
+                    val(1),
+                )],
+                &[1, 2],
+            ),
+            // `block1` wants the value in that register, and then on the stack.
+            InstData::Op {
+                operands: vec![operand(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(one_reg),
+                    val(0),
+                )],
+                side_effects: true,
+            },
+            branch(
+                vec![operand(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Stack,
+                    val(0),
+                )],
+                &[2],
+            ),
+            // `block2` is only somewhere for `block1` to end.
+            branch(vec![], &[]),
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3)],
+            vec![inst(4)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A value defined in one block and wanted in a much later one, with a
     /// block in between that never mentions it and needs every register for
     /// itself, so the piece crossing that block has no uses of its own.
@@ -6125,6 +6262,14 @@ pub fn corpus() -> Vec<TestInput> {
         // source and needs somewhere real to be read from after all.
         {
             let mut input = TestInput::with_a_value_carried_past_a_crowded_block(true);
+            input.set_remat_costs(Some(RematCost::CheaperThanReload));
+            input
+        },
+        // A value that arrives in a block from a piece holding it nowhere, and
+        // has a slot: the store cannot go at that block's start, where the
+        // recomputation that fills the register has not run yet.
+        {
+            let mut input = TestInput::with_a_value_stored_where_it_arrives_from_nowhere();
             input.set_remat_costs(Some(RematCost::CheaperThanReload));
             input
         },

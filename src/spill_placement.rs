@@ -258,6 +258,15 @@ where
 
     /// The same blocks as `is_spill_site`, in the order we found them.
     spill_site_blocks: Vec<Block<E>>,
+
+    /// For the value currently being placed, the blocks it arrives in from
+    /// nowhere.
+    ///
+    /// A predecessor carries the value across the edge in a span that holds it
+    /// nowhere, so the value only lands in a register once the
+    /// rematerialization at the block's entry has run, which is after any
+    /// store we would place there.
+    arrives_from_nowhere: EntitySet<Block<E>>,
 }
 
 impl<E> Default for SpillPlacement<E>
@@ -283,6 +292,7 @@ where
             union_find: UnionFind::new(),
             is_spill_site: EntitySet::new(),
             spill_site_blocks: Vec::new(),
+            arrives_from_nowhere: EntitySet::new(),
         }
     }
 
@@ -296,6 +306,7 @@ where
             union_find,
             is_spill_site,
             spill_site_blocks,
+            arrives_from_nowhere,
         } = self;
         spills.clear();
         stack_bundles.reset();
@@ -305,6 +316,7 @@ where
         debug_assert!(spans.is_empty());
         debug_assert!(is_spill_site.is_empty());
         debug_assert!(spill_site_blocks.is_empty());
+        debug_assert!(arrives_from_nowhere.is_empty());
     }
 
     pub fn is_reset(&self) -> bool {
@@ -317,6 +329,7 @@ where
             union_find,
             is_spill_site,
             spill_site_blocks,
+            arrives_from_nowhere,
         } = self;
         spills.is_empty()
             && stack_bundles.is_reset()
@@ -326,6 +339,7 @@ where
             && union_find.is_reset()
             && is_spill_site.is_empty()
             && spill_site_blocks.is_empty()
+            && arrives_from_nowhere.is_empty()
     }
 
     /// The spills we placed.
@@ -533,13 +547,15 @@ where
         self.legal.reset();
         self.is_spill_site.reset();
         self.union_find.reset();
+        self.arrives_from_nowhere.reset();
     }
 
     /// Find every block where it is legal to spill the associated value and
     /// record them in `self.legal`.
     ///
     /// This is every block where the value is live and in a register at the
-    /// start of the block.
+    /// start of the block, before any of the block's own moves or
+    /// rematerializations have run.
     fn find_legal_spill_blocks(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -554,6 +570,28 @@ where
         // blocks.
         if input.func.value(val.with_repr32()).remat_cost() == Some(RematCost::AlwaysRemat) {
             return;
+        }
+
+        // Blocks the value arrives in from nowhere are not legal spill
+        // locations because the rematerialization that puts the value in a
+        // register runs at the block's entry, after the spill we would place
+        // there.
+        for &span in val_spans {
+            let block = span.block(input.func, live_ranges);
+            if span.end(live_ranges) != block.end_point(input)
+                || !span
+                    .bundle(live_ranges)
+                    .unwrap()
+                    .is_rematerialized(live_ranges)
+            {
+                continue;
+            }
+            for succ in input.func.block(block.with_repr32()).successors() {
+                let succ = succ
+                    .with_repr::<E>()
+                    .expect("every block index already fit in `E` in the earlier passes");
+                self.arrives_from_nowhere.insert(succ);
+            }
         }
 
         let mut num_candidates = 0;
@@ -571,6 +609,7 @@ where
                     .unwrap()
                     .is_rematerialized(live_ranges)
                 && span.start(live_ranges) == block.start_point(input)
+                && !self.arrives_from_nowhere.contains(block)
             {
                 self.legal[block] = Some(span);
                 num_candidates += 1;
@@ -1441,6 +1480,102 @@ mod tests {
             for (_, event) in ctx.events.iter() {
                 if let LoggedEvent::SpillBlockChosen { block, .. } = *event {
                     assert_ne!(block, crowded, "{crowded:?} is not a legal spill block");
+                }
+            }
+        });
+    }
+
+    /// A block the value arrives in from a span that holds it nowhere is no
+    /// better: the store would go at that block's start, sharing the position
+    /// with the incoming edge's moves, and the rematerialization that puts the
+    /// value in a register there runs after every one of them.
+    #[test]
+    fn no_spill_where_the_value_arrives_from_nowhere() {
+        let mut test_input = TestInput::with_a_value_stored_where_it_arrives_from_nowhere();
+        test_input.set_remat_costs(Some(RematCost::CheaperThanReload));
+        let context = place(&test_input).unwrap().unwrap();
+
+        test_input.with_input(|input| {
+            let ctx = &context.context32;
+            let func = input.func;
+            let live_ranges = &ctx.live_ranges;
+
+            let val = Val::<u32>::try_new(0).unwrap();
+            let def_block = Block::<u32>::try_new(0).unwrap();
+            let arrival = Block::<u32>::try_new(1).unwrap();
+            assert!(
+                ctx.spill_slots.spilled().contains(val),
+                "the stack-constrained read has to give the value a slot, or there is no spill \
+                 to place at all",
+            );
+
+            // The premise: the value leaves its defining block in a piece that
+            // holds it nowhere, and the next block takes it from there.
+            let crossing = live_ranges
+                .spans()
+                .filter(|span| {
+                    span.val(live_ranges) == val
+                        && span.block(func, live_ranges) == def_block
+                        && span.end(live_ranges) == def_block.end_point(input)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                crossing.len(),
+                1,
+                "expected one crossing piece, got {crossing:?}"
+            );
+            let bundle = crossing[0]
+                .bundle(live_ranges)
+                .expect("a live span belongs to a bundle");
+            assert!(bundle.is_rematerialized(live_ranges));
+            assert!(bundle.reg_allocation(live_ranges).is_none());
+
+            // And the block it arrives in is otherwise everything the walk
+            // looks for: a span at the block's entry, in a register.
+            let arriving = live_ranges
+                .spans()
+                .filter(|span| {
+                    span.val(live_ranges) == val
+                        && span.block(func, live_ranges) == arrival
+                        && span.start(live_ranges) == arrival.start_point(input)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                arriving.len(),
+                1,
+                "expected one arriving piece, got {arriving:?}"
+            );
+            assert!(
+                arriving[0]
+                    .bundle(live_ranges)
+                    .expect("a live span belongs to a bundle")
+                    .reg_allocation(live_ranges)
+                    .is_some(),
+                "the arriving piece has to be in a register for the guard to have to skip it",
+            );
+
+            // So the store stays behind in the defining block, as early as the
+            // definition allows.
+            let sites = ctx.spill_placement.spills();
+            assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
+            let site = sites[0];
+            assert_eq!(site.val(live_ranges), val);
+            assert_eq!(
+                site.block(func, live_ranges),
+                def_block,
+                "the spill belongs where the value still has a register",
+            );
+            assert_eq!(
+                site.point(),
+                LivePoint::new(block_first_inst(&func.block(def_block)), Position::Late)
+                    .inst_boundary_after(),
+            );
+
+            // And the block it arrives in was never even a candidate.
+            #[cfg(feature = "visualizer")]
+            for (_, event) in ctx.events.iter() {
+                if let LoggedEvent::SpillBlockChosen { block, .. } = *event {
+                    assert_ne!(block, arrival, "{arrival:?} is not a legal spill block");
                 }
             }
         });

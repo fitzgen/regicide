@@ -1044,6 +1044,17 @@ where
             if spill_site.point() != block.end_point(input) {
                 let pos = PackedMovePosition::point(spill_site.point());
                 let key_val = self.val_for_spill_key(input, output, block, val, pos)?;
+
+                debug_assert!(
+                    !(spill_site.point() == block.start_point(input)
+                        && block.is_live_in(liveness, val)
+                        && block.with_repr32() != func.entry_block()
+                        && func.block(block.with_repr32()).len_predecessors() == 1)
+                        || self.sources.contains_key(&HalfMoveKey::new(pos, key_val)),
+                    "{val:?} arrives in {block:?} from nowhere, so the spill \
+                     placed at its start has no source to read from",
+                );
+
                 self.emit_spill(counts, events, pos, key_val, arrives_in, dst);
                 continue;
             }
