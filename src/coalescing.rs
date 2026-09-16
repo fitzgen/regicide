@@ -1043,8 +1043,8 @@ mod tests {
     use crate::entity::Inst;
     use crate::input::BlockFrequency;
     use crate::live_ranges::{
-        LiveBundle, is_minimal_bundle, normalize_spill_weight, round_bundle_spill_weight,
-        touch_mid_inst,
+        LiveBundle, is_minimal_bundle, normalize_spill_weight, remat_scale,
+        round_bundle_spill_weight, touch_mid_inst,
     };
     use crate::test::{TestFunction, TestInput};
     use mutatis::{
@@ -1605,19 +1605,22 @@ mod tests {
                     }
                 }
 
-                // 11. A bundle's weight, its fixed-use flag, and its
-                // minimality are exactly what its spans say they are: the flag
-                // is the OR of theirs, the weight is their uses' weights over
-                // their summed length, normalized, and the minimality is
+                // 11. A bundle's weight, its fixed-use flag, and its minimality
+                // are exactly what its spans say they are: the flag is the OR
+                // of theirs, the weight is their uses' weights over their
+                // summed length, normalized, and the minimality is
                 // `is_minimal_bundle` of the gaps a cut could go in, their
-                // uses' count, and the instructions they actually cover.
-                // Recomputing the weight from the *packed* per-use weights and
-                // rounding the result the way the bundle does makes that one an
-                // equality rather than an approximation.
+                // uses' count, and the instructions they actually cover. A
+                // bundle that is not minimal also discounts each span's uses by
+                // its value's remat cost. Recomputing the weight from the
+                // *packed* per-use weights and rounding the result the way the
+                // bundle does makes that one an equality rather than an
+                // approximation.
                 test_input.with_input(|input| -> Result<(), String> {
                 for bundle in live_ranges.bundles() {
                     let mut expected_fixed = false;
                     let mut total_cost = 0.0;
+                    let mut discounted_cost = 0.0;
                     let mut num_insts = 0;
                     let num_spans = bundle.spans(live_ranges).len();
                     let mut num_uses = 0;
@@ -1634,10 +1637,13 @@ mod tests {
                         expected_fixed |= span.has_fixed_use(live_ranges);
                         let uses = span.uses(live_ranges);
                         num_uses += uses.len();
-                        total_cost += uses
+                        let span_cost = uses
                             .into_iter()
                             .map(|u| u.weight(live_ranges).as_f32())
                             .sum::<f32>();
+                        total_cost += span_cost;
+                        let remat = input.func.value(span.val(live_ranges)).remat_cost();
+                        discounted_cost += span_cost * remat_scale(remat);
                         num_insts += span.len_insts(live_ranges);
 
                         if let Some(prev) = prev {
@@ -1661,22 +1667,30 @@ mod tests {
                         ));
                     }
 
+                    let distinct_insts = num_insts - shared_insts;
+                    let expected_minimal =
+                        is_minimal_bundle(num_cuttable_gaps, num_uses, distinct_insts);
+
+                    // A minimal bundle has no length left to give up, so its
+                    // uses pay full price.
+                    let expected_cost = if expected_minimal {
+                        total_cost
+                    } else {
+                        discounted_cost
+                    };
                     let expected =
-                        round_bundle_spill_weight(normalize_spill_weight(total_cost, num_insts));
+                        round_bundle_spill_weight(normalize_spill_weight(expected_cost, num_insts));
                     let actual = bundle.spill_weight(live_ranges);
                     if actual != expected {
                         return Err(format!(
                             "{bundle:?} weighs {actual}, but its {num_insts} instructions and \
-                             {total_cost} of use cost come to {expected}",
+                             {expected_cost} of use cost come to {expected}",
                         ));
                     }
                     if !actual.is_finite() || actual < 0.0 {
                         return Err(format!("{bundle:?} weighs {actual}, which is not a weight"));
                     }
 
-                    let distinct_insts = num_insts - shared_insts;
-                    let expected_minimal =
-                        is_minimal_bundle(num_cuttable_gaps, num_uses, distinct_insts);
                     if bundle.is_minimal(live_ranges) != expected_minimal {
                         return Err(format!(
                             "{bundle:?} reports is_minimal = {}, but it holds {num_spans} spans \

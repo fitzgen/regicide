@@ -865,16 +865,23 @@ impl<E> LiveSpan<E>
 where
     E: EntityRepr,
 {
-    /// Where this span's value lives over this span.
+    /// Where this span's value lives over this span, or `None` when it is
+    /// rematerialized whenever needed again.
+    ///
+    /// Note that, even when it is rematerialized on demand, the value may still
+    /// have a stack home, for example, if used via a stack constraint.
     pub(crate) fn allocation(
         self,
         live_ranges: &LiveRanges<E>,
         spill_slots: &SpillSlots<E>,
-    ) -> Allocation<E> {
+    ) -> Option<Allocation<E>> {
         let bundle = self.bundle(live_ranges).unwrap();
         match bundle.reg_allocation(live_ranges) {
-            Some(alloc) => Allocation::Reg(alloc),
-            None => Allocation::Stack(self.val(live_ranges).stack_home(spill_slots).unwrap()),
+            Some(alloc) => Some(Allocation::Reg(alloc)),
+            None if bundle.is_rematerialized(live_ranges) => None,
+            None => Some(Allocation::Stack(
+                self.val(live_ranges).stack_home(spill_slots).unwrap(),
+            )),
         }
     }
 }
@@ -1436,5 +1443,37 @@ mod tests {
             Val::<u32>::try_new(0).unwrap().stack_home(spill_slots),
             None
         );
+    }
+
+    /// A value carried past a block that wants every register costs no slot
+    /// when recomputing it is cheaper than reloading it: the piece crossing
+    /// that block gets no location, so nothing here hears of a spill -- and no
+    /// store and reload come with it.
+    #[test]
+    fn a_recomputed_value_carried_past_a_crowded_block_gets_no_slot() {
+        let mut test_input = TestInput::with_a_value_carried_past_a_crowded_block(false);
+        test_input.set_remat_costs(Some(crate::input::RematCost::CheaperThanReload));
+
+        let context = allocate(&test_input).unwrap().unwrap();
+        let spill_slots = &context.context32.spill_slots;
+
+        assert_eq!(spill_slots.len_slots(), 0);
+        assert!(spill_slots.spilled.is_empty());
+        let carried = Val::<u32>::try_new(0).unwrap();
+        assert_eq!(carried.stack_home(spill_slots), None);
+    }
+
+    /// The same value, but the crowded block passes it to its successor: that
+    /// piece is the source half of an edge move, so it gets a slot.
+    #[test]
+    fn the_same_value_passed_to_a_successor_gets_a_slot() {
+        let mut test_input = TestInput::with_a_value_carried_past_a_crowded_block(true);
+        test_input.set_remat_costs(Some(crate::input::RematCost::CheaperThanReload));
+
+        let context = allocate(&test_input).unwrap().unwrap();
+        let spill_slots = &context.context32.spill_slots;
+
+        let carried = Val::<u32>::try_new(0).unwrap();
+        assert!(carried.stack_home(spill_slots).is_some());
     }
 }

@@ -4020,6 +4020,140 @@ impl TestInput {
         input
     }
 
+    /// Three values wanting a register at a point where only two of them can
+    /// have one, the odd one out being recomputable and read in a hot block.
+    ///
+    /// ```ignore
+    /// block0: inst0  late def v0 (any)                // v0 is recomputable
+    ///         inst1  early use v0, late def v1 (any)  // v1's definition reads
+    ///         inst2  early use v1, late def v2 (any)  // an operand, and so
+    ///         inst3  --> block1                       // does v2's, so neither
+    /// block1: inst4  late def v3 (any)                // of them is
+    ///         inst5  early use v3 (any)               // recomputable; v3 is
+    ///         inst6  --> block2
+    /// block2: inst7  early use v1 (any)
+    ///         inst8  early use v2 (any)
+    ///         inst9  returns
+    /// ```
+    ///
+    /// `block1` runs a hundred times as often as its neighbours, and v1 and v2
+    /// hold both registers across it while paying only what their uses in the
+    /// cooler blocks are worth. v3 is minimal, but its use is worth a hot stack
+    /// access -- far more -- so it can take a register from one of them.
+    pub fn with_a_recomputed_read_under_pressure() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let any = OperandConstraint::Any;
+
+        func.values = PrimaryMap::new();
+        for def in [0, 1, 2, 4] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: inst(def),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let def = |v| InstData::Op {
+            operands: vec![Operand::new(Position::Late, DefUse::Def, any, Some(val(v)))],
+            side_effects: true,
+        };
+        let read = |v| InstData::Op {
+            operands: vec![Operand::new(
+                Position::Early,
+                DefUse::Use,
+                any,
+                Some(val(v)),
+            )],
+            side_effects: true,
+        };
+        // A read pinned to one register, which puts its bundle ahead of every
+        // unpinned one in the queue.
+        let pinned_read = |v, class| InstData::Op {
+            operands: vec![Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(RegClass::try_new(class).unwrap()),
+                Some(val(v)),
+            )],
+            side_effects: true,
+        };
+        // A definition that reads an operand, so its value gets no remat cost.
+        let read_and_def = |read, defined| InstData::Op {
+            operands: vec![
+                Operand::new(Position::Early, DefUse::Use, any, Some(val(read))),
+                Operand::new(Position::Late, DefUse::Def, any, Some(val(defined))),
+            ],
+            side_effects: true,
+        };
+        let branch = |target| InstData::Branch {
+            operands: vec![],
+            targets: vec![BlockCall {
+                target: block(target),
+                args: vec![],
+            }],
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            def(0),
+            read_and_def(0, 1),
+            read_and_def(1, 2),
+            branch(1),
+            def(3),
+            read(3),
+            branch(2),
+            pinned_read(1, 0),
+            pinned_read(2, 1),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1), inst(2), inst(3)],
+            vec![inst(4), inst(5), inst(6)],
+            vec![inst(7), inst(8), inst(9)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        input.set_block_frequency(block(1), BlockFrequency::HOT);
+        input
+    }
+
     /// A chain of four blocks defining one value in the first and reading it in
     /// two of the others, so that it is live across all of them and every block
     /// after the definition holds it differently: read at its first point and
@@ -4263,6 +4397,169 @@ impl TestInput {
             func,
         };
         input.fixup();
+        input
+    }
+
+    /// A value defined in one block and wanted in a much later one, with a
+    /// block in between that never mentions it and needs every register for
+    /// itself, so the piece crossing that block has no uses of its own.
+    ///
+    /// `passed_to_the_successor` says how the later block gets the value: as a
+    /// block-call argument from the crowded block, or by reading it itself.
+    ///
+    /// ```ignore
+    /// block0: inst0  early def v0 (reg)
+    ///         inst1  --> block1, block2
+    /// block1: inst2  early def v1 (reg)      // hot: v0 is live through here,
+    ///         inst3  early def v2 (reg)      // but never mentioned, and v1
+    ///         inst4  early use v1, use v2    // and v2 want both registers
+    ///         inst5  --> block3              // passing v0 along, or not
+    /// block2: inst6  returns
+    /// block3: inst7  early use v0 (reg)      // or of block3's parameter
+    ///         inst8  returns
+    /// ```
+    ///
+    /// Give the value a remat cost and the crossing piece is worth no location
+    /// at all -- unless `block1` passes it along, which makes it the source
+    /// half of an edge move, and a move needs a real place to read from.
+    /// `block1` is hot so that the crossing piece is the one that loses its
+    /// register.
+    pub fn with_a_value_carried_past_a_crowded_block(passed_to_the_successor: bool) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let reg = OperandConstraint::Reg(
+            RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+        );
+
+        // `v0`, carried past the crowded block; the two values that crowd it;
+        // and `block3`'s parameter when `v0` is passed along.
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: inst(0),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(2),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(3),
+                i: 0,
+            },
+        ]
+        .into_iter()
+        .chain(passed_to_the_successor.then_some(ValDef::BlockParam {
+            block: block(3),
+            i: 0,
+        })) {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand =
+            |kind, constraint, v| Operand::new(Position::Early, kind, constraint, Some(v));
+        let def = |v| InstData::Op {
+            operands: vec![operand(DefUse::Def, reg, v)],
+            side_effects: true,
+        };
+        let read = |v| InstData::Op {
+            operands: vec![operand(DefUse::Use, reg, v)],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize], args: Vec<Val<u32>>| InstData::Branch {
+            operands: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: args.clone(),
+                })
+                .collect(),
+        };
+
+        // The value `block3` reads: its own parameter, or `v0` itself.
+        let read_val = if passed_to_the_successor {
+            val(3)
+        } else {
+            val(0)
+        };
+        let args = if passed_to_the_successor {
+            vec![val(0)]
+        } else {
+            vec![]
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0` defines the value.
+            def(val(0)),
+            branch(&[1, 2], vec![]),
+            // `block1` never mentions it, and wants both registers itself.
+            def(val(1)),
+            def(val(2)),
+            InstData::Op {
+                operands: vec![
+                    operand(DefUse::Use, reg, val(1)),
+                    operand(DefUse::Use, reg, val(2)),
+                ],
+                side_effects: true,
+            },
+            branch(&[3], args),
+            // `block2` is the other way out of `block0`.
+            branch(&[], vec![]),
+            // `block3` is where the value is finally wanted.
+            read(read_val),
+            branch(&[], vec![]),
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (params, insts) in [
+            (vec![], vec![inst(0), inst(1)]),
+            (vec![], vec![inst(2), inst(3), inst(4), inst(5)]),
+            (vec![], vec![inst(6)]),
+            (
+                if passed_to_the_successor {
+                    vec![val(3)]
+                } else {
+                    vec![]
+                },
+                vec![inst(7), inst(8)],
+            ),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input.set_block_frequency(block(1), BlockFrequency::HOT);
         input
     }
 
@@ -5489,6 +5786,23 @@ pub fn corpus() -> Vec<TestInput> {
         {
             let mut input = TestInput::with_a_value_read_on_the_stack_past_a_crowded_block();
             input.set_remat_costs(Some(RematCost::AlwaysRemat));
+            input
+        },
+        // A value we always recompute, read where both registers are spoken
+        // for: recomputing is still no reason to deny its use a register.
+        TestInput::with_a_recomputed_read_under_pressure(),
+        // A value carried past a block that wants every register, cheap enough
+        // to recompute that the crossing piece gets no location at all.
+        {
+            let mut input = TestInput::with_a_value_carried_past_a_crowded_block(false);
+            input.set_remat_costs(Some(RematCost::CheaperThanReload));
+            input
+        },
+        // The same, but passed to the successor, so that piece is a move's
+        // source and needs somewhere real to be read from after all.
+        {
+            let mut input = TestInput::with_a_value_carried_past_a_crowded_block(true);
+            input.set_remat_costs(Some(RematCost::CheaperThanReload));
             input
         },
     ]

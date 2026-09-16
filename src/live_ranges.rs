@@ -261,7 +261,7 @@ const STACK_ACCESS_SCALE: f32 = 0.5;
 const SPILL_WEIGHT_ADJUST: usize = 25;
 
 /// Cost scale for a value that is always cheaper to rematerialize than to keep
-/// in a register: spilling it costs nothing at all.
+/// in a register: holding a register across its live range buys nothing at all.
 const REMAT_ALWAYS_SCALE: f32 = 0.0;
 
 /// Cost scale for a value that is cheaper to rematerialize than to move.
@@ -312,8 +312,10 @@ where
     }
 }
 
-/// How much cheaper rematerializing a value makes spilling it.
-fn remat_scale(remat_cost: Option<RematCost>) -> f32 {
+/// How much cheaper rematerializing a value makes holding it across a range.
+///
+/// This is a discount on length, not on uses.
+pub(crate) fn remat_scale(remat_cost: Option<RematCost>) -> f32 {
     match remat_cost {
         None => 1.0,
         Some(RematCost::AlwaysRemat) => REMAT_ALWAYS_SCALE,
@@ -322,8 +324,7 @@ fn remat_scale(remat_cost: Option<RematCost>) -> f32 {
     }
 }
 
-/// Like `use_spill_cost`, but scaled by rematerializability and block
-/// frequency.
+/// Like `use_spill_cost`, but scaled by block frequency.
 fn use_spill_weight<E>(
     input: &Input<'_, impl InputFunction>,
     uses: &PrimaryMap<Use<E>, UseData<E>>,
@@ -334,7 +335,6 @@ fn use_spill_weight<E>(
 where
     E: EntityRepr,
 {
-    let remat_scale = remat_scale(input.func.value(val.with_repr32()).remat_cost());
     let point = uses[u].point;
     let operand = usize::from(uses[u].operand);
     let input_inst = input.func.inst(point.inst().with_repr32());
@@ -348,7 +348,7 @@ where
     );
     debug_assert!(cost.is_sign_positive());
 
-    let weight = cost * remat_scale * frequency;
+    let weight = cost * frequency;
     debug_assert!(weight.is_sign_positive());
 
     SpillWeight::new(weight)
@@ -562,6 +562,10 @@ where
 
     /// The registers this bundle is currently allocated to.
     reg_allocation: Option<RegAllocation<E>>,
+
+    /// Is this bundle recomputed wherever it is next wanted, rather than held
+    /// anywhere at all?
+    rematerialized: bool,
 
     /// Packed weight and flags.
     ///
@@ -1238,6 +1242,7 @@ where
                 constraint,
                 preference: RegSet::new(),
                 reg_allocation: None,
+                rematerialized: false,
                 weight_and_flags: 0,
             },
         )?;
@@ -1256,6 +1261,7 @@ where
     ) {
         let mut has_fixed_uses = false;
         let mut total_use_cost = 0.0;
+        let mut discounted_use_cost = 0.0;
         let mut sum_len_insts = 0;
         let mut len_uses = 0;
 
@@ -1271,10 +1277,14 @@ where
             has_fixed_uses |= span.has_fixed_use(live_ranges);
             let uses = span.uses(live_ranges);
             len_uses += uses.len();
-            total_use_cost += uses
+            let span_use_cost = uses
                 .into_iter()
                 .map(|u| u.weight(live_ranges).as_f32())
                 .sum::<f32>();
+            total_use_cost += span_use_cost;
+            let val = span.val(live_ranges);
+            discounted_use_cost +=
+                span_use_cost * remat_scale(input.func.value(val.with_repr32()).remat_cost());
             sum_len_insts += span.len_insts(live_ranges);
 
             if let Some(prev) = prev {
@@ -1298,12 +1308,21 @@ where
         // covered, counting a shared one once.
         let len_insts = sum_len_insts - shared_insts;
 
+        // A minimal bundle can't punt by splitting uses off into remats, so it
+        // pays the full price.
+        let is_minimal = is_minimal_bundle(len_cuttable_gaps, len_uses, len_insts);
+        let use_cost = if is_minimal {
+            total_use_cost
+        } else {
+            discounted_use_cost
+        };
+
         let mut weight_and_flags = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::new(
-            normalize_spill_weight(total_use_cost, sum_len_insts),
+            normalize_spill_weight(use_cost, sum_len_insts),
         )
         .bits();
         debug_assert_eq!(weight_and_flags & !BUNDLE_SPILL_WEIGHT_MASK, 0);
-        if is_minimal_bundle(len_cuttable_gaps, len_uses, len_insts) {
+        if is_minimal {
             weight_and_flags |= BUNDLE_MINIMAL;
         }
         if has_fixed_uses {
@@ -1750,6 +1769,19 @@ where
         live_ranges.bundles[self].reg_allocation = None;
     }
 
+    /// Is this bundle recomputed where next wanted, rather than held anywhere?
+    #[inline]
+    pub(crate) fn is_rematerialized(self, live_ranges: &LiveRanges<E>) -> bool {
+        live_ranges.bundles[self].rematerialized
+    }
+
+    /// Record that nothing holds this bundle's value over its range.
+    #[inline]
+    pub(crate) fn set_rematerialized(self, live_ranges: &mut LiveRanges<E>) {
+        debug_assert!(live_ranges.bundles[self].reg_allocation.is_none());
+        live_ranges.bundles[self].rematerialized = true;
+    }
+
     /// Is this bundle minimal, i.e. too small to be split any further?
     #[inline]
     #[allow(dead_code, reason = "will probably need it")]
@@ -1949,6 +1981,23 @@ where
             .into_iter()
             .find(|&u| u.point(live_ranges).inst() == self && u.operand(live_ranges) == operand)
             .map(|u| u.span(live_ranges))
+    }
+}
+
+impl<E> Val<E>
+where
+    E: EntityRepr,
+{
+    /// Does `block` pass this value as an argument to any of its successors?
+    pub(crate) fn is_passed_to_a_successor(
+        self,
+        func: &impl InputFunction,
+        block: Block<E>,
+    ) -> bool {
+        let input_block = func.block(block.with_repr32());
+        let val = self.with_repr32();
+        (0..input_block.len_successors())
+            .any(|i| input_block.successor_block_args(i).any(|arg| arg == val))
     }
 }
 
@@ -2549,7 +2598,7 @@ where
     // And a block that never mentions such a value holds it nowhere at all:
     // whoever wants it next recomputes it, so there is nothing to carry
     // through, not even when the value is live on both sides.
-    if always_remat && span_uses.is_empty() && !is_passed_to_a_successor(input.func, block, val) {
+    if always_remat && span_uses.is_empty() && !val.is_passed_to_a_successor(input.func, block) {
         return Ok(());
     }
 
@@ -2620,17 +2669,6 @@ where
         block,
     )?;
     Ok(())
-}
-
-/// Does `block` pass `val` as an argument to any of its successors?
-fn is_passed_to_a_successor<E>(func: &impl InputFunction, block: Block<E>, val: Val<E>) -> bool
-where
-    E: EntityRepr,
-{
-    let input_block = func.block(block.with_repr32());
-    let val = val.with_repr32();
-    (0..input_block.len_successors())
-        .any(|i| input_block.successor_block_args(i).any(|arg| arg == val))
 }
 
 /// Does a later operand tie a definition to another read of `index`'s value?
@@ -2826,6 +2864,7 @@ mod tests {
             constraint: OperandConstraint::Any,
             preference: RegSet::new(),
             reg_allocation: None,
+            rematerialized: false,
             weight_and_flags,
         }
     }
@@ -4740,42 +4779,106 @@ mod tests {
         assert!(cold < weight_at(BlockFrequency::NORMAL));
     }
 
-    /// A value that can be recomputed on demand is worth less in a register,
-    /// and the cheaper it is to recompute the less it is worth.
+    /// Recomputing a value discounts *holding* it, not its uses: a minimal
+    /// bundle pays full price, a bundle with gaps the discounted one.
     #[test]
-    fn rematerializable_values_are_cheaper_to_spill() {
-        let rc2 = OperandConstraint::Reg(RegClass::try_new(2).unwrap());
+    fn rematerializable_values_are_cheaper_to_hold() {
+        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
 
-        let weight_with = |remat| {
-            let mut test_input = TestInput::with_use_constraints(&[rc2]);
+        // A bundle over `pick`'s spans: weight, minimality, and the
+        // undiscounted cost and length behind that weight.
+        let weigh = |remat, pick: fn(Vec<LiveSpan>) -> Vec<LiveSpan>| -> (f32, bool, f32, usize) {
+            // Alternating conflicting classes, so span construction cuts a
+            // span per use at every remat cost, not just the always-remat one.
+            let mut test_input = TestInput::with_use_constraints(&[rc(0), rc(1), rc(0), rc(1)]);
             test_input.set_remat_costs(remat);
-            use_weights(&test_input)[1].2
+
+            let (_liveness, mut live_ranges) = analyze_spans(&test_input).unwrap();
+            let spans = pick(live_ranges.spans().collect());
+            let mut output = OutputInner::<u32>::new();
+            let bundle = test_input
+                .with_input(|input| {
+                    live_ranges.push_bundle(
+                        input,
+                        &mut output,
+                        Region::try_new(0).unwrap(),
+                        OperandConstraint::Any,
+                        spans.iter().copied(),
+                    )
+                })
+                .unwrap();
+
+            let raw_cost = bundle
+                .spans(&live_ranges)
+                .flat_map(|span| span.uses(&live_ranges).into_iter())
+                .map(|u| u.weight(&live_ranges).as_f32())
+                .sum::<f32>();
+            let len_insts = bundle
+                .spans(&live_ranges)
+                .map(|span| span.len_insts(&live_ranges))
+                .sum::<usize>();
+
+            (
+                bundle.spill_weight(&live_ranges),
+                bundle.is_minimal(&live_ranges),
+                raw_cost,
+                len_insts,
+            )
         };
 
-        assert_eq!(weight_with(None), packed(CLASS_COST));
-        assert_eq!(
-            weight_with(Some(RematCost::CheaperThanReload)),
-            packed(REMAT_CHEAPER_THAN_RELOAD_SCALE * CLASS_COST),
-        );
-        assert_eq!(
-            weight_with(Some(RematCost::CheaperThanMove)),
-            packed(REMAT_CHEAPER_THAN_MOVE_SCALE * CLASS_COST),
-        );
-        assert_eq!(
-            weight_with(Some(RematCost::AlwaysRemat)),
-            0.0,
-            "a value that is always cheaper to recompute is free to spill",
-        );
+        // Neighbouring spans conflict, so a bundle with room in it takes
+        // every other one.
+        let with_gaps: fn(Vec<LiveSpan>) -> Vec<LiveSpan> =
+            |spans| spans.into_iter().step_by(2).collect();
+        let one_use: fn(Vec<LiveSpan>) -> Vec<LiveSpan> = |spans| vec![spans[2]];
 
-        assert!(
-            weight_with(Some(RematCost::AlwaysRemat))
-                < weight_with(Some(RematCost::CheaperThanMove))
+        let expected = |cost: f32, len_insts: usize| {
+            round_bundle_spill_weight(normalize_spill_weight(cost, len_insts))
+        };
+
+        let costs = [
+            (None, 1.0),
+            (
+                Some(RematCost::CheaperThanReload),
+                REMAT_CHEAPER_THAN_RELOAD_SCALE,
+            ),
+            (
+                Some(RematCost::CheaperThanMove),
+                REMAT_CHEAPER_THAN_MOVE_SCALE,
+            ),
+            (Some(RematCost::AlwaysRemat), REMAT_ALWAYS_SCALE),
+        ];
+
+        for (remat, _) in costs {
+            let (weight, minimal, raw_cost, len_insts) = weigh(remat, one_use);
+            assert!(minimal, "{remat:?}: wanted a minimal bundle to price");
+            assert_eq!(
+                weight,
+                expected(raw_cost, len_insts),
+                "{remat:?}: a minimal bundle pays the full price of its use",
+            );
+            assert!(weight > 0.0, "{remat:?}");
+        }
+
+        for (remat, scale) in costs {
+            let (weight, minimal, raw_cost, len_insts) = weigh(remat, with_gaps);
+            assert!(
+                !minimal,
+                "{remat:?}: wanted a bundle with length to give up"
+            );
+            assert_eq!(
+                weight,
+                expected(scale * raw_cost, len_insts),
+                "{remat:?}: a bundle with gaps pays its value's discounted price",
+            );
+        }
+
+        assert_eq!(
+            weigh(Some(RematCost::AlwaysRemat), with_gaps).0,
+            0.0,
+            "holding a value that is always cheaper to recompute across a gap \
+             buys nothing at all",
         );
-        assert!(
-            weight_with(Some(RematCost::CheaperThanMove))
-                < weight_with(Some(RematCost::CheaperThanReload))
-        );
-        assert!(weight_with(Some(RematCost::CheaperThanReload)) < weight_with(None));
     }
 
     /// A use that names a class holding one register has no allocation choice
@@ -5515,7 +5618,6 @@ mod tests {
                 test_input.with_input(|input| -> Result<(), String> {
                     for span in live_ranges.spans() {
                         let val = span.val(&live_ranges);
-                        let remat = remat_scale(input.func.value(val).remat_cost());
                         let mut any_fixed = false;
 
                         for u in span.uses(&live_ranges) {
@@ -5530,8 +5632,7 @@ mod tests {
                             let resolved = raw.resolved(&sibling);
 
                             let expected = SpillWeight::new(
-                                (use_spill_cost(input, val, raw, resolved) * remat * frequency)
-                                    .max(0.0),
+                                (use_spill_cost(input, val, raw, resolved) * frequency).max(0.0),
                             );
                             let actual = u.weight(&live_ranges);
                             if actual != expected {

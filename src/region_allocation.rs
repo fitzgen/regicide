@@ -13,6 +13,7 @@ use crate::{
     entity::{EntityRepr, Region, SecondaryMap},
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
+    input::InputValue,
     live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
     machine::{Machine, Reg, RegClassMembers},
     output::{OutputInner, RegAllocation},
@@ -911,8 +912,24 @@ where
         let result = (|| {
             if cuts.is_empty() {
                 match bundle.constraint(live_ranges) {
-                    // Free to live on the stack.
-                    OperandConstraint::Any | OperandConstraint::Stack => {}
+                    // Free to live on the stack, or nowhere at all when
+                    // recomputing its values is cheaper than keeping them.
+                    OperandConstraint::Any => {
+                        if bundle.is_cheaper_to_recompute_than_to_spill(input, live_ranges) {
+                            bundle.set_rematerialized(live_ranges);
+                            counts.rematerialized_bundles.inc();
+                            event!(
+                                events,
+                                BundleRematerialized {
+                                    bundle,
+                                    region: bundle.region(live_ranges),
+                                }
+                            );
+                            return Ok(());
+                        }
+                    }
+                    // An operand asked for memory, so memory is what it gets.
+                    OperandConstraint::Stack => {}
                     // It wants a register, we could not find one for it, and
                     // there is nothing left to try.
                     OperandConstraint::Reg(_) => return output.error(Error::TooManyLiveRegs),
@@ -983,6 +1000,26 @@ where
 {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<E> LiveBundle<E>
+where
+    E: EntityRepr,
+{
+    /// Would we rather recompute this bundle's values wherever they are next
+    /// wanted than give it the stack slot it has fallen back to?
+    fn is_cheaper_to_recompute_than_to_spill(
+        self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+    ) -> bool {
+        self.spans(live_ranges).all(|span| {
+            let val = span.val(live_ranges);
+            span.uses(live_ranges).is_empty()
+                && input.func.value(val.with_repr32()).remat_cost().is_some()
+                && !val.is_passed_to_a_successor(input.func, span.block(input.func, live_ranges))
+        })
     }
 }
 
@@ -1388,7 +1425,7 @@ mod tests {
     use std::{vec, vec::Vec};
 
     #[cfg(feature = "visualizer")]
-    use crate::{context::Context, events::Event, test::TestInput};
+    use crate::{context::Context, events::Event, input::InputValue, test::TestInput};
     #[cfg(feature = "visualizer")]
     use mutatis::check::{Check, CheckResult};
     #[cfg(feature = "visualizer")]
@@ -1542,6 +1579,7 @@ mod tests {
                         | Event::BundleAssignedNonPreferred { bundle, .. }
                         | Event::BundleAssignedViaEviction { bundle, .. }
                         | Event::BundleSpilledToStack { bundle, .. }
+                        | Event::BundleRematerialized { bundle, .. }
                         | Event::BundleSplitBetweenSpans { bundle, .. }
                         | Event::BundleSplitWithinSpan { bundle, .. }
                         | Event::BundleSplitIntoMinimal { bundle, .. } => Some(bundle),
@@ -1599,6 +1637,105 @@ mod tests {
             })
     }
 
+    /// Register pressure alone never sends a value to the stack that we could
+    /// recompute instead: a use-less bundle holding only recomputable values is
+    /// left without a location rather than spilled.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn pressure_alone_never_spills_what_we_could_recompute() -> CheckResult<TestInput> {
+        Check::new()
+            .iters(1_000)
+            .run(|test_input: &TestInput| -> Result<(), String> {
+                let Some(context) = allocate(test_input)? else {
+                    return Ok(());
+                };
+                let inner = &context.context32;
+                let live_ranges = &inner.live_ranges;
+
+                for (_, event) in inner.events.iter() {
+                    let Event::BundleSpilledToStack {
+                        bundle,
+                        forced: false,
+                        ..
+                    } = *event
+                    else {
+                        continue;
+                    };
+                    let could_have_been_recomputed = test_input.with_input(|input| {
+                        bundle.is_cheaper_to_recompute_than_to_spill(input, live_ranges)
+                    });
+                    if could_have_been_recomputed {
+                        return Err(format!(
+                            "{bundle:?} has no uses and holds only values we could recompute, \
+                             but pressure sent it to the stack anyway",
+                        ));
+                    }
+                }
+
+                Ok(())
+            })
+    }
+
+    /// A minimal bundle over an always-recomputable value still pays full
+    /// price for the register its use needs, so under pressure it takes one
+    /// from a bundle worth less rather than going to the stack: its use in the
+    /// hot block needs a register however the value got there, and a hot stack
+    /// access costs far more than the long, cool bundle it displaces.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn a_minimal_recomputable_bundle_evicts_rather_than_spilling() {
+        let test_input = TestInput::with_a_recomputed_read_under_pressure();
+        let context = allocate(&test_input)
+            .expect("the input allocates")
+            .expect("and fits on the machine");
+        let inner = &context.context32;
+        let live_ranges = &inner.live_ranges;
+
+        let holds_a_recomputable_value = |bundle: LiveBundle<u32>| {
+            test_input.with_input(|input| {
+                bundle.spans(live_ranges).any(|span| {
+                    input
+                        .func
+                        .value(span.val(live_ranges).with_repr32())
+                        .remat_cost()
+                        .is_some()
+                })
+            })
+        };
+
+        let mut evictions = Vec::new();
+        for (_, event) in inner.events.iter() {
+            match *event {
+                Event::BundleSpilledToStack { bundle, .. } => assert!(
+                    !holds_a_recomputable_value(bundle),
+                    "{bundle:?} holds a value cheaper to recompute than to spill, \
+                     and went to the stack anyway",
+                ),
+                Event::BundleAssignedViaEviction {
+                    bundle, evicted, ..
+                } if holds_a_recomputable_value(bundle) => evictions.push((bundle, evicted)),
+                _ => {}
+            }
+        }
+
+        assert!(
+            !evictions.is_empty(),
+            "nothing recomputable took a register from anything",
+        );
+        for (bundle, evicted) in evictions {
+            assert!(
+                bundle.is_minimal(live_ranges),
+                "{bundle:?} is the minimal piece its value was eagerly split into",
+            );
+            assert!(
+                bundle.spill_weight(live_ranges) > evicted.spill_weight(live_ranges),
+                "{bundle:?} paid {} for {evicted:?}'s register, which was worth {}",
+                bundle.spill_weight(live_ranges),
+                evicted.spill_weight(live_ranges),
+            );
+        }
+    }
+
     const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
     const MAX_GROUP_SIZE: usize = PRIORITY_GROUP_SIZE_MAX;
     const MAX_BROKEN_HINTS: usize = EVICTION_COST_BROKEN_HINTS_MAX;
@@ -1610,6 +1747,84 @@ mod tests {
         Phase::SplitWithinSpan,
         Phase::SplitIntoMinimalOrSpill,
     ];
+    /// A use-less bundle over a recomputable value gets no location at all
+    /// rather than a stack slot -- unless its block passes the value to a
+    /// successor, making it the source half of an edge move. Both halves run on
+    /// the same shape, so the guard is the only difference.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn a_use_less_recomputable_bundle_is_rematerialized_unless_it_is_passed_along() {
+        use crate::input::RematCost;
+
+        for passed_to_the_successor in [false, true] {
+            let mut test_input =
+                TestInput::with_a_value_carried_past_a_crowded_block(passed_to_the_successor);
+            test_input.set_remat_costs(Some(RematCost::CheaperThanReload));
+
+            let context = allocate(&test_input)
+                .expect("the input allocates")
+                .expect("and fits on the machine");
+            let inner = &context.context32;
+            let live_ranges = &inner.live_ranges;
+
+            // A bundle the decision could apply to: no uses, all recomputable.
+            let is_a_candidate = |bundle: LiveBundle<u32>| {
+                test_input.with_input(|input| {
+                    bundle.spans(live_ranges).all(|span| {
+                        span.uses(live_ranges).is_empty()
+                            && input
+                                .func
+                                .value(span.val(live_ranges).with_repr32())
+                                .remat_cost()
+                                .is_some()
+                    })
+                })
+            };
+
+            let mut rematerialized = Vec::new();
+            let mut spilled = Vec::new();
+            for (_, event) in inner.events.iter() {
+                match *event {
+                    Event::BundleRematerialized { bundle, .. } => rematerialized.push(bundle),
+                    Event::BundleSpilledToStack {
+                        bundle,
+                        forced: false,
+                        ..
+                    } if is_a_candidate(bundle) => spilled.push(bundle),
+                    _ => {}
+                }
+            }
+
+            if passed_to_the_successor {
+                assert!(
+                    rematerialized.is_empty(),
+                    "{rematerialized:?} was left without a location, but the block that holds \
+                     it passes its value to a successor and so has a move to source",
+                );
+                assert!(
+                    !spilled.is_empty(),
+                    "nothing use-less and recomputable was spilled, so the guard was never \
+                     reached",
+                );
+            } else {
+                assert!(
+                    spilled.is_empty(),
+                    "{spilled:?} got a stack slot it has no use for",
+                );
+                assert_eq!(
+                    rematerialized.len(),
+                    1,
+                    "the piece crossing the crowded block should be the one bundle left \
+                     without a location, got {rematerialized:?}",
+                );
+                for bundle in rematerialized {
+                    assert!(is_a_candidate(bundle));
+                    assert!(bundle.is_rematerialized(live_ranges));
+                    assert!(bundle.reg_allocation(live_ranges).is_none());
+                }
+            }
+        }
+    }
 
     fn bundle(index: usize) -> LiveBundle<u32> {
         LiveBundle::try_new(index).unwrap()

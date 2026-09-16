@@ -998,7 +998,10 @@ impl<E: EntityRepr> OutputInner<E> {
             for u in block.uses(live_ranges) {
                 let inst = u.point(live_ranges).inst();
                 let operand = u.operand(live_ranges);
-                let alloc = u.span(live_ranges).allocation(live_ranges, spill_slots);
+                let alloc = u
+                    .span(live_ranges)
+                    .allocation(live_ranges, spill_slots)
+                    .expect("a use's span holds its value somewhere");
 
                 let range = self.inst_allocs[inst];
                 let index = range.start.index() + operand;
@@ -1060,7 +1063,9 @@ impl<E: EntityRepr> OutputInner<E> {
                 _ => incumbents[index] = Some(span),
             }
 
-            let alloc = span.allocation(live_ranges, spill_slots);
+            let alloc = span
+                .allocation(live_ranges, spill_slots)
+                .expect("a block parameter always has an allocation");
             self.param_allocs.as_mut_slice()[index] = Some(alloc.with_repr32());
         }
 

@@ -566,6 +566,10 @@ where
             prev_block = Some(block);
 
             if !self.on_stack(span, live_ranges)
+                && !span
+                    .bundle(live_ranges)
+                    .unwrap()
+                    .is_rematerialized(live_ranges)
                 && span.start(live_ranges) == block.start_point(input)
             {
                 self.legal[block] = Some(span);
@@ -1368,6 +1372,77 @@ mod tests {
                     .inst_boundary_after(),
                 "and as early in that block as the definition allows",
             );
+        });
+    }
+
+    /// A block whose span of the value holds it nowhere at all is not a place
+    /// we can spill it from: a stack-constrained use gives the value a slot,
+    /// while the crossing piece is at its block's entry and not on the stack --
+    /// everything the walk used to ask for -- with nothing there to store.
+    #[test]
+    fn no_spill_from_a_span_that_holds_the_value_nowhere() {
+        let mut test_input = TestInput::with_a_value_read_on_the_stack_past_a_crowded_block();
+        test_input.set_remat_costs(Some(RematCost::CheaperThanReload));
+        let context = place(&test_input).unwrap().unwrap();
+
+        test_input.with_input(|input| {
+            let ctx = &context.context32;
+            let func = input.func;
+            let live_ranges = &ctx.live_ranges;
+
+            let val = Val::<u32>::try_new(0).unwrap();
+            let crowded = Block::<u32>::try_new(1).unwrap();
+            assert!(
+                ctx.spill_slots.spilled().contains(val),
+                "the stack-constrained read has to give the value a slot, or there is no spill \
+                 to place at all",
+            );
+
+            // The premise: the crossing piece is the shape the walk would
+            // otherwise pick up.
+            let nowhere = live_ranges
+                .spans()
+                .filter(|span| {
+                    span.val(live_ranges) == val && span.block(func, live_ranges) == crowded
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                nowhere.len(),
+                1,
+                "expected one crossing piece, got {nowhere:?}"
+            );
+            let nowhere = nowhere[0];
+            let bundle = nowhere
+                .bundle(live_ranges)
+                .expect("a live span belongs to a bundle");
+            assert!(bundle.is_rematerialized(live_ranges));
+            assert!(bundle.reg_allocation(live_ranges).is_none());
+            assert_eq!(nowhere.start(live_ranges), crowded.start_point(input));
+
+            // So nothing is spilled there, and every spill reads a register.
+            for site in ctx.spill_placement.spills() {
+                assert_ne!(
+                    site.block(func, live_ranges),
+                    crowded,
+                    "{site:?} stores the value from a span that does not hold it",
+                );
+                assert!(
+                    site.span
+                        .bundle(live_ranges)
+                        .expect("a live span belongs to a bundle")
+                        .reg_allocation(live_ranges)
+                        .is_some(),
+                    "{site:?} has no register to store from",
+                );
+            }
+
+            // And it was never even a candidate.
+            #[cfg(feature = "visualizer")]
+            for (_, event) in ctx.events.iter() {
+                if let LoggedEvent::SpillBlockChosen { block, .. } = *event {
+                    assert_ne!(block, crowded, "{crowded:?} is not a legal spill block");
+                }
+            }
         });
     }
 

@@ -2017,6 +2017,10 @@
         "bundle": "LiveBundle",
         "region": "Region"
       },
+      "BundleRematerialized": {
+        "bundle": "LiveBundle",
+        "region": "Region"
+      },
       "BundleSpilledToStack": {
         "bundle": "LiveBundle",
         "region": "Region"

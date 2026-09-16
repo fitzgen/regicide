@@ -294,6 +294,15 @@ where
         forced: bool,
     },
 
+    /// A bundle will live nowhere at all: it has no uses of its own, and
+    /// recomputing its values beats reloading them from a slot.
+    BundleRematerialized {
+        /// The bundle.
+        bundle: LiveBundle<E>,
+        /// The region it was being allocated within.
+        region: Region<E>,
+    },
+
     /// A bundle was biased towards a set of registers.
     BundleHint {
         /// The bundle.
@@ -604,6 +613,7 @@ mod viz_enabled {
                 Self::BundleSplitFailed { .. } => "BundleSplitFailed",
                 Self::BundleSplitIntoMinimal { .. } => "BundleSplitIntoMinimal",
                 Self::BundleSpilledToStack { .. } => "BundleSpilledToStack",
+                Self::BundleRematerialized { .. } => "BundleRematerialized",
                 Self::BundleHint { .. } => "BundleHint",
                 Self::BundleSplit { .. } => "BundleSplit",
                 Self::SpillSlotCreated { .. } => "SpillSlotCreated",
@@ -806,6 +816,11 @@ mod viz_enabled {
                     region,
                     forced: _,
                 } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Region(*region));
+                }
+
+                Self::BundleRematerialized { bundle, region } => {
                     f(EntityRef::Bundle(*bundle));
                     f(EntityRef::Region(*region));
                 }
@@ -1137,6 +1152,10 @@ mod viz_enabled {
             bundle: LiveBundle,
             region: Region,
             forced: _,
+        }
+        BundleRematerialized {
+            bundle: LiveBundle,
+            region: Region,
         }
         BundleHint {
             bundle: LiveBundle,

@@ -722,7 +722,17 @@ where
             let block = span.block(func, live_ranges);
             let start = span.start(live_ranges);
             let end = span.end(live_ranges);
-            let alloc = span.allocation(live_ranges, spill_slots);
+
+            // A span that holds its value nowhere has no moves at all:
+            // whoever wants the value next recomputes it.
+            let Some(alloc) = span.allocation(live_ranges, spill_slots) else {
+                debug_assert!(
+                    span.bundle(live_ranges)
+                        .unwrap()
+                        .is_rematerialized(live_ranges)
+                );
+                continue;
+            };
 
             // Handle live-in spans: spans for values that are either live upon
             // entering this block or this block's parameters.
@@ -808,9 +818,12 @@ where
                         );
                         reaches
                     })
-                    .copied();
-                if let Some(prev) = incoming {
-                    let prev_alloc = prev.allocation(live_ranges, spill_slots);
+                    .copied()
+                    // A previous piece holding its value nowhere does not flow
+                    // into this one: dropping it leaves the source-less
+                    // destination below, which `resolve` fills by recomputing.
+                    .and_then(|prev| prev.allocation(live_ranges, spill_slots));
+                if let Some(prev_alloc) = incoming {
                     if prev_alloc != alloc {
                         debug_assert!(
                             start.pos().is_early(),
@@ -920,12 +933,16 @@ where
         else {
             return Ok(());
         };
-        let arrival_alloc = arrival_span.allocation(live_ranges, spill_slots);
+        let arrival_alloc = arrival_span
+            .allocation(live_ranges, spill_slots)
+            .expect("a block parameter always has an allocation");
 
         let pos = PackedMovePosition::point(start);
         let mut emitted_source = false;
         for span in entry_start_spans() {
-            let alloc = span.allocation(live_ranges, spill_slots);
+            let alloc = span
+                .allocation(live_ranges, spill_slots)
+                .expect("a block parameter always has an allocation");
             if alloc == arrival_alloc {
                 continue;
             }
@@ -1020,7 +1037,9 @@ where
             let block = span.block(func, live_ranges);
             let home = val.stack_home(spill_slots).unwrap();
             let dst = Allocation::Stack(home);
-            let arrives_in = span.allocation(live_ranges, spill_slots);
+            let arrives_in = span
+                .allocation(live_ranges, spill_slots)
+                .expect("a span we spill from holds its value in a register");
 
             if spill_site.point() != block.end_point(input) {
                 let pos = PackedMovePosition::point(spill_site.point());
@@ -1963,17 +1982,19 @@ mod tests {
                 }
             };
 
-            // Every span, with the allocation the allocator gave it.
+            // Every span that holds its value somewhere, with the allocation
+            // the allocator gave it. One holding it nowhere neither puts
+            // anything in place nor requires anything to be.
             let spans = live_ranges
                 .spans()
-                .map(|span| {
-                    (
+                .filter_map(|span| {
+                    Some((
                         span.val(live_ranges),
                         span.start(live_ranges),
                         span.end(live_ranges),
-                        span.allocation(live_ranges, spill_slots),
+                        span.allocation(live_ranges, spill_slots)?,
                         span.block(func, live_ranges),
-                    )
+                    ))
                 })
                 .collect::<Vec<_>>();
 
@@ -2212,7 +2233,7 @@ mod tests {
                             span.val(live_ranges) == param && span.start(live_ranges) == entry_start
                         })
                         .max_by_key(|span| (span.end(live_ranges), *span))
-                        .map(|span| span.allocation(live_ranges, spill_slots))
+                        .and_then(|span| span.allocation(live_ranges, spill_slots))
                 };
 
                 // The parameters are left out of the slot seeding, not just
@@ -2550,6 +2571,15 @@ mod tests {
             TestInput::with_a_self_looping_entry_block(),
             TestInput::with_a_spilled_self_looping_entry_param(),
             TestInput::with_a_recomputed_read_before_a_spill_and_a_reload(),
+            // A value carried past a block that wants every register, cheap
+            // enough to recompute that the crossing piece holds it nowhere and
+            // the moves at the far end have no source. Not `AlwaysRemat`, so
+            // the other costs' path is reached too.
+            {
+                let mut test_input = TestInput::with_a_value_carried_past_a_crowded_block(false);
+                test_input.set_remat_costs(Some(RematCost::CheaperThanReload));
+                test_input
+            },
         ]
     }
 

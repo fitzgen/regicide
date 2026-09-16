@@ -434,7 +434,7 @@ where
                 bundle: span.bundle(live_ranges),
                 allocation: span
                     .bundle(live_ranges)
-                    .map(|_| span.allocation(live_ranges, spill_slots)),
+                    .and_then(|_| span.allocation(live_ranges, spill_slots)),
                 uses: Vec::from_iter(span.uses(live_ranges)),
                 constraint: span.constraint(live_ranges, input),
                 parent: indices.span_parent(span),

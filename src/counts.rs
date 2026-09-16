@@ -79,6 +79,7 @@ pub struct Counts {
     pub split_within_span_failed: Count,
     pub split_into_minimal_or_spill: Count,
     pub spilled_bundles: Count,
+    pub rematerialized_bundles: Count,
     pub spilled_values: Count,
     pub spill_slots: Count,
     pub spill_slot_assignments: Count,
@@ -116,6 +117,7 @@ impl Counts {
             split_within_span_failed: Count::new(),
             split_into_minimal_or_spill: Count::new(),
             spilled_bundles: Count::new(),
+            rematerialized_bundles: Count::new(),
             spilled_values: Count::new(),
             spill_slots: Count::new(),
             spill_slot_assignments: Count::new(),
@@ -157,6 +159,7 @@ impl Counts {
             split_within_span_failed,
             split_into_minimal_or_spill,
             spilled_bundles,
+            rematerialized_bundles,
             spilled_values,
             spill_slots,
             spill_slot_assignments,
@@ -190,6 +193,7 @@ impl Counts {
             && split_within_span_failed.is_reset()
             && split_into_minimal_or_spill.is_reset()
             && spilled_bundles.is_reset()
+            && rematerialized_bundles.is_reset()
             && spilled_values.is_reset()
             && spill_slots.is_reset()
             && spill_slot_assignments.is_reset()
