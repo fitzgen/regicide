@@ -1238,7 +1238,10 @@ mod tests {
     use super::*;
     use crate::Error;
     use crate::test::TestInput;
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{format, string::String, vec::Vec};
 
     /// How many edits move generation produced, across the whole function.
@@ -1263,82 +1266,88 @@ mod tests {
         Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let mut context = Context::new();
-                test_input.with_input(|input| {
-                    let func = input.func;
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let mut context = Context::new();
+                    test_input.with_input(|input| {
+                        let func = input.func;
 
-                    let output = match crate::run(&mut context, input) {
-                        Ok(output) => output,
-                        // Not every function fits on every machine, and that
-                        // is not this pass's problem.
-                        Err(Error::TooManyLiveRegs) => return Ok(()),
-                        Err(error) => return Err(format!("allocation failed: {error:?}")),
-                    };
+                        let output = match crate::run(&mut context, input) {
+                            Ok(output) => output,
+                            // Not every function fits on every machine, and that
+                            // is not this pass's problem.
+                            Err(Error::TooManyLiveRegs) => return Ok(()),
+                            Err(error) => return Err(format!("allocation failed: {error:?}")),
+                        };
 
-                    // Every operand gets exactly one allocation, and no two
-                    // operands of one instruction that are in registers share a
-                    // register unless they are the same value.
-                    for (_, input_block) in func.blocks() {
-                        for (inst, input_inst) in input_block.insts() {
-                            let allocs = output.inst_allocs(inst);
-                            if allocs.len() != input_inst.operands_len() {
-                                return Err(format!(
-                                    "{inst:?} has {} operands but {} allocations",
-                                    input_inst.operands_len(),
-                                    allocs.len(),
-                                ));
+                        // Every operand gets exactly one allocation, and no two
+                        // operands of one instruction that are in registers share a
+                        // register unless they are the same value.
+                        for (_, input_block) in func.blocks() {
+                            for (inst, input_inst) in input_block.insts() {
+                                let allocs = output.inst_allocs(inst);
+                                if allocs.len() != input_inst.operands_len() {
+                                    return Err(format!(
+                                        "{inst:?} has {} operands but {} allocations",
+                                        input_inst.operands_len(),
+                                        allocs.len(),
+                                    ));
+                                }
                             }
                         }
-                    }
 
-                    // Every instruction is yielded exactly once, in program
-                    // order, and no edit is dropped or duplicated.
-                    let mut num_edits = 0;
-                    for (block, input_block) in func.blocks() {
-                        let expected: Vec<Inst> =
-                            input_block.insts().map(|(inst, _)| inst).collect();
+                        // Every instruction is yielded exactly once, in program
+                        // order, and no edit is dropped or duplicated.
+                        let mut num_edits = 0;
+                        for (block, input_block) in func.blocks() {
+                            let expected: Vec<Inst> =
+                                input_block.insts().map(|(inst, _)| inst).collect();
 
-                        let mut insts = Vec::new();
-                        let mut seen_last_inst = false;
-                        for item in output.block_insts_and_edits(func, block) {
-                            match item {
-                                InstOrEdit::Inst(inst) => {
-                                    seen_last_inst = insts.len() + 1 == expected.len();
-                                    insts.push(inst);
-                                }
-                                InstOrEdit::Edit(edit) => {
-                                    num_edits += 1;
-                                    // A critical edge is split on the way out
-                                    // of the block, so its edits come after
-                                    // every instruction in it.
-                                    if matches!(edit, Edit::CriticalEdge(_)) && !seen_last_inst {
-                                        return Err(format!(
-                                            "{block:?} yielded {edit:?} before its terminator",
-                                        ));
+                            let mut insts = Vec::new();
+                            let mut seen_last_inst = false;
+                            for item in output.block_insts_and_edits(func, block) {
+                                match item {
+                                    InstOrEdit::Inst(inst) => {
+                                        seen_last_inst = insts.len() + 1 == expected.len();
+                                        insts.push(inst);
+                                    }
+                                    InstOrEdit::Edit(edit) => {
+                                        num_edits += 1;
+                                        // A critical edge is split on the way out
+                                        // of the block, so its edits come after
+                                        // every instruction in it.
+                                        if matches!(edit, Edit::CriticalEdge(_)) && !seen_last_inst
+                                        {
+                                            return Err(format!(
+                                                "{block:?} yielded {edit:?} before its terminator",
+                                            ));
+                                        }
                                     }
                                 }
                             }
+
+                            if insts != expected {
+                                return Err(format!(
+                                    "{block:?} yielded instructions {insts:?} but \
+                                     contains {expected:?}",
+                                ));
+                            }
                         }
 
-                        if insts != expected {
+                        let total = total_edits(&output);
+                        if num_edits != total {
                             return Err(format!(
-                                "{block:?} yielded instructions {insts:?} but contains {expected:?}",
+                                "the blocks yielded {num_edits} edits but move generation produced \
+                                 {total}",
                             ));
                         }
-                    }
 
-                    let total = total_edits(&output);
-                    if num_edits != total {
-                        return Err(format!(
-                            "the blocks yielded {num_edits} edits but move generation produced \
-                             {total}",
-                        ));
-                    }
-
-                    Ok(())
-                })
-            })
+                        Ok(())
+                    })
+                },
+            )
     }
 
     /// The spill slot queries agree with each other and cover every slot.
@@ -1347,68 +1356,72 @@ mod tests {
         Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let mut context = Context::new();
-                test_input.with_input(|input| {
-                    let output = match crate::run(&mut context, input) {
-                        Ok(output) => output,
-                        Err(Error::TooManyLiveRegs) => return Ok(()),
-                        Err(error) => return Err(format!("allocation failed: {error:?}")),
-                    };
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let mut context = Context::new();
+                    test_input.with_input(|input| {
+                        let output = match crate::run(&mut context, input) {
+                            Ok(output) => output,
+                            Err(Error::TooManyLiveRegs) => return Ok(()),
+                            Err(error) => return Err(format!("allocation failed: {error:?}")),
+                        };
 
-                    let slots: Vec<(SpillSlot, SpillSlotSize)> = output.spill_slots().collect();
-                    if slots.len() != output.spill_slots().len() {
-                        return Err(format!(
-                            "`spill_slots` reports {} slots but yields {}",
-                            output.spill_slots().len(),
-                            slots.len(),
-                        ));
-                    }
-
-                    for (i, (slot, size)) in slots.iter().copied().enumerate() {
-                        if slot.index() != i {
-                            return Err(format!("the {i}th slot yielded is {slot:?}"));
-                        }
-                        if output.spill_slot(slot) != size {
+                        let slots: Vec<(SpillSlot, SpillSlotSize)> = output.spill_slots().collect();
+                        if slots.len() != output.spill_slots().len() {
                             return Err(format!(
-                                "`spill_slots` says {slot:?} is {size:?} but `spill_slot` says \
-                                 {:?}",
-                                output.spill_slot(slot),
+                                "`spill_slots` reports {} slots but yields {}",
+                                output.spill_slots().len(),
+                                slots.len(),
                             ));
                         }
-                    }
 
-                    // Every group is made of slots that exist and that no other
-                    // member of the group is.
-                    for (_, input_block) in input.func.blocks() {
-                        for (inst, _) in input_block.insts() {
-                            for alloc in output.inst_allocs(inst) {
-                                let Allocation::Stack(StackAllocation::SpillSlotGroup(group)) =
-                                    *alloc
-                                else {
-                                    continue;
-                                };
-                                let members: Vec<SpillSlot> =
-                                    output.spill_slot_group_members(group).collect();
-                                for (i, member) in members.iter().copied().enumerate() {
-                                    if member.index() >= slots.len() {
-                                        return Err(format!(
-                                            "{group:?} contains {member:?}, which \
+                        for (i, (slot, size)) in slots.iter().copied().enumerate() {
+                            if slot.index() != i {
+                                return Err(format!("the {i}th slot yielded is {slot:?}"));
+                            }
+                            if output.spill_slot(slot) != size {
+                                return Err(format!(
+                                    "`spill_slots` says {slot:?} is {size:?} but `spill_slot` says \
+                                 {:?}",
+                                    output.spill_slot(slot),
+                                ));
+                            }
+                        }
+
+                        // Every group is made of slots that exist and that no other
+                        // member of the group is.
+                        for (_, input_block) in input.func.blocks() {
+                            for (inst, _) in input_block.insts() {
+                                for alloc in output.inst_allocs(inst) {
+                                    let Allocation::Stack(StackAllocation::SpillSlotGroup(group)) =
+                                        *alloc
+                                    else {
+                                        continue;
+                                    };
+                                    let members: Vec<SpillSlot> =
+                                        output.spill_slot_group_members(group).collect();
+                                    for (i, member) in members.iter().copied().enumerate() {
+                                        if member.index() >= slots.len() {
+                                            return Err(format!(
+                                                "{group:?} contains {member:?}, which \
                                                             is not a slot we created"
-                                        ));
-                                    }
-                                    if members[..i].contains(&member) {
-                                        return Err(format!(
-                                            "{group:?} contains {member:?} more than once",
-                                        ));
+                                            ));
+                                        }
+                                        if members[..i].contains(&member) {
+                                            return Err(format!(
+                                                "{group:?} contains {member:?} more than once",
+                                            ));
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    Ok(())
-                })
-            })
+                        Ok(())
+                    })
+                },
+            )
     }
 }

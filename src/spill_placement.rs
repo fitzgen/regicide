@@ -801,7 +801,6 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         format,
         string::String,
-        vec,
         vec::Vec,
     };
 
@@ -863,101 +862,105 @@ mod tests {
         Check::new()
             .min_iters(1_000)
             .min_duration(std::time::Duration::from_secs(1))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = place(test_input)? else {
-                    return Ok(());
-                };
-                // A second build of the same input, only so that the checks
-                // below can ask which block a point is in.
-                test_input.with_input(|input| -> Result<(), String> {
-                    let inner = &context.context32;
-                    let live_ranges = &inner.live_ranges;
-                    let spill_slots = &inner.spill_slots;
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = place(test_input)? else {
+                        return Ok(());
+                    };
+                    // A second build of the same input, only so that the checks
+                    // below can ask which block a point is in.
+                    test_input.with_input(|input| -> Result<(), String> {
+                        let inner = &context.context32;
+                        let live_ranges = &inner.live_ranges;
+                        let spill_slots = &inner.spill_slots;
 
-                    let mut on_stack: BTreeSet<LiveBundle<u32>> = BTreeSet::new();
-                    let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
-                    let mut placed: Vec<(LivePoint<u32>, LiveSpan<u32>)> = Vec::new();
+                        let mut on_stack: BTreeSet<LiveBundle<u32>> = BTreeSet::new();
+                        let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
+                        let mut placed: Vec<(LivePoint<u32>, LiveSpan<u32>)> = Vec::new();
 
-                    for (_, event) in inner.events.iter() {
-                        match *event {
-                            LoggedEvent::BundleSpilledToStack { bundle, .. } => {
-                                on_stack.insert(bundle);
-                            }
-                            LoggedEvent::ValueSpilled { val, .. } => {
-                                spilled.insert(val);
-                            }
-                            LoggedEvent::SpillPlaced {
-                                val,
-                                span,
-                                at,
-                                block,
-                                slot,
-                            } => {
-                                if span.val(live_ranges) != val {
-                                    return Err(format!("{span:?} does not hold {val:?}"));
+                        for (_, event) in inner.events.iter() {
+                            match *event {
+                                LoggedEvent::BundleSpilledToStack { bundle, .. } => {
+                                    on_stack.insert(bundle);
                                 }
-                                if Some(slot) != val.stack_home(spill_slots) {
-                                    return Err(format!(
-                                        "{val:?} was spilled to {slot:?}, but lives at {:?}",
-                                        val.stack_home(spill_slots),
-                                    ));
+                                LoggedEvent::ValueSpilled { val, .. } => {
+                                    spilled.insert(val);
                                 }
-                                if block != span.block(input.func, live_ranges) {
-                                    return Err(format!(
-                                        "{span:?} is in {:?}, not {block:?}",
-                                        span.block(input.func, live_ranges),
-                                    ));
-                                }
-                                if !spilled.contains(&val) {
-                                    return Err(format!(
-                                        "{val:?} is spilled at {at:?}, but was never logged as \
+                                LoggedEvent::SpillPlaced {
+                                    val,
+                                    span,
+                                    at,
+                                    block,
+                                    slot,
+                                } => {
+                                    if span.val(live_ranges) != val {
+                                        return Err(format!("{span:?} does not hold {val:?}"));
+                                    }
+                                    if Some(slot) != val.stack_home(spill_slots) {
+                                        return Err(format!(
+                                            "{val:?} was spilled to {slot:?}, but lives at {:?}",
+                                            val.stack_home(spill_slots),
+                                        ));
+                                    }
+                                    if block != span.block(input.func, live_ranges) {
+                                        return Err(format!(
+                                            "{span:?} is in {:?}, not {block:?}",
+                                            span.block(input.func, live_ranges),
+                                        ));
+                                    }
+                                    if !spilled.contains(&val) {
+                                        return Err(format!(
+                                            "{val:?} is spilled at {at:?}, but was never logged as \
                                          going to the stack"
-                                    ));
+                                        ));
+                                    }
+                                    placed.push((at, span));
                                 }
-                                placed.push((at, span));
-                            }
-                            LoggedEvent::SpillBlockChosen { num_candidates, .. } => {
-                                if num_candidates == 0 {
-                                    return Err(String::from(
-                                        "a legal spill block was logged with no candidates",
-                                    ));
+                                LoggedEvent::SpillBlockChosen { num_candidates, .. } => {
+                                    if num_candidates == 0 {
+                                        return Err(String::from(
+                                            "a legal spill block was logged with no candidates",
+                                        ));
+                                    }
                                 }
+                                _ => {}
                             }
-                            _ => {}
                         }
-                    }
 
-                    // Every spill the pass recorded was logged, and nothing else
-                    // was.
-                    let mut want: Vec<(LivePoint<u32>, LiveSpan<u32>)> = inner
-                        .spill_placement
-                        .spills()
-                        .iter()
-                        .map(|site| (site.point, site.span))
-                        .collect();
-                    want.sort_unstable();
-                    placed.sort_unstable();
-                    if placed != want {
-                        return Err(format!("logged spills {placed:?}, but placed {want:?}"));
-                    }
+                        // Every spill the pass recorded was logged, and nothing else
+                        // was.
+                        let mut want: Vec<(LivePoint<u32>, LiveSpan<u32>)> = inner
+                            .spill_placement
+                            .spills()
+                            .iter()
+                            .map(|site| (site.point, site.span))
+                            .collect();
+                        want.sort_unstable();
+                        placed.sort_unstable();
+                        if placed != want {
+                            return Err(format!("logged spills {placed:?}, but placed {want:?}"));
+                        }
 
-                    // And each one names the span that still holds the value
-                    // in a register there, which is what the store reads from.
-                    for &(_, span) in &placed {
-                        let bundle = span
-                            .bundle(live_ranges)
-                            .expect("a live span belongs to a bundle");
-                        if on_stack.contains(&bundle) {
-                            return Err(format!(
-                                "{span:?} is already on the stack in {bundle:?}, so there is \
+                        // And each one names the span that still holds the value
+                        // in a register there, which is what the store reads from.
+                        for &(_, span) in &placed {
+                            let bundle = span
+                                .bundle(live_ranges)
+                                .expect("a live span belongs to a bundle");
+                            if on_stack.contains(&bundle) {
+                                return Err(format!(
+                                    "{span:?} is already on the stack in {bundle:?}, so there is \
                                  nothing to store from"
-                            ));
+                                ));
+                            }
                         }
-                    }
 
-                    Ok(())
-                })
-            })
+                        Ok(())
+                    })
+                },
+            )
     }
 
     /// What a run of the property check below saw, so that it can tell whether
@@ -967,32 +970,6 @@ mod tests {
         spills: usize,
         merge_param_spills: usize,
         spills_hoisted_out_of_a_region: usize,
-    }
-
-    /// The inputs the property check starts from.
-    fn seeds() -> Vec<TestInput> {
-        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
-        let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
-        vec![
-            TestInput::default(),
-            // A merge block's parameter that spills: the spill has to land in
-            // the block itself, not on one of the edges into it.
-            TestInput::with_spilled_merge_param(),
-            TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
-            TestInput::with_use_constraints(&[OperandConstraint::Stack]),
-            TestInput::with_use_constraints(&[
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(class),
-            ]),
-            TestInput::with_group_use_constraints(&[
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(group_class),
-            ]),
-            TestInput::with_reuse_def(OperandConstraint::Any),
-            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
-            TestInput::with_stack_param_and_arg(),
-            TestInput::with_a_value_spilled_inside_a_loop(),
-        ]
     }
 
     /// Place the spills for `test_input` and check every property the placement
@@ -1251,7 +1228,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestInput>(),
-                seeds(),
+                crate::test::corpus(),
                 |test_input: &TestInput| -> Result<(), String> {
                     let seen = check_placement(test_input)?;
                     SPILLS.fetch_add(seen.spills, Ordering::Relaxed);

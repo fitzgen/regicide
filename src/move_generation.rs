@@ -2533,52 +2533,6 @@ mod tests {
         });
     }
 
-    /// The inputs the property check starts its random walk from.
-    fn seeds() -> Vec<TestInput> {
-        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
-        let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
-        std::vec![
-            TestInput::default(),
-            TestInput::with_spilled_merge_param(),
-            TestInput::with_stack_param_and_arg(),
-            TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
-            TestInput::with_use_constraints(&[
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(class),
-            ]),
-            // A value in a register group that has to be on the stack for one
-            // use and in its group for another: the spills and reloads of a
-            // single group member that this pass had to learn to do.
-            TestInput::with_group_use_constraints(&[
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(group_class),
-            ]),
-            TestInput::with_group_use_constraints(&[
-                OperandConstraint::Reg(group_class),
-                OperandConstraint::Stack,
-                OperandConstraint::Reg(group_class),
-            ]),
-            TestInput::with_reuse_def(OperandConstraint::Any),
-            TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
-            // Parameters of the *entry* block, the only ones no edge fills.
-            TestInput::with_two_entry_params(),
-            TestInput::with_an_entry_param_read_two_ways(),
-            TestInput::with_entry_params_in_two_banks(),
-            TestInput::with_a_self_looping_entry_block(),
-            TestInput::with_a_spilled_self_looping_entry_param(),
-            TestInput::with_a_recomputed_read_before_a_spill_and_a_reload(),
-            // A value carried past a block that wants every register, cheap
-            // enough to recompute that the crossing piece holds it nowhere and
-            // the moves at the far end have no source. Not `AlwaysRemat`, so
-            // the other costs' path is reached too.
-            {
-                let mut test_input = TestInput::with_a_value_carried_past_a_crowded_block(false);
-                test_input.set_remat_costs(Some(RematCost::CheaperThanReload));
-                test_input
-            },
-        ]
-    }
-
     /// The moves put every value where the allocation says it belongs, at
     /// every boundary and along every edge. The counters make sure the inputs
     /// really reach every kind of move.
@@ -2600,7 +2554,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestInput>(),
-                seeds(),
+                crate::test::corpus(),
                 |test_input: &TestInput| -> Result<(), String> {
                     let seen = check_moves(test_input)?;
                     REG_REGS.fetch_add(seen.reg_regs, Ordering::Relaxed);
@@ -2656,7 +2610,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestInput>(),
-                seeds(),
+                crate::test::corpus(),
                 |test_input: &TestInput| -> Result<(), String> {
                     let Some(context) = generate(test_input)? else {
                         return Ok(());
@@ -2743,7 +2697,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestInput>(),
-                seeds(),
+                crate::test::corpus(),
                 |test_input: &TestInput| -> Result<(), String> {
                     let Some(context) = generate(test_input)? else {
                         return Ok(());
@@ -2811,7 +2765,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestInput>(),
-                seeds(),
+                crate::test::corpus(),
                 |test_input: &TestInput| -> Result<(), String> {
                     let Some(context) = generate(test_input)? else {
                         return Ok(());
@@ -2863,12 +2817,11 @@ mod tests {
     fn the_event_log_serializes() {
         let mut kinds = BTreeSet::new();
 
-        // The seeds, plus a critical edge, plus the seeds again with every
-        // value rematerializable: between them they reach every corner of move
+        // The corpus, plus the corpus again with every value
+        // rematerializable: between them they reach every corner of move
         // generation.
-        let mut inputs = seeds();
-        inputs.push(TestInput::with_a_critical_edge());
-        inputs.extend(seeds().into_iter().map(|mut test_input| {
+        let mut inputs = crate::test::corpus();
+        inputs.extend(crate::test::corpus().into_iter().map(|mut test_input| {
             test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
             test_input
         }));

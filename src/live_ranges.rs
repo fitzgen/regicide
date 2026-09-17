@@ -3182,52 +3182,6 @@ mod tests {
         map
     }
 
-    /// The inputs `live_span_properties` starts its random walk from.
-    fn seeds() -> Vec<TestInput> {
-        vec![
-            TestInput::default(),
-            TestInput::with_reuse_of_a_surviving_value(),
-            TestInput::with_two_reads_and_a_reuse_of_a_surviving_value(),
-            TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
-            TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
-            TestInput::with_a_pinned_read_before_a_reuse_of_a_dying_value(),
-            TestInput::with_a_reuse_of_a_live_in_value(),
-            TestInput::with_two_reuses_at_one_point(),
-            TestInput::with_two_reuses_of_a_dying_value(),
-            TestInput::with_a_read_overwritten_by_a_fixed_def(),
-            TestInput::with_a_dying_read_overwritten_by_a_fixed_def(),
-            TestInput::with_two_reads_overwritten_by_a_fixed_def(),
-            TestInput::with_a_critical_edge(),
-            TestInput::with_two_entry_params(),
-            TestInput::with_an_entry_param_read_two_ways(),
-            TestInput::with_entry_params_in_two_banks(),
-            TestInput::with_values_in_two_banks_spilled_and_reloaded(),
-            TestInput::with_use_constraints(&[
-                OperandConstraint::Any,
-                OperandConstraint::Stack,
-                OperandConstraint::Any,
-                OperandConstraint::Any,
-            ]),
-            // A value the allocator would always recompute, whose spans are
-            // therefore cut at every instruction and missing altogether from a
-            // block that never mentions it. Mutating outward from the broken
-            // shape is the only way the properties above see it.
-            {
-                let mut input = TestInput::with_a_value_read_in_two_distant_blocks();
-                input.set_remat_costs(Some(RematCost::AlwaysRemat));
-                input
-            },
-            // The same shape with a stack read and a block in between that
-            // needs every register, so that mutations reach the gaps with
-            // something at stake in them.
-            {
-                let mut input = TestInput::with_a_value_read_on_the_stack_past_a_crowded_block();
-                input.set_remat_costs(Some(RematCost::AlwaysRemat));
-                input
-            },
-        ]
-    }
-
     /// A value we will always recompute holds a register for one instruction
     /// at a time: every instruction that mentions it gets its own piece, and
     /// the stretches in between are nobody's.
@@ -5250,7 +5204,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestInput>(),
-                seeds(),
+                crate::test::corpus(),
                 |test_input: &TestInput| -> Result<(), String> {
                     let func = &test_input.func;
                     let (mut liveness, live_ranges) = analyze_spans(test_input)?;

@@ -6394,8 +6394,8 @@ impl DefaultMutate for TestInput {
     type DefaultMutate = TestInputMutator;
 }
 
-/// The fixtures that the property check, the fuzz target's corpus, and
-/// `the_corpus_all_checks_out` all start from.
+/// The fixtures that every `TestInput` property check, the fuzz target's
+/// corpus, and `the_corpus_all_checks_out` all start from.
 ///
 /// Each entry is a shape the allocator has to get right: a critical edge, a
 /// reuse of a value that survives its definition, a register group, a
@@ -6411,7 +6411,23 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
         TestInput::with_use_constraints(&[OperandConstraint::Stack]),
         TestInput::with_use_constraints(&[OperandConstraint::Stack, OperandConstraint::Reg(class)]),
+        // One stack use in the middle of a run of uses that do not care where
+        // they read from, which is what cuts a live range into spans on either
+        // side of it.
+        TestInput::with_use_constraints(&[
+            OperandConstraint::Any,
+            OperandConstraint::Stack,
+            OperandConstraint::Any,
+            OperandConstraint::Any,
+        ]),
         TestInput::with_group_use_constraints(&[
+            OperandConstraint::Stack,
+            OperandConstraint::Reg(group_class),
+        ]),
+        // The same value on the stack between two uses in its register group:
+        // the spill and reload of a single member of a group.
+        TestInput::with_group_use_constraints(&[
+            OperandConstraint::Reg(group_class),
             OperandConstraint::Stack,
             OperandConstraint::Reg(group_class),
         ]),
@@ -6431,6 +6447,10 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_two_uses_of_different_values(),
         TestInput::with_a_critical_edge(),
         TestInput::with_values_in_two_banks_spilled_and_reloaded(),
+        // A value defined outside a loop that spends part of its live range on
+        // the stack inside it, which is where a spill has a region to be
+        // hoisted out of.
+        TestInput::with_a_value_spilled_inside_a_loop(),
         TestInput::with_a_def_only_value_under_pressure(),
         TestInput::with_a_stack_constrained_value_under_pressure(),
         TestInput::with_three_values_needing_two_register_groups(),
@@ -6438,6 +6458,11 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_two_entry_params(),
         TestInput::with_entry_params_in_two_banks(),
         TestInput::with_a_self_looping_entry_block(),
+        // The same self loop with the parameter split at the top of the block:
+        // the gap atop the entry block is the one gap two paths share, so an
+        // edge into it cannot lean on the store there the way any other edge
+        // can.
+        TestInput::with_a_spilled_self_looping_entry_param(),
         TestInput::with_a_move_before_an_unconditional_branch(),
         TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
         TestInput::with_a_reuse_of_a_pinned_read(),
@@ -6461,6 +6486,11 @@ pub fn corpus() -> Vec<TestInput> {
             input.set_remat_costs(Some(RematCost::AlwaysRemat));
             input
         },
+        // A value recomputed at a read after a gap, beside a second value
+        // that is spilled and reloaded: the rematerialization comes at the
+        // earlier position of the two, the one shape where the index a move is
+        // emitted with is not the index it lands at.
+        TestInput::with_a_recomputed_read_before_a_spill_and_a_reload(),
         // A value we always recompute, read where both registers are spoken
         // for: recomputing is still no reason to deny its use a register.
         TestInput::with_a_recomputed_read_under_pressure(),
@@ -6530,7 +6560,10 @@ mod tests {
         error::{Error, InternalError},
         validation,
     };
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{format, string::String};
 
     /// Check that `func` is a well-formed function in valid SSA form, as
@@ -6612,7 +6645,7 @@ mod tests {
         Check::new()
             .min_iters(1_000)
             .min_duration(std::time::Duration::from_secs(1))
-            .run(|input: &TestInput| {
+            .run_with(m::default::<TestInput>(), corpus(), |input: &TestInput| {
                 check_ssa(&input.machine.build(), &input.func)?;
 
                 // `TestInput::fixup` reaches a fixed point too, and not just the

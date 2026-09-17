@@ -776,7 +776,10 @@ mod tests {
         machine::RegSet,
         test::{TestFunction, TestInput},
     };
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{collections::BTreeSet, string::ToString, vec};
 
     /// Allocate `test_input` and index the result.
@@ -810,9 +813,10 @@ mod tests {
     /// entity, and every entity an event mentions has that event in its list.
     #[test]
     fn by_entity_is_exactly_the_events_that_name_each_entity() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(1_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
                     let len = inner.events.iter().count();
                     let mut error = None;
@@ -856,16 +860,18 @@ mod tests {
                     }
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// The `byKind` lists partition the log, and each key is the kind of every
     /// event under it.
     #[test]
     fn by_kind_partitions_the_log() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(1_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
                     let mut seen = BTreeSet::new();
                     for (kind, list) in &index.indices.by_kind {
@@ -895,15 +901,17 @@ mod tests {
                     Ok(())
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// `kind` agrees with the serde tag, which is what the JavaScript sees.
     #[test]
     fn kind_agrees_with_the_serde_tag() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(1_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, _index| {
                     for (event, logged) in inner.events.iter() {
                         let json: serde_json::Value = serde_json::to_value(logged).unwrap();
@@ -921,16 +929,18 @@ mod tests {
                     Ok(())
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// Parents were created before their children, which also makes the parent
     /// maps acyclic.
     #[test]
     fn parents_come_before_their_children() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(1_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
                     for (span, parent) in index.indices.span_parents.iter() {
                         let Some(parent) = parent else { continue };
@@ -1007,16 +1017,18 @@ mod tests {
                     Ok(())
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// The statistics really do summarize the buckets, for every histogram of
     /// every allocation.
     #[test]
     fn histograms_are_consistent() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(1_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, _inner, index| {
                     let mut ids = BTreeSet::new();
                     for histogram in &index.histograms {
@@ -1028,7 +1040,8 @@ mod tests {
                     Ok(())
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// The invariants every histogram has, however it was built.
@@ -1139,9 +1152,10 @@ mod tests {
     /// register a bundle was hinted towards can be looked up.
     #[test]
     fn registers_are_indexed() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(1_000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, inner, index| {
                     let by_reg = &index.indices.by_entity.reg;
                     let by_group = &index.indices.by_entity.reg_group;
@@ -1190,15 +1204,17 @@ mod tests {
                     Ok(())
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// The whole index round-trips through JSON.
     #[test]
     fn the_index_round_trips_through_json() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(100)
-            .run(|test_input: &TestInput| -> Result<(), String> {
+        Check::new().iters(100).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |test_input: &TestInput| -> Result<(), String> {
                 with_indexed(test_input, |_input, _inner, index| {
                     let json = serde_json::to_string(index).unwrap();
                     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1208,7 +1224,8 @@ mod tests {
                     Ok(())
                 })?
                 .unwrap_or(Ok(()))
-            })
+            },
+        )
     }
 
     /// A function with nothing to spill still gets its spill histograms, empty.

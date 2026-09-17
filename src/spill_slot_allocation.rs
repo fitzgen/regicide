@@ -906,7 +906,10 @@ mod tests {
         input::OperandConstraint,
         test::{TestInput, TestMachine},
     };
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     use std::{
         collections::{BTreeMap, BTreeSet},
         format,
@@ -1255,51 +1258,56 @@ mod tests {
         Check::new()
             .min_iters(1_000)
             .min_duration(std::time::Duration::from_secs(1))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = run_everything(test_input)? else {
-                    return Ok(());
-                };
-                let inner = &context.context32;
-                let spill_slots = &inner.spill_slots;
-
-                let mut created: BTreeMap<SpillSlot<u32>, (SpillSlotSize, bool)> = BTreeMap::new();
-                for (_, event) in inner.events.iter() {
-                    let LoggedEvent::SpillSlotCreated {
-                        slot,
-                        size,
-                        emergency,
-                    } = *event
-                    else {
-                        continue;
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = run_everything(test_input)? else {
+                        return Ok(());
                     };
-                    if created.insert(slot, (size, emergency)).is_some() {
-                        return Err(format!("{slot:?} was created twice"));
-                    }
-                }
+                    let inner = &context.context32;
+                    let spill_slots = &inner.spill_slots;
 
-                let emergency: BTreeSet<SpillSlot<u32>> =
-                    spill_slots.emergency.iter().flatten().copied().collect();
-
-                for (index, &size) in spill_slots.sizes().iter().enumerate() {
-                    let slot = SpillSlot::<u32>::try_new(index).unwrap();
-                    let want = (size, emergency.contains(&slot));
-                    match created.remove(&slot) {
-                        Some(got) if got == want => {}
-                        Some(got) => {
-                            return Err(format!(
-                                "{slot:?} was announced as {got:?}, but it is {want:?}"
-                            ));
+                    let mut created: BTreeMap<SpillSlot<u32>, (SpillSlotSize, bool)> =
+                        BTreeMap::new();
+                    for (_, event) in inner.events.iter() {
+                        let LoggedEvent::SpillSlotCreated {
+                            slot,
+                            size,
+                            emergency,
+                        } = *event
+                        else {
+                            continue;
+                        };
+                        if created.insert(slot, (size, emergency)).is_some() {
+                            return Err(format!("{slot:?} was created twice"));
                         }
-                        None => return Err(format!("{slot:?} was never announced")),
                     }
-                }
 
-                if let Some((slot, _)) = created.pop_first() {
-                    return Err(format!("{slot:?} was announced but does not exist"));
-                }
+                    let emergency: BTreeSet<SpillSlot<u32>> =
+                        spill_slots.emergency.iter().flatten().copied().collect();
 
-                Ok(())
-            })
+                    for (index, &size) in spill_slots.sizes().iter().enumerate() {
+                        let slot = SpillSlot::<u32>::try_new(index).unwrap();
+                        let want = (size, emergency.contains(&slot));
+                        match created.remove(&slot) {
+                            Some(got) if got == want => {}
+                            Some(got) => {
+                                return Err(format!(
+                                    "{slot:?} was announced as {got:?}, but it is {want:?}"
+                                ));
+                            }
+                            None => return Err(format!("{slot:?} was never announced")),
+                        }
+                    }
+
+                    if let Some((slot, _)) = created.pop_first() {
+                        return Err(format!("{slot:?} was announced but does not exist"));
+                    }
+
+                    Ok(())
+                },
+            )
     }
 
     /// Every spilled value was announced, and given a home made of slots that
@@ -1310,75 +1318,79 @@ mod tests {
         Check::new()
             .min_iters(1_000)
             .min_duration(std::time::Duration::from_secs(1))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = allocate(test_input)? else {
-                    return Ok(());
-                };
-                let inner = &context.context32;
-                let spill_slots = &inner.spill_slots;
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = allocate(test_input)? else {
+                        return Ok(());
+                    };
+                    let inner = &context.context32;
+                    let spill_slots = &inner.spill_slots;
 
-                let mut slots_so_far: BTreeSet<SpillSlot<u32>> = BTreeSet::new();
-                let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
-                let mut homes: BTreeMap<Val<u32>, StackAllocation<u32>> = BTreeMap::new();
+                    let mut slots_so_far: BTreeSet<SpillSlot<u32>> = BTreeSet::new();
+                    let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
+                    let mut homes: BTreeMap<Val<u32>, StackAllocation<u32>> = BTreeMap::new();
 
-                for (_, event) in inner.events.iter() {
-                    match *event {
-                        LoggedEvent::SpillSlotCreated { slot, .. } => {
-                            slots_so_far.insert(slot);
-                        }
-                        LoggedEvent::SpillSlotGroupCreated {
-                            group, ref members, ..
-                        } => {
-                            if members != group.members(spill_slots) {
-                                return Err(format!(
-                                    "{group:?} was announced with {members:?}, but holds {:?}",
-                                    group.members(spill_slots),
-                                ));
+                    for (_, event) in inner.events.iter() {
+                        match *event {
+                            LoggedEvent::SpillSlotCreated { slot, .. } => {
+                                slots_so_far.insert(slot);
                             }
-                            for &slot in members {
-                                if !slots_so_far.contains(&slot) {
+                            LoggedEvent::SpillSlotGroupCreated {
+                                group, ref members, ..
+                            } => {
+                                if members != group.members(spill_slots) {
                                     return Err(format!(
-                                        "{group:?} names {slot:?}, which was not created yet"
+                                        "{group:?} was announced with {members:?}, but holds {:?}",
+                                        group.members(spill_slots),
                                     ));
                                 }
+                                for &slot in members {
+                                    if !slots_so_far.contains(&slot) {
+                                        return Err(format!(
+                                            "{group:?} names {slot:?}, which was not created yet"
+                                        ));
+                                    }
+                                }
                             }
+                            LoggedEvent::ValueSpilled { val, num_spans } => {
+                                if num_spans == 0 {
+                                    return Err(format!("{val:?} was spilled with no spans"));
+                                }
+                                if !spilled.insert(val) {
+                                    return Err(format!("{val:?} was spilled twice"));
+                                }
+                            }
+                            LoggedEvent::SpillSlotAssigned { val, slot } => {
+                                if homes.insert(val, slot).is_some() {
+                                    return Err(format!("{val:?} was given two homes"));
+                                }
+                            }
+                            _ => {}
                         }
-                        LoggedEvent::ValueSpilled { val, num_spans } => {
-                            if num_spans == 0 {
-                                return Err(format!("{val:?} was spilled with no spans"));
-                            }
-                            if !spilled.insert(val) {
-                                return Err(format!("{val:?} was spilled twice"));
-                            }
-                        }
-                        LoggedEvent::SpillSlotAssigned { val, slot } => {
-                            if homes.insert(val, slot).is_some() {
-                                return Err(format!("{val:?} was given two homes"));
-                            }
-                        }
-                        _ => {}
                     }
-                }
 
-                let want_spilled: BTreeSet<Val<u32>> = spill_slots.spilled().iter().collect();
-                if spilled != want_spilled {
-                    return Err(format!(
-                        "the log spilled {spilled:?}, but the pass spilled {want_spilled:?}"
-                    ));
-                }
-
-                for val in want_spilled {
-                    let home = val.stack_home(spill_slots);
-                    if homes.get(&val).copied() != home {
+                    let want_spilled: BTreeSet<Val<u32>> = spill_slots.spilled().iter().collect();
+                    if spilled != want_spilled {
                         return Err(format!(
-                            "{val:?} was announced at {:?}, but lives at {home:?}",
-                            homes.get(&val),
+                            "the log spilled {spilled:?}, but the pass spilled {want_spilled:?}"
                         ));
                     }
-                }
 
-                Ok(())
-            })
+                    for val in want_spilled {
+                        let home = val.stack_home(spill_slots);
+                        if homes.get(&val).copied() != home {
+                            return Err(format!(
+                                "{val:?} was announced at {:?}, but lives at {home:?}",
+                                homes.get(&val),
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                },
+            )
     }
 
     #[test]
@@ -1386,15 +1398,19 @@ mod tests {
         Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                // Spill everything, which maximizes the pressure on the
-                // coloring, and then every other value, which interleaves
-                // spilled and unspilled values.
-                for stride in [1, 2] {
-                    check_coloring(test_input, stride)?;
-                }
-                Ok(())
-            })
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    // Spill everything, which maximizes the pressure on the
+                    // coloring, and then every other value, which interleaves
+                    // spilled and unspilled values.
+                    for stride in [1, 2] {
+                        check_coloring(test_input, stride)?;
+                    }
+                    Ok(())
+                },
+            )
     }
 
     /// A value whose only use must be on the stack gets a stack slot, and it is

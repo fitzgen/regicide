@@ -1033,7 +1033,10 @@ mod round_trip_tests {
         format,
         string::{String, ToString},
     };
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
 
     /// Round-trip `machine` through both formats, and report what came back.
     ///
@@ -1222,18 +1225,22 @@ mod round_trip_tests {
     /// an accessor the format forgot.
     #[test]
     fn round_trips_arbitrary_inputs() -> CheckResult<TestInput> {
-        Check::new().iters(1000).run(|input: &TestInput| {
-            input.with_input(|input| -> Result<(), String> {
-                let before = describe_allocation(input);
-                for deserialized in round_trip_input(input)? {
-                    assert_same_function(input.func, deserialized.func());
-                    if describe_allocation(&deserialized.as_input()) != before {
-                        return Err("a round trip changed the allocation".into());
+        Check::new().iters(1000).run_with(
+            m::default::<TestInput>(),
+            crate::test::corpus(),
+            |input: &TestInput| {
+                input.with_input(|input| -> Result<(), String> {
+                    let before = describe_allocation(input);
+                    for deserialized in round_trip_input(input)? {
+                        assert_same_function(input.func, deserialized.func());
+                        if describe_allocation(&deserialized.as_input()) != before {
+                            return Err("a round trip changed the allocation".into());
+                        }
                     }
-                }
-                Ok(())
-            })
-        })
+                    Ok(())
+                })
+            },
+        )
     }
 
     /// A frequency survives postcard bit-exactly: it is already truncated to

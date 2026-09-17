@@ -1428,7 +1428,10 @@ mod tests {
     #[cfg(feature = "visualizer")]
     use crate::{context::Context, events::Event, input::InputValue, test::TestInput};
     #[cfg(feature = "visualizer")]
-    use mutatis::check::{Check, CheckResult};
+    use mutatis::{
+        check::{Check, CheckResult},
+        mutators as m,
+    };
     #[cfg(feature = "visualizer")]
     use std::{
         collections::{BTreeMap, BTreeSet},
@@ -1491,74 +1494,78 @@ mod tests {
         Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = allocate(test_input)? else {
-                    return Ok(());
-                };
-                let inner = &context.context32;
-                let live_ranges = &inner.live_ranges;
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = allocate(test_input)? else {
+                        return Ok(());
+                    };
+                    let inner = &context.context32;
+                    let live_ranges = &inner.live_ranges;
 
-                let mut constructed_bundles = BTreeSet::new();
-                let mut bundle_parents: BTreeMap<LiveBundle<u32>, usize> = BTreeMap::new();
-                let mut constructed_spans = BTreeSet::new();
-                let mut span_parents: BTreeMap<crate::live_ranges::LiveSpan<u32>, usize> =
-                    BTreeMap::new();
+                    let mut constructed_bundles = BTreeSet::new();
+                    let mut bundle_parents: BTreeMap<LiveBundle<u32>, usize> = BTreeMap::new();
+                    let mut constructed_spans = BTreeSet::new();
+                    let mut span_parents: BTreeMap<crate::live_ranges::LiveSpan<u32>, usize> =
+                        BTreeMap::new();
 
-                for (_, event) in inner.events.iter() {
-                    match *event {
-                        Event::BundleConstructed { bundle, .. } => {
-                            constructed_bundles.insert(bundle);
-                        }
-                        Event::BundleSplit { child, .. } => {
-                            *bundle_parents.entry(child).or_default() += 1;
-                        }
-                        Event::SpanConstructed { span, .. } => {
-                            constructed_spans.insert(span);
-                        }
-                        Event::SpanSplit {
-                            parent,
-                            first,
-                            second,
-                            ..
-                        } => {
-                            if first != parent {
-                                return Err(format!(
-                                    "a span split rewrites its first piece in place, so {first:?} \
-                                     should be {parent:?}"
-                                ));
+                    for (_, event) in inner.events.iter() {
+                        match *event {
+                            Event::BundleConstructed { bundle, .. } => {
+                                constructed_bundles.insert(bundle);
                             }
-                            *span_parents.entry(second).or_default() += 1;
+                            Event::BundleSplit { child, .. } => {
+                                *bundle_parents.entry(child).or_default() += 1;
+                            }
+                            Event::SpanConstructed { span, .. } => {
+                                constructed_spans.insert(span);
+                            }
+                            Event::SpanSplit {
+                                parent,
+                                first,
+                                second,
+                                ..
+                            } => {
+                                if first != parent {
+                                    return Err(format!(
+                                        "a span split rewrites its first piece in \
+                                         place, so {first:?} should be {parent:?}"
+                                    ));
+                                }
+                                *span_parents.entry(second).or_default() += 1;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
-                }
 
-                for bundle in live_ranges.bundles() {
-                    let parents = bundle_parents.get(&bundle).copied().unwrap_or(0);
-                    let constructed = constructed_bundles.contains(&bundle);
-                    if usize::from(constructed) + parents != 1 {
-                        return Err(format!(
-                            "{bundle:?} was constructed {} time(s) and split out of a parent \
-                             {parents} time(s); it should be exactly one of the two",
-                            usize::from(constructed),
-                        ));
+                    for bundle in live_ranges.bundles() {
+                        let parents = bundle_parents.get(&bundle).copied().unwrap_or(0);
+                        let constructed = constructed_bundles.contains(&bundle);
+                        if usize::from(constructed) + parents != 1 {
+                            return Err(format!(
+                                "{bundle:?} was constructed {} time(s) and split out of a parent \
+                                 {parents} time(s); it should be exactly one of the two",
+                                usize::from(constructed),
+                            ));
+                        }
                     }
-                }
 
-                for span in live_ranges.spans() {
-                    let parents = span_parents.get(&span).copied().unwrap_or(0);
-                    let constructed = constructed_spans.contains(&span);
-                    if usize::from(constructed) + parents != 1 {
-                        return Err(format!(
-                            "{span:?} was constructed {} time(s) and cut out of a parent \
-                             {parents} time(s); it should be exactly one of the two",
-                            usize::from(constructed),
-                        ));
+                    for span in live_ranges.spans() {
+                        let parents = span_parents.get(&span).copied().unwrap_or(0);
+                        let constructed = constructed_spans.contains(&span);
+                        if usize::from(constructed) + parents != 1 {
+                            return Err(format!(
+                                "{span:?} was constructed {} time(s) and cut out of a parent \
+                                 {parents} time(s); it should be exactly one of the two",
+                                usize::from(constructed),
+                            ));
+                        }
                     }
-                }
 
-                Ok(())
-            })
+                    Ok(())
+                },
+            )
     }
 
     /// The queue events tell the whole story of the queue: nothing is popped
@@ -1569,75 +1576,83 @@ mod tests {
         Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = allocate(test_input)? else {
-                    return Ok(());
-                };
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = allocate(test_input)? else {
+                        return Ok(());
+                    };
 
-                // The bundle each queue event names, and whether the event
-                // resolves a pop.
-                fn outcome(event: &Event<u32>) -> Option<LiveBundle<u32>> {
-                    match *event {
-                        Event::BundleAssignedPreferred { bundle, .. }
-                        | Event::BundleAssignedNonPreferred { bundle, .. }
-                        | Event::BundleAssignedViaEviction { bundle, .. }
-                        | Event::BundleSpilledToStack { bundle, .. }
-                        | Event::BundleRematerialized { bundle, .. }
-                        | Event::BundleSplitBetweenSpans { bundle, .. }
-                        | Event::BundleSplitWithinSpan { bundle, .. }
-                        | Event::BundleSplitIntoMinimal { bundle, .. } => Some(bundle),
-                        _ => None,
-                    }
-                }
-
-                let mut queued: BTreeMap<LiveBundle<u32>, usize> = BTreeMap::new();
-                let mut popped: Option<LiveBundle<u32>> = None;
-                let mut resolutions = 0;
-
-                for (_, event) in context.context32.events.iter() {
-                    match *event {
-                        Event::BundleQueued { bundle, .. } => {
-                            *queued.entry(bundle).or_default() += 1;
-                        }
-                        Event::BundleQueuePopped { bundle, .. } => {
-                            if let Some(prev) = popped
-                                && resolutions != 1
-                            {
-                                return Err(format!(
-                                    "popping {prev:?} led to {resolutions} outcomes, want 1"
-                                ));
-                            }
-                            match queued.get_mut(&bundle) {
-                                Some(n) if *n > 0 => *n -= 1,
-                                _ => return Err(format!("popped {bundle:?} without queueing it")),
-                            }
-                            popped = Some(bundle);
-                            resolutions = 0;
-                        }
-                        _ => {
-                            if outcome(event) == popped {
-                                resolutions += 1;
-                            }
+                    // The bundle each queue event names, and whether the event
+                    // resolves a pop.
+                    fn outcome(event: &Event<u32>) -> Option<LiveBundle<u32>> {
+                        match *event {
+                            Event::BundleAssignedPreferred { bundle, .. }
+                            | Event::BundleAssignedNonPreferred { bundle, .. }
+                            | Event::BundleAssignedViaEviction { bundle, .. }
+                            | Event::BundleSpilledToStack { bundle, .. }
+                            | Event::BundleRematerialized { bundle, .. }
+                            | Event::BundleSplitBetweenSpans { bundle, .. }
+                            | Event::BundleSplitWithinSpan { bundle, .. }
+                            | Event::BundleSplitIntoMinimal { bundle, .. } => Some(bundle),
+                            _ => None,
                         }
                     }
-                }
 
-                if let Some(prev) = popped
-                    && resolutions != 1
-                {
-                    return Err(format!(
-                        "popping {prev:?} led to {resolutions} outcomes, want 1"
-                    ));
-                }
+                    let mut queued: BTreeMap<LiveBundle<u32>, usize> = BTreeMap::new();
+                    let mut popped: Option<LiveBundle<u32>> = None;
+                    let mut resolutions = 0;
 
-                // And the queue drains: every region finishes with an empty
-                // one.
-                if let Some((bundle, _)) = queued.iter().find(|&(_, &n)| n > 0) {
-                    return Err(format!("{bundle:?} was left on the queue"));
-                }
+                    for (_, event) in context.context32.events.iter() {
+                        match *event {
+                            Event::BundleQueued { bundle, .. } => {
+                                *queued.entry(bundle).or_default() += 1;
+                            }
+                            Event::BundleQueuePopped { bundle, .. } => {
+                                if let Some(prev) = popped
+                                    && resolutions != 1
+                                {
+                                    return Err(format!(
+                                        "popping {prev:?} led to {resolutions} outcomes, want 1"
+                                    ));
+                                }
+                                match queued.get_mut(&bundle) {
+                                    Some(n) if *n > 0 => *n -= 1,
+                                    _ => {
+                                        return Err(format!(
+                                            "popped {bundle:?} without queueing it"
+                                        ));
+                                    }
+                                }
+                                popped = Some(bundle);
+                                resolutions = 0;
+                            }
+                            _ => {
+                                if outcome(event) == popped {
+                                    resolutions += 1;
+                                }
+                            }
+                        }
+                    }
 
-                Ok(())
-            })
+                    if let Some(prev) = popped
+                        && resolutions != 1
+                    {
+                        return Err(format!(
+                            "popping {prev:?} led to {resolutions} outcomes, want 1"
+                        ));
+                    }
+
+                    // And the queue drains: every region finishes with an empty
+                    // one.
+                    if let Some((bundle, _)) = queued.iter().find(|&(_, &n)| n > 0) {
+                        return Err(format!("{bundle:?} was left on the queue"));
+                    }
+
+                    Ok(())
+                },
+            )
     }
 
     /// Register pressure alone never sends a value to the stack that we could
@@ -1649,35 +1664,39 @@ mod tests {
         Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = allocate(test_input)? else {
-                    return Ok(());
-                };
-                let inner = &context.context32;
-                let live_ranges = &inner.live_ranges;
-
-                for (_, event) in inner.events.iter() {
-                    let Event::BundleSpilledToStack {
-                        bundle,
-                        forced: false,
-                        ..
-                    } = *event
-                    else {
-                        continue;
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = allocate(test_input)? else {
+                        return Ok(());
                     };
-                    let could_have_been_recomputed = test_input.with_input(|input| {
-                        bundle.is_cheaper_to_recompute_than_to_spill(input, live_ranges)
-                    });
-                    if could_have_been_recomputed {
-                        return Err(format!(
-                            "{bundle:?} has no uses and holds only values we could recompute, \
-                             but pressure sent it to the stack anyway",
-                        ));
-                    }
-                }
+                    let inner = &context.context32;
+                    let live_ranges = &inner.live_ranges;
 
-                Ok(())
-            })
+                    for (_, event) in inner.events.iter() {
+                        let Event::BundleSpilledToStack {
+                            bundle,
+                            forced: false,
+                            ..
+                        } = *event
+                        else {
+                            continue;
+                        };
+                        let could_have_been_recomputed = test_input.with_input(|input| {
+                            bundle.is_cheaper_to_recompute_than_to_spill(input, live_ranges)
+                        });
+                        if could_have_been_recomputed {
+                            return Err(format!(
+                                "{bundle:?} has no uses and holds only values we could recompute, \
+                             but pressure sent it to the stack anyway",
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                },
+            )
     }
 
     /// A minimal bundle over an always-recomputable value still pays full
