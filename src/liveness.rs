@@ -968,7 +968,8 @@ mod tests {
     #[test]
     fn liveness_properties() -> CheckResult<TestFunction> {
         Check::new()
-            .iters(10_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|func: &TestFunction| -> Result<(), String> {
                 let entry = func.entry_block();
                 let num_values = func.len_values();

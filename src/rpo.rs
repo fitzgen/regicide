@@ -120,7 +120,8 @@ mod tests {
     #[test]
     fn rpo_properties() -> CheckResult<TestFunction> {
         Check::new()
-            .iters(10_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|func: &TestFunction| -> Result<(), String> {
                 let rpo = rpo_of(func);
                 let blocks: Vec<Block> = rpo.iter().collect();

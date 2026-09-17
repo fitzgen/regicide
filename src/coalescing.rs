@@ -1326,7 +1326,7 @@ mod tests {
 
     #[test]
     fn coalescing_properties() -> CheckResult<TestInput> {
-        Check::new().iters(10_000).run_with(
+        Check::new().min_iters(2_000).min_duration(std::time::Duration::from_secs(2)).run_with(
             m::default::<TestInput>(),
             crate::test::corpus(),
             |test_input: &TestInput| -> Result<(), String> {

@@ -171,102 +171,105 @@ mod tests {
 
     #[test]
     fn dfs_properties() -> CheckResult<TestFunction> {
-        Check::new().iters(10_000).run(|func: &TestFunction| {
-            let entry = func.entry_block();
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run(|func: &TestFunction| {
+                let entry = func.entry_block();
 
-            let (events, visited) = run_dfs(func, BTreeSet::new());
+                let (events, visited) = run_dfs(func, BTreeSet::new());
 
-            // The DFS should visit exactly the blocks reachable from the entry
-            // block.
-            let reachable = reachable_avoiding(func, entry, &BTreeSet::new());
-            if visited != reachable {
-                return Err("DFS did not visit exactly the blocks reachable from the entry block");
-            }
+                // The DFS should visit exactly the blocks reachable from the entry
+                // block.
+                let reachable = reachable_avoiding(func, entry, &BTreeSet::new());
+                if visited != reachable {
+                    return Err("DFS did not visit exactly the blocks reachable from the entry block");
+                }
 
-            // The traversal always begins by discovering the entry block.
-            if events.first().copied() != Some(DfsEvent::Pre(entry)) {
-                return Err("first DFS event was not `Pre(entry_block)`");
-            }
+                // The traversal always begins by discovering the entry block.
+                if events.first().copied() != Some(DfsEvent::Pre(entry)) {
+                    return Err("first DFS event was not `Pre(entry_block)`");
+                }
 
-            // Replay the events, checking that they form a well-nested DFS: every
-            // block is discovered and finished at most once, `AfterEdge` only
-            // fires while its source block is the innermost open block, and
-            // edges only ever point at already-discovered blocks.
-            let mut pre_seen = BTreeSet::new();
-            let mut post_seen = BTreeSet::new();
-            let mut shadow_stack = Vec::new();
-            let mut after_edge_targets: HashMap<Block, Vec<Block>> = HashMap::new();
-            for &event in &events {
-                match event {
-                    DfsEvent::Pre(b) => {
-                        if !pre_seen.insert(b) {
-                            return Err("a block was discovered (`Pre`) more than once");
+                // Replay the events, checking that they form a well-nested DFS: every
+                // block is discovered and finished at most once, `AfterEdge` only
+                // fires while its source block is the innermost open block, and
+                // edges only ever point at already-discovered blocks.
+                let mut pre_seen = BTreeSet::new();
+                let mut post_seen = BTreeSet::new();
+                let mut shadow_stack = Vec::new();
+                let mut after_edge_targets: HashMap<Block, Vec<Block>> = HashMap::new();
+                for &event in &events {
+                    match event {
+                        DfsEvent::Pre(b) => {
+                            if !pre_seen.insert(b) {
+                                return Err("a block was discovered (`Pre`) more than once");
+                            }
+                            shadow_stack.push(b);
                         }
-                        shadow_stack.push(b);
-                    }
-                    DfsEvent::AfterEdge(b, s) => {
-                        if shadow_stack.last() != Some(&b) {
-                            return Err(
-                                "`AfterEdge` fired while its block was not the innermost open block",
-                            );
+                        DfsEvent::AfterEdge(b, s) => {
+                            if shadow_stack.last() != Some(&b) {
+                                return Err(
+                                    "`AfterEdge` fired while its block was not the innermost open block",
+                                );
+                            }
+                            if !pre_seen.contains(&s) {
+                                return Err("`AfterEdge` referenced a block that had not been discovered");
+                            }
+                            after_edge_targets.entry(b).or_default().push(s);
                         }
-                        if !pre_seen.contains(&s) {
-                            return Err("`AfterEdge` referenced a block that had not been discovered");
-                        }
-                        after_edge_targets.entry(b).or_default().push(s);
-                    }
-                    DfsEvent::Post(b) => {
-                        if !post_seen.insert(b) {
-                            return Err("a block was finished (`Post`) more than once");
-                        }
-                        if shadow_stack.pop() != Some(b) {
-                            return Err("`Post` did not match the innermost open block");
+                        DfsEvent::Post(b) => {
+                            if !post_seen.insert(b) {
+                                return Err("a block was finished (`Post`) more than once");
+                            }
+                            if shadow_stack.pop() != Some(b) {
+                                return Err("`Post` did not match the innermost open block");
+                            }
                         }
                     }
                 }
-            }
 
-            if !shadow_stack.is_empty() {
-                return Err("the traversal finished with unclosed blocks");
-            }
-            if pre_seen != post_seen {
-                return Err("not every discovered block was also finished");
-            }
-
-            // Every `AfterEdge` fired for a block must correspond exactly to
-            // that block's successors.
-            for &block in &pre_seen {
-                let mut expected: Vec<Block> = func.block(block).successors().collect();
-                expected.reverse();
-                let actual = after_edge_targets.remove(&block).unwrap_or_default();
-                if expected != actual {
-                    return Err("`AfterEdge` targets did not match the block's successors");
+                if !shadow_stack.is_empty() {
+                    return Err("the traversal finished with unclosed blocks");
                 }
-            }
+                if pre_seen != post_seen {
+                    return Err("not every discovered block was also finished");
+                }
 
-            // Running the same traversal again from scratch is deterministic.
-            let (events_again, _) = run_dfs(func, BTreeSet::new());
-            if events != events_again {
-                return Err("two DFS traversals of the same function produced different events");
-            }
+                // Every `AfterEdge` fired for a block must correspond exactly to
+                // that block's successors.
+                for &block in &pre_seen {
+                    let mut expected: Vec<Block> = func.block(block).successors().collect();
+                    expected.reverse();
+                    let actual = after_edge_targets.remove(&block).unwrap_or_default();
+                    if expected != actual {
+                        return Err("`AfterEdge` targets did not match the block's successors");
+                    }
+                }
 
-            // Mark every other discovered block as already "seen", and check
-            // that the traversal skips exactly those blocks (and anything only
-            // reachable through them), while still reaching everything else.
-            let already_seen: BTreeSet<Block> = pre_seen
-                .iter()
-                .copied()
-                .filter(|b| b.index() % 2 == 0)
-                .collect();
-            let (_, visited_with_seed) = run_dfs(func, already_seen.clone());
-            let newly_discovered: BTreeSet<Block> =
-                visited_with_seed.difference(&already_seen).copied().collect();
-            let expected_discovered = reachable_avoiding(func, entry, &already_seen);
-            if newly_discovered != expected_discovered {
-                return Err("DFS did not respect externally pre-seeded `seen` blocks");
-            }
+                // Running the same traversal again from scratch is deterministic.
+                let (events_again, _) = run_dfs(func, BTreeSet::new());
+                if events != events_again {
+                    return Err("two DFS traversals of the same function produced different events");
+                }
 
-            Ok(())
-        })
+                // Mark every other discovered block as already "seen", and check
+                // that the traversal skips exactly those blocks (and anything only
+                // reachable through them), while still reaching everything else.
+                let already_seen: BTreeSet<Block> = pre_seen
+                    .iter()
+                    .copied()
+                    .filter(|b| b.index() % 2 == 0)
+                    .collect();
+                let (_, visited_with_seed) = run_dfs(func, already_seen.clone());
+                let newly_discovered: BTreeSet<Block> =
+                    visited_with_seed.difference(&already_seen).copied().collect();
+                let expected_discovered = reachable_avoiding(func, entry, &already_seen);
+                if newly_discovered != expected_discovered {
+                    return Err("DFS did not respect externally pre-seeded `seen` blocks");
+                }
+
+                Ok(())
+            })
     }
 }

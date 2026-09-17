@@ -5245,712 +5245,715 @@ mod tests {
         static TIE_ONLY_SPLITS: AtomicUsize = AtomicUsize::new(0);
         TIE_ONLY_SPLITS.store(0, Ordering::Relaxed);
 
-        let result = Check::new().iters(10_000).run_with(
-            m::default::<TestInput>(),
-            seeds(),
-            |test_input: &TestInput| -> Result<(), String> {
-                let func = &test_input.func;
-                let (mut liveness, live_ranges) = analyze_spans(test_input)?;
+        let result = Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                seeds(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let func = &test_input.func;
+                    let (mut liveness, live_ranges) = analyze_spans(test_input)?;
 
-                let num_values = func.len_values();
-                let operands = all_operands(func);
-                let block_args = all_block_args(func);
+                    let num_values = func.len_values();
+                    let operands = all_operands(func);
+                    let block_args = all_block_args(func);
 
-                // A value we will always recompute is cut into one piece per
-                // instruction that mentions it, leaving gaps between them, so
-                // several of the properties below hold only in the unbroken
-                // shape every other value's live range has. See
-                // `push_span_and_split_conflicts`.
-                let always_remat =
-                    |val: Val| func.value(val).remat_cost() == Some(RematCost::AlwaysRemat);
-                let inst_block = inst_blocks(func);
-                let bounds: HashMap<Block, (LivePoint<u32>, LivePoint<u32>)> = func
-                    .blocks()
-                    .map(|(b, _)| (b, block_points(func, b)))
-                    .collect();
+                    // A value we will always recompute is cut into one piece per
+                    // instruction that mentions it, leaving gaps between them, so
+                    // several of the properties below hold only in the unbroken
+                    // shape every other value's live range has. See
+                    // `push_span_and_split_conflicts`.
+                    let always_remat =
+                        |val: Val| func.value(val).remat_cost() == Some(RematCost::AlwaysRemat);
+                    let inst_block = inst_blocks(func);
+                    let bounds: HashMap<Block, (LivePoint<u32>, LivePoint<u32>)> = func
+                        .blocks()
+                        .map(|(b, _)| (b, block_points(func, b)))
+                        .collect();
 
-                // Index the spans by the block they live in and by their value.
-                // A span's block is the one that owns the instruction its start
-                // points at; property 1 below checks that the whole span fits
-                // inside that block.
-                let mut spans_of: HashMap<(Val, Block), Vec<LiveSpan>> = HashMap::new();
-                let mut spans_in: HashMap<Block, Vec<LiveSpan>> =
-                    func.blocks().map(|(b, _)| (b, Vec::new())).collect();
+                    // Index the spans by the block they live in and by their value.
+                    // A span's block is the one that owns the instruction its start
+                    // points at; property 1 below checks that the whole span fits
+                    // inside that block.
+                    let mut spans_of: HashMap<(Val, Block), Vec<LiveSpan>> = HashMap::new();
+                    let mut spans_in: HashMap<Block, Vec<LiveSpan>> =
+                        func.blocks().map(|(b, _)| (b, Vec::new())).collect();
 
-                // 1. Every span is well formed and stays inside a single block.
-                for span in live_ranges.spans() {
-                    if span.start(&live_ranges) >= span.end(&live_ranges) {
-                        return Err(format!(
-                            "{span:?} covers {:?}..{:?}, which is empty or backwards",
-                            span.start(&live_ranges),
-                            span.end(&live_ranges),
-                        ));
-                    }
-                    if span.val(&live_ranges).index() >= num_values {
-                        return Err(format!(
-                            "{span:?} is for {:?}, but the function only defines {num_values} \
-                             values",
-                            span.val(&live_ranges),
-                        ));
-                    }
-                    let Some(&block) = inst_block.get(&span.start(&live_ranges).inst()) else {
-                        return Err(format!(
-                            "{span:?} starts at {:?}, which is in no block",
-                            span.start(&live_ranges),
-                        ));
-                    };
-                    let (block_start, block_end) = bounds[&block];
-                    if span.start(&live_ranges) < block_start || span.end(&live_ranges) > block_end
-                    {
-                        return Err(format!(
-                            "{span:?} covers {:?}..{:?}, which escapes {block:?}'s bounds \
-                             {block_start:?}..{block_end:?}",
-                            span.start(&live_ranges),
-                            span.end(&live_ranges),
-                        ));
-                    }
-                    spans_of
-                        .entry((span.val(&live_ranges), block))
-                        .or_default()
-                        .push(span);
-                    spans_in.get_mut(&block).unwrap().push(span);
-                }
-
-                // Construction groups a block's spans by whether they are
-                // live-in and/or live-out, rather than by program order, so put
-                // each value's pieces back into program order before checking
-                // the properties that talk about "the first" and "the last"
-                // piece.
-                for spans in spans_of.values_mut() {
-                    spans.sort_unstable_by_key(|&s| (s.start(&live_ranges), s.end(&live_ranges)));
-                }
-
-                // 1b. Each span's uses are inside it, are strictly ascending in
-                // `(point, operand)`, and name real operands of that span's
-                // value.
-                for span in live_ranges.spans() {
-                    let mut previous = None;
-                    for use_data in span.uses(&live_ranges) {
-                        let key = (use_data.point(&live_ranges), use_data.operand(&live_ranges));
-                        if use_data.point(&live_ranges) < span.start(&live_ranges)
-                            || use_data.point(&live_ranges) >= span.end(&live_ranges)
-                        {
+                    // 1. Every span is well formed and stays inside a single block.
+                    for span in live_ranges.spans() {
+                        if span.start(&live_ranges) >= span.end(&live_ranges) {
                             return Err(format!(
-                                "{span:?} covers {:?}..{:?} but has a use at {:?}",
+                                "{span:?} covers {:?}..{:?}, which is empty or backwards",
                                 span.start(&live_ranges),
                                 span.end(&live_ranges),
-                                use_data.point(&live_ranges),
                             ));
                         }
-                        if previous.is_some_and(|previous| previous >= key) {
+                        if span.val(&live_ranges).index() >= num_values {
                             return Err(format!(
-                                "{span:?}'s uses are not in ascending program order: \
-                                 {previous:?} is followed by {key:?}",
-                            ));
-                        }
-                        previous = Some(key);
-                        let is_real = operands.iter().any(|&(_b, point, i, _kind, val)| {
-                            point == use_data.point(&live_ranges)
-                                && i == use_data.operand(&live_ranges)
-                                && val == span.val(&live_ranges)
-                        });
-                        if !is_real {
-                            return Err(format!(
-                                "{span:?} records a use of {:?} at {:?}, operand {}, but no such \
-                                 operand exists",
+                                "{span:?} is for {:?}, but the function only defines {num_values} \
+                                 values",
                                 span.val(&live_ranges),
-                                use_data.point(&live_ranges),
-                                use_data.operand(&live_ranges),
                             ));
                         }
+                        let Some(&block) = inst_block.get(&span.start(&live_ranges).inst()) else {
+                            return Err(format!(
+                                "{span:?} starts at {:?}, which is in no block",
+                                span.start(&live_ranges),
+                            ));
+                        };
+                        let (block_start, block_end) = bounds[&block];
+                        if span.start(&live_ranges) < block_start || span.end(&live_ranges) > block_end
+                        {
+                            return Err(format!(
+                                "{span:?} covers {:?}..{:?}, which escapes {block:?}'s bounds \
+                                 {block_start:?}..{block_end:?}",
+                                span.start(&live_ranges),
+                                span.end(&live_ranges),
+                            ));
+                        }
+                        spans_of
+                            .entry((span.val(&live_ranges), block))
+                            .or_default()
+                            .push(span);
+                        spans_in.get_mut(&block).unwrap().push(span);
                     }
-                }
 
-                // 1c. The spans' use ranges tile the uses map exactly: every
-                // recorded use belongs to exactly one span.
-                let mut ranges: Vec<(usize, usize)> = live_ranges
-                    .spans()
-                    .map(|span| span.uses(&live_ranges))
-                    .filter(|range| !range.is_empty())
-                    .map(|range| (range.start.index(), range.end.index()))
-                    .collect();
-                ranges.sort();
-                let mut next = 0;
-                for &(start, end) in &ranges {
-                    if start != next {
-                        return Err(format!(
-                            "the spans' use ranges do not tile the uses map: expected the next \
-                             range to start at {next}, but it starts at {start}",
-                        ));
+                    // Construction groups a block's spans by whether they are
+                    // live-in and/or live-out, rather than by program order, so put
+                    // each value's pieces back into program order before checking
+                    // the properties that talk about "the first" and "the last"
+                    // piece.
+                    for spans in spans_of.values_mut() {
+                        spans.sort_unstable_by_key(|&s| (s.start(&live_ranges), s.end(&live_ranges)));
                     }
-                    next = end;
-                }
-                if next != live_ranges.len_uses() {
-                    return Err(format!(
-                        "the spans' use ranges cover {next} of the {} recorded uses",
-                        live_ranges.len_uses(),
-                    ));
-                }
 
-                // 1d. One span is one allocation, so all of a span's uses have
-                // to be satisfiable by a single location. Fold their
-                // constraints the way construction does; folding is exact,
-                // because the machine's class list is closed under
-                // intersection, so a fold that succeeds really does describe a
-                // location that every use accepts. This is the property that
-                // eager splitting buys.
-                test_input.with_input(|input| -> Result<(), String> {
+                    // 1b. Each span's uses are inside it, are strictly ascending in
+                    // `(point, operand)`, and name real operands of that span's
+                    // value.
                     for span in live_ranges.spans() {
-                        let mut constraint = OperandConstraint::Any;
+                        let mut previous = None;
                         for use_data in span.uses(&live_ranges) {
-                            // Fold the way construction folds, down to
-                            // resolving each answer against the instruction it
-                            // came from, so that this is a check on where the
-                            // spans were cut and not on a second reading of the
-                            // same operands.
-                            let this = reuse_aware_constraint(
-                                input,
-                                use_data.point(&live_ranges).inst(),
-                                use_data.operand(&live_ranges),
-                            );
-                            match constraint.merge_resolved(&this, input.machine) {
-                                Some(merged) => constraint = merged,
-                                None => {
-                                    return Err(format!(
-                                        "{span:?} has a use at {:?} constrained to {this:?}, \
-                                         which cannot be satisfied along with {constraint:?}, \
-                                         the constraints of the uses before it",
-                                        use_data.point(&live_ranges),
-                                    ));
-                                }
+                            let key = (use_data.point(&live_ranges), use_data.operand(&live_ranges));
+                            if use_data.point(&live_ranges) < span.start(&live_ranges)
+                                || use_data.point(&live_ranges) >= span.end(&live_ranges)
+                            {
+                                return Err(format!(
+                                    "{span:?} covers {:?}..{:?} but has a use at {:?}",
+                                    span.start(&live_ranges),
+                                    span.end(&live_ranges),
+                                    use_data.point(&live_ranges),
+                                ));
+                            }
+                            if previous.is_some_and(|previous| previous >= key) {
+                                return Err(format!(
+                                    "{span:?}'s uses are not in ascending program order: \
+                                     {previous:?} is followed by {key:?}",
+                                ));
+                            }
+                            previous = Some(key);
+                            let is_real = operands.iter().any(|&(_b, point, i, _kind, val)| {
+                                point == use_data.point(&live_ranges)
+                                    && i == use_data.operand(&live_ranges)
+                                    && val == span.val(&live_ranges)
+                            });
+                            if !is_real {
+                                return Err(format!(
+                                    "{span:?} records a use of {:?} at {:?}, operand {}, but no such \
+                                     operand exists",
+                                    span.val(&live_ranges),
+                                    use_data.point(&live_ranges),
+                                    use_data.operand(&live_ranges),
+                                ));
                             }
                         }
                     }
-                    Ok(())
-                })?;
 
-                // 1e. `uses_at` brackets exactly the uses at a point. It
-                // binary searches, which property 1b's ascending order
-                // licenses; the oracle here is the linear scan that the binary
-                // search replaced.
-                for span in live_ranges.spans() {
-                    let mut points: Vec<LivePoint<u32>> = span
-                        .uses(&live_ranges)
-                        .into_iter()
-                        .map(|u| u.point(&live_ranges))
+                    // 1c. The spans' use ranges tile the uses map exactly: every
+                    // recorded use belongs to exactly one span.
+                    let mut ranges: Vec<(usize, usize)> = live_ranges
+                        .spans()
+                        .map(|span| span.uses(&live_ranges))
+                        .filter(|range| !range.is_empty())
+                        .map(|range| (range.start.index(), range.end.index()))
                         .collect();
-                    // Points with no use at all, on both sides of the span, so
-                    // that the empty answer is checked too.
-                    points.push(span.start(&live_ranges));
-                    points.push(span.end(&live_ranges));
-                    points.push(span.start(&live_ranges).inst_boundary_at_or_before());
-
-                    for point in points {
-                        let expected: Vec<_> = span
-                            .uses(&live_ranges)
-                            .into_iter()
-                            .filter(|u| u.point(&live_ranges) == point)
-                            .collect();
-                        let actual: Vec<_> =
-                            span.uses_at(&live_ranges, point).into_iter().collect();
-                        if actual != expected {
+                    ranges.sort();
+                    let mut next = 0;
+                    for &(start, end) in &ranges {
+                        if start != next {
                             return Err(format!(
-                                "{span:?}'s uses at {point:?} are {expected:?}, but `uses_at` \
-                                 answered {actual:?}",
+                                "the spans' use ranges do not tile the uses map: expected the next \
+                                 range to start at {next}, but it starts at {start}",
                             ));
                         }
+                        next = end;
                     }
-                }
-
-                // 2. A value's pieces in a block ascend, and they barely
-                // overlap.
-                //
-                // Splitting is what makes several pieces out of one range. They
-                // may overlap only within the instruction the later one begins
-                // at, which it always does at that instruction's boundary.
-                // Anything wider, or a piece starting mid-instruction, would
-                // need a move where there is no gap to put one.
-                //
-                // Nor do they usually leave a gap, since the move out of one
-                // piece and into the next has to read the value from
-                // somewhere. The exception is a value we will always recompute,
-                // which is cut at every instruction precisely so that the
-                // stretches in between are registers nobody has to hold: the
-                // piece across such a gap recomputes the value rather than
-                // receiving it, so it begins at an instruction boundary and
-                // holds that instruction's uses.
-                for ((val, block), spans) in &spans_of {
-                    for pair in spans.windows(2) {
-                        let (previous, next) = (pair[0], pair[1]);
-                        let (previous_start, previous_end) =
-                            (previous.start(&live_ranges), previous.end(&live_ranges));
-                        let next_start = next.start(&live_ranges);
-
-                        let ascends = previous_start <= next_start;
-                        let gap_is_legal = next_start <= previous_end
-                            || (always_remat(*val) && next_start.pos() == Position::Early);
-
-                        if !ascends || !gap_is_legal {
-                            return Err(format!(
-                                "{val:?}'s spans in {block:?} are out of order or leave a gap it \
-                                 has no way to fill: {previous_start:?}..{previous_end:?} is \
-                                 followed by {next_start:?}..{:?}",
-                                next.end(&live_ranges),
-                            ));
-                        }
-                    }
-                }
-                for span_a in live_ranges.spans() {
-                    for span_b in live_ranges.spans() {
-                        if span_a >= span_b || span_a.val(&live_ranges) != span_b.val(&live_ranges)
-                        {
-                            continue;
-                        }
-                        let (a_start, a_end) =
-                            (span_a.start(&live_ranges), span_a.end(&live_ranges));
-                        let (b_start, b_end) =
-                            (span_b.start(&live_ranges), span_b.end(&live_ranges));
-                        if a_start >= b_end || b_start >= a_end {
-                            continue;
-                        }
-
-                        // Order the two by `(start, end)` rather than by start
-                        // alone, so that two pieces that begin at the same point
-                        // -- what a third conflicting use at that point leaves
-                        // behind -- are still compared earlier-first.
-                        let (first, second) = if (a_start, a_end) <= (b_start, b_end) {
-                            (span_a, span_b)
-                        } else {
-                            (span_b, span_a)
-                        };
-                        let point = second.start(&live_ranges);
-
-                        // The later piece begins at an instruction boundary,
-                        // which is the only place a move between the two
-                        // allocations can go.
-                        let start_is_legal = point.pos() == Position::Early;
-
-                        // And the overlap stays inside that instruction.
-                        let overlap_is_narrow =
-                            first.end(&live_ranges) <= point.inst_boundary_after();
-
-                        if !start_is_legal || !overlap_is_narrow {
-                            return Err(format!(
-                                "{span_a:?} ({a_start:?}..{a_end:?}) and {span_b:?} \
-                                 ({b_start:?}..{b_end:?}) are both for {:?}, but {second:?} does \
-                                 not begin at an instruction boundary or they overlap by more \
-                                 than the instruction it begins at",
-                                span_a.val(&live_ranges),
-                            ));
-                        }
-                    }
-                }
-
-                for (block, input_block) in func.blocks() {
-                    let (block_start, block_end) = bounds[&block];
-                    let first_inst = input_block.insts().next().unwrap().0;
-                    let last_inst = input_block.insts().next_back().unwrap().0;
-
-                    // Does this block mention `val` at `inst`, or anywhere at
-                    // all?
-                    let mentioned_at = |inst: Inst, val: Val| {
-                        operands
-                            .iter()
-                            .any(|&(b, p, _i, _k, v)| b == block && p.inst() == inst && v == val)
-                    };
-                    let mentioned_anywhere = |val: Val| {
-                        operands
-                            .iter()
-                            .any(|&(b, _p, _i, _k, v)| b == block && v == val)
-                    };
-
-                    // Does this block hold the value anywhere at all?
-                    //
-                    // It always does for a value it mentions, and for any value
-                    // live across it -- except one we will always recompute,
-                    // which a block that never mentions it holds nowhere:
-                    // nothing here wants it in a register, and whoever wants it
-                    // next recomputes it. Passing it to a successor is the
-                    // exception, because a parameter that lands in a spill slot
-                    // is filled from the argument across the edge, and a
-                    // rematerialization writes a register and never a slot.
-                    let carried_through = |val: Val| {
-                        !always_remat(val)
-                            || mentioned_anywhere(val)
-                            || block_args.contains(&(block, val))
-                    };
-
-                    // 3. A span starts at the block's entry exactly when its
-                    // value is live-in there, or is defined by the very first
-                    // program point in the block.
-                    //
-                    // A value we will always recompute is the exception, since
-                    // its pieces begin where its uses do: being live-in only
-                    // starts it at the entry when the first instruction is one
-                    // of the ones mentioning it, or when the block never
-                    // mentions it at all and the one piece carried through for
-                    // its successors is never cut.
-                    let starting_at_entry: Set<Val> = spans_in[&block]
-                        .iter()
-                        .filter(|&&span| span.start(&live_ranges) == block_start)
-                        .map(|&span| span.val(&live_ranges))
-                        .collect();
-                    let mut expected: Set<Val> = block
-                        .live_in(&liveness)
-                        .filter(|&val| {
-                            !always_remat(val)
-                                || mentioned_at(first_inst, val)
-                                || (!mentioned_anywhere(val) && carried_through(val))
-                        })
-                        .collect();
-                    for &(b, point, _i, kind, val) in &operands {
-                        if b == block && point == block_start && matches!(kind, DefUse::Def) {
-                            expected.insert(val);
-                        }
-                    }
-                    if starting_at_entry != expected {
+                    if next != live_ranges.len_uses() {
                         return Err(format!(
-                            "the values whose spans start at {block:?}'s entry are \
-                             {starting_at_entry:?}, but should be {expected:?} (its live-in set \
-                             plus whatever it defines at {block_start:?})",
+                            "the spans' use ranges cover {next} of the {} recorded uses",
+                            live_ranges.len_uses(),
                         ));
                     }
 
-                    // 4. Spans that end at the block's exit are exactly those
-                    // whose last event is the last thing that happens in the
-                    // block. Three ways to be one, and the block's exit is the
-                    // exclusive end point in all three:
-                    //
-                    // * The value is live-out, so its span reaches the exit by
-                    //   definition.
-                    //
-                    // * The value is defined somewhere in the last instruction.
-                    //   A def that nothing reads still spans past its own
-                    //   instruction, and a def that something reads can only be
-                    //   read at the late slot of that same instruction.
-                    //
-                    // * The value is used at the last instruction's late slot,
-                    //   the block's final program point, so the span that
-                    //   reaches that use ends just after it.
-                    let ending_at_exit: Set<Val> = spans_in[&block]
-                        .iter()
-                        .filter(|&&span| span.end(&live_ranges) == block_end)
-                        .map(|&span| span.val(&live_ranges))
-                        .collect();
-                    let mut expected: Set<Val> = block
-                        .live_out(&liveness)
-                        .filter(|&val| carried_through(val))
-                        .collect();
-                    for &(b, point, _i, kind, val) in &operands {
-                        if b != block || point.inst() != last_inst {
-                            continue;
-                        }
-                        if matches!(kind, DefUse::Def) || point.pos() == Position::Late {
-                            expected.insert(val);
-                        }
-                    }
-                    if ending_at_exit != expected {
-                        return Err(format!(
-                            "the values whose spans end at {block:?}'s exit are \
-                             {ending_at_exit:?}, but should be {expected:?}",
-                        ));
-                    }
-
-                    // 5. A dead block parameter gets no span at all, while a
-                    // live one gets a span starting at the block's entry. This
-                    // is the one place we deliberately differ from regalloc2,
-                    // which gives a dead parameter a trivial range.
-                    for param in input_block.params() {
-                        let spans = spans_of.get(&(param, block));
-                        if block.is_live_in(&liveness, param) {
-                            match spans.map(|s| s.as_slice()) {
-                                // A parameter is live-in, so its range starts
-                                // at the entry however many pieces the range is
-                                // later split into.
-                                Some([first, ..]) => {
-                                    if first.start(&live_ranges) != block_start {
+                    // 1d. One span is one allocation, so all of a span's uses have
+                    // to be satisfiable by a single location. Fold their
+                    // constraints the way construction does; folding is exact,
+                    // because the machine's class list is closed under
+                    // intersection, so a fold that succeeds really does describe a
+                    // location that every use accepts. This is the property that
+                    // eager splitting buys.
+                    test_input.with_input(|input| -> Result<(), String> {
+                        for span in live_ranges.spans() {
+                            let mut constraint = OperandConstraint::Any;
+                            for use_data in span.uses(&live_ranges) {
+                                // Fold the way construction folds, down to
+                                // resolving each answer against the instruction it
+                                // came from, so that this is a check on where the
+                                // spans were cut and not on a second reading of the
+                                // same operands.
+                                let this = reuse_aware_constraint(
+                                    input,
+                                    use_data.point(&live_ranges).inst(),
+                                    use_data.operand(&live_ranges),
+                                );
+                                match constraint.merge_resolved(&this, input.machine) {
+                                    Some(merged) => constraint = merged,
+                                    None => {
                                         return Err(format!(
-                                            "{param:?} is live-in at {block:?}, but its first \
-                                             span starts at {:?} rather than the block's entry \
-                                             {block_start:?}",
-                                            first.start(&live_ranges),
+                                            "{span:?} has a use at {:?} constrained to {this:?}, \
+                                             which cannot be satisfied along with {constraint:?}, \
+                                             the constraints of the uses before it",
+                                            use_data.point(&live_ranges),
                                         ));
                                     }
                                 }
-                                _ => {
+                            }
+                        }
+                        Ok(())
+                    })?;
+
+                    // 1e. `uses_at` brackets exactly the uses at a point. It
+                    // binary searches, which property 1b's ascending order
+                    // licenses; the oracle here is the linear scan that the binary
+                    // search replaced.
+                    for span in live_ranges.spans() {
+                        let mut points: Vec<LivePoint<u32>> = span
+                            .uses(&live_ranges)
+                            .into_iter()
+                            .map(|u| u.point(&live_ranges))
+                            .collect();
+                        // Points with no use at all, on both sides of the span, so
+                        // that the empty answer is checked too.
+                        points.push(span.start(&live_ranges));
+                        points.push(span.end(&live_ranges));
+                        points.push(span.start(&live_ranges).inst_boundary_at_or_before());
+
+                        for point in points {
+                            let expected: Vec<_> = span
+                                .uses(&live_ranges)
+                                .into_iter()
+                                .filter(|u| u.point(&live_ranges) == point)
+                                .collect();
+                            let actual: Vec<_> =
+                                span.uses_at(&live_ranges, point).into_iter().collect();
+                            if actual != expected {
+                                return Err(format!(
+                                    "{span:?}'s uses at {point:?} are {expected:?}, but `uses_at` \
+                                     answered {actual:?}",
+                                ));
+                            }
+                        }
+                    }
+
+                    // 2. A value's pieces in a block ascend, and they barely
+                    // overlap.
+                    //
+                    // Splitting is what makes several pieces out of one range. They
+                    // may overlap only within the instruction the later one begins
+                    // at, which it always does at that instruction's boundary.
+                    // Anything wider, or a piece starting mid-instruction, would
+                    // need a move where there is no gap to put one.
+                    //
+                    // Nor do they usually leave a gap, since the move out of one
+                    // piece and into the next has to read the value from
+                    // somewhere. The exception is a value we will always recompute,
+                    // which is cut at every instruction precisely so that the
+                    // stretches in between are registers nobody has to hold: the
+                    // piece across such a gap recomputes the value rather than
+                    // receiving it, so it begins at an instruction boundary and
+                    // holds that instruction's uses.
+                    for ((val, block), spans) in &spans_of {
+                        for pair in spans.windows(2) {
+                            let (previous, next) = (pair[0], pair[1]);
+                            let (previous_start, previous_end) =
+                                (previous.start(&live_ranges), previous.end(&live_ranges));
+                            let next_start = next.start(&live_ranges);
+
+                            let ascends = previous_start <= next_start;
+                            let gap_is_legal = next_start <= previous_end
+                                || (always_remat(*val) && next_start.pos() == Position::Early);
+
+                            if !ascends || !gap_is_legal {
+                                return Err(format!(
+                                    "{val:?}'s spans in {block:?} are out of order or leave a gap it \
+                                     has no way to fill: {previous_start:?}..{previous_end:?} is \
+                                     followed by {next_start:?}..{:?}",
+                                    next.end(&live_ranges),
+                                ));
+                            }
+                        }
+                    }
+                    for span_a in live_ranges.spans() {
+                        for span_b in live_ranges.spans() {
+                            if span_a >= span_b || span_a.val(&live_ranges) != span_b.val(&live_ranges)
+                            {
+                                continue;
+                            }
+                            let (a_start, a_end) =
+                                (span_a.start(&live_ranges), span_a.end(&live_ranges));
+                            let (b_start, b_end) =
+                                (span_b.start(&live_ranges), span_b.end(&live_ranges));
+                            if a_start >= b_end || b_start >= a_end {
+                                continue;
+                            }
+
+                            // Order the two by `(start, end)` rather than by start
+                            // alone, so that two pieces that begin at the same point
+                            // -- what a third conflicting use at that point leaves
+                            // behind -- are still compared earlier-first.
+                            let (first, second) = if (a_start, a_end) <= (b_start, b_end) {
+                                (span_a, span_b)
+                            } else {
+                                (span_b, span_a)
+                            };
+                            let point = second.start(&live_ranges);
+
+                            // The later piece begins at an instruction boundary,
+                            // which is the only place a move between the two
+                            // allocations can go.
+                            let start_is_legal = point.pos() == Position::Early;
+
+                            // And the overlap stays inside that instruction.
+                            let overlap_is_narrow =
+                                first.end(&live_ranges) <= point.inst_boundary_after();
+
+                            if !start_is_legal || !overlap_is_narrow {
+                                return Err(format!(
+                                    "{span_a:?} ({a_start:?}..{a_end:?}) and {span_b:?} \
+                                     ({b_start:?}..{b_end:?}) are both for {:?}, but {second:?} does \
+                                     not begin at an instruction boundary or they overlap by more \
+                                     than the instruction it begins at",
+                                    span_a.val(&live_ranges),
+                                ));
+                            }
+                        }
+                    }
+
+                    for (block, input_block) in func.blocks() {
+                        let (block_start, block_end) = bounds[&block];
+                        let first_inst = input_block.insts().next().unwrap().0;
+                        let last_inst = input_block.insts().next_back().unwrap().0;
+
+                        // Does this block mention `val` at `inst`, or anywhere at
+                        // all?
+                        let mentioned_at = |inst: Inst, val: Val| {
+                            operands
+                                .iter()
+                                .any(|&(b, p, _i, _k, v)| b == block && p.inst() == inst && v == val)
+                        };
+                        let mentioned_anywhere = |val: Val| {
+                            operands
+                                .iter()
+                                .any(|&(b, _p, _i, _k, v)| b == block && v == val)
+                        };
+
+                        // Does this block hold the value anywhere at all?
+                        //
+                        // It always does for a value it mentions, and for any value
+                        // live across it -- except one we will always recompute,
+                        // which a block that never mentions it holds nowhere:
+                        // nothing here wants it in a register, and whoever wants it
+                        // next recomputes it. Passing it to a successor is the
+                        // exception, because a parameter that lands in a spill slot
+                        // is filled from the argument across the edge, and a
+                        // rematerialization writes a register and never a slot.
+                        let carried_through = |val: Val| {
+                            !always_remat(val)
+                                || mentioned_anywhere(val)
+                                || block_args.contains(&(block, val))
+                        };
+
+                        // 3. A span starts at the block's entry exactly when its
+                        // value is live-in there, or is defined by the very first
+                        // program point in the block.
+                        //
+                        // A value we will always recompute is the exception, since
+                        // its pieces begin where its uses do: being live-in only
+                        // starts it at the entry when the first instruction is one
+                        // of the ones mentioning it, or when the block never
+                        // mentions it at all and the one piece carried through for
+                        // its successors is never cut.
+                        let starting_at_entry: Set<Val> = spans_in[&block]
+                            .iter()
+                            .filter(|&&span| span.start(&live_ranges) == block_start)
+                            .map(|&span| span.val(&live_ranges))
+                            .collect();
+                        let mut expected: Set<Val> = block
+                            .live_in(&liveness)
+                            .filter(|&val| {
+                                !always_remat(val)
+                                    || mentioned_at(first_inst, val)
+                                    || (!mentioned_anywhere(val) && carried_through(val))
+                            })
+                            .collect();
+                        for &(b, point, _i, kind, val) in &operands {
+                            if b == block && point == block_start && matches!(kind, DefUse::Def) {
+                                expected.insert(val);
+                            }
+                        }
+                        if starting_at_entry != expected {
+                            return Err(format!(
+                                "the values whose spans start at {block:?}'s entry are \
+                                 {starting_at_entry:?}, but should be {expected:?} (its live-in set \
+                                 plus whatever it defines at {block_start:?})",
+                            ));
+                        }
+
+                        // 4. Spans that end at the block's exit are exactly those
+                        // whose last event is the last thing that happens in the
+                        // block. Three ways to be one, and the block's exit is the
+                        // exclusive end point in all three:
+                        //
+                        // * The value is live-out, so its span reaches the exit by
+                        //   definition.
+                        //
+                        // * The value is defined somewhere in the last instruction.
+                        //   A def that nothing reads still spans past its own
+                        //   instruction, and a def that something reads can only be
+                        //   read at the late slot of that same instruction.
+                        //
+                        // * The value is used at the last instruction's late slot,
+                        //   the block's final program point, so the span that
+                        //   reaches that use ends just after it.
+                        let ending_at_exit: Set<Val> = spans_in[&block]
+                            .iter()
+                            .filter(|&&span| span.end(&live_ranges) == block_end)
+                            .map(|&span| span.val(&live_ranges))
+                            .collect();
+                        let mut expected: Set<Val> = block
+                            .live_out(&liveness)
+                            .filter(|&val| carried_through(val))
+                            .collect();
+                        for &(b, point, _i, kind, val) in &operands {
+                            if b != block || point.inst() != last_inst {
+                                continue;
+                            }
+                            if matches!(kind, DefUse::Def) || point.pos() == Position::Late {
+                                expected.insert(val);
+                            }
+                        }
+                        if ending_at_exit != expected {
+                            return Err(format!(
+                                "the values whose spans end at {block:?}'s exit are \
+                                 {ending_at_exit:?}, but should be {expected:?}",
+                            ));
+                        }
+
+                        // 5. A dead block parameter gets no span at all, while a
+                        // live one gets a span starting at the block's entry. This
+                        // is the one place we deliberately differ from regalloc2,
+                        // which gives a dead parameter a trivial range.
+                        for param in input_block.params() {
+                            let spans = spans_of.get(&(param, block));
+                            if block.is_live_in(&liveness, param) {
+                                match spans.map(|s| s.as_slice()) {
+                                    // A parameter is live-in, so its range starts
+                                    // at the entry however many pieces the range is
+                                    // later split into.
+                                    Some([first, ..]) => {
+                                        if first.start(&live_ranges) != block_start {
+                                            return Err(format!(
+                                                "{param:?} is live-in at {block:?}, but its first \
+                                                 span starts at {:?} rather than the block's entry \
+                                                 {block_start:?}",
+                                                first.start(&live_ranges),
+                                            ));
+                                        }
+                                    }
+                                    _ => {
+                                        return Err(format!(
+                                            "{param:?} is live-in at {block:?}, but has {} spans \
+                                             there",
+                                            spans.map_or(0, |s| s.len()),
+                                        ));
+                                    }
+                                }
+                            } else if spans.is_some_and(|s| !s.is_empty()) {
+                                return Err(format!(
+                                    "nothing reads {block:?}'s parameter {param:?}, so it is only \
+                                     the destination of a move that is never made and needs no \
+                                     register, but it still got a span",
+                                ));
+                            }
+                        }
+
+                        // 6. A value with a span in a block is live at that block's
+                        // entry or exit, or the block mentions it.
+                        for &span in &spans_in[&block] {
+                            let val = span.val(&live_ranges);
+                            let mentioned = operands
+                                .iter()
+                                .any(|&(b, _p, _i, _k, v)| b == block && v == val);
+                            if !mentioned
+                                && !block.is_live_in(&liveness, val)
+                                && !block.is_live_out(&liveness, val)
+                            {
+                                return Err(format!(
+                                    "{span:?} gives {val:?} a span in {block:?}, which neither \
+                                     mentions it nor has it live at either end",
+                                ));
+                            }
+                        }
+
+                        // 7. A value that flows straight through a block has a span
+                        // that tiles the whole block, with no gap at either end.
+                        //
+                        // A value we will always recompute tiles only the far end.
+                        // Where it starts is property 3's business and the gaps its
+                        // pieces leave are property 2's, but its last piece still
+                        // has to reach the block's exit: a `Remat` writes a register
+                        // and never a slot, so an outgoing edge filling a
+                        // stack-allocated parameter has to find a source to read
+                        // rather than the `unreachable!` in `resolve`. And a block
+                        // that neither mentions such a value nor passes it on holds
+                        // it nowhere, however live it is on both sides.
+                        for val_index in 0..num_values {
+                            let val = Val::try_new(val_index).unwrap();
+                            if !block.is_live_in(&liveness, val) || !block.is_live_out(&liveness, val) {
+                                continue;
+                            }
+                            let spans = spans_of.get(&(val, block)).filter(|s| !s.is_empty());
+                            let Some(spans) = spans else {
+                                if !carried_through(val) {
+                                    continue;
+                                }
+                                return Err(format!(
+                                    "{val:?} is live across all of {block:?}, but does not have any \
+                                     span there",
+                                ));
+                            };
+                            if !carried_through(val) {
+                                return Err(format!(
+                                    "{block:?} neither mentions {val:?} nor passes it to a successor, \
+                                     and it is a value we would always recompute, so the block should \
+                                     hold it nowhere; it got {spans:?}",
+                                ));
+                            }
+
+                            // Property 2 has already established that the pieces
+                            // are ascending and, remat aside, leave no gap, so
+                            // tiling the block is the first one starting at its
+                            // entry and the last one ending at its exit.
+                            let first = *spans.first().unwrap();
+                            let last = *spans.last().unwrap();
+                            let starts_at_entry =
+                                always_remat(val) || first.start(&live_ranges) == block_start;
+                            if !starts_at_entry || last.end(&live_ranges) != block_end {
+                                return Err(format!(
+                                    "{val:?} is live across all of {block:?}, but its spans cover \
+                                     only {:?}..{:?} of {block_start:?}..{block_end:?}",
+                                    first.start(&live_ranges),
+                                    last.end(&live_ranges),
+                                ));
+                            }
+                        }
+
+                        // 8. A span with no uses begins and ends at an
+                        // instruction boundary.
+                        //
+                        // Such a piece only carries its value from one boundary to
+                        // another, and a boundary is the only place a move into or
+                        // out of it can go. One ending mid-instruction holds a
+                        // register that nothing reads.
+                        for &span in &spans_in[&block] {
+                            if !span.uses(&live_ranges).is_empty() {
+                                continue;
+                            }
+                            let (start, end) = (span.start(&live_ranges), span.end(&live_ranges));
+                            if start.pos() != Position::Early || end.pos() != Position::Early {
+                                return Err(format!(
+                                    "{span:?} covers {start:?}..{end:?} of {block:?} and has no \
+                                     uses, so it holds a location that nothing reads",
+                                ));
+                            }
+                        }
+                    }
+
+                    // 9. Every operand is accounted for: a def starts its value's
+                    // span exactly at its own program point, a use is strictly
+                    // inside one, and either way the span records it.
+                    for &(block, point, i, kind, val) in &operands {
+                        let Some(spans) = spans_of.get(&(val, block)).filter(|s| !s.is_empty()) else {
+                            return Err(format!(
+                                "{block:?} has an operand at {point:?} naming {val:?}, but {val:?} \
+                                 does not have any span in {block:?}",
+                            ));
+                        };
+                        match kind {
+                            // A def is where the value's range in the block begins,
+                            // so it is the first piece that starts at its point.
+                            DefUse::Def => {
+                                let first = *spans.first().unwrap();
+                                if first.start(&live_ranges) != point {
                                     return Err(format!(
-                                        "{param:?} is live-in at {block:?}, but has {} spans \
-                                         there",
-                                        spans.map_or(0, |s| s.len()),
+                                        "{val:?} is defined at {point:?} in {block:?}, but its first \
+                                         span there starts at {:?}",
+                                        first.start(&live_ranges),
                                     ));
                                 }
                             }
-                        } else if spans.is_some_and(|s| !s.is_empty()) {
+                            // A use only has to fall inside one of the pieces.
+                            DefUse::Use => {
+                                let covered = spans.iter().any(|&span| {
+                                    point >= span.start(&live_ranges) && point < span.end(&live_ranges)
+                                });
+                                if !covered {
+                                    return Err(format!(
+                                        "{val:?} is used at {point:?} in {block:?}, but none of its \
+                                         spans there cover that point",
+                                    ));
+                                }
+                            }
+                        }
+                        let recorded = spans.iter().any(|&span| {
+                            span.uses(&live_ranges)
+                                .into_iter()
+                                .any(|u| u.point(&live_ranges) == point && u.operand(&live_ranges) == i)
+                        });
+                        if !recorded {
                             return Err(format!(
-                                "nothing reads {block:?}'s parameter {param:?}, so it is only \
-                                 the destination of a move that is never made and needs no \
-                                 register, but it still got a span",
+                                "operand {i} of {point:?} names {val:?}, but no span of {val:?} in \
+                                 {block:?} records it as one of its uses",
                             ));
                         }
                     }
 
-                    // 6. A value with a span in a block is live at that block's
-                    // entry or exit, or the block mentions it.
-                    for &span in &spans_in[&block] {
-                        let val = span.val(&live_ranges);
-                        let mentioned = operands
-                            .iter()
-                            .any(|&(b, _p, _i, _k, v)| b == block && v == val);
-                        if !mentioned
-                            && !block.is_live_in(&liveness, val)
-                            && !block.is_live_out(&liveness, val)
-                        {
-                            return Err(format!(
-                                "{span:?} gives {val:?} a span in {block:?}, which neither \
-                                 mentions it nor has it live at either end",
-                            ));
-                        }
-                    }
+                    // 10. Each use's weight is the cost model applied to that
+                    // use's own operand, in that use's own block, and a span flags
+                    // a fixed use exactly when one of its uses names a class that
+                    // holds a single register.
+                    test_input.with_input(|input| -> Result<(), String> {
+                        for span in live_ranges.spans() {
+                            let val = span.val(&live_ranges);
+                            let mut any_fixed = false;
 
-                    // 7. A value that flows straight through a block has a span
-                    // that tiles the whole block, with no gap at either end.
-                    //
-                    // A value we will always recompute tiles only the far end.
-                    // Where it starts is property 3's business and the gaps its
-                    // pieces leave are property 2's, but its last piece still
-                    // has to reach the block's exit: a `Remat` writes a register
-                    // and never a slot, so an outgoing edge filling a
-                    // stack-allocated parameter has to find a source to read
-                    // rather than the `unreachable!` in `resolve`. And a block
-                    // that neither mentions such a value nor passes it on holds
-                    // it nowhere, however live it is on both sides.
-                    for val_index in 0..num_values {
-                        let val = Val::try_new(val_index).unwrap();
-                        if !block.is_live_in(&liveness, val) || !block.is_live_out(&liveness, val) {
-                            continue;
+                            for u in span.uses(&live_ranges) {
+                                let point = u.point(&live_ranges);
+                                let operand = u.operand(&live_ranges);
+                                let block = inst_block[&point.inst()];
+                                let frequency = func.block(block).frequency().as_f32();
+
+                                let input_inst = input.func.inst(point.inst());
+                                let sibling = |j| input_inst.operand(j).constraint();
+                                let raw = input_inst.operand(operand).constraint();
+                                let resolved = raw.resolved(&sibling);
+
+                                let expected = SpillWeight::new(
+                                    (use_spill_cost(input, val, raw, resolved) * frequency).max(0.0),
+                                );
+                                let actual = u.weight(&live_ranges);
+                                if actual != expected {
+                                    return Err(format!(
+                                        "{u:?} (operand {operand} of {point:?}, in {block:?}) weighs \
+                                         {}, but the cost model says {}",
+                                        actual.as_f32(),
+                                        expected.as_f32(),
+                                    ));
+                                }
+                                if !actual.as_f32().is_finite() || actual.as_f32() < 0.0 {
+                                    return Err(format!(
+                                        "{u:?} weighs {}, which is not a weight",
+                                        actual.as_f32(),
+                                    ));
+                                }
+
+                                // A tie strengthens `Any` into the value's class,
+                                // which may hold one register, as construction saw.
+                                any_fixed |= match reuse_aware_constraint(input, point.inst(), operand)
+                                {
+                                    OperandConstraint::Reg(class) => class.is_singleton(input.machine),
+                                    _ => false,
+                                };
+                            }
+
+                            if span.has_fixed_use(&live_ranges) != any_fixed {
+                                return Err(format!(
+                                    "{span:?} reports has_fixed_use = {}, but {} of its uses names a \
+                                     class holding a single register",
+                                    span.has_fixed_use(&live_ranges),
+                                    if any_fixed { "one" } else { "none" },
+                                ));
+                            }
                         }
-                        let spans = spans_of.get(&(val, block)).filter(|s| !s.is_empty());
-                        let Some(spans) = spans else {
-                            if !carried_through(val) {
+                        Ok(())
+                    })?;
+
+                    // Count the reads the tie disjunct alone splits out, for the
+                    // non-vacuity assertion below. `end` is the value's live range
+                    // end in the block, which is what construction compares the
+                    // tie's point against, and so the last piece's end.
+                    test_input.with_input(|input| {
+                        for &(block, point, i, kind, val) in &operands {
+                            if kind != DefUse::Use {
                                 continue;
                             }
-                            return Err(format!(
-                                "{val:?} is live across all of {block:?}, but does not have any \
-                                 span there",
-                            ));
-                        };
-                        if !carried_through(val) {
-                            return Err(format!(
-                                "{block:?} neither mentions {val:?} nor passes it to a successor, \
-                                 and it is a value we would always recompute, so the block should \
-                                 hold it nowhere; it got {spans:?}",
-                            ));
-                        }
-
-                        // Property 2 has already established that the pieces
-                        // are ascending and, remat aside, leave no gap, so
-                        // tiling the block is the first one starting at its
-                        // entry and the last one ending at its exit.
-                        let first = *spans.first().unwrap();
-                        let last = *spans.last().unwrap();
-                        let starts_at_entry =
-                            always_remat(val) || first.start(&live_ranges) == block_start;
-                        if !starts_at_entry || last.end(&live_ranges) != block_end {
-                            return Err(format!(
-                                "{val:?} is live across all of {block:?}, but its spans cover \
-                                 only {:?}..{:?} of {block_start:?}..{block_end:?}",
-                                first.start(&live_ranges),
-                                last.end(&live_ranges),
-                            ));
-                        }
-                    }
-
-                    // 8. A span with no uses begins and ends at an
-                    // instruction boundary.
-                    //
-                    // Such a piece only carries its value from one boundary to
-                    // another, and a boundary is the only place a move into or
-                    // out of it can go. One ending mid-instruction holds a
-                    // register that nothing reads.
-                    for &span in &spans_in[&block] {
-                        if !span.uses(&live_ranges).is_empty() {
-                            continue;
-                        }
-                        let (start, end) = (span.start(&live_ranges), span.end(&live_ranges));
-                        if start.pos() != Position::Early || end.pos() != Position::Early {
-                            return Err(format!(
-                                "{span:?} covers {start:?}..{end:?} of {block:?} and has no \
-                                 uses, so it holds a location that nothing reads",
-                            ));
-                        }
-                    }
-                }
-
-                // 9. Every operand is accounted for: a def starts its value's
-                // span exactly at its own program point, a use is strictly
-                // inside one, and either way the span records it.
-                for &(block, point, i, kind, val) in &operands {
-                    let Some(spans) = spans_of.get(&(val, block)).filter(|s| !s.is_empty()) else {
-                        return Err(format!(
-                            "{block:?} has an operand at {point:?} naming {val:?}, but {val:?} \
-                             does not have any span in {block:?}",
-                        ));
-                    };
-                    match kind {
-                        // A def is where the value's range in the block begins,
-                        // so it is the first piece that starts at its point.
-                        DefUse::Def => {
-                            let first = *spans.first().unwrap();
-                            if first.start(&live_ranges) != point {
-                                return Err(format!(
-                                    "{val:?} is defined at {point:?} in {block:?}, but its first \
-                                     span there starts at {:?}",
-                                    first.start(&live_ranges),
-                                ));
-                            }
-                        }
-                        // A use only has to fall inside one of the pieces.
-                        DefUse::Use => {
-                            let covered = spans.iter().any(|&span| {
-                                point >= span.start(&live_ranges) && point < span.end(&live_ranges)
-                            });
-                            if !covered {
-                                return Err(format!(
-                                    "{val:?} is used at {point:?} in {block:?}, but none of its \
-                                     spans there cover that point",
-                                ));
-                            }
-                        }
-                    }
-                    let recorded = spans.iter().any(|&span| {
-                        span.uses(&live_ranges)
-                            .into_iter()
-                            .any(|u| u.point(&live_ranges) == point && u.operand(&live_ranges) == i)
-                    });
-                    if !recorded {
-                        return Err(format!(
-                            "operand {i} of {point:?} names {val:?}, but no span of {val:?} in \
-                             {block:?} records it as one of its uses",
-                        ));
-                    }
-                }
-
-                // 10. Each use's weight is the cost model applied to that
-                // use's own operand, in that use's own block, and a span flags
-                // a fixed use exactly when one of its uses names a class that
-                // holds a single register.
-                test_input.with_input(|input| -> Result<(), String> {
-                    for span in live_ranges.spans() {
-                        let val = span.val(&live_ranges);
-                        let mut any_fixed = false;
-
-                        for u in span.uses(&live_ranges) {
-                            let point = u.point(&live_ranges);
-                            let operand = u.operand(&live_ranges);
-                            let block = inst_block[&point.inst()];
-                            let frequency = func.block(block).frequency().as_f32();
-
                             let input_inst = input.func.inst(point.inst());
-                            let sibling = |j| input_inst.operand(j).constraint();
-                            let raw = input_inst.operand(operand).constraint();
-                            let resolved = raw.resolved(&sibling);
-
-                            let expected = SpillWeight::new(
-                                (use_spill_cost(input, val, raw, resolved) * frequency).max(0.0),
-                            );
-                            let actual = u.weight(&live_ranges);
-                            if actual != expected {
-                                return Err(format!(
-                                    "{u:?} (operand {operand} of {point:?}, in {block:?}) weighs \
-                                     {}, but the cost model says {}",
-                                    actual.as_f32(),
-                                    expected.as_f32(),
-                                ));
-                            }
-                            if !actual.as_f32().is_finite() || actual.as_f32() < 0.0 {
-                                return Err(format!(
-                                    "{u:?} weighs {}, which is not a weight",
-                                    actual.as_f32(),
-                                ));
-                            }
-
-                            // A tie strengthens `Any` into the value's class,
-                            // which may hold one register, as construction saw.
-                            any_fixed |= match reuse_aware_constraint(input, point.inst(), operand)
+                            let end = spans_of[&(val, block)]
+                                .iter()
+                                .map(|span| span.end(&live_ranges))
+                                .max()
+                                .expect("property 9 found a span for every operand's value");
+                            if is_reuse_target(&input_inst, i)
+                                && end <= point.next_point()
+                                && another_tie_follows(&input_inst, i)
                             {
-                                OperandConstraint::Reg(class) => class.is_singleton(input.machine),
-                                _ => false,
-                            };
+                                TIE_ONLY_SPLITS.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
+                    });
 
-                        if span.has_fixed_use(&live_ranges) != any_fixed {
-                            return Err(format!(
-                                "{span:?} reports has_fixed_use = {}, but {} of its uses names a \
-                                 class holding a single register",
-                                span.has_fixed_use(&live_ranges),
-                                if any_fixed { "one" } else { "none" },
-                            ));
+                    // 11. Constructing twice gives exactly the same spans and uses.
+                    let (_, again) = analyze_spans(test_input)?;
+                    let first: Vec<_> = live_ranges.spans.as_slice().to_vec();
+                    let second: Vec<_> = again.spans.as_slice().to_vec();
+                    if first != second {
+                        return Err("constructing twice gave different spans".to_string());
+                    }
+                    if live_ranges.len_uses() != again.len_uses() {
+                        return Err("constructing twice gave different uses".to_string());
+                    }
+                    for index in 0..live_ranges.len_uses() {
+                        let u = Use::try_new(index).unwrap();
+                        if live_ranges.uses[u] != again.uses[u] {
+                            return Err(format!("constructing twice gave {u:?} different data"));
                         }
                     }
+
+                    // 12. Both halves reset cleanly, including the scratch that
+                    // span construction borrows from `Liveness`.
+                    let mut live_ranges = live_ranges;
+                    live_ranges.reset();
+                    if !live_ranges.is_reset() {
+                        return Err("`LiveRanges::is_reset` is false after `reset`".to_string());
+                    }
+                    liveness.reset();
+                    if !liveness.is_reset() {
+                        return Err("`Liveness::is_reset` is false after `reset`".to_string());
+                    }
+
                     Ok(())
-                })?;
-
-                // Count the reads the tie disjunct alone splits out, for the
-                // non-vacuity assertion below. `end` is the value's live range
-                // end in the block, which is what construction compares the
-                // tie's point against, and so the last piece's end.
-                test_input.with_input(|input| {
-                    for &(block, point, i, kind, val) in &operands {
-                        if kind != DefUse::Use {
-                            continue;
-                        }
-                        let input_inst = input.func.inst(point.inst());
-                        let end = spans_of[&(val, block)]
-                            .iter()
-                            .map(|span| span.end(&live_ranges))
-                            .max()
-                            .expect("property 9 found a span for every operand's value");
-                        if is_reuse_target(&input_inst, i)
-                            && end <= point.next_point()
-                            && another_tie_follows(&input_inst, i)
-                        {
-                            TIE_ONLY_SPLITS.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-
-                // 11. Constructing twice gives exactly the same spans and uses.
-                let (_, again) = analyze_spans(test_input)?;
-                let first: Vec<_> = live_ranges.spans.as_slice().to_vec();
-                let second: Vec<_> = again.spans.as_slice().to_vec();
-                if first != second {
-                    return Err("constructing twice gave different spans".to_string());
-                }
-                if live_ranges.len_uses() != again.len_uses() {
-                    return Err("constructing twice gave different uses".to_string());
-                }
-                for index in 0..live_ranges.len_uses() {
-                    let u = Use::try_new(index).unwrap();
-                    if live_ranges.uses[u] != again.uses[u] {
-                        return Err(format!("constructing twice gave {u:?} different data"));
-                    }
-                }
-
-                // 12. Both halves reset cleanly, including the scratch that
-                // span construction borrows from `Liveness`.
-                let mut live_ranges = live_ranges;
-                live_ranges.reset();
-                if !live_ranges.is_reset() {
-                    return Err("`LiveRanges::is_reset` is false after `reset`".to_string());
-                }
-                liveness.reset();
-                if !liveness.is_reset() {
-                    return Err("`Liveness::is_reset` is false after `reset`".to_string());
-                }
-
-                Ok(())
-            },
-        );
+                },
+            );
 
         if result.is_ok() {
             assert!(

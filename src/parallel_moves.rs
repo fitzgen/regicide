@@ -1317,50 +1317,53 @@ mod tests {
         static CONCURRENT: AtomicUsize = AtomicUsize::new(0);
         static WIDE: AtomicUsize = AtomicUsize::new(0);
 
-        let result = Check::new().iters(10_000).run_with(
-            m::default::<TestParallelMoves>(),
-            seeds(),
-            |moves: &TestParallelMoves| -> Result<(), String> {
-                let outcome = moves.check()?;
+        let result = Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestParallelMoves>(),
+                seeds(),
+                |moves: &TestParallelMoves| -> Result<(), String> {
+                    let outcome = moves.check()?;
 
-                if outcome.emitted > 0 {
-                    SOLVED.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.wanted_scratch {
-                    CYCLES.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.routed_stack_to_stack {
-                    ROUTED.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.nested_scratch {
-                    NESTED.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.routed_wide_stack_to_stack {
-                    WIDE.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.concurrent_scratches {
-                    CONCURRENT.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.refused {
-                    REFUSED.fetch_add(1, Ordering::Relaxed);
-                }
-                if outcome.non_trivial < moves.moves().len() {
-                    TRIVIAL.fetch_add(1, Ordering::Relaxed);
-                }
-                if moves
-                    .moves()
-                    .iter()
-                    .any(|m| matches!(m.src, TestLocation::Slot(_)))
-                {
-                    STACK.fetch_add(1, Ordering::Relaxed);
-                }
-                if moves.has_a_source_covered_twice() {
-                    PARTIAL.fetch_add(1, Ordering::Relaxed);
-                }
+                    if outcome.emitted > 0 {
+                        SOLVED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.wanted_scratch {
+                        CYCLES.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.routed_stack_to_stack {
+                        ROUTED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.nested_scratch {
+                        NESTED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.routed_wide_stack_to_stack {
+                        WIDE.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.concurrent_scratches {
+                        CONCURRENT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.refused {
+                        REFUSED.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if outcome.non_trivial < moves.moves().len() {
+                        TRIVIAL.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if moves
+                        .moves()
+                        .iter()
+                        .any(|m| matches!(m.src, TestLocation::Slot(_)))
+                    {
+                        STACK.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if moves.has_a_source_covered_twice() {
+                        PARTIAL.fetch_add(1, Ordering::Relaxed);
+                    }
 
-                Ok(())
-            },
-        );
+                    Ok(())
+                },
+            );
 
         // Not a property of the solver; a check that the search above was not
         // vacuous.

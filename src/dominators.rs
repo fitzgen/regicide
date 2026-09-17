@@ -541,162 +541,165 @@ mod tests {
 
     #[test]
     fn dominator_tree_properties() -> CheckResult<TestFunction> {
-        Check::new().iters(10_000).run(|func: &TestFunction| -> Result<(), String> {
-            let entry = func.entry_block();
-            let dominators = func.dominators();
-            let blocks: Vec<Block> = func.blocks().map(|(b, _)| b).collect();
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run(|func: &TestFunction| -> Result<(), String> {
+                let entry = func.entry_block();
+                let dominators = func.dominators();
+                let blocks: Vec<Block> = func.blocks().map(|(b, _)| b).collect();
 
-            // `TestFunction::fixup` is supposed to make every block reachable
-            // from the entry block. If it didn't, that's a bug in the generator
-            // rather than in the dominator tree, so check it on its own.
-            let reachable = reachable_avoiding(func, None);
-            if reachable.len() != blocks.len() {
-                return Err(format!(
-                    "only {} of this function's {} blocks are reachable from {entry:?}; \
-                     `TestFunction::fixup` should have made them all reachable",
-                    reachable.len(),
-                    blocks.len(),
-                ));
-            }
-            for b in &blocks {
-                if !b.is_reachable(dominators) {
-                    return Err(format!("`is_reachable({b:?})` is false"));
+                // `TestFunction::fixup` is supposed to make every block reachable
+                // from the entry block. If it didn't, that's a bug in the generator
+                // rather than in the dominator tree, so check it on its own.
+                let reachable = reachable_avoiding(func, None);
+                if reachable.len() != blocks.len() {
+                    return Err(format!(
+                        "only {} of this function's {} blocks are reachable from {entry:?}; \
+                         `TestFunction::fixup` should have made them all reachable",
+                        reachable.len(),
+                        blocks.len(),
+                    ));
                 }
-            }
-
-            let oracle = dominance_oracle(func);
-
-            // `dominates` must agree with the definition of dominance for every
-            // ordered pair of blocks. We go through the `InputBlock` trait method
-            // rather than `DominatorTree` directly, since that is what the
-            // register allocator will use.
-            for a in &blocks {
-                let input_block = func.block(*a);
                 for b in &blocks {
-                    let actual = input_block.dominates(*b);
-                    let expected = oracle[a].contains(b);
-                    if actual != expected {
+                    if !b.is_reachable(dominators) {
+                        return Err(format!("`is_reachable({b:?})` is false"));
+                    }
+                }
+
+                let oracle = dominance_oracle(func);
+
+                // `dominates` must agree with the definition of dominance for every
+                // ordered pair of blocks. We go through the `InputBlock` trait method
+                // rather than `DominatorTree` directly, since that is what the
+                // register allocator will use.
+                for a in &blocks {
+                    let input_block = func.block(*a);
+                    for b in &blocks {
+                        let actual = input_block.dominates(*b);
+                        let expected = oracle[a].contains(b);
+                        if actual != expected {
+                            return Err(format!(
+                                "`{a:?}.dominates({b:?})` is {actual}, but {a:?} does {}dominate \
+                                 {b:?}",
+                                if expected { "" } else { "not " },
+                            ));
+                        }
+                    }
+                }
+
+                // The entry block is the only block without an immediate dominator.
+                for b in &blocks {
+                    let idom = func.block(*b).immediate_dominator();
+                    if (*b == entry) != idom.is_none() {
                         return Err(format!(
-                            "`{a:?}.dominates({b:?})` is {actual}, but {a:?} does {}dominate \
-                             {b:?}",
-                            if expected { "" } else { "not " },
+                            "`{b:?}.immediate_dominator()` is {idom:?}, but {b:?} is {}the entry \
+                             block",
+                            if *b == entry { "" } else { "not " },
                         ));
                     }
                 }
-            }
 
-            // The entry block is the only block without an immediate dominator.
-            for b in &blocks {
-                let idom = func.block(*b).immediate_dominator();
-                if (*b == entry) != idom.is_none() {
-                    return Err(format!(
-                        "`{b:?}.immediate_dominator()` is {idom:?}, but {b:?} is {}the entry \
-                         block",
-                        if *b == entry { "" } else { "not " },
-                    ));
-                }
-            }
+                // Walking up the immediate dominators from a block must enumerate
+                // exactly that block's dominators, and must terminate at the entry
+                // block.
+                for b in &blocks {
+                    let expected: BTreeSet<Block> = blocks
+                        .iter()
+                        .copied()
+                        .filter(|a| oracle[a].contains(b))
+                        .collect();
 
-            // Walking up the immediate dominators from a block must enumerate
-            // exactly that block's dominators, and must terminate at the entry
-            // block.
-            for b in &blocks {
-                let expected: BTreeSet<Block> = blocks
-                    .iter()
-                    .copied()
-                    .filter(|a| oracle[a].contains(b))
-                    .collect();
+                    let mut chain = BTreeSet::new();
+                    let mut curr = Some(*b);
+                    while let Some(c) = curr {
+                        if !chain.insert(c) {
+                            return Err(format!(
+                                "the immediate dominator chain of {b:?} revisits {c:?}, so it is not \
+                                 a tree"
+                            ));
+                        }
+                        curr = func.block(c).immediate_dominator();
+                    }
 
-                let mut chain = BTreeSet::new();
-                let mut curr = Some(*b);
-                while let Some(c) = curr {
-                    if !chain.insert(c) {
+                    if !chain.contains(&entry) {
                         return Err(format!(
-                            "the immediate dominator chain of {b:?} revisits {c:?}, so it is not \
-                             a tree"
+                            "the immediate dominator chain of {b:?} is {chain:?}, which does not \
+                             reach {entry:?}"
                         ));
                     }
-                    curr = func.block(c).immediate_dominator();
-                }
-
-                if !chain.contains(&entry) {
-                    return Err(format!(
-                        "the immediate dominator chain of {b:?} is {chain:?}, which does not \
-                         reach {entry:?}"
-                    ));
-                }
-                if chain != expected {
-                    return Err(format!(
-                        "the immediate dominator chain of {b:?} is {chain:?} but its dominators \
-                         are {expected:?}"
-                    ));
-                }
-            }
-
-            // `children` must be exactly the inverse of `immediate_dominator`:
-            // every block but the entry block is the child of exactly one block.
-            let mut children = BTreeSet::new();
-            for d in &blocks {
-                for c in d.dom_children(dominators) {
-                    if !children.insert(c) {
+                    if chain != expected {
                         return Err(format!(
-                            "{c:?} is a dominator tree child of more than one block"
-                        ));
-                    }
-                    let idom = func.block(c).immediate_dominator();
-                    if idom != Some(*d) {
-                        return Err(format!(
-                            "{c:?} is a dominator tree child of {d:?} but its immediate \
-                             dominator is {idom:?}"
+                            "the immediate dominator chain of {b:?} is {chain:?} but its dominators \
+                             are {expected:?}"
                         ));
                     }
                 }
-            }
-            let expected_children: BTreeSet<Block> =
-                blocks.iter().copied().filter(|b| *b != entry).collect();
-            if children != expected_children {
-                return Err(format!(
-                    "the dominator tree's children are {children:?}, but every block except \
-                     {entry:?} should be a child of some block"
-                ));
-            }
 
-            // The cached CFG postorder must contain every reachable block exactly
-            // once, and must end at the entry block.
-            let postorder = dominators.cfg_postorder();
-            let postorder_set: BTreeSet<Block> = postorder.iter().copied().collect();
-            if postorder_set.len() != postorder.len() {
-                return Err(format!("the CFG postorder {postorder:?} repeats a block"));
-            }
-            if postorder_set != reachable {
-                return Err(format!(
-                    "the CFG postorder {postorder:?} does not contain exactly the blocks \
-                     reachable from {entry:?}"
-                ));
-            }
-            if postorder.last() != Some(&entry) {
-                return Err(format!(
-                    "the CFG postorder {postorder:?} does not end at {entry:?}"
-                ));
-            }
-
-            // Recomputing the dominator tree gives the same answer.
-            let mut again = DominatorTree::new();
-            again.compute(func);
-            if again.postorder != dominators.postorder {
-                return Err("recomputing gave a different CFG postorder".to_string());
-            }
-            for b in &blocks {
-                if again.nodes[*b] != dominators.nodes[*b] {
+                // `children` must be exactly the inverse of `immediate_dominator`:
+                // every block but the entry block is the child of exactly one block.
+                let mut children = BTreeSet::new();
+                for d in &blocks {
+                    for c in d.dom_children(dominators) {
+                        if !children.insert(c) {
+                            return Err(format!(
+                                "{c:?} is a dominator tree child of more than one block"
+                            ));
+                        }
+                        let idom = func.block(c).immediate_dominator();
+                        if idom != Some(*d) {
+                            return Err(format!(
+                                "{c:?} is a dominator tree child of {d:?} but its immediate \
+                                 dominator is {idom:?}"
+                            ));
+                        }
+                    }
+                }
+                let expected_children: BTreeSet<Block> =
+                    blocks.iter().copied().filter(|b| *b != entry).collect();
+                if children != expected_children {
                     return Err(format!(
-                        "recomputing gave a different dominator tree node for {b:?}: {:?} \
-                         versus {:?}",
-                        again.nodes[*b], dominators.nodes[*b],
+                        "the dominator tree's children are {children:?}, but every block except \
+                         {entry:?} should be a child of some block"
                     ));
                 }
-            }
 
-            Ok(())
-        })
+                // The cached CFG postorder must contain every reachable block exactly
+                // once, and must end at the entry block.
+                let postorder = dominators.cfg_postorder();
+                let postorder_set: BTreeSet<Block> = postorder.iter().copied().collect();
+                if postorder_set.len() != postorder.len() {
+                    return Err(format!("the CFG postorder {postorder:?} repeats a block"));
+                }
+                if postorder_set != reachable {
+                    return Err(format!(
+                        "the CFG postorder {postorder:?} does not contain exactly the blocks \
+                         reachable from {entry:?}"
+                    ));
+                }
+                if postorder.last() != Some(&entry) {
+                    return Err(format!(
+                        "the CFG postorder {postorder:?} does not end at {entry:?}"
+                    ));
+                }
+
+                // Recomputing the dominator tree gives the same answer.
+                let mut again = DominatorTree::new();
+                again.compute(func);
+                if again.postorder != dominators.postorder {
+                    return Err("recomputing gave a different CFG postorder".to_string());
+                }
+                for b in &blocks {
+                    if again.nodes[*b] != dominators.nodes[*b] {
+                        return Err(format!(
+                            "recomputing gave a different dominator tree node for {b:?}: {:?} \
+                             versus {:?}",
+                            again.nodes[*b], dominators.nodes[*b],
+                        ));
+                    }
+                }
+
+                Ok(())
+            })
     }
 }

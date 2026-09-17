@@ -735,7 +735,8 @@ mod tests {
     #[test]
     fn pre_order_iter_properties() -> CheckResult<TestFunction> {
         Check::new()
-            .iters(10_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|func: &TestFunction| -> Result<(), String> {
                 let tree = construct(func)?;
 
@@ -836,333 +837,336 @@ mod tests {
 
     #[test]
     fn region_tree_properties() -> CheckResult<TestFunction> {
-        Check::new().iters(10_000).run(|func: &TestFunction| -> Result<(), String> {
-            let entry = func.entry_block();
-            let blocks: Vec<Block> = func.blocks().map(|(b, _)| b).collect();
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run(|func: &TestFunction| -> Result<(), String> {
+                let entry = func.entry_block();
+                let blocks: Vec<Block> = func.blocks().map(|(b, _)| b).collect();
 
-            // `TestFunction::fixup` is supposed to make every block reachable
-            // from the entry block. If it didn't, that's a bug in the generator
-            // rather than in the region tree, so check it on its own.
-            let reachable = reachable_avoiding(func, None);
-            if reachable.len() != blocks.len() {
-                return Err(format!(
-                    "only {} of this function's {} blocks are reachable from {entry:?}; \
-                     `TestFunction::fixup` should have made them all reachable",
-                    reachable.len(),
-                    blocks.len(),
-                ));
-            }
-
-            let tree = construct(func)?;
-
-            let dominators = dominators_oracle(func);
-            let idoms = idoms_oracle(&dominators);
-            let oracle_sccs = sccs_oracle(func);
-            let oracle_regions = regions_oracle(func, &oracle_sccs, &idoms);
-
-            // Property 1: the regions partition the blocks, and two blocks
-            // share a region exactly when the oracle says they should.
-            //
-            // `blocks()` covering every block exactly once and agreeing with
-            // `Block::region` gives the partition; comparing the two groupings
-            // gives the agreement.
-            let mut actual_groups: BTreeMap<Region, BTreeSet<Block>> = BTreeMap::new();
-            for b in &blocks {
-                actual_groups
-                    .entry(b.region(&tree))
-                    .or_default()
-                    .insert(*b);
-            }
-            let mut expected_groups: BTreeMap<RegionId, BTreeSet<Block>> = BTreeMap::new();
-            for b in &blocks {
-                expected_groups
-                    .entry(oracle_regions[b].clone())
-                    .or_default()
-                    .insert(*b);
-            }
-            let actual_partition: BTreeSet<&BTreeSet<Block>> = actual_groups.values().collect();
-            let expected_partition: BTreeSet<&BTreeSet<Block>> = expected_groups.values().collect();
-            if actual_partition != expected_partition {
-                return Err(format!(
-                    "the regions group the blocks as {actual_partition:?} but should group them \
-                     as {expected_partition:?}"
-                ));
-            }
-
-            let regions: Vec<Region> = actual_groups.keys().copied().collect();
-            for region in &regions {
-                let listed: BTreeSet<Block> = region.blocks(&tree).collect();
-                if listed.len() != region.blocks(&tree).len() {
+                // `TestFunction::fixup` is supposed to make every block reachable
+                // from the entry block. If it didn't, that's a bug in the generator
+                // rather than in the region tree, so check it on its own.
+                let reachable = reachable_avoiding(func, None);
+                if reachable.len() != blocks.len() {
                     return Err(format!(
-                        "`blocks({region:?})` repeats a block: {:?}",
-                        region.blocks(&tree).collect::<Vec<_>>(),
+                        "only {} of this function's {} blocks are reachable from {entry:?}; \
+                         `TestFunction::fixup` should have made them all reachable",
+                        reachable.len(),
+                        blocks.len(),
                     ));
                 }
-                if listed != actual_groups[region] {
+
+                let tree = construct(func)?;
+
+                let dominators = dominators_oracle(func);
+                let idoms = idoms_oracle(&dominators);
+                let oracle_sccs = sccs_oracle(func);
+                let oracle_regions = regions_oracle(func, &oracle_sccs, &idoms);
+
+                // Property 1: the regions partition the blocks, and two blocks
+                // share a region exactly when the oracle says they should.
+                //
+                // `blocks()` covering every block exactly once and agreeing with
+                // `Block::region` gives the partition; comparing the two groupings
+                // gives the agreement.
+                let mut actual_groups: BTreeMap<Region, BTreeSet<Block>> = BTreeMap::new();
+                for b in &blocks {
+                    actual_groups
+                        .entry(b.region(&tree))
+                        .or_default()
+                        .insert(*b);
+                }
+                let mut expected_groups: BTreeMap<RegionId, BTreeSet<Block>> = BTreeMap::new();
+                for b in &blocks {
+                    expected_groups
+                        .entry(oracle_regions[b].clone())
+                        .or_default()
+                        .insert(*b);
+                }
+                let actual_partition: BTreeSet<&BTreeSet<Block>> = actual_groups.values().collect();
+                let expected_partition: BTreeSet<&BTreeSet<Block>> = expected_groups.values().collect();
+                if actual_partition != expected_partition {
                     return Err(format!(
-                        "`blocks({region:?})` is {listed:?} but the blocks whose `region` \
-                         is {region:?} are {:?}",
-                        actual_groups[region],
+                        "the regions group the blocks as {actual_partition:?} but should group them \
+                         as {expected_partition:?}"
                     ));
                 }
-            }
 
-            // Property 2: a region is identified by the component that defines
-            // it, i.e. a region's index is the index of the first component
-            // at-or-above its blocks that is a loop or the entry's component.
-            for b in &blocks {
-                let defining = *oracle_regions[b]
-                    .first()
-                    .expect("a region is defined by a non-empty component");
-                let expected = Region::try_new(defining.scc(&tree.sccs).index()).unwrap();
-                if b.region(&tree) != expected {
-                    return Err(format!(
-                        "{b:?}'s region is {:?}, but its region is defined by the component \
-                         {:?}, so it should be {expected:?}",
-                        b.region(&tree),
-                        oracle_regions[b],
-                    ));
-                }
-            }
-
-            // Property 3: a loop is never split across regions.
-            for b in &blocks {
-                let region = b.region(&tree);
-                for &other in &oracle_sccs[b] {
-                    if other.region(&tree) != region {
+                let regions: Vec<Region> = actual_groups.keys().copied().collect();
+                for region in &regions {
+                    let listed: BTreeSet<Block> = region.blocks(&tree).collect();
+                    if listed.len() != region.blocks(&tree).len() {
                         return Err(format!(
-                            "{b:?} and {other:?} are in the same strongly-connected component \
-                             {:?}, but {b:?} is in {region:?} and {other:?} is in {:?}",
-                            oracle_sccs[b],
-                            other.region(&tree),
+                            "`blocks({region:?})` repeats a block: {:?}",
+                            region.blocks(&tree).collect::<Vec<_>>(),
+                        ));
+                    }
+                    if listed != actual_groups[region] {
+                        return Err(format!(
+                            "`blocks({region:?})` is {listed:?} but the blocks whose `region` \
+                             is {region:?} are {:?}",
+                            actual_groups[region],
                         ));
                     }
                 }
-            }
 
-            // Property 4: the block and children ranges tile their storage
-            // contiguously, with no gaps and no overlap.
-            let mut next_start = 0;
-            for region in &regions {
-                let range = tree.region_blocks[*region];
-                if range.indices().start != next_start {
-                    return Err(format!(
-                        "{region:?}'s blocks start at {} but the previous region's blocks ended \
-                         at {next_start}",
-                        range.indices().start,
-                    ));
-                }
-                next_start = range.indices().end;
-            }
-            if next_start != tree.region_blocks_storage.len() {
-                return Err(format!(
-                    "the regions' block ranges cover {next_start} blocks but \
-                     `region_blocks_storage` holds {}",
-                    tree.region_blocks_storage.len(),
-                ));
-            }
-
-            let mut next_start = 0;
-            for region in &regions {
-                let range = tree.region_children[*region];
-                if range.is_empty() {
-                    continue;
-                }
-                if range.indices().start != next_start {
-                    return Err(format!(
-                        "{region:?}'s children start at {} but the previous region's children \
-                         ended at {next_start}",
-                        range.indices().start,
-                    ));
-                }
-                next_start = range.indices().end;
-            }
-            if next_start != tree.region_children_storage.len() {
-                return Err(format!(
-                    "the regions' children ranges cover {next_start} regions but \
-                     `region_children_storage` holds {}",
-                    tree.region_children_storage.len(),
-                ));
-            }
-
-            // Property 5: the regions form a tree rooted at the region
-            // containing the entry block, which is the region that `root`
-            // reports.
-            let root = tree.root();
-            if root != entry.region(&tree) {
-                return Err(format!(
-                    "`root()` is {root:?} but {entry:?}'s region is {:?}",
-                    entry.region(&tree),
-                ));
-            }
-            if !root.blocks(&tree).any(|b| b == entry) {
-                return Err(format!(
-                    "`root()` is {root:?}, but its blocks are {:?}, which do not include the \
-                     entry block {entry:?}",
-                    root.blocks(&tree).collect::<Vec<_>>(),
-                ));
-            }
-            for region in &regions {
-                let parent = region.parent(&tree);
-                if (*region == root) != parent.is_none() {
-                    return Err(format!(
-                        "`parent({region:?})` is {parent:?}, but {region:?} is {}the region \
-                         containing {entry:?}",
-                        if *region == root { "" } else { "not " },
-                    ));
-                }
-            }
-            for region in &regions {
-                let mut chain = BTreeSet::new();
-                let mut curr = Some(*region);
-                while let Some(r) = curr {
-                    if !chain.insert(r) {
+                // Property 2: a region is identified by the component that defines
+                // it, i.e. a region's index is the index of the first component
+                // at-or-above its blocks that is a loop or the entry's component.
+                for b in &blocks {
+                    let defining = *oracle_regions[b]
+                        .first()
+                        .expect("a region is defined by a non-empty component");
+                    let expected = Region::try_new(defining.scc(&tree.sccs).index()).unwrap();
+                    if b.region(&tree) != expected {
                         return Err(format!(
-                            "the parent chain of {region:?} revisits {r:?}, so the regions do \
-                             not form a tree"
-                        ));
-                    }
-                    curr = r.parent(&tree);
-                }
-                if !chain.contains(&root) {
-                    return Err(format!(
-                        "the parent chain of {region:?} is {chain:?}, which does not reach the \
-                         root region {root:?}"
-                    ));
-                }
-            }
-
-            // Property 6: `children` is exactly the inverse of `parent`.
-            let mut children = BTreeSet::new();
-            for region in &regions {
-                for child in region.children(&tree) {
-                    if !children.insert(child) {
-                        return Err(format!("{child:?} is a child of more than one region"));
-                    }
-                    if child.parent(&tree) != Some(*region) {
-                        return Err(format!(
-                            "{child:?} is listed as a child of {region:?} but its parent is {:?}",
-                            child.parent(&tree),
+                            "{b:?}'s region is {:?}, but its region is defined by the component \
+                             {:?}, so it should be {expected:?}",
+                            b.region(&tree),
+                            oracle_regions[b],
                         ));
                     }
                 }
-            }
-            let expected_children: BTreeSet<Region> =
-                regions.iter().copied().filter(|r| *r != root).collect();
-            if children != expected_children {
-                return Err(format!(
-                    "the regions' children are {children:?}, but every region except the root \
-                     {root:?} should be a child of some region"
-                ));
-            }
 
-            // Property 7: a region's parent is the region of the nearest common
-            // dominator of its blocks, stepping out when that block is itself
-            // in the region. This is the tie-break that makes `parent` well
-            // defined for irreducible control flow, where a region's component
-            // can have several entry points.
-            let ncd = |a: Block, b: Block| -> Block {
-                let mut a = a;
-                while !dominators[&b].contains(&a) {
-                    a = idoms[&a].expect("the entry block dominates every reachable block");
-                }
-                a
-            };
-            for region in &regions {
-                let mut region_blocks = region.blocks(&tree);
-                let mut d = region_blocks.next().expect("regions are never empty");
-                for b in region_blocks {
-                    d = ncd(d, b);
-                }
-
-                let expected = if d.region(&tree) == *region {
-                    idoms[&d].map(|idom| idom.region(&tree))
-                } else {
-                    Some(d.region(&tree))
-                };
-
-                if region.parent(&tree) != expected {
-                    return Err(format!(
-                        "`parent({region:?})` is {:?} but the nearest common dominator of its \
-                         blocks is {d:?}, which makes the parent {expected:?}",
-                        region.parent(&tree),
-                    ));
-                }
-            }
-
-            // Property 8: nesting is consistent with dominance. If one region
-            // is a descendant of another, the ancestor's nearest common
-            // dominator dominates every one of the descendant's blocks.
-            for region in &regions {
-                let mut curr = region.parent(&tree);
-                while let Some(ancestor) = curr {
-                    let mut ancestor_blocks = ancestor.blocks(&tree);
-                    let mut ancestor_ncd = ancestor_blocks.next().expect("regions are never empty");
-                    for b in ancestor_blocks {
-                        ancestor_ncd = ncd(ancestor_ncd, b);
-                    }
-
-                    for b in region.blocks(&tree) {
-                        if !dominators[&b].contains(&ancestor_ncd) {
+                // Property 3: a loop is never split across regions.
+                for b in &blocks {
+                    let region = b.region(&tree);
+                    for &other in &oracle_sccs[b] {
+                        if other.region(&tree) != region {
                             return Err(format!(
-                                "{region:?} is a descendant of {ancestor:?}, whose nearest \
-                                 common dominator {ancestor_ncd:?} does not dominate \
-                                 {region:?}'s block {b:?}"
+                                "{b:?} and {other:?} are in the same strongly-connected component \
+                                 {:?}, but {b:?} is in {region:?} and {other:?} is in {:?}",
+                                oracle_sccs[b],
+                                other.region(&tree),
                             ));
                         }
                     }
-
-                    curr = ancestor.parent(&tree);
                 }
-            }
 
-            // Property 9: constructing the region tree again gives the same
-            // answer, and it resets cleanly.
-            let tree_again = construct(func)?;
-            if tree_again.root() != root {
-                return Err(format!(
-                    "constructing twice gave the roots {root:?} and {:?}",
-                    tree_again.root(),
-                ));
-            }
-            for b in &blocks {
-                if b.region(&tree_again) != b.region(&tree) {
+                // Property 4: the block and children ranges tile their storage
+                // contiguously, with no gaps and no overlap.
+                let mut next_start = 0;
+                for region in &regions {
+                    let range = tree.region_blocks[*region];
+                    if range.indices().start != next_start {
+                        return Err(format!(
+                            "{region:?}'s blocks start at {} but the previous region's blocks ended \
+                             at {next_start}",
+                            range.indices().start,
+                        ));
+                    }
+                    next_start = range.indices().end;
+                }
+                if next_start != tree.region_blocks_storage.len() {
                     return Err(format!(
-                        "constructing twice put {b:?} in {:?} and then {:?}",
-                        b.region(&tree),
-                        b.region(&tree_again),
+                        "the regions' block ranges cover {next_start} blocks but \
+                         `region_blocks_storage` holds {}",
+                        tree.region_blocks_storage.len(),
                     ));
                 }
-            }
-            for region in &regions {
-                if region.blocks(&tree_again).collect::<Vec<_>>()
-                    != region.blocks(&tree).collect::<Vec<_>>()
-                {
-                    return Err(format!(
-                        "constructing twice gave {region:?} different blocks"
-                    ));
-                }
-                if region.parent(&tree_again) != region.parent(&tree) {
-                    return Err(format!(
-                        "constructing twice gave {region:?} a different parent"
-                    ));
-                }
-                if region.children(&tree_again).collect::<Vec<_>>()
-                    != region.children(&tree).collect::<Vec<_>>()
-                {
-                    return Err(format!(
-                        "constructing twice gave {region:?} different children"
-                    ));
-                }
-            }
 
-            let mut tree = tree;
-            tree.reset();
-            if !tree.is_reset() {
-                return Err("`is_reset` is false after `reset`".to_string());
-            }
+                let mut next_start = 0;
+                for region in &regions {
+                    let range = tree.region_children[*region];
+                    if range.is_empty() {
+                        continue;
+                    }
+                    if range.indices().start != next_start {
+                        return Err(format!(
+                            "{region:?}'s children start at {} but the previous region's children \
+                             ended at {next_start}",
+                            range.indices().start,
+                        ));
+                    }
+                    next_start = range.indices().end;
+                }
+                if next_start != tree.region_children_storage.len() {
+                    return Err(format!(
+                        "the regions' children ranges cover {next_start} regions but \
+                         `region_children_storage` holds {}",
+                        tree.region_children_storage.len(),
+                    ));
+                }
 
-            Ok(())
-        })
+                // Property 5: the regions form a tree rooted at the region
+                // containing the entry block, which is the region that `root`
+                // reports.
+                let root = tree.root();
+                if root != entry.region(&tree) {
+                    return Err(format!(
+                        "`root()` is {root:?} but {entry:?}'s region is {:?}",
+                        entry.region(&tree),
+                    ));
+                }
+                if !root.blocks(&tree).any(|b| b == entry) {
+                    return Err(format!(
+                        "`root()` is {root:?}, but its blocks are {:?}, which do not include the \
+                         entry block {entry:?}",
+                        root.blocks(&tree).collect::<Vec<_>>(),
+                    ));
+                }
+                for region in &regions {
+                    let parent = region.parent(&tree);
+                    if (*region == root) != parent.is_none() {
+                        return Err(format!(
+                            "`parent({region:?})` is {parent:?}, but {region:?} is {}the region \
+                             containing {entry:?}",
+                            if *region == root { "" } else { "not " },
+                        ));
+                    }
+                }
+                for region in &regions {
+                    let mut chain = BTreeSet::new();
+                    let mut curr = Some(*region);
+                    while let Some(r) = curr {
+                        if !chain.insert(r) {
+                            return Err(format!(
+                                "the parent chain of {region:?} revisits {r:?}, so the regions do \
+                                 not form a tree"
+                            ));
+                        }
+                        curr = r.parent(&tree);
+                    }
+                    if !chain.contains(&root) {
+                        return Err(format!(
+                            "the parent chain of {region:?} is {chain:?}, which does not reach the \
+                             root region {root:?}"
+                        ));
+                    }
+                }
+
+                // Property 6: `children` is exactly the inverse of `parent`.
+                let mut children = BTreeSet::new();
+                for region in &regions {
+                    for child in region.children(&tree) {
+                        if !children.insert(child) {
+                            return Err(format!("{child:?} is a child of more than one region"));
+                        }
+                        if child.parent(&tree) != Some(*region) {
+                            return Err(format!(
+                                "{child:?} is listed as a child of {region:?} but its parent is {:?}",
+                                child.parent(&tree),
+                            ));
+                        }
+                    }
+                }
+                let expected_children: BTreeSet<Region> =
+                    regions.iter().copied().filter(|r| *r != root).collect();
+                if children != expected_children {
+                    return Err(format!(
+                        "the regions' children are {children:?}, but every region except the root \
+                         {root:?} should be a child of some region"
+                    ));
+                }
+
+                // Property 7: a region's parent is the region of the nearest common
+                // dominator of its blocks, stepping out when that block is itself
+                // in the region. This is the tie-break that makes `parent` well
+                // defined for irreducible control flow, where a region's component
+                // can have several entry points.
+                let ncd = |a: Block, b: Block| -> Block {
+                    let mut a = a;
+                    while !dominators[&b].contains(&a) {
+                        a = idoms[&a].expect("the entry block dominates every reachable block");
+                    }
+                    a
+                };
+                for region in &regions {
+                    let mut region_blocks = region.blocks(&tree);
+                    let mut d = region_blocks.next().expect("regions are never empty");
+                    for b in region_blocks {
+                        d = ncd(d, b);
+                    }
+
+                    let expected = if d.region(&tree) == *region {
+                        idoms[&d].map(|idom| idom.region(&tree))
+                    } else {
+                        Some(d.region(&tree))
+                    };
+
+                    if region.parent(&tree) != expected {
+                        return Err(format!(
+                            "`parent({region:?})` is {:?} but the nearest common dominator of its \
+                             blocks is {d:?}, which makes the parent {expected:?}",
+                            region.parent(&tree),
+                        ));
+                    }
+                }
+
+                // Property 8: nesting is consistent with dominance. If one region
+                // is a descendant of another, the ancestor's nearest common
+                // dominator dominates every one of the descendant's blocks.
+                for region in &regions {
+                    let mut curr = region.parent(&tree);
+                    while let Some(ancestor) = curr {
+                        let mut ancestor_blocks = ancestor.blocks(&tree);
+                        let mut ancestor_ncd = ancestor_blocks.next().expect("regions are never empty");
+                        for b in ancestor_blocks {
+                            ancestor_ncd = ncd(ancestor_ncd, b);
+                        }
+
+                        for b in region.blocks(&tree) {
+                            if !dominators[&b].contains(&ancestor_ncd) {
+                                return Err(format!(
+                                    "{region:?} is a descendant of {ancestor:?}, whose nearest \
+                                     common dominator {ancestor_ncd:?} does not dominate \
+                                     {region:?}'s block {b:?}"
+                                ));
+                            }
+                        }
+
+                        curr = ancestor.parent(&tree);
+                    }
+                }
+
+                // Property 9: constructing the region tree again gives the same
+                // answer, and it resets cleanly.
+                let tree_again = construct(func)?;
+                if tree_again.root() != root {
+                    return Err(format!(
+                        "constructing twice gave the roots {root:?} and {:?}",
+                        tree_again.root(),
+                    ));
+                }
+                for b in &blocks {
+                    if b.region(&tree_again) != b.region(&tree) {
+                        return Err(format!(
+                            "constructing twice put {b:?} in {:?} and then {:?}",
+                            b.region(&tree),
+                            b.region(&tree_again),
+                        ));
+                    }
+                }
+                for region in &regions {
+                    if region.blocks(&tree_again).collect::<Vec<_>>()
+                        != region.blocks(&tree).collect::<Vec<_>>()
+                    {
+                        return Err(format!(
+                            "constructing twice gave {region:?} different blocks"
+                        ));
+                    }
+                    if region.parent(&tree_again) != region.parent(&tree) {
+                        return Err(format!(
+                            "constructing twice gave {region:?} a different parent"
+                        ));
+                    }
+                    if region.children(&tree_again).collect::<Vec<_>>()
+                        != region.children(&tree).collect::<Vec<_>>()
+                    {
+                        return Err(format!(
+                            "constructing twice gave {region:?} different children"
+                        ));
+                    }
+                }
+
+                let mut tree = tree;
+                tree.reset();
+                if !tree.is_reset() {
+                    return Err("`is_reset` is false after `reset`".to_string());
+                }
+
+                Ok(())
+            })
     }
 }

@@ -2323,17 +2323,20 @@ mod tests {
                 ITERS.store(0, Ordering::Relaxed);
                 SKIPPED.store(0, Ordering::Relaxed);
 
-                let result = Check::new().iters(20_000).run_with(
-                    m::default::<TestInput>(),
-                    crate::test::corpus(),
-                    |test_input: &TestInput| -> Result<(), String> {
-                        let stats = check_allocation(test_input)?;
-                        ITERS.fetch_add(1, Ordering::Relaxed);
-                        SKIPPED.fetch_add(stats.too_many_live_regs, Ordering::Relaxed);
-                        $($name.fetch_add(stats.$field, Ordering::Relaxed);)*
-                        Ok(())
-                    },
-                );
+                let result = Check::new()
+                    .min_iters(20_000)
+                    .min_duration(std::time::Duration::from_secs(10))
+                    .run_with(
+                        m::default::<TestInput>(),
+                        crate::test::corpus(),
+                        |test_input: &TestInput| -> Result<(), String> {
+                            let stats = check_allocation(test_input)?;
+                            ITERS.fetch_add(1, Ordering::Relaxed);
+                            SKIPPED.fetch_add(stats.too_many_live_regs, Ordering::Relaxed);
+                            $($name.fetch_add(stats.$field, Ordering::Relaxed);)*
+                            Ok(())
+                        },
+                    );
 
                 if result.is_ok() {
                     $(assert!(

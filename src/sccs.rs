@@ -380,108 +380,111 @@ mod tests {
 
     #[test]
     fn scc_properties() -> CheckResult<TestFunction> {
-        Check::new().iters(10_000).run(|func: &TestFunction| -> Result<(), String> {
-            let entry = func.entry_block();
-            let sccs = components(func)?;
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run(|func: &TestFunction| -> Result<(), String> {
+                let entry = func.entry_block();
+                let sccs = components(func)?;
 
-            // No component is empty, and no block appears in more than one
-            // component.
-            let mut scc_of = HashMap::<Block, usize>::new();
-            for (i, blocks) in sccs.iter().enumerate() {
-                if blocks.is_empty() {
-                    return Err(format!("component {i} of {sccs:?} is empty"));
-                }
-                for &block in blocks {
-                    if let Some(j) = scc_of.insert(block, i) {
-                        return Err(format!(
-                            "{block:?} appears in both component {j} and component {i} \
-                             of {sccs:?}"
-                        ));
+                // No component is empty, and no block appears in more than one
+                // component.
+                let mut scc_of = HashMap::<Block, usize>::new();
+                for (i, blocks) in sccs.iter().enumerate() {
+                    if blocks.is_empty() {
+                        return Err(format!("component {i} of {sccs:?} is empty"));
+                    }
+                    for &block in blocks {
+                        if let Some(j) = scc_of.insert(block, i) {
+                            return Err(format!(
+                                "{block:?} appears in both component {j} and component {i} \
+                                 of {sccs:?}"
+                            ));
+                        }
                     }
                 }
-            }
 
-            let reachable = reachability(func);
+                let reachable = reachability(func);
 
-            // `TestFunction::fixup` is supposed to make every block reachable
-            // from the entry block. If it didn't, that's a bug in the generator
-            // rather than in the SCCs, so check it on its own.
-            if reachable[&entry].len() != func.len_blocks() {
-                return Err(format!(
-                    "only {} of this function's {} blocks are reachable from {entry:?}; \
-                     `TestFunction::fixup` should have made them all reachable",
-                    reachable[&entry].len(),
-                    func.len_blocks(),
-                ));
-            }
+                // `TestFunction::fixup` is supposed to make every block reachable
+                // from the entry block. If it didn't, that's a bug in the generator
+                // rather than in the SCCs, so check it on its own.
+                if reachable[&entry].len() != func.len_blocks() {
+                    return Err(format!(
+                        "only {} of this function's {} blocks are reachable from {entry:?}; \
+                         `TestFunction::fixup` should have made them all reachable",
+                        reachable[&entry].len(),
+                        func.len_blocks(),
+                    ));
+                }
 
-            // The components partition exactly the blocks that are reachable
-            // from the entry block: no more and no less.
-            let covered: BTreeSet<Block> = scc_of.keys().copied().collect();
-            if covered != reachable[&entry] {
-                return Err(format!(
-                    "the components cover {covered:?} but {:?} are reachable from {entry:?}",
-                    reachable[&entry],
-                ));
-            }
+                // The components partition exactly the blocks that are reachable
+                // from the entry block: no more and no less.
+                let covered: BTreeSet<Block> = scc_of.keys().copied().collect();
+                if covered != reachable[&entry] {
+                    return Err(format!(
+                        "the components cover {covered:?} but {:?} are reachable from {entry:?}",
+                        reachable[&entry],
+                    ));
+                }
 
-            // The defining property of strongly-connected components: two
-            // blocks are members of the same component if and only if they are
-            // mutually reachable.
-            for (a, _) in func.blocks() {
-                for (b, _) in func.blocks() {
-                    let mutually_reachable =
-                        reachable[&a].contains(&b) && reachable[&b].contains(&a);
-                    let same_component = scc_of[&a] == scc_of[&b];
-                    if mutually_reachable != same_component {
-                        return Err(format!(
-                            "{a:?} is in component {} and {b:?} is in component {}, but they \
-                             are {}mutually reachable",
-                            scc_of[&a],
-                            scc_of[&b],
-                            if mutually_reachable { "" } else { "not " },
-                        ));
+                // The defining property of strongly-connected components: two
+                // blocks are members of the same component if and only if they are
+                // mutually reachable.
+                for (a, _) in func.blocks() {
+                    for (b, _) in func.blocks() {
+                        let mutually_reachable =
+                            reachable[&a].contains(&b) && reachable[&b].contains(&a);
+                        let same_component = scc_of[&a] == scc_of[&b];
+                        if mutually_reachable != same_component {
+                            return Err(format!(
+                                "{a:?} is in component {} and {b:?} is in component {}, but they \
+                                 are {}mutually reachable",
+                                scc_of[&a],
+                                scc_of[&b],
+                                if mutually_reachable { "" } else { "not " },
+                            ));
+                        }
                     }
                 }
-            }
 
-            // The components are found in reverse-topological order: for every
-            // control-flow edge, the successor's component is never numbered
-            // higher than the predecessor's.
-            for (a, input_block) in func.blocks() {
-                for b in input_block.successors() {
-                    if scc_of[&b] > scc_of[&a] {
-                        return Err(format!(
-                            "the edge {a:?} --> {b:?} goes from component {} to the later \
-                             component {}, so the components are not in reverse-topological \
-                             order",
-                            scc_of[&a], scc_of[&b],
-                        ));
+                // The components are found in reverse-topological order: for every
+                // control-flow edge, the successor's component is never numbered
+                // higher than the predecessor's.
+                for (a, input_block) in func.blocks() {
+                    for b in input_block.successors() {
+                        if scc_of[&b] > scc_of[&a] {
+                            return Err(format!(
+                                "the edge {a:?} --> {b:?} goes from component {} to the later \
+                                 component {}, so the components are not in reverse-topological \
+                                 order",
+                                scc_of[&a], scc_of[&b],
+                            ));
+                        }
                     }
                 }
-            }
 
-            // The entry block is always the root of its own component (its
-            // lowlink can never be less than its index of zero) and its `Post`
-            // event is always the last one, so its component is always found
-            // last.
-            if scc_of[&entry] != sccs.len() - 1 {
-                return Err(format!(
-                    "{entry:?} is in component {} but should be in the last component, {}",
-                    scc_of[&entry],
-                    sccs.len() - 1,
-                ));
-            }
+                // The entry block is always the root of its own component (its
+                // lowlink can never be less than its index of zero) and its `Post`
+                // event is always the last one, so its component is always found
+                // last.
+                if scc_of[&entry] != sccs.len() - 1 {
+                    return Err(format!(
+                        "{entry:?} is in component {} but should be in the last component, {}",
+                        scc_of[&entry],
+                        sccs.len() - 1,
+                    ));
+                }
 
-            // Computing the components again gives the same answer.
-            let sccs_again = components(func)?;
-            if sccs != sccs_again {
-                return Err(format!(
-                    "computing the SCCs twice gave different answers: {sccs:?} vs {sccs_again:?}"
-                ));
-            }
+                // Computing the components again gives the same answer.
+                let sccs_again = components(func)?;
+                if sccs != sccs_again {
+                    return Err(format!(
+                        "computing the SCCs twice gave different answers: {sccs:?} vs {sccs_again:?}"
+                    ));
+                }
 
-            Ok(())
-        })
+                Ok(())
+            })
     }
 }

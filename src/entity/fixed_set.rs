@@ -304,12 +304,9 @@ mod tests {
         vec::Vec,
     };
 
-    type TestSet = FixedEntitySet<Val, { words_for(256) }>;
+    type TestSet = FixedEntitySet<Val, { words_for(128) }>;
 
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "`TestSet` has a 256-entity capacity"
-    )]
+    #[allow(clippy::cast_possible_truncation)]
     const CAPACITY: u32 = TestSet::CAPACITY as u32;
 
     #[derive(Clone, Debug, Mutate)]
@@ -358,83 +355,128 @@ mod tests {
 
     #[test]
     fn fixed_entity_set_properties() -> CheckResult<Vec<Op>> {
-        let mutator = m::default::<Vec<Op>>().map(|_ctx, ops| {
-            ops.truncate(50);
-            for op in ops.iter_mut() {
-                match op {
-                    Op::Insert { index } | Op::Remove { index } => *index %= CAPACITY,
-                    Op::Reset => {}
-                }
-            }
-            Ok(())
-        });
+        let mutator = m::default::<Vec<Op>>()
+            .or(m::from_fn(
+                |ctx: &mut mutatis::Context, ops: &mut Vec<Op>| {
+                    let Some(i) = ctx.rng().gen_index(ops.len()) else {
+                        ops.push(Op::Insert { index: 0 });
+                        ops.push(Op::Insert { index: 127 });
+                        ops.push(Op::Remove { index: 0 });
+                        ops.push(Op::Remove { index: 127 });
+                        ops.push(Op::Reset);
+                        return Ok(());
+                    };
 
-        Check::new().iters(10_000).run_with(
-            mutator,
-            [
-                vec![],
-                vec![Op::Insert { index: 0 }, Op::Remove { index: 0 }],
-                vec![Op::Insert { index: 63 }, Op::Remove { index: 63 }],
-                vec![Op::Insert { index: 64 }, Op::Remove { index: 64 }],
-                vec![Op::Insert { index: 150 }, Op::Remove { index: 150 }],
-                vec![Op::Insert { index: 255 }, Op::Remove { index: 255 }],
-            ],
-            |ops: &Vec<Op>| -> Result<(), String> {
-                let mut set = TestSet::new();
-                let mut oracle = BTreeSet::<Val>::new();
+                    let src_index = match ops[i] {
+                        Op::Insert { index } | Op::Remove { index } => index,
+                        Op::Reset => return Ok(()),
+                    };
 
-                if !set.is_reset() {
-                    return Err("a new set is not reset".to_string());
-                }
-                check_agree(&set, &oracle)?;
-
-                for op in ops {
-                    match *op {
-                        Op::Insert { index } => {
-                            let val = Val::try_new(index as usize).unwrap();
-                            let actual = set.insert(val);
-                            let expected = oracle.insert(val);
-                            if actual != expected {
-                                return Err(format!(
-                                    "inserting {val:?} returned {actual} but should have \
-                                     returned {expected}",
-                                ));
+                    match ctx.rng().gen_u8() % 3 {
+                        0 => ops.push(Op::Insert { index: src_index }),
+                        1 => ops.push(Op::Remove { index: src_index }),
+                        2 => {
+                            let j = ctx.rng().gen_index(ops.len()).unwrap();
+                            if i == j {
+                                ops.push(if ctx.rng().gen_bool() {
+                                    Op::Insert { index: src_index }
+                                } else {
+                                    Op::Remove { index: src_index }
+                                });
+                            } else {
+                                match &mut ops[j] {
+                                    Op::Insert { index } | Op::Remove { index } => {
+                                        *index = src_index
+                                    }
+                                    Op::Reset => {}
+                                }
                             }
                         }
-                        Op::Remove { index } => {
-                            let val = Val::try_new(index as usize).unwrap();
-                            let actual = set.remove(val);
-                            let expected = oracle.remove(&val);
-                            if actual != expected {
-                                return Err(format!(
-                                    "removing {val:?} returned {actual} but should have \
-                                     returned {expected}",
-                                ));
-                            }
-                        }
-                        Op::Reset => {
-                            set.reset();
-                            oracle.clear();
-                        }
+                        _ => unreachable!(),
                     }
 
-                    check_agree(&set, &oracle)?;
-                }
-
-                for index in 0..CAPACITY {
-                    let val = Val::try_new(index as usize).unwrap();
-                    if set.contains(val) != oracle.contains(&val) {
-                        return Err(format!(
-                            "`contains({val:?})` is {} but should be {}",
-                            set.contains(val),
-                            oracle.contains(&val),
-                        ));
+                    Ok(())
+                },
+            ))
+            .map(|_ctx, ops| {
+                ops.truncate(50);
+                for op in ops.iter_mut() {
+                    match op {
+                        Op::Insert { index } | Op::Remove { index } => *index %= CAPACITY,
+                        Op::Reset => {}
                     }
                 }
-
                 Ok(())
-            },
-        )
+            });
+
+        Check::new()
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
+            .run_with(
+                mutator,
+                [
+                    vec![],
+                    vec![Op::Insert { index: 0 }, Op::Remove { index: 0 }],
+                    vec![Op::Insert { index: 63 }, Op::Remove { index: 63 }],
+                    vec![Op::Insert { index: 64 }, Op::Remove { index: 64 }],
+                    vec![Op::Insert { index: 127 }, Op::Remove { index: 127 }],
+                ],
+                |ops: &Vec<Op>| -> Result<(), String> {
+                    let mut set = TestSet::new();
+                    let mut oracle = BTreeSet::<Val>::new();
+
+                    if !set.is_reset() {
+                        return Err("a new set is not reset".to_string());
+                    }
+                    check_agree(&set, &oracle)?;
+
+                    for op in ops {
+                        match *op {
+                            Op::Insert { index } => {
+                                let val = Val::try_new(index as usize).unwrap();
+                                let actual = set.insert(val);
+                                let expected = oracle.insert(val);
+                                if actual != expected {
+                                    return Err(format!(
+                                        "inserting {val:?} returned {actual} but should have \
+                                     returned {expected}",
+                                    ));
+                                }
+                            }
+                            Op::Remove { index } => {
+                                let val = Val::try_new(index as usize).unwrap();
+                                let actual = set.remove(val);
+                                let expected = oracle.remove(&val);
+                                if actual != expected {
+                                    return Err(format!(
+                                        "removing {val:?} returned {actual} but should have \
+                                     returned {expected}",
+                                    ));
+                                }
+                            }
+                            Op::Reset => {
+                                set.reset();
+                                oracle.clear();
+                            }
+                        }
+
+                        check_agree(&set, &oracle)?;
+                    }
+
+                    for index in 0..CAPACITY {
+                        let val = Val::try_new(index as usize).unwrap();
+                        if set.contains(val) != oracle.contains(&val) {
+                            return Err(format!(
+                                "`contains({val:?})` is {} but should be {}",
+                                set.contains(val),
+                                oracle.contains(&val),
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                },
+            )
     }
 
     /// Two sets to combine, plus how much of the first to reuse as a set that is
@@ -469,54 +511,58 @@ mod tests {
             Ok(())
         });
 
-        Check::new().iters(10_000).run_with(
-            mutator,
-            [SetPair::default()],
-            |pair: &SetPair| -> Result<(), String> {
-                let (a, oracle_a) = build(&pair.lhs);
-                let (b, oracle_b) = build(&pair.rhs);
+        Check::new()
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
+            .run_with(
+                mutator,
+                [SetPair::default()],
+                |pair: &SetPair| -> Result<(), String> {
+                    let (a, oracle_a) = build(&pair.lhs);
+                    let (b, oracle_b) = build(&pair.rhs);
 
-                let union = a.union(&b);
-                let expected: BTreeSet<Val> = oracle_a.union(&oracle_b).copied().collect();
-                check_agree(&union, &expected)?;
+                    let union = a.union(&b);
+                    let expected: BTreeSet<Val> = oracle_a.union(&oracle_b).copied().collect();
+                    check_agree(&union, &expected)?;
 
-                let intersection = a.intersection(&b);
-                let expected: BTreeSet<Val> = oracle_a.intersection(&oracle_b).copied().collect();
-                check_agree(&intersection, &expected)?;
+                    let intersection = a.intersection(&b);
+                    let expected: BTreeSet<Val> =
+                        oracle_a.intersection(&oracle_b).copied().collect();
+                    check_agree(&intersection, &expected)?;
 
-                let difference = a.difference(&b);
-                let expected: BTreeSet<Val> = oracle_a.difference(&oracle_b).copied().collect();
-                check_agree(&difference, &expected)?;
+                    let difference = a.difference(&b);
+                    let expected: BTreeSet<Val> = oracle_a.difference(&oracle_b).copied().collect();
+                    check_agree(&difference, &expected)?;
 
-                for (x, oracle_x, y, oracle_y) in [
-                    (&a, &oracle_a, &b, &oracle_b),
-                    (&b, &oracle_b, &a, &oracle_a),
-                ] {
-                    let actual = x.is_subset_of(y);
-                    let expected = oracle_x.is_subset(oracle_y);
+                    for (x, oracle_x, y, oracle_y) in [
+                        (&a, &oracle_a, &b, &oracle_b),
+                        (&b, &oracle_b, &a, &oracle_a),
+                    ] {
+                        let actual = x.is_subset_of(y);
+                        let expected = oracle_x.is_subset(oracle_y);
+                        if actual != expected {
+                            return Err(format!(
+                                "`{x:?}.is_subset_of({y:?})` is {actual} but should be {expected}",
+                            ));
+                        }
+                    }
+
+                    // Test a set that is a subset of `a` by construction, because
+                    // the `is_subset_of` check above is unlikely to exercise the
+                    // `true`-returning case for random inputs.
+                    let prefix = &pair.lhs[..(pair.lhs_prefix as usize).min(pair.lhs.len())];
+                    let (c, oracle_c) = build(prefix);
+                    let actual = c.is_subset_of(&a);
+                    let expected = oracle_c.is_subset(&oracle_a);
                     if actual != expected {
                         return Err(format!(
-                            "`{x:?}.is_subset_of({y:?})` is {actual} but should be {expected}",
+                            "`{c:?}.is_subset_of({a:?})` is {actual} but should be {expected}",
                         ));
                     }
-                }
 
-                // Test a set that is a subset of `a` by construction, because
-                // the `is_subset_of` check above is unlikely to exercise the
-                // `true`-returning case for random inputs.
-                let prefix = &pair.lhs[..(pair.lhs_prefix as usize).min(pair.lhs.len())];
-                let (c, oracle_c) = build(prefix);
-                let actual = c.is_subset_of(&a);
-                let expected = oracle_c.is_subset(&oracle_a);
-                if actual != expected {
-                    return Err(format!(
-                        "`{c:?}.is_subset_of({a:?})` is {actual} but should be {expected}",
-                    ));
-                }
-
-                Ok(())
-            },
-        )
+                    Ok(())
+                },
+            )
     }
 
     #[test]

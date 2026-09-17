@@ -231,84 +231,134 @@ mod tests {
 
     #[test]
     fn entity_set_properties() -> CheckResult<Vec<Op>> {
-        let mutator = m::default::<Vec<Op>>().map(|_ctx, ops| {
-            ops.truncate(50);
-            for op in ops.iter_mut() {
-                match op {
-                    Op::Insert { index } | Op::Remove { index } => *index %= MAX_INDEX,
-                    Op::Reset => {}
-                }
-            }
-            Ok(())
-        });
+        let mutator = m::default::<Vec<Op>>()
+            .or(m::from_fn(
+                |ctx: &mut mutatis::Context, ops: &mut Vec<Op>| {
+                    let Some(i) = ctx.rng().gen_index(ops.len()) else {
+                        ops.push(Op::Insert { index: 0 });
+                        ops.push(Op::Insert {
+                            index: MAX_INDEX - 1,
+                        });
+                        ops.push(Op::Remove { index: 0 });
+                        ops.push(Op::Remove {
+                            index: MAX_INDEX - 1,
+                        });
+                        ops.push(Op::Reset);
+                        return Ok(());
+                    };
 
-        Check::new().iters(10_000).run_with(
-            mutator,
-            [
-                alloc::vec![Op::Insert { index: 0 }, Op::Remove { index: 0 }],
-                alloc::vec![Op::Insert { index: 63 }, Op::Remove { index: 63 }],
-                alloc::vec![Op::Insert { index: 64 }, Op::Remove { index: 64 }],
-                alloc::vec![Op::Insert { index: 150 }, Op::Remove { index: 150 }],
-            ],
-            |ops: &Vec<Op>| -> Result<(), String> {
-                let mut set = EntitySet::<Val>::new();
-                let mut oracle = BTreeSet::<Val>::new();
+                    let src_index = match ops[i] {
+                        Op::Insert { index } | Op::Remove { index } => index,
+                        Op::Reset => return Ok(()),
+                    };
 
-                if !set.is_reset() {
-                    return Err("a new set is not reset".to_string());
-                }
-                check_agree(&set, &oracle)?;
-
-                for op in ops {
-                    match *op {
-                        Op::Insert { index } => {
-                            let val = Val::try_new(index as usize).unwrap();
-                            let actual = set.insert(val);
-                            let expected = oracle.insert(val);
-                            if actual != expected {
-                                return Err(format!(
-                                    "inserting {val:?} returned {actual} but should have \
-                                     returned {expected}",
-                                ));
+                    match ctx.rng().gen_u8() % 3 {
+                        0 => ops.push(Op::Insert { index: src_index }),
+                        1 => ops.push(Op::Remove { index: src_index }),
+                        2 => {
+                            let j = ctx.rng().gen_index(ops.len()).unwrap();
+                            if i == j {
+                                ops.push(if ctx.rng().gen_bool() {
+                                    Op::Insert { index: src_index }
+                                } else {
+                                    Op::Remove { index: src_index }
+                                });
+                            } else {
+                                match &mut ops[j] {
+                                    Op::Insert { index } | Op::Remove { index } => {
+                                        *index = src_index
+                                    }
+                                    Op::Reset => {}
+                                }
                             }
                         }
-                        Op::Remove { index } => {
-                            let val = Val::try_new(index as usize).unwrap();
-                            let actual = set.remove(val);
-                            let expected = oracle.remove(&val);
-                            if actual != expected {
-                                return Err(format!(
-                                    "removing {val:?} returned {actual} but should have \
-                                     returned {expected}",
-                                ));
-                            }
-                        }
-                        Op::Reset => {
-                            set.reset();
-                            oracle.clear();
-                        }
+                        _ => unreachable!(),
                     }
 
-                    check_agree(&set, &oracle)?;
-                }
-
-                // Finally, ask about every entity the operations could have
-                // named and then some, which reaches past the end of the set's
-                // storage. Iteration alone would not catch a bit set outside the
-                // range it walks, or a `contains` reading the wrong word.
-                for index in 0..PROBE_LIMIT {
-                    let val = Val::try_new(index as usize).unwrap();
-                    if set.contains(val) != oracle.contains(&val) {
-                        return Err(format!(
-                            "`contains({val:?})` is {} but should be {}",
-                            set.contains(val),
-                            oracle.contains(&val),
-                        ));
+                    Ok(())
+                },
+            ))
+            .map(|_ctx, ops| {
+                ops.truncate(50);
+                for op in ops.iter_mut() {
+                    match op {
+                        Op::Insert { index } | Op::Remove { index } => *index %= MAX_INDEX,
+                        Op::Reset => {}
                     }
                 }
-
                 Ok(())
-            },
-        )
+            });
+
+        Check::new()
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
+            .run_with(
+                mutator,
+                [
+                    alloc::vec![Op::Insert { index: 0 }, Op::Remove { index: 0 }],
+                    alloc::vec![Op::Insert { index: 63 }, Op::Remove { index: 63 }],
+                    alloc::vec![Op::Insert { index: 64 }, Op::Remove { index: 64 }],
+                    alloc::vec![Op::Insert { index: 150 }, Op::Remove { index: 150 }],
+                ],
+                |ops: &Vec<Op>| -> Result<(), String> {
+                    let mut set = EntitySet::<Val>::new();
+                    let mut oracle = BTreeSet::<Val>::new();
+
+                    if !set.is_reset() {
+                        return Err("a new set is not reset".to_string());
+                    }
+                    check_agree(&set, &oracle)?;
+
+                    for op in ops {
+                        match *op {
+                            Op::Insert { index } => {
+                                let val = Val::try_new(index as usize).unwrap();
+                                let actual = set.insert(val);
+                                let expected = oracle.insert(val);
+                                if actual != expected {
+                                    return Err(format!(
+                                        "inserting {val:?} returned {actual} but should have \
+                                     returned {expected}",
+                                    ));
+                                }
+                            }
+                            Op::Remove { index } => {
+                                let val = Val::try_new(index as usize).unwrap();
+                                let actual = set.remove(val);
+                                let expected = oracle.remove(&val);
+                                if actual != expected {
+                                    return Err(format!(
+                                        "removing {val:?} returned {actual} but should have \
+                                     returned {expected}",
+                                    ));
+                                }
+                            }
+                            Op::Reset => {
+                                set.reset();
+                                oracle.clear();
+                            }
+                        }
+
+                        check_agree(&set, &oracle)?;
+                    }
+
+                    // Finally, ask about every entity the operations could have
+                    // named and then some, which reaches past the end of the set's
+                    // storage. Iteration alone would not catch a bit set outside the
+                    // range it walks, or a `contains` reading the wrong word.
+                    for index in 0..PROBE_LIMIT {
+                        let val = Val::try_new(index as usize).unwrap();
+                        if set.contains(val) != oracle.contains(&val) {
+                            return Err(format!(
+                                "`contains({val:?})` is {} but should be {}",
+                                set.contains(val),
+                                oracle.contains(&val),
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                },
+            )
     }
 }

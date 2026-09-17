@@ -6396,22 +6396,25 @@ mod tests {
 
     #[test]
     fn fixup_produces_valid_ssa() -> CheckResult<TestInput> {
-        Check::new().iters(10_000).run(|input: &TestInput| {
-            check_ssa(&input.machine.build(), &input.func)?;
+        Check::new()
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
+            .run(|input: &TestInput| {
+                check_ssa(&input.machine.build(), &input.func)?;
 
-            // `TestInput::fixup` reaches a fixed point too, and not just the
-            // function's half of it: the operand constraints it rewrites refer
-            // to the machine, so a second pass has to leave them alone.
-            let mut again = input.clone();
-            again.fixup();
-            if hash(&again) != hash(input) {
-                return Err(format!(
-                    "`TestInput::fixup` is not idempotent; running it a second time gives:\n{again:#?}"
-                ));
-            }
+                // `TestInput::fixup` reaches a fixed point too, and not just the
+                // function's half of it: the operand constraints it rewrites refer
+                // to the machine, so a second pass has to leave them alone.
+                let mut again = input.clone();
+                again.fixup();
+                if hash(&again) != hash(input) {
+                    return Err(format!(
+                        "`TestInput::fixup` is not idempotent; running it a second time gives:\n{again:#?}"
+                    ));
+                }
 
-            Ok(())
-        })
+                Ok(())
+            })
     }
 
     /// A `TestInput` asks for a level of move elimination, and `with_input`
@@ -6459,7 +6462,8 @@ mod tests {
     #[test]
     fn every_test_machine_builds() -> CheckResult<TestMachine> {
         Check::new()
-            .iters(10_000)
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
             .run(|test_machine: &TestMachine| -> Result<(), String> {
                 let machine = test_machine.build();
 

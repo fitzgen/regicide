@@ -2201,14 +2201,13 @@ mod tests {
             Ok(())
         });
 
-        Check::new().iters(10_000).run_with(
-            mutator,
-            seeds(),
-            |ops: &Vec<Op>| -> Result<(), String> {
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(mutator, seeds(), |ops: &Vec<Op>| -> Result<(), String> {
                 run(ops)?;
                 Ok(())
-            },
-        )
+            })
     }
 
     /// Splitting bottoms out.
@@ -2229,10 +2228,10 @@ mod tests {
             Ok(())
         });
 
-        Check::new().iters(1_000).run_with(
-            mutator,
-            seeds(),
-            |ops: &Vec<Op>| -> Result<(), String> {
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(mutator, seeds(), |ops: &Vec<Op>| -> Result<(), String> {
                 let mut state = run(ops)?;
 
                 let budget = state.whole.len_insts();
@@ -2299,8 +2298,7 @@ mod tests {
                     "still cutting after {budget} steps, but the bundle only ever covered \
                      {budget} instructions, so it can hold at most that many pieces",
                 ))
-            },
-        )
+            })
     }
 
     /// The hand-written cases behind the seeds above, stated as what

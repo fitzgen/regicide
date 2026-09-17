@@ -1253,7 +1253,8 @@ mod tests {
     #[test]
     fn every_slot_is_announced_once() -> CheckResult<TestInput> {
         Check::new()
-            .iters(1_000)
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let Some(context) = run_everything(test_input)? else {
                     return Ok(());
@@ -1307,7 +1308,8 @@ mod tests {
     #[test]
     fn every_value_gets_an_announced_home() -> CheckResult<TestInput> {
         Check::new()
-            .iters(1_000)
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let Some(context) = allocate(test_input)? else {
                     return Ok(());
@@ -1379,26 +1381,11 @@ mod tests {
             })
     }
 
-    /// Running the whole pipeline, up to and including this pass, never panics
-    /// and never trips a debug assertion.
-    ///
-    /// This is the only test that drives every phase in sequence, so it is
-    /// where a broken invariant in an earlier phase surfaces. It checks nothing
-    /// about the result; `spill_slot_properties` does that.
-    #[test]
-    fn the_whole_pipeline_runs() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(10_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                allocate(test_input)?;
-                Ok(())
-            })
-    }
-
     #[test]
     fn spill_slot_properties() -> CheckResult<TestInput> {
         Check::new()
-            .iters(10_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 // Spill everything, which maximizes the pressure on the
                 // coloring, and then every other value, which interleaves

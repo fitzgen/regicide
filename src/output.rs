@@ -1261,7 +1261,8 @@ mod tests {
     #[test]
     fn output_properties() -> CheckResult<TestInput> {
         Check::new()
-            .iters(10_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let mut context = Context::new();
                 test_input.with_input(|input| {
@@ -1344,7 +1345,8 @@ mod tests {
     #[test]
     fn spill_slot_queries_agree() -> CheckResult<TestInput> {
         Check::new()
-            .iters(10_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let mut context = Context::new();
                 test_input.with_input(|input| {

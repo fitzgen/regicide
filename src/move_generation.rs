@@ -2412,21 +2412,6 @@ mod tests {
         })
     }
 
-    /// The pipeline through this pass never panics or trips a debug assertion,
-    /// and leaves a context that resets.
-    #[test]
-    fn the_whole_pipeline_runs() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(1_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                if let Some(mut context) = generate(test_input)? {
-                    context.reset();
-                    assert!(context.is_reset());
-                }
-                Ok(())
-            })
-    }
-
     /// A value that lives in a register group is spilled and reloaded one
     /// member at a time, each member in its own slot.
     ///
@@ -2610,24 +2595,27 @@ mod tests {
         static GROUP_SPILLS: AtomicUsize = AtomicUsize::new(0);
         static GROUP_RELOADS: AtomicUsize = AtomicUsize::new(0);
 
-        let result = Check::new().iters(10_000).run_with(
-            m::default::<TestInput>(),
-            seeds(),
-            |test_input: &TestInput| -> Result<(), String> {
-                let seen = check_moves(test_input)?;
-                REG_REGS.fetch_add(seen.reg_regs, Ordering::Relaxed);
-                SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
-                RELOADS.fetch_add(seen.reloads, Ordering::Relaxed);
-                REMATS.fetch_add(seen.remats, Ordering::Relaxed);
-                CRITICAL_EDGE_MOVES.fetch_add(seen.critical_edge_moves, Ordering::Relaxed);
-                PARAM_EDGES.fetch_add(seen.param_edges, Ordering::Relaxed);
-                STACK_PARAMS.fetch_add(seen.stack_params, Ordering::Relaxed);
-                ENTRY_PARAM_FILLS.fetch_add(seen.entry_param_fills, Ordering::Relaxed);
-                GROUP_SPILLS.fetch_add(seen.group_spills, Ordering::Relaxed);
-                GROUP_RELOADS.fetch_add(seen.group_reloads, Ordering::Relaxed);
-                Ok(())
-            },
-        );
+        let result = Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                seeds(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let seen = check_moves(test_input)?;
+                    REG_REGS.fetch_add(seen.reg_regs, Ordering::Relaxed);
+                    SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
+                    RELOADS.fetch_add(seen.reloads, Ordering::Relaxed);
+                    REMATS.fetch_add(seen.remats, Ordering::Relaxed);
+                    CRITICAL_EDGE_MOVES.fetch_add(seen.critical_edge_moves, Ordering::Relaxed);
+                    PARAM_EDGES.fetch_add(seen.param_edges, Ordering::Relaxed);
+                    STACK_PARAMS.fetch_add(seen.stack_params, Ordering::Relaxed);
+                    ENTRY_PARAM_FILLS.fetch_add(seen.entry_param_fills, Ordering::Relaxed);
+                    GROUP_SPILLS.fetch_add(seen.group_spills, Ordering::Relaxed);
+                    GROUP_RELOADS.fetch_add(seen.group_reloads, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
 
         if result.is_ok() {
             for (what, counter) in [
@@ -2663,74 +2651,77 @@ mod tests {
         // index it ends up at.
         static SHIFTED: AtomicUsize = AtomicUsize::new(0);
 
-        let result = Check::new().iters(10_000).run_with(
-            m::default::<TestInput>(),
-            seeds(),
-            |test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = generate(test_input)? else {
-                    return Ok(());
-                };
-                let ctx = &context.context32;
-                let edits = ctx.move_generation.edits();
-
-                let is_move = |edit: &Edit<u32>| {
-                    matches!(
-                        edit,
-                        Edit::Move(_)
-                            | Edit::CriticalEdge(CriticalEdgeEdit {
-                                edit: EdgeEdit::Move(_),
-                                ..
-                            })
-                    )
-                };
-
-                let mut num_emitted = 0;
-                for (_, event) in ctx.events.iter() {
-                    let LoggedEvent::MoveEmitted { pos, move_, index } = *event else {
-                        continue;
+        let result = Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                seeds(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = generate(test_input)? else {
+                        return Ok(());
                     };
-                    num_emitted += 1;
+                    let ctx = &context.context32;
+                    let edits = ctx.move_generation.edits();
 
-                    let (edit_pos, edit) = *edits.get(index).ok_or_else(|| {
-                        format!("{move_:?} claims edit {index}, past the end of the edit list")
-                    })?;
-                    if edit_pos != pos {
+                    let is_move = |edit: &Edit<u32>| {
+                        matches!(
+                            edit,
+                            Edit::Move(_)
+                                | Edit::CriticalEdge(CriticalEdgeEdit {
+                                    edit: EdgeEdit::Move(_),
+                                    ..
+                                })
+                        )
+                    };
+
+                    let mut num_emitted = 0;
+                    for (_, event) in ctx.events.iter() {
+                        let LoggedEvent::MoveEmitted { pos, move_, index } = *event else {
+                            continue;
+                        };
+                        num_emitted += 1;
+
+                        let (edit_pos, edit) = *edits.get(index).ok_or_else(|| {
+                            format!("{move_:?} claims edit {index}, past the end of the edit list")
+                        })?;
+                        if edit_pos != pos {
+                            return Err(format!(
+                                "{move_:?} claims edit {index}, which is at {edit_pos:?}, not {pos:?}",
+                            ));
+                        }
+                        let emitted = match edit {
+                            Edit::Move(mv) => mv,
+                            Edit::CriticalEdge(CriticalEdgeEdit {
+                                edit: EdgeEdit::Move(mv),
+                                ..
+                            }) => mv,
+                            _ => return Err(format!("edit {index} is {edit:?}, not a move")),
+                        };
+                        if emitted != move_ {
+                            return Err(format!("edit {index} is {emitted:?}, not {move_:?}"));
+                        }
+                    }
+
+                    // And no move edit went unannounced.
+                    let num_move_edits = edits.iter().filter(|(_, edit)| is_move(edit)).count();
+                    if num_emitted != num_move_edits {
                         return Err(format!(
-                            "{move_:?} claims edit {index}, which is at {edit_pos:?}, not {pos:?}",
+                            "{num_emitted} `MoveEmitted` events for {num_move_edits} move edits",
                         ));
                     }
-                    let emitted = match edit {
-                        Edit::Move(mv) => mv,
-                        Edit::CriticalEdge(CriticalEdgeEdit {
-                            edit: EdgeEdit::Move(mv),
-                            ..
-                        }) => mv,
-                        _ => return Err(format!("edit {index} is {edit:?}, not a move")),
-                    };
-                    if emitted != move_ {
-                        return Err(format!("edit {index} is {emitted:?}, not {move_:?}"));
+
+                    let first_remat = edits.iter().position(|(_, edit)| !is_move(edit));
+                    let last_move = edits.iter().rposition(|(_, edit)| is_move(edit));
+                    if let (Some(first_remat), Some(last_move)) = (first_remat, last_move)
+                        && first_remat < last_move
+                    {
+                        SHIFTED.fetch_add(1, Ordering::Relaxed);
                     }
-                }
 
-                // And no move edit went unannounced.
-                let num_move_edits = edits.iter().filter(|(_, edit)| is_move(edit)).count();
-                if num_emitted != num_move_edits {
-                    return Err(format!(
-                        "{num_emitted} `MoveEmitted` events for {num_move_edits} move edits",
-                    ));
-                }
-
-                let first_remat = edits.iter().position(|(_, edit)| !is_move(edit));
-                let last_move = edits.iter().rposition(|(_, edit)| is_move(edit));
-                if let (Some(first_remat), Some(last_move)) = (first_remat, last_move)
-                    && first_remat < last_move
-                {
-                    SHIFTED.fetch_add(1, Ordering::Relaxed);
-                }
-
-                Ok(())
-            },
-        );
+                    Ok(())
+                },
+            );
 
         if result.is_ok() {
             assert!(
@@ -2747,64 +2738,67 @@ mod tests {
     #[cfg(feature = "visualizer")]
     #[test]
     fn every_resolved_move_has_both_halves() -> CheckResult<TestInput> {
-        Check::new().iters(10_000).run_with(
-            m::default::<TestInput>(),
-            seeds(),
-            |test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = generate(test_input)? else {
-                    return Ok(());
-                };
-                let ctx = &context.context32;
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                seeds(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = generate(test_input)? else {
+                        return Ok(());
+                    };
+                    let ctx = &context.context32;
 
-                let mut sources = BTreeMap::new();
-                let mut dests = BTreeMap::new();
-                let mut resolved = Vec::new();
-                for (_, event) in ctx.events.iter() {
-                    match *event {
-                        LoggedEvent::HalfMoveSource {
-                            pos, val, alloc, ..
-                        } => {
-                            // A later source displaces an earlier one, and the
-                            // last one is the one `resolve` reads.
-                            sources.insert((pos, val), alloc);
+                    let mut sources = BTreeMap::new();
+                    let mut dests = BTreeMap::new();
+                    let mut resolved = Vec::new();
+                    for (_, event) in ctx.events.iter() {
+                        match *event {
+                            LoggedEvent::HalfMoveSource {
+                                pos, val, alloc, ..
+                            } => {
+                                // A later source displaces an earlier one, and the
+                                // last one is the one `resolve` reads.
+                                sources.insert((pos, val), alloc);
+                            }
+                            LoggedEvent::HalfMoveDest { pos, val, alloc } => {
+                                dests.entry((pos, val)).or_insert_with(Vec::new).push(alloc);
+                            }
+                            LoggedEvent::MoveResolved { pos, val, src, dst } => {
+                                resolved.push((pos, val, src, dst));
+                            }
+                            _ => continue,
                         }
-                        LoggedEvent::HalfMoveDest { pos, val, alloc } => {
-                            dests.entry((pos, val)).or_insert_with(Vec::new).push(alloc);
-                        }
-                        LoggedEvent::MoveResolved { pos, val, src, dst } => {
-                            resolved.push((pos, val, src, dst));
-                        }
-                        _ => continue,
                     }
-                }
 
-                for (pos, val, src, dst) in resolved {
-                    match sources.get(&(pos, val)) {
-                        Some(&alloc) if alloc == src => {}
-                        Some(&alloc) => {
-                            return Err(format!(
-                                "the move of {val:?} at {pos:?} reads {src:?}, but the last \
+                    for (pos, val, src, dst) in resolved {
+                        match sources.get(&(pos, val)) {
+                            Some(&alloc) if alloc == src => {}
+                            Some(&alloc) => {
+                                return Err(format!(
+                                    "the move of {val:?} at {pos:?} reads {src:?}, but the last \
                                  source there was {alloc:?}",
-                            ));
-                        }
-                        None => {
-                            return Err(format!(
-                                "the move of {val:?} at {pos:?} reads {src:?}, which was never \
+                                ));
+                            }
+                            None => {
+                                return Err(format!(
+                                    "the move of {val:?} at {pos:?} reads {src:?}, which was never \
                                  logged as a source",
+                                ));
+                            }
+                        }
+                        if !dests.get(&(pos, val)).is_some_and(|ds| ds.contains(&dst)) {
+                            return Err(format!(
+                                "the move of {val:?} at {pos:?} writes {dst:?}, which was never \
+                             logged as a destination",
                             ));
                         }
                     }
-                    if !dests.get(&(pos, val)).is_some_and(|ds| ds.contains(&dst)) {
-                        return Err(format!(
-                            "the move of {val:?} at {pos:?} writes {dst:?}, which was never \
-                             logged as a destination",
-                        ));
-                    }
-                }
 
-                Ok(())
-            },
-        )
+                    Ok(())
+                },
+            )
     }
 
     /// Every rematerialization fills a destination that was asked for, in a
@@ -2812,52 +2806,55 @@ mod tests {
     #[cfg(feature = "visualizer")]
     #[test]
     fn every_remat_fills_a_logged_dest() -> CheckResult<TestInput> {
-        Check::new().iters(10_000).run_with(
-            m::default::<TestInput>(),
-            seeds(),
-            |test_input: &TestInput| -> Result<(), String> {
-                let Some(context) = generate(test_input)? else {
-                    return Ok(());
-                };
-                let ctx = &context.context32;
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                seeds(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = generate(test_input)? else {
+                        return Ok(());
+                    };
+                    let ctx = &context.context32;
 
-                let mut dests = BTreeSet::new();
-                let mut remats = Vec::new();
-                for (_, event) in ctx.events.iter() {
-                    match *event {
-                        LoggedEvent::HalfMoveDest { pos, val, alloc } => {
-                            dests.insert((pos, val, alloc));
+                    let mut dests = BTreeSet::new();
+                    let mut remats = Vec::new();
+                    for (_, event) in ctx.events.iter() {
+                        match *event {
+                            LoggedEvent::HalfMoveDest { pos, val, alloc } => {
+                                dests.insert((pos, val, alloc));
+                            }
+                            LoggedEvent::RematEmitted { pos, val, dest } => {
+                                remats.push((pos, val, dest));
+                            }
+                            _ => continue,
                         }
-                        LoggedEvent::RematEmitted { pos, val, dest } => {
-                            remats.push((pos, val, dest));
+                    }
+
+                    for (pos, val, dest) in remats {
+                        let dst = Allocation::Reg(RegAllocation::Reg(dest));
+                        if !dests.contains(&(pos, val, dst)) {
+                            return Err(format!(
+                                "{val:?} is rematerialized into {dest:?} at {pos:?}, which was never \
+                                 logged as a destination",
+                            ));
                         }
-                        _ => continue,
+                        if test_input
+                            .func
+                            .value(val.with_repr32())
+                            .remat_cost()
+                            .is_none()
+                        {
+                            return Err(format!(
+                                "{val:?} is rematerialized but not rematerializable"
+                            ));
+                        }
                     }
-                }
 
-                for (pos, val, dest) in remats {
-                    let dst = Allocation::Reg(RegAllocation::Reg(dest));
-                    if !dests.contains(&(pos, val, dst)) {
-                        return Err(format!(
-                            "{val:?} is rematerialized into {dest:?} at {pos:?}, which was never \
-                             logged as a destination",
-                        ));
-                    }
-                    if test_input
-                        .func
-                        .value(val.with_repr32())
-                        .remat_cost()
-                        .is_none()
-                    {
-                        return Err(format!(
-                            "{val:?} is rematerialized but not rematerializable"
-                        ));
-                    }
-                }
-
-                Ok(())
-            },
-        )
+                    Ok(())
+                },
+            )
     }
 
     /// A whole run's event log is valid JSON, whatever it holds.

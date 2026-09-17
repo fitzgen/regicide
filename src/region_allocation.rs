@@ -1488,7 +1488,8 @@ mod tests {
     #[test]
     fn everything_has_a_provenance() -> CheckResult<TestInput> {
         Check::new()
-            .iters(1_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let Some(context) = allocate(test_input)? else {
                     return Ok(());
@@ -1565,7 +1566,8 @@ mod tests {
     #[test]
     fn every_pop_is_queued_and_resolved() -> CheckResult<TestInput> {
         Check::new()
-            .iters(1_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let Some(context) = allocate(test_input)? else {
                     return Ok(());
@@ -1644,7 +1646,8 @@ mod tests {
     #[test]
     fn pressure_alone_never_spills_what_we_could_recompute() -> CheckResult<TestInput> {
         Check::new()
-            .iters(1_000)
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let Some(context) = allocate(test_input)? else {
                     return Ok(());

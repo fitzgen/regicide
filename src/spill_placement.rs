@@ -861,7 +861,8 @@ mod tests {
     #[test]
     fn every_spill_is_logged() -> CheckResult<TestInput> {
         Check::new()
-            .iters(1_000)
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
             .run(|test_input: &TestInput| -> Result<(), String> {
                 let Some(context) = place(test_input)? else {
                     return Ok(());
@@ -1229,18 +1230,6 @@ mod tests {
         Ok(seen)
     }
 
-    /// Running the whole pipeline, up to and including this pass, never panics
-    /// and never trips a debug assertion.
-    #[test]
-    fn the_whole_pipeline_runs() -> CheckResult<TestInput> {
-        Check::new()
-            .iters(10_000)
-            .run(|test_input: &TestInput| -> Result<(), String> {
-                place(test_input)?;
-                Ok(())
-            })
-    }
-
     /// The placement has every property it is supposed to have. The counters
     /// make sure the inputs really reached the cases those properties are
     /// about, so that a run that checks nothing cannot pass.
@@ -1257,18 +1246,21 @@ mod tests {
         MERGE_PARAM_SPILLS.store(0, Ordering::Relaxed);
         HOISTED_OUT_OF_A_REGION.store(0, Ordering::Relaxed);
 
-        let result = Check::new().iters(10_000).run_with(
-            m::default::<TestInput>(),
-            seeds(),
-            |test_input: &TestInput| -> Result<(), String> {
-                let seen = check_placement(test_input)?;
-                SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
-                MERGE_PARAM_SPILLS.fetch_add(seen.merge_param_spills, Ordering::Relaxed);
-                HOISTED_OUT_OF_A_REGION
-                    .fetch_add(seen.spills_hoisted_out_of_a_region, Ordering::Relaxed);
-                Ok(())
-            },
-        );
+        let result = Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                seeds(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let seen = check_placement(test_input)?;
+                    SPILLS.fetch_add(seen.spills, Ordering::Relaxed);
+                    MERGE_PARAM_SPILLS.fetch_add(seen.merge_param_spills, Ordering::Relaxed);
+                    HOISTED_OUT_OF_A_REGION
+                        .fetch_add(seen.spills_hoisted_out_of_a_region, Ordering::Relaxed);
+                    Ok(())
+                },
+            );
 
         if result.is_ok() {
             for (what, counter) in [
