@@ -12,12 +12,14 @@ cargo-fuzz = true
 regicide = {
   path = "..",
   features = [
-    "std",
     "checker",
+    "deserialize",
+    "entity-repr-8",
+    "entity-repr-16",
+    "serialize",
+    "std",
     "test-utils",
     "trace-log",
-    "serialize",
-    "deserialize",
   ],
 }
 env_logger = "0.11.8"

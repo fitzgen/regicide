@@ -27,15 +27,15 @@ mutatis = { version = "0.5.2", features = ["check", "derive"], optional = true }
 regicide = {
   version = "0.1.0", path = ".",
   features = [
-    "std",
     "checker",
-    "timing",
-    "trace-log",
+    "deserialize",
     "entity-repr-8",
     "entity-repr-16",
     "visualizer",
     "serialize",
-    "deserialize",
+    "std",
+    "timing",
+    "trace-log",
   ],
 }
 mutatis = { version = "0.5.2", features = ["check", "derive"] }
