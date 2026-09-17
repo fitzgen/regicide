@@ -114,16 +114,29 @@ impl<E> Default for OperandMutator<E> {
 
 /// Generate a constraint that the packed `Operand` encoding can represent.
 fn gen_operand_constraint(ctx: &mut mutatis::Context) -> mutatis::Result<OperandConstraint> {
-    Ok(match ctx.rng().gen_index(4).unwrap() {
-        0 => OperandConstraint::Any,
-        1 => {
+    // Deliberately not uniform:
+    //
+    // * `Stack` is weighted up because it is the only constraint that
+    //   `TestInput::fixup` never rewrites, and because an operand that demands
+    //   memory is what drives spill slots, reloads, and the stack-resident
+    //   bundle paths.
+    //
+    // * `Reg` is weighted *down* to pay for it: the only bundle the allocator
+    //   gives up on is one that is already minimal and still wants a register,
+    //   so fewer hard register demands per instruction is what keeps the skip
+    //   rate affordable while the machines themselves get scarcer. Not below a
+    //   sixth, though, since a `Reg` on a singleton class is the only way to
+    //   pin an operand to one register.
+    Ok(match ctx.rng().gen_index(20).unwrap() {
+        0..6 => OperandConstraint::Any,
+        6..9 => {
             let index = ctx
                 .rng()
                 .gen_index(RegClass::MAX_INCLUDING_DERIVED)
                 .unwrap();
             OperandConstraint::Reg(RegClass::try_new(index).unwrap())
         }
-        2 => OperandConstraint::Stack,
+        9..16 => OperandConstraint::Stack,
         _ => {
             let index = ctx.rng().gen_index(MAX_OPERANDS_PER_INST).unwrap();
             OperandConstraint::Reuse(index)
@@ -2118,6 +2131,45 @@ impl Mutate<TestMachine> for TestMachineMutator {
         mutations: &mut mutatis::Candidates<'_>,
         machine: &mut TestMachine,
     ) -> mutatis::Result<()> {
+        // Bias toward banks holding only one or two registers the allocator
+        // owns, where spilling, eviction, and emergency slots are ordinary
+        // rather than a rarity.
+        mutations.mutation(|ctx| {
+            let Some(index) = ctx.rng().gen_index(machine.banks.len()) else {
+                return Ok(());
+            };
+            let target = if ctx.rng().gen_index(4).unwrap() == 0 {
+                1
+            } else {
+                2
+            };
+            machine.banks[index].regs.truncate(target);
+            machine.fixup();
+            Ok(())
+        })?;
+
+        // Point a class at a register group.
+        if !mutations.shrink() {
+            mutations.mutation(|ctx| {
+                let Some(index) = ctx.rng().gen_index(machine.banks.len()) else {
+                    return Ok(());
+                };
+                let bank = &mut machine.banks[index];
+                if bank.regs.len() < 2 || bank.classes.is_empty() {
+                    return Ok(());
+                }
+                if bank.groups.is_empty() {
+                    bank.groups.push(TestGroup {
+                        members: vec![0, 1],
+                    });
+                }
+                let class = ctx.rng().gen_index(bank.classes.len()).unwrap();
+                bank.classes[class].members = TestClassMembers::Groups(vec![0]);
+                machine.fixup();
+                Ok(())
+            })?;
+        }
+
         <Vec<TestBank> as DefaultMutate>::DefaultMutate::default()
             .proj(|TestMachine { banks, .. }: &mut TestMachine| banks)
             .map(|_ctx, m| {
@@ -3126,11 +3178,20 @@ impl TestInput {
         input
     }
 
-    /// A single-block input in which each of `num_values` values is defined by
-    /// the instruction of the same index, the instructions carry `operands` in
-    /// order, and the block ends with a terminator of its own so that
-    /// `ensure_terminators` does not rewrite the reads before it.
-    fn around_an_overwritten_read(num_values: usize, operands: Vec<Vec<Operand>>) -> Self {
+    /// A single-block input in which each of `num_values` values belongs to
+    /// `reg_class` and is defined by the instruction of the same index, the
+    /// instructions carry `operands` in order, and the block ends with a
+    /// terminator of its own so that `ensure_terminators` does not rewrite the
+    /// reads before it.
+    ///
+    /// `reg_class` has to be a class `machine` has allocatable registers in,
+    /// since every value here needs somewhere to live.
+    fn defining_values_in_order(
+        machine: TestMachine,
+        reg_class: u8,
+        num_values: usize,
+        operands: Vec<Vec<Operand>>,
+    ) -> Self {
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
 
@@ -3140,7 +3201,7 @@ impl TestInput {
                 .push(
                     &mut output,
                     ValData {
-                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        reg_class,
                         def: ValDef::InstResult {
                             inst: Inst::try_new(i).unwrap(),
                             i: 0,
@@ -3164,7 +3225,19 @@ impl TestInput {
                 .unwrap();
         }
 
-        Self::single_block(TestMachine::two_registers(), func, output)
+        Self::single_block(machine, func, output)
+    }
+
+    /// A single-block input on [`TestMachine::two_registers`] in which each of
+    /// `num_values` values is defined by the instruction of the same index and
+    /// the instructions carry `operands` in order.
+    fn around_an_overwritten_read(num_values: usize, operands: Vec<Vec<Operand>>) -> Self {
+        Self::defining_values_in_order(
+            TestMachine::two_registers(),
+            TestMachine::BOTH_REGS_CLASS,
+            num_values,
+            operands,
+        )
     }
 
     /// A single-block input whose early read is pinned to the one register
@@ -3442,6 +3515,143 @@ impl TestInput {
                     ),
                 ],
                 vec![later_read(first), later_read(second)],
+            ],
+        )
+    }
+
+    /// A value defined and never read, on a machine whose two registers are
+    /// both spoken for across its definition.
+    pub fn with_a_def_only_value_under_pressure() -> Self {
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let unread = Val::try_new(2).unwrap();
+        let r0 = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let r1 = RegClass::try_new(TestMachine::SECOND_REG_CLASS.into()).unwrap();
+        let def = |val| {
+            Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                Some(val),
+            )
+        };
+
+        Self::around_an_overwritten_read(
+            3,
+            vec![
+                vec![def(first)],
+                vec![def(second)],
+                // The definition no one consumes, made while both registers
+                // are still carrying values that are read below.
+                vec![def(unread)],
+                vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(r0),
+                        Some(first),
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(r1),
+                        Some(second),
+                    ),
+                ],
+            ],
+        )
+    }
+
+    /// A value read from memory on a machine with a single allocatable
+    /// register, which another value holds across that read.
+    pub fn with_a_stack_constrained_value_under_pressure() -> Self {
+        let mut machine = TestMachine::two_registers();
+        machine.set_regs_per_bank(1);
+
+        let spilled = Val::try_new(0).unwrap();
+        let resident = Val::try_new(1).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+        let def = |val| {
+            Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                Some(val),
+            )
+        };
+
+        Self::defining_values_in_order(
+            machine,
+            TestMachine::BOTH_REGS_CLASS,
+            2,
+            vec![
+                vec![def(spilled)],
+                vec![def(resident)],
+                vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Stack,
+                        Some(spilled),
+                    ),
+                    // The one register the machine has, held by something
+                    // else, so the read above cannot quietly be given it.
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(both),
+                        Some(resident),
+                    ),
+                ],
+                // Read back into that same register, so the value really does
+                // make the round trip through memory.
+                vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(both),
+                    Some(spilled),
+                )],
+            ],
+        )
+    }
+
+    /// Three values that each need a register *group*, on a machine with two
+    /// groups to go around.
+    pub fn with_three_values_needing_two_register_groups() -> Self {
+        let carried = Val::try_new(0).unwrap();
+        let first = Val::try_new(1).unwrap();
+        let second = Val::try_new(2).unwrap();
+        let groups = RegClass::try_new(TestMachine::EITHER_GROUP_CLASS.into()).unwrap();
+        let def = |val| {
+            Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                Some(val),
+            )
+        };
+        let read = |val| {
+            Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(groups),
+                Some(val),
+            )
+        };
+
+        Self::defining_values_in_order(
+            TestMachine::groups_and_registers(),
+            TestMachine::EITHER_GROUP_CLASS,
+            3,
+            vec![
+                vec![def(carried)],
+                vec![def(first)],
+                vec![def(second)],
+                // Both of these take a group while `carried` is still live,
+                // which is one group more than the bank has.
+                vec![read(first)],
+                vec![read(second)],
+                vec![read(carried)],
             ],
         )
     }
@@ -6221,6 +6431,9 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_two_uses_of_different_values(),
         TestInput::with_a_critical_edge(),
         TestInput::with_values_in_two_banks_spilled_and_reloaded(),
+        TestInput::with_a_def_only_value_under_pressure(),
+        TestInput::with_a_stack_constrained_value_under_pressure(),
+        TestInput::with_three_values_needing_two_register_groups(),
         TestInput::with_an_entry_param_read_two_ways(),
         TestInput::with_two_entry_params(),
         TestInput::with_entry_params_in_two_banks(),

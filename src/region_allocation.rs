@@ -928,12 +928,13 @@ where
                             return Ok(());
                         }
                     }
-                    // An operand asked for memory, so memory is what it gets.
-                    OperandConstraint::Stack => {}
+
                     // It wants a register, we could not find one for it, and
                     // there is nothing left to try.
                     OperandConstraint::Reg(_) => return output.error(Error::TooManyLiveRegs),
+
                     OperandConstraint::Reuse(_) => unreachable!("already resolved"),
+                    OperandConstraint::Stack => unreachable!("already handled"),
                 }
                 counts.spilled_bundles.inc();
                 self.stack_bundles.push(bundle);
