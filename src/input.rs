@@ -209,18 +209,6 @@ impl OperandConstraint {
         }
     }
 
-    /// Does this constraint, which must already be resolved, demand one
-    /// particular register?
-    ///
-    /// That is, does it name a class with exactly one member?
-    pub(crate) fn is_fixed(self, machine: &Machine) -> bool {
-        debug_assert!(!matches!(self, Self::Reuse(_)), "must already be resolved");
-        match self {
-            Self::Reg(class) => class.is_singleton(machine),
-            _ => false,
-        }
-    }
-
     /// The weakest constraint that satisfies both `self` and `other`, or `None`
     /// when nothing satisfies both.
     ///
@@ -597,6 +585,20 @@ pub enum DefUse {
     Def = 0,
     /// A use.
     Use = 1,
+}
+
+impl DefUse {
+    /// Is this a definition of a value?
+    #[inline]
+    pub fn is_def(self) -> bool {
+        matches!(self, DefUse::Def)
+    }
+
+    /// Is this a use of a value?
+    #[inline]
+    pub fn is_use(self) -> bool {
+        matches!(self, DefUse::Use)
+    }
 }
 
 /// A function that needs register allocation.

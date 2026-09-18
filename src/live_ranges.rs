@@ -37,6 +37,11 @@ define_entities! {
 
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct BundleSpansStorageIndex = "bundle_spans_storage_index";
+
+    /// A register held for one fixed operand, outside of any value's live
+    /// range.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct Reservation = "reservation";
 }
 
 /// A single program point at which a value is (or is not) live.
@@ -497,32 +502,19 @@ where
 
     /// The value that this span is associated with.
     val: Val<E>,
-
-    /// Bit:     0
-    ///        +------------------+
-    /// Field: | has_fixed_use: 1 |
-    ///        +------------------+
-    flags: u8,
 }
-
-const SPAN_HAS_FIXED_USE: u8 = 1 << 0;
 
 impl<E> LiveSpanData<E>
 where
     E: EntityRepr,
 {
     /// Create a span covering `[start, end)` for `val`, with the given uses.
-    ///
-    /// `has_fixed_use` is whether any of `uses` demands one particular register,
-    /// i.e. resolves to a singleton class. The caller computes it because it is
-    /// already resolving each use's constraint to decide where to split.
     #[inline]
     pub(crate) fn new(
         start: LivePoint<E>,
         end: LivePoint<E>,
         val: Val<E>,
         uses: EntityRange<Use<E>>,
-        has_fixed_use: bool,
     ) -> Self {
         debug_assert!(start < end);
         LiveSpanData {
@@ -530,7 +522,6 @@ where
             end,
             uses,
             val,
-            flags: if has_fixed_use { SPAN_HAS_FIXED_USE } else { 0 },
         }
     }
 }
@@ -574,16 +565,15 @@ where
     /// `weight_and_flags`, rather than under a rule that every comparison site
     /// has to remember to apply.
     ///
-    /// Bit:     31           30                  29     ...     0
-    ///        +------------+-------------------+------------------+
-    /// Field: | minimal: 1 | has_fixed_uses: 1 | spill_weight: 30 |
-    ///        +------------+-------------------+------------------+
+    /// Bit:     31           30     ...     0
+    ///        +------------+------------------+
+    /// Field: | minimal: 1 | spill_weight: 31 |
+    ///        +------------+------------------+
     weight_and_flags: u32,
 }
 
-const BUNDLE_SPILL_WEIGHT_BITS: u32 = 30;
+const BUNDLE_SPILL_WEIGHT_BITS: u32 = 31;
 const BUNDLE_SPILL_WEIGHT_MASK: u32 = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::MASK;
-const BUNDLE_HAS_FIXED_USES: u32 = 1 << 30;
 const BUNDLE_MINIMAL: u32 = 1 << 31;
 
 impl<E> LiveBundleData<E>
@@ -610,6 +600,86 @@ where
         }
 
         self.preference = narrowed;
+    }
+}
+
+/// A register held for the fixed operands of one instruction that name it for
+/// one value.
+///
+/// A fixed operand, one whose resolved constraint names a class holding a
+/// single register or register group, is not choosing among registers but
+/// naming one. Rather than constrain the value's bundle to that class and make
+/// it compete through the ordinary assign-evict-split ladder, the register is
+/// held outright across the instruction and the value is move-connected and
+/// hinted to it.
+///
+/// A reservation is unevictable, never a queue participant, and constrains
+/// nothing, but it is porous to its own `val`, reads and definitions alike.
+/// regalloc3 can make a definition a hard wall because it *excises* the fixed
+/// half-instruction from the value's live range; regicide has no point to
+/// excise to, so the value's own span covers its own reservation and a hard
+/// wall would forbid the very assignment the hint asks for.
+pub(crate) struct ReservationData<E>
+where
+    E: EntityRepr,
+{
+    /// The sole member of the operands' singleton class.
+    reg: RegAllocation<E>,
+
+    /// Where the reservation begins, inclusive.
+    start: LivePoint<E>,
+
+    /// Where it ends, exclusive.
+    end: LivePoint<E>,
+
+    /// The value delivered into, or produced out of, `reg`.
+    val: Val<E>,
+
+    /// Whether some operand reads `val` out of `reg`, and so needs the move
+    /// delivering it there.
+    uses: bool,
+
+    /// Whether some operand writes `val` into `reg`, and so needs the move
+    /// carrying it back out.
+    defs: bool,
+}
+
+impl<E> Reservation<E>
+where
+    E: EntityRepr,
+{
+    /// The register, or register group, this reservation holds.
+    pub(crate) fn reg(self, live_ranges: &LiveRanges<E>) -> RegAllocation<E> {
+        live_ranges.reservations[self].reg
+    }
+
+    /// Where this reservation begins.
+    pub(crate) fn start(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
+        live_ranges.reservations[self].start
+    }
+
+    /// Where this reservation ends, exclusive.
+    pub(crate) fn end(self, live_ranges: &LiveRanges<E>) -> LivePoint<E> {
+        live_ranges.reservations[self].end
+    }
+
+    /// The value delivered into, or produced out of, the reserved register.
+    pub(crate) fn val(self, live_ranges: &LiveRanges<E>) -> Val<E> {
+        live_ranges.reservations[self].val
+    }
+
+    /// Whether some operand reads the value out of the reserved register.
+    ///
+    /// See `ReservationData::uses`.
+    pub(crate) fn uses(self, live_ranges: &LiveRanges<E>) -> bool {
+        live_ranges.reservations[self].uses
+    }
+
+    /// Whether some operand writes the value into the reserved register.
+    ///
+    /// See `ReservationData::defs`.
+    pub(crate) fn defs(self, live_ranges: &LiveRanges<E>) -> bool {
+        live_ranges.reservations[self].defs
     }
 }
 
@@ -658,6 +728,20 @@ where
     /// Map from a block to the uses within it.
     block_uses: SecondaryMap<Block<E>, EntityRange<Use<E>>>,
 
+    /// The registers held for the input function's fixed operands.
+    ///
+    /// Grouped by block, and in program order within a block, so that
+    /// `block_reservations` can name each block's run as a range.
+    reservations: PrimaryMap<Reservation<E>, ReservationData<E>>,
+
+    /// Map from a block to the reservations within it.
+    ///
+    /// A reservation belongs to the instruction that asked for it, so this
+    /// partitions `reservations` exactly once. Region allocation leans on
+    /// that: a region's reservations are the union of its blocks' and belong
+    /// to that region alone.
+    block_reservations: SecondaryMap<Block<E>, EntityRange<Reservation<E>>>,
+
     /// Map from a region to the bundles that coalescing created for it.
     ///
     /// Does not include bundles created after coalescing, e.g. by splitting
@@ -680,6 +764,8 @@ where
             live_in_spans: SecondaryMap::new(EntityRange::empty()),
             live_out_spans: SecondaryMap::new(EntityRange::empty()),
             block_uses: SecondaryMap::new(EntityRange::empty()),
+            reservations: PrimaryMap::new(),
+            block_reservations: SecondaryMap::new(EntityRange::empty()),
             region_bundles: SecondaryMap::new(EntityRange::empty()),
             use_span: SecondaryMap::new(LiveSpan::MAX_REPRESENTABLE),
         }
@@ -696,6 +782,8 @@ where
             live_in_spans,
             live_out_spans,
             block_uses,
+            reservations,
+            block_reservations,
             use_span,
             region_bundles,
         } = self;
@@ -708,6 +796,8 @@ where
         live_in_spans.reset();
         live_out_spans.reset();
         block_uses.reset();
+        reservations.reset();
+        block_reservations.reset();
         use_span.reset();
         region_bundles.reset();
     }
@@ -723,6 +813,8 @@ where
             live_in_spans,
             live_out_spans,
             block_uses,
+            reservations,
+            block_reservations,
             use_span,
             region_bundles,
         } = self;
@@ -735,8 +827,16 @@ where
             && live_in_spans.is_reset()
             && live_out_spans.is_reset()
             && block_uses.is_reset()
+            && reservations.is_reset()
+            && block_reservations.is_reset()
             && use_span.is_reset()
             && region_bundles.is_reset()
+    }
+
+    /// Iterate over every reservation in the function, in program order.
+    #[allow(dead_code, reason = "read by the tests")]
+    pub fn reservations(&self) -> impl Iterator<Item = Reservation<E>> + '_ {
+        self.reservations.keys()
     }
 
     /// How many live spans have been constructed?
@@ -746,8 +846,7 @@ where
     }
 
     /// Iterate over every live span that has been constructed.
-    #[allow(dead_code, reason = "will probably need it")]
-    pub fn spans(&self) -> impl Iterator<Item = LiveSpan<E>> + '_ {
+    pub fn spans(&self) -> impl ExactSizeIterator<Item = LiveSpan<E>> + '_ {
         self.spans.keys()
     }
 
@@ -825,6 +924,8 @@ where
             live_in_spans,
             live_out_spans,
             block_uses,
+            reservations,
+            block_reservations,
             use_span,
             ..
         } = self;
@@ -839,6 +940,15 @@ where
             let block = output.with_repr(block)?;
             let spans_start = spans.next_key(output)?;
             let uses_start = uses.next_key(output)?;
+
+            // Collected before the spans, so that nothing below has to thread
+            // reservations through the per-value walk.
+            let reservations_start = reservations.next_key(output)?;
+            collect_block_reservations(input, reservations, &input_block, output)?;
+            block_reservations[block] = EntityRange {
+                start: reservations_start,
+                end: reservations.next_key(output)?,
+            };
 
             #[cfg(feature = "visualizer")]
             let events_start = events.len();
@@ -1009,22 +1119,22 @@ where
 
     /// Does this use demand one particular register?
     ///
-    /// Resolving the operand's constraint needs its siblings, which is why
-    /// this takes `input` rather than reading anything cached.
+    /// Resolving the operand's constraint needs its siblings, hence the
+    /// function rather than anything cached. Resolved exactly as reservation
+    /// collection does, so the two agree on which operands are fixed.
     pub(crate) fn is_fixed(
         self,
         live_ranges: &LiveRanges<E>,
-        input: &Input<'_, impl InputFunction>,
+        func: &impl InputFunction,
+        machine: &Machine,
     ) -> bool {
-        let input_inst = input
-            .func
-            .inst(self.point(live_ranges).inst().with_repr32());
-        let sibling = |j| input_inst.operand(j).constraint();
-        input_inst
-            .operand(self.operand(live_ranges))
-            .constraint()
-            .resolved(&sibling)
-            .is_fixed(input.machine)
+        fixed_operand_of(
+            func,
+            machine,
+            self.point(live_ranges).inst().with_repr32(),
+            self.operand(live_ranges),
+        )
+        .is_some()
     }
 }
 
@@ -1107,12 +1217,6 @@ where
             .expect("every block index already fit in `E` in the earlier passes")
     }
 
-    /// Does this span contain a use with a fixed register constraint?
-    #[inline]
-    pub(crate) fn has_fixed_use(self, live_ranges: &LiveRanges<E>) -> bool {
-        live_ranges.spans[self].flags & SPAN_HAS_FIXED_USE != 0
-    }
-
     /// Must this span stay in the same bundle as `prev`, the span immediately
     /// before it in some bundle?
     ///
@@ -1192,7 +1296,7 @@ where
     ) -> OperandConstraint {
         let mut constraint = OperandConstraint::Any;
         for u in self.uses(live_ranges) {
-            let use_constraint = reuse_aware_constraint(
+            let use_constraint = reservation_aware_constraint(
                 input,
                 u.point(live_ranges).inst().with_repr32(),
                 u.operand(live_ranges),
@@ -1252,14 +1356,13 @@ where
         Ok(bundle)
     }
 
-    /// Recompute the cached `has_fixed_uses`, `is_minimal` and spill weight
-    /// from the spans this bundle currently holds.
+    /// Recompute the cached `is_minimal` flag and spill weight from the spans
+    /// this bundle currently holds.
     fn recompute_weight_and_flags(
         self,
         live_ranges: &mut LiveRanges<E>,
         input: &Input<'_, impl InputFunction>,
     ) {
-        let mut has_fixed_uses = false;
         let mut total_use_cost = 0.0;
         let mut discounted_use_cost = 0.0;
         let mut sum_len_insts = 0;
@@ -1274,7 +1377,6 @@ where
         let mut prev: Option<LiveSpan<E>> = None;
 
         for span in self.spans(live_ranges) {
-            has_fixed_uses |= span.has_fixed_use(live_ranges);
             let uses = span.uses(live_ranges);
             len_uses += uses.len();
             let span_use_cost = uses
@@ -1325,10 +1427,6 @@ where
         if is_minimal {
             weight_and_flags |= BUNDLE_MINIMAL;
         }
-        if has_fixed_uses {
-            weight_and_flags |= BUNDLE_HAS_FIXED_USES;
-        }
-
         live_ranges.bundles[self].weight_and_flags = weight_and_flags;
     }
 
@@ -1529,7 +1627,6 @@ where
             end,
             uses,
             val,
-            flags: _,
         } = live_ranges.spans[old];
         debug_assert!(start < at);
         debug_assert!(at < end);
@@ -1552,22 +1649,15 @@ where
             end: uses.end,
         };
 
-        let is_fixed = |live_ranges: &LiveRanges<E>, range: EntityRange<Use<E>>| {
-            range.into_iter().any(|u| u.is_fixed(live_ranges, input))
-        };
-        let lo_is_fixed = is_fixed(live_ranges, lo_uses);
-        let hi_is_fixed = is_fixed(live_ranges, hi_uses);
-
         // Rewrite the divided span in place as the first piece; because we are
         // rewriting this span in place, its uses are already associated with it
         // and its `span_bundle` entry remains valid.
-        live_ranges.spans[old] = LiveSpanData::new(start, at, val, lo_uses, lo_is_fixed);
+        live_ranges.spans[old] = LiveSpanData::new(start, at, val, lo_uses);
 
         // The new span takes second piece.
-        let new_span = live_ranges.spans.push(
-            output,
-            LiveSpanData::new(at, end, val, hi_uses, hi_is_fixed),
-        )?;
+        let new_span = live_ranges
+            .spans
+            .push(output, LiveSpanData::new(at, end, val, hi_uses))?;
 
         // And the new span's uses need to be reassociated with it.
         for u in hi_uses {
@@ -1793,13 +1883,6 @@ where
         live_ranges.bundles[self].weight_and_flags & BUNDLE_MINIMAL != 0
     }
 
-    /// Does this bundle contain a use with a fixed register constraint?
-    #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
-    pub(crate) fn has_fixed_uses(self, live_ranges: &LiveRanges<E>) -> bool {
-        live_ranges.bundles[self].weight_and_flags & BUNDLE_HAS_FIXED_USES != 0
-    }
-
     /// How expensive it would be to spill this bundle.
     #[inline]
     pub(crate) fn spill_weight(self, live_ranges: &LiveRanges<E>) -> f32 {
@@ -1943,6 +2026,11 @@ where
     pub(crate) fn uses(self, live_ranges: &LiveRanges<E>) -> EntityRange<Use<E>> {
         live_ranges.block_uses[self]
     }
+
+    /// Get the registers held for this block's fixed operands.
+    pub(crate) fn reservations(self, live_ranges: &LiveRanges<E>) -> EntityRange<Reservation<E>> {
+        live_ranges.block_reservations[self]
+    }
 }
 
 impl<E> Region<E>
@@ -2005,18 +2093,203 @@ where
     }
 }
 
+/// The same register, or register group, in this allocation's entity
+/// representation.
+fn with_repr_reg_allocation<E>(
+    reg: RegAllocation,
+    output: &mut OutputInner<E>,
+) -> IResult<RegAllocation<E>>
+where
+    E: EntityRepr,
+{
+    Ok(match reg {
+        RegAllocation::Reg(reg) => RegAllocation::Reg(output.with_repr(reg)?),
+        RegAllocation::RegGroup(group) => RegAllocation::RegGroup(group),
+    })
+}
+
+/// What a fixed operand asks for: one particular register, for one particular
+/// value, over one particular range of program points.
+///
+/// The allocator makes good on it by holding that register over `held_range`
+/// rather than by constraining the operand's value (see `ReservationData`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FixedOperand {
+    /// The single register, or register group, the operand names.
+    pub reg: RegAllocation,
+
+    /// The value it reads out of, or writes into, `reg`.
+    pub val: Val,
+
+    /// Whether the operand reads `reg` or defines it.
+    pub kind: DefUse,
+
+    /// The half-instruction the operand itself occupies.
+    pub pos: Position,
+}
+
+impl FixedOperand {
+    /// The program points a reservation for this operand holds its register
+    /// over.
+    ///
+    /// A read is delivered by a move in the gap before the instruction, which
+    /// borrows the early half (`MovePosition::range`), so the register is held
+    /// from there through the half the read happens in, late reads included.
+    ///
+    /// A definition writes the register itself, so it holds it from its own
+    /// half through the gap after, where the move carrying the value out
+    /// lives. It deliberately does not reach back, so that an early read and a
+    /// late definition of one register want disjoint halves of it, the shape
+    /// report 000 could not allocate.
+    pub(crate) fn held_range<E>(&self, inst: Inst<E>) -> core::ops::Range<LivePoint<E>>
+    where
+        E: EntityRepr,
+    {
+        let point = LivePoint::new(inst, self.pos);
+        if self.kind.is_use() {
+            point.inst_boundary_at_or_before()..point.next_point()
+        } else {
+            point..point.inst_boundary_after()
+        }
+    }
+
+    /// Does the hold cover `pos` of `inst`, the operand's own instruction?
+    ///
+    /// Derived from `held_range` rather than restated, so that
+    /// `validation::check_inst_fixed_operands` rejects exactly the overlaps
+    /// `collect_block_reservations` could not hold registers for.
+    pub(crate) fn holds<E>(&self, inst: Inst<E>, pos: Position) -> bool
+    where
+        E: EntityRepr,
+    {
+        let range = self.held_range(inst);
+        let point = LivePoint::new(inst, pos);
+        range.start <= point && point < range.end
+    }
+}
+
+/// What `operand` of `inst` names, when it is a fixed operand, and `None` when
+/// it is not.
+///
+/// This is the one definition of "is this operand fixed", consulted by
+/// `collect_block_reservations`, `reservation_aware_constraint`,
+/// `validation::check_inst_fixed_operands`,
+/// `OutputInner::reserve_block_inst_allocs` and `Use::is_fixed`. None of the
+/// ways they can disagree fails loudly: relaxing without reserving leaves the
+/// register unprotected, reserving without relaxing pins the value into a
+/// singleton class again, and reporting without reserving shows the checker a
+/// register nobody held.
+///
+/// An operand naming no value names a register the allocator does not own
+/// (`check_block_reg_classes`), which covers no register unit and so never
+/// appears in the matrix.
+///
+/// The constraint is resolved first, because a `Reuse` of a fixed target is
+/// itself fixed and gets its own reservation on the same register, satisfying
+/// the tie by construction.
+pub(crate) fn fixed_operand_of(
+    func: &impl InputFunction,
+    machine: &Machine,
+    inst: Inst,
+    operand: usize,
+) -> Option<FixedOperand> {
+    let input_inst = func.inst(inst);
+    let operand_ref = input_inst.operand(operand);
+
+    let OperandConstraint::Reg(class) = reuse_aware_constraint(func, machine, inst, operand) else {
+        return None;
+    };
+
+    let reg = class.fixed_reg(machine)?;
+    let val = operand_ref.val()?;
+
+    Some(FixedOperand {
+        reg,
+        val,
+        kind: operand_ref.kind(),
+        pos: operand_ref.pos(),
+    })
+}
+
+/// Record a reservation for each fixed operand of each of `block`'s
+/// instructions.
+///
+/// Instructions are walked in program order and hold their registers no
+/// further than the gap after them, so the reservations come out sorted by
+/// start point. See `ReservationData` for why a fixed operand gets one instead
+/// of a constraint.
+fn collect_block_reservations<'a, E>(
+    input: &Input<'_, impl InputFunction>,
+    reservations: &mut PrimaryMap<Reservation<E>, ReservationData<E>>,
+    input_block: &impl InputBlock<'a>,
+    output: &mut OutputInner<E>,
+) -> IResult<()>
+where
+    E: EntityRepr,
+{
+    for (inst, input_inst) in input_block.insts() {
+        let repr32_inst = inst;
+        let inst = output.with_repr(inst)?;
+
+        // The whole search space for the merge below: only operands of one
+        // instruction can name one register for one value at one time.
+        let inst_start = reservations.len();
+
+        for i in 0..input_inst.operands_len() {
+            let Some(fixed) = fixed_operand_of(input.func, input.machine, repr32_inst, i) else {
+                continue;
+            };
+
+            let reg = with_repr_reg_allocation(fixed.reg, output)?;
+            let val = output.with_repr(fixed.val)?;
+            let core::ops::Range { start, end } = fixed.held_range(inst);
+
+            // Naming one register for one value twice asks no more than
+            // naming it once, so hold it over the union of what the operands
+            // ask for. That has to be one reservation and not two, since
+            // reservations on a register may not overlap; anything else
+            // claiming it here is a conflict `check_inst_fixed_operands` has
+            // already rejected.
+            if let Some(held) = reservations.as_mut_slice()[inst_start..]
+                .iter_mut()
+                .find(|r| r.reg == reg && r.val == val)
+            {
+                held.start = held.start.min(start);
+                held.end = held.end.max(end);
+                held.uses |= fixed.kind.is_use();
+                held.defs |= fixed.kind.is_def();
+                continue;
+            }
+
+            reservations.push(
+                output,
+                ReservationData {
+                    reg,
+                    start,
+                    end,
+                    val,
+                    uses: fixed.kind.is_use(),
+                    defs: fixed.kind.is_def(),
+                },
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Get the constraint that an instruction's `operand` places on its span.
 ///
 /// Resolves a `Reuse` to its target's constraint, narrows both halves of a tie
 /// by the same sibling reads, and then strengthens both to demand a register:
 /// a stack home belongs to one value alone and so cannot be reused for two
 /// different values.
-fn reuse_aware_constraint(
-    input: &Input<'_, impl InputFunction>,
+pub(crate) fn reuse_aware_constraint(
+    func: &impl InputFunction,
+    machine: &Machine,
     inst: Inst,
     operand: usize,
 ) -> OperandConstraint {
-    let input_inst = input.func.inst(inst);
+    let input_inst = func.inst(inst);
     let constraint = input_inst.operand(operand).constraint();
     let mut resolved = constraint.resolved(|j| input_inst.operand(j).constraint());
 
@@ -2034,6 +2307,10 @@ fn reuse_aware_constraint(
     // Both halves fold those siblings in identically: narrowing only the
     // definition would leave the target free to fold into an earlier piece the
     // definition cannot share, and the tie would be quietly broken.
+    //
+    // A sibling naming one particular register is not such a sibling: its
+    // value is delivered into the reserved register rather than read out of
+    // the tie's location, so it says nothing about where that location is.
     if let Some(target) = tie_target {
         let target = input_inst.operand(target);
         for other in input_inst.operands() {
@@ -2049,10 +2326,13 @@ fn reuse_aware_constraint(
             else {
                 continue;
             };
+            if other.is_fixed_reg(machine) {
+                continue;
+            }
             resolved = match resolved {
                 OperandConstraint::Any => OperandConstraint::Reg(other),
                 OperandConstraint::Reg(rc) => rc
-                    .intersect(input.machine, other)
+                    .intersect(machine, other)
                     .map_or(resolved, OperandConstraint::Reg),
                 resolved => resolved,
             };
@@ -2063,10 +2343,35 @@ fn reuse_aware_constraint(
     match resolved {
         OperandConstraint::Any if is_tied => {
             let val = input_inst.operand(operand).val().unwrap();
-            OperandConstraint::Reg(input.func.value(val).reg_class())
+            OperandConstraint::Reg(func.value(val).reg_class())
         }
         resolved => resolved,
     }
+}
+
+/// Get the constraint that an instruction's `operand` places on the span its
+/// value lands in.
+///
+/// This is `reuse_aware_constraint`, minus the fixed operands: an operand that
+/// names one particular register constrains its value not at all, since the
+/// register is held for it by a reservation (see `ReservationData`).
+///
+/// That freedom is the entire point. A constraint naming a single register
+/// leaves its bundle exactly one place to go, with no second candidate, no
+/// narrower piece to split off and no stack slot to fall back on. Two values
+/// each pinned to the other's register across one instruction cannot both be
+/// satisfied at all where a value has one location at a time, which is what
+/// `reports/000-early-use-late-def-both-in-fixed-reg.md` and
+/// `reports/001-eviction-and-fixed-reg.md` are about.
+fn reservation_aware_constraint(
+    input: &Input<'_, impl InputFunction>,
+    inst: Inst,
+    operand: usize,
+) -> OperandConstraint {
+    if fixed_operand_of(input.func, input.machine, inst, operand).is_some() {
+        return OperandConstraint::Any;
+    }
+    reuse_aware_constraint(input.func, input.machine, inst, operand)
 }
 
 /// Rewrite the provisional span keys in the events a block's span construction
@@ -2111,7 +2416,6 @@ fn push_span<E>(
     (start, end): (LivePoint<E>, LivePoint<E>),
     (uses_start, uses_end): (Use<E>, Use<E>),
     constraint: OperandConstraint,
-    has_fixed_use: bool,
     block: Block<E>,
 ) -> IResult<LiveSpan<E>>
 where
@@ -2121,10 +2425,7 @@ where
         start: uses_start,
         end: uses_end,
     };
-    let span = spans.push(
-        output,
-        LiveSpanData::new(start, end, val, uses, has_fixed_use),
-    )?;
+    let span = spans.push(output, LiveSpanData::new(start, end, val, uses))?;
     event!(
         events,
         SpanConstructed {
@@ -2135,7 +2436,6 @@ where
             block,
             num_uses: uses.len(),
             constraint,
-            has_fixed_use,
         }
     );
     Ok(span)
@@ -2158,9 +2458,6 @@ where
     /// Its resolved constraint.
     constraint: OperandConstraint,
 
-    /// And whether the constraint is a single, fixed register.
-    is_fixed: bool,
-
     /// Whether this use reads the value, as opposed to defining it.
     is_read: bool,
 }
@@ -2178,8 +2475,7 @@ where
         let use_data = &uses[use_];
         let point = use_data.point;
         let operand = usize::from(use_data.operand);
-        let constraint = reuse_aware_constraint(input, point.inst().with_repr32(), operand);
-        let is_fixed = constraint.is_fixed(input.machine);
+        let constraint = reservation_aware_constraint(input, point.inst().with_repr32(), operand);
         let is_read = input
             .func
             .inst(point.inst().with_repr32())
@@ -2191,16 +2487,16 @@ where
             point,
             operand,
             constraint,
-            is_fixed,
             is_read,
         }
     }
 
-    /// Which split, if any, a definition overwriting the register this operand
-    /// is read from demands of the piece accumulated so far.
+    /// Which split, if any, a definition tied to this read by a `Reuse`
+    /// demands of the piece accumulated so far.
     ///
-    /// Two shapes ask for it: a definition tied to this read by a `Reuse`, and
-    /// a definition pinned to the one register this read is pinned to.
+    /// A definition merely pinned to the register this read is pinned to no
+    /// longer asks for any: neither operand constrains its value, so there is
+    /// no shared register to overwrite. See `reservation_aware_constraint`.
     fn tie_split(
         &self,
         input: &Input<'_, impl InputFunction>,
@@ -2218,13 +2514,7 @@ where
         let survives = end > self.point.next_point();
 
         if !is_reuse_target(&input_inst, self.operand) {
-            // Nothing is tied to this read, but a read pinned to a register
-            // that one of this instruction's own definitions overwrites wants
-            // the very same three pieces. The definition takes the register at
-            // `Late` and no move may be placed in the middle of an
-            // instruction, so the value cannot stay there past the early half.
-            return (survives && is_overwritten_read_that_splits(input, inst, self.operand))
-                .then_some(TieSplit::AtOverwrite);
+            return None;
         }
 
         // The value outlives the tie, so it needs a second copy for its later
@@ -2289,9 +2579,6 @@ where
     /// The merged constraint of everything folded in so far.
     constraint: OperandConstraint,
 
-    /// Whether the merged constraint demands one particular register.
-    has_fixed_use: bool,
-
     /// The piece's last point, thus far.
     point: LivePoint<E>,
 
@@ -2306,12 +2593,6 @@ where
 
     /// The merged constraint of just the run of uses.
     run_constraint: OperandConstraint,
-
-    /// Whether the run's merged constraint demands one particular register.
-    run_has_fixed_use: bool,
-
-    /// Whether the piece demanded a fixed register before this run began.
-    before_run_has_fixed_use: bool,
 }
 
 impl<E> Piece<E>
@@ -2324,14 +2605,11 @@ where
             start,
             uses_start,
             constraint: OperandConstraint::Any,
-            has_fixed_use: false,
             point: start,
             first_read: None,
             holds_def: false,
             run_start: uses_start,
             run_constraint: OperandConstraint::Any,
-            run_has_fixed_use: false,
-            before_run_has_fixed_use: false,
         }
     }
 
@@ -2341,14 +2619,11 @@ where
             start,
             uses_start: u.use_,
             constraint: u.constraint,
-            has_fixed_use: u.is_fixed,
             point: u.point,
             first_read: u.is_read.then_some(u.point),
             holds_def: !u.is_read,
             run_start: u.use_,
             run_constraint: u.constraint,
-            run_has_fixed_use: u.is_fixed,
-            before_run_has_fixed_use: false,
         }
     }
 
@@ -2363,11 +2638,8 @@ where
     /// `merged` is the merge of `u`'s constraint with the piece's.
     fn fold(&mut self, u: &ResolvedUse<E>, merged: OperandConstraint, machine: &Machine) {
         if u.point != self.point {
-            // A new run begins: remember the fixedness predating it.
-            self.before_run_has_fixed_use = self.has_fixed_use;
             self.run_start = u.use_;
             self.run_constraint = u.constraint;
-            self.run_has_fixed_use = u.is_fixed;
         } else {
             // The run accumulates only its own uses, not the piece's: whether
             // it can join a tie is only about the uses that would move into the
@@ -2376,10 +2648,8 @@ where
                 .run_constraint
                 .merge_resolved(&u.constraint, machine)
                 .expect("the run admits everything the piece does, which merged with `u`");
-            self.run_has_fixed_use |= u.is_fixed;
         }
         self.constraint = merged;
-        self.has_fixed_use |= u.is_fixed;
         if self.first_read.is_none() && u.is_read {
             self.first_read = Some(u.point);
         }
@@ -2441,7 +2711,6 @@ where
             (self.start, end),
             (self.uses_start, u.use_),
             self.constraint,
-            self.has_fixed_use,
             block,
         )?;
         event!(
@@ -2530,18 +2799,18 @@ where
                 .merge_resolved(&u.constraint, machine)
                 .is_some();
 
-        // Where the piece ends, where its uses end, and whose fixedness.
-        let (end, uses_end, has_fixed_use) = if run_joins_the_tie {
+        // Where the piece ends and where its uses end.
+        let (end, uses_end) = if run_joins_the_tie {
             // The run belongs to the tie: the piece stops short of it.
-            (u.point, self.run_start, self.before_run_has_fixed_use)
+            (u.point, self.run_start)
         } else if run_at_this_point {
             // The run conflicts with the tie, so it stays in the piece, which
             // must reach past the early half to contain it.
-            (u.point.next_point(), u.use_, self.has_fixed_use)
+            (u.point.next_point(), u.use_)
         } else {
             // Nothing here is in the piece, so it ends where the instruction
             // begins.
-            (u.point, u.use_, self.has_fixed_use)
+            (u.point, u.use_)
         };
 
         // The piece so far, `span1`. May be empty, and then not pushed at all.
@@ -2554,7 +2823,6 @@ where
                 (self.start, end),
                 (self.uses_start, uses_end),
                 self.constraint,
-                has_fixed_use,
                 block,
             )?)
         } else {
@@ -2572,7 +2840,6 @@ where
             (u.point, u.point.next_point()),
             (uses_end, after),
             u.constraint,
-            u.is_fixed || (run_joins_the_tie && self.run_has_fixed_use),
             block,
         )?;
         event!(
@@ -2704,7 +2971,6 @@ where
         (piece.start, end),
         (piece.uses_start, span_uses.end),
         piece.constraint,
-        piece.has_fixed_use,
         block,
     )?;
     Ok(())
@@ -2733,70 +2999,6 @@ fn is_reuse_target<'a>(input_inst: &impl InputInst<'a>, index: usize) -> bool {
         .any(|op| op.constraint() == OperandConstraint::Reuse(index))
 }
 
-/// Does this instruction define a value into the one register an early read
-/// constrained to `read_class` is delivered in?
-fn a_late_def_overwrites(
-    input: &Input<'_, impl InputFunction>,
-    inst: Inst,
-    read_class: RegClass,
-) -> bool {
-    debug_assert!(read_class.is_singleton(input.machine));
-    let input_inst = input.func.inst(inst);
-    (0..input_inst.operands_len()).any(|j| {
-        let op = input_inst.operand(j);
-        if op.kind() != DefUse::Def || op.pos() != Position::Late {
-            return false;
-        }
-        let OperandConstraint::Reg(def_class) = reuse_aware_constraint(input, inst, j) else {
-            return false;
-        };
-        def_class.is_singleton(input.machine)
-            && !def_class
-                .member_set(input.machine)
-                .intersection(read_class.member_set(input.machine))
-                .is_empty()
-    })
-}
-
-/// Is the `index`th operand of `inst` an early read pinned to a register that a
-/// definition of this same instruction overwrites?
-fn is_an_overwritten_read(input: &Input<'_, impl InputFunction>, inst: Inst, index: usize) -> bool {
-    let op = input.func.inst(inst).operand(index);
-    if op.kind() != DefUse::Use || op.pos() != Position::Early {
-        return false;
-    }
-    let OperandConstraint::Reg(read_class) = reuse_aware_constraint(input, inst, index) else {
-        return false;
-    };
-    read_class.is_singleton(input.machine) && a_late_def_overwrites(input, inst, read_class)
-}
-
-/// Does a later operand read the same value from a register this instruction
-/// overwrites too?
-fn another_overwritten_read_follows(
-    input: &Input<'_, impl InputFunction>,
-    inst: Inst,
-    index: usize,
-) -> bool {
-    let input_inst = input.func.inst(inst);
-    let val = input_inst.operand(index).val();
-    (index + 1..input_inst.operands_len())
-        .any(|j| input_inst.operand(j).val() == val && is_an_overwritten_read(input, inst, j))
-}
-
-/// Should span construction split this operand's span around a definition that
-/// overwrites the register it is read from? And should coalescing try to glue
-/// the head and tail that surround the split back together?
-pub(crate) fn is_overwritten_read_that_splits(
-    input: &Input<'_, impl InputFunction>,
-    inst: Inst,
-    index: usize,
-) -> bool {
-    is_an_overwritten_read(input, inst, index)
-        && !is_reuse_target(&input.func.inst(inst), index)
-        && !another_overwritten_read_follows(input, inst, index)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2808,7 +3010,7 @@ mod tests {
     use crate::input::BlockFrequency;
     use crate::region_tree::RegionTree;
     use crate::rpo::Rpo;
-    use crate::test::{TestFunction, TestInput};
+    use crate::test::{TestFunction, TestInput, TestMachine};
     use core::sync::atomic::{AtomicUsize, Ordering};
     use mutatis::{
         check::{Check, CheckResult},
@@ -2940,26 +3142,6 @@ mod tests {
         assert_eq!(size_of::<UseData<u8>>(), 6);
     }
 
-    fn span(flags: u8) -> LiveSpanData<u32> {
-        LiveSpanData {
-            start: LivePoint::new(inst(0), Position::Early),
-            end: LivePoint::new(inst(0), Position::Late),
-            uses: EntityRange::empty(),
-            val: Val::try_new(0).unwrap(),
-            flags,
-        }
-    }
-
-    fn has_fixed_use(span: &LiveSpanData<u32>) -> bool {
-        span.flags & SPAN_HAS_FIXED_USE != 0
-    }
-
-    #[test]
-    fn span_has_fixed_use_flag_round_trips() {
-        assert!(!has_fixed_use(&span(0)));
-        assert!(has_fixed_use(&span(SPAN_HAS_FIXED_USE)));
-    }
-
     fn bundle(weight_and_flags: u32) -> LiveBundleData<u32> {
         LiveBundleData {
             spans: EntityRange::empty(),
@@ -2976,10 +3158,6 @@ mod tests {
         bundle.weight_and_flags & BUNDLE_MINIMAL != 0
     }
 
-    fn has_fixed_uses(bundle: &LiveBundleData<u32>) -> bool {
-        bundle.weight_and_flags & BUNDLE_HAS_FIXED_USES != 0
-    }
-
     fn spill_weight(bundle: &LiveBundleData<u32>) -> f32 {
         PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::from_bits(
             bundle.weight_and_flags & BUNDLE_SPILL_WEIGHT_MASK,
@@ -2993,13 +3171,11 @@ mod tests {
 
         let plain = bundle(weight);
         assert!(!is_minimal(&plain));
-        assert!(!has_fixed_uses(&plain));
         assert_eq!(spill_weight(&plain), 3.25);
 
-        let all = bundle(weight | BUNDLE_MINIMAL | BUNDLE_HAS_FIXED_USES);
-        assert!(is_minimal(&all));
-        assert!(has_fixed_uses(&all));
-        assert_eq!(spill_weight(&all), 3.25);
+        let minimal = bundle(weight | BUNDLE_MINIMAL);
+        assert!(is_minimal(&minimal));
+        assert_eq!(spill_weight(&minimal), 3.25);
     }
 
     /// The reason the flags sit above the weight: a minimal bundle outranks
@@ -3017,13 +3193,8 @@ mod tests {
     /// The flag bits and the weight field must exactly tile a `u32`.
     #[test]
     fn bundle_weight_and_flags_tile_a_u32() {
-        assert_eq!(
-            BUNDLE_SPILL_WEIGHT_MASK | BUNDLE_HAS_FIXED_USES | BUNDLE_MINIMAL,
-            u32::MAX
-        );
-        for flag in [BUNDLE_HAS_FIXED_USES, BUNDLE_MINIMAL] {
-            assert_eq!(flag & BUNDLE_SPILL_WEIGHT_MASK, 0);
-        }
+        assert_eq!(BUNDLE_SPILL_WEIGHT_MASK | BUNDLE_MINIMAL, u32::MAX);
+        assert_eq!(BUNDLE_MINIMAL & BUNDLE_SPILL_WEIGHT_MASK, 0);
     }
 
     /// The set holding exactly the registers with these indices.
@@ -3071,6 +3242,31 @@ mod tests {
 
         bundle.add_hint(regs(&[1, 3]));
         assert_eq!(bundle.preference, regs(&[0, 2]));
+    }
+
+    /// Every register held for a fixed operand, as
+    /// `(reg, start, end, reads, writes)`.
+    fn reservations(
+        live_ranges: &LiveRanges<u32>,
+    ) -> Vec<(
+        RegAllocation<u32>,
+        LivePoint<u32>,
+        LivePoint<u32>,
+        bool,
+        bool,
+    )> {
+        live_ranges
+            .reservations()
+            .map(|r| {
+                (
+                    r.reg(live_ranges),
+                    r.start(live_ranges),
+                    r.end(live_ranges),
+                    r.uses(live_ranges),
+                    r.defs(live_ranges),
+                )
+            })
+            .collect()
     }
 
     /// Compute the liveness and live spans of `test_input`'s function.
@@ -3365,16 +3561,17 @@ mod tests {
     }
 
     /// The point of eager splitting, stated directly: a value whose uses want
-    /// disjoint register classes gets one span per class, cut just before the
-    /// use that conflicts.
+    /// locations that no one location satisfies gets one span per demand, cut
+    /// just before the use that conflicts.
     ///
     /// The property test above says that no span is left unsatisfiable; this
     /// says where the split lands, which no invariant pins down.
     #[test]
     fn split_a_span_whose_uses_conflict() {
         let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let stack = OperandConstraint::Stack;
 
-        let test_input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
+        let test_input = TestInput::with_use_constraints(&[rc(2), stack]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         let spans: Vec<LiveSpan> = live_ranges.spans().collect();
@@ -3407,9 +3604,10 @@ mod tests {
         assert_eq!(points(spans[0]), vec![def, first_use]);
         assert_eq!(points(spans[1]), vec![second_use]);
 
-        // The control: `rc2` holds both registers, so it can be satisfied
-        // alongside `rc0` and there is nothing to split.
-        let test_input = TestInput::with_use_constraints(&[rc(0), rc(2)]);
+        // The control: `rc0` and `rc1` are singleton classes, so those uses
+        // hold their registers outright rather than constraining the value,
+        // and no longer disagree about anything.
+        let test_input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         assert_eq!(live_ranges.spans().count(), 1);
     }
@@ -3491,7 +3689,8 @@ mod tests {
         use crate::events::Event;
 
         let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
-        let test_input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
+        let stack = OperandConstraint::Stack;
+        let test_input = TestInput::with_use_constraints(&[rc(2), stack]);
         let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
 
         let spans: Vec<LiveSpan> = live_ranges.spans().collect();
@@ -3535,8 +3734,8 @@ mod tests {
         assert_eq!(before, spans[0]);
         assert_eq!(val, spans[0].val(&live_ranges));
         assert_eq!(at, LivePoint::new(inst(2), Position::Early));
-        assert_eq!(constraint, rc(0));
-        assert_eq!(conflicting, rc(1));
+        assert_eq!(constraint, rc(2));
+        assert_eq!(conflicting, stack);
     }
 
     /// Both directions of a stack cut are logged, each naming the constraint
@@ -3631,21 +3830,16 @@ mod tests {
     /// An overwrite split names the use it was made for and the one-point span
     /// the definition overwrites.
     ///
-    /// Both triggers log the one event: a definition tied to the read by a
-    /// `Reuse`, and a definition pinned to the one register the read is pinned
-    /// to. `target_use` is what tells a reader of the log which of them it was.
+    /// Only a `Reuse` triggers one now: a definition merely pinned to the
+    /// register a read is pinned to holds it by reservation instead.
     #[test]
     #[cfg(feature = "visualizer")]
     fn overwrite_splits_are_logged() {
         use crate::events::Event;
 
-        for (i, test_input) in [
-            TestInput::with_reuse_of_a_surviving_value(),
-            TestInput::with_a_read_overwritten_by_a_fixed_def(),
-            TestInput::with_two_reads_overwritten_by_a_fixed_def(),
-        ]
-        .into_iter()
-        .enumerate()
+        for (i, test_input) in [TestInput::with_reuse_of_a_surviving_value()]
+            .into_iter()
+            .enumerate()
         {
             let (_liveness, live_ranges, events) = analyze_spans_and_events(&test_input).unwrap();
 
@@ -3757,11 +3951,14 @@ mod tests {
     }
 
     /// A read pinned to the one register its own instruction's late definition
-    /// overwrites gets the same three-piece shape a `Reuse` does, and for the
-    /// same reason: the definition takes the register at `Late`, so a value
-    /// that outlives the instruction needs a second copy to carry it onwards.
+    /// overwrites does not split its value's span at all.
+    ///
+    /// This is report 000's shape. The pin no longer constrains the value:
+    /// the instruction holds the register across each of its halves, one
+    /// reservation for the read and one for the definition, and the value is
+    /// free to live somewhere else entirely and be moved in.
     #[test]
-    fn split_a_span_around_a_read_overwritten_by_a_fixed_def() {
+    fn a_read_overwritten_by_a_fixed_def_is_not_split() {
         let test_input = TestInput::with_a_read_overwritten_by_a_fixed_def();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
@@ -3772,50 +3969,59 @@ mod tests {
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)
             .collect();
-        assert_eq!(spans.len(), 3, "{spans:#?}");
+        assert_eq!(spans.len(), 1, "{spans:#?}");
 
         let def = LivePoint::new(inst(0), Position::Late);
         let read = LivePoint::new(inst(1), Position::Early);
         let overwritten = LivePoint::new(inst(1), Position::Late);
         let later_use = LivePoint::new(inst(2), Position::Late);
 
-        // The run up to the pinned read ...
         assert_eq!(spans[0].start(&live_ranges), def);
+        assert_eq!(spans[0].end(&live_ranges), later_use.next_point());
         assert_eq!(
-            spans[0].end(&live_ranges),
-            read,
-            "the first piece stops at the instruction that overwrites its place",
-        );
-
-        // ... the copy the definition overwrites, the instruction's early half ...
-        assert_eq!(spans[1].start(&live_ranges), read);
-        assert_eq!(
-            spans[1].end(&live_ranges),
-            overwritten,
-            "the doomed piece covers just the early half, which is all the \
-             definition leaves it",
-        );
-
-        // ... and the survivor, starting alongside it so both share a source.
-        assert_eq!(spans[2].start(&live_ranges), read);
-        assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
-
-        // The pinned read belongs to the overwritten piece, so that is what
-        // carries its `Reg` constraint and what `Inst::operand_span` resolves
-        // to; the survivor is left free to live anywhere.
-        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
-            span.uses(&live_ranges)
+            spans[0]
+                .uses(&live_ranges)
                 .into_iter()
                 .map(|u| u.point(&live_ranges))
-                .collect()
-        };
-        assert_eq!(points(spans[0]), vec![def]);
-        assert_eq!(points(spans[1]), vec![read]);
-        assert_eq!(points(spans[2]), vec![later_use]);
+                .collect::<Vec<_>>(),
+            vec![def, read, later_use],
+        );
+
+        // And it is free to live anywhere: the pin is a reservation now, not
+        // a constraint.
+        test_input.with_input(|input| {
+            assert_eq!(
+                spans[0].constraint(&live_ranges, input),
+                OperandConstraint::Any,
+                "{:#?}",
+                spans[0],
+            );
+        });
+
+        // The register is held across the read's half and then across the
+        // definition's, by two adjacent reservations rather than one: they
+        // deliver different values, and the second one's value is written
+        // where the first one's was read.
+        let held = reservations(&live_ranges);
+        assert_eq!(held.len(), 2, "{held:#?}");
+        assert_eq!(
+            held[0].0, held[1].0,
+            "both name the same register: {held:#?}"
+        );
+        assert_eq!(held[0], (held[0].0, read, overwritten, true, false));
+        assert_eq!(
+            held[1],
+            (
+                held[1].0,
+                overwritten,
+                overwritten.inst_boundary_after(),
+                false,
+                true,
+            ),
+        );
 
         // The control: with no later read the value dies at the pinned read,
-        // its span ends where the definition takes the register, and there is
-        // nothing to split.
+        // and its span ends at the instruction's late half either way.
         let test_input = TestInput::with_a_dying_read_overwritten_by_a_fixed_def();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
         let survivor =
@@ -3829,14 +4035,12 @@ mod tests {
     }
 
     /// Two reads of one value pinned to the register their instruction
-    /// overwrites share a single doomed copy.
+    /// overwrites hold that register once between them.
     ///
-    /// Both are at one point and want the same register, so splitting at each
-    /// in turn would build one copy per read, all pinned to that register and
-    /// all overlapping --- a demand for registers that do not exist. The split
-    /// fires at the last of them, and the earlier ones fold into its span.
+    /// Naming one register for one value twice asks for nothing more than
+    /// naming it once, and there is only ever the one move that delivers it.
     #[test]
-    fn split_a_span_around_two_reads_overwritten_by_a_fixed_def() {
+    fn two_reads_overwritten_by_a_fixed_def_hold_one_register_once() {
         let test_input = TestInput::with_two_reads_overwritten_by_a_fixed_def();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
@@ -3846,23 +4050,35 @@ mod tests {
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)
             .collect();
-        assert_eq!(spans.len(), 3, "{spans:#?}");
+        assert_eq!(spans.len(), 1, "{spans:#?}");
 
         let read = LivePoint::new(inst(1), Position::Early);
-        assert_eq!(spans[1].start(&live_ranges), read);
-        assert_eq!(
-            spans[1].end(&live_ranges),
-            LivePoint::new(inst(1), Position::Late),
-        );
+        let overwritten = LivePoint::new(inst(1), Position::Late);
 
-        // Both reads landed in the one doomed copy.
+        // Both reads are in the one span, and the two of them share the one
+        // reservation the definition then takes over from.
         assert_eq!(
-            spans[1]
+            spans[0]
                 .uses(&live_ranges)
                 .into_iter()
+                .filter(|u| u.point(&live_ranges) == read)
                 .map(|u| u.operand(&live_ranges))
                 .collect::<Vec<_>>(),
             vec![0, 1],
+        );
+
+        let held = reservations(&live_ranges);
+        assert_eq!(held.len(), 2, "{held:#?}");
+        assert_eq!(held[0], (held[0].0, read, overwritten, true, false));
+        assert_eq!(
+            held[1],
+            (
+                held[1].0,
+                overwritten,
+                overwritten.inst_boundary_after(),
+                false,
+                true,
+            ),
         );
     }
 
@@ -3924,8 +4140,11 @@ mod tests {
 
     /// The same three pieces, but with the plain read pinned to `r0` while the
     /// tie's own operand demands nothing.
+    ///
+    /// The tie is what splits here, not the pin: the pinned read reserves
+    /// `r0` and leaves every piece free to live wherever it likes.
     #[test]
-    fn a_fixed_read_beside_a_reuse_fixes_the_overwritten_piece() {
+    fn a_fixed_read_beside_a_reuse_still_splits_at_the_overwrite() {
         let test_input = TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
@@ -3949,29 +4168,40 @@ mod tests {
         assert_eq!(spans[2].start(&live_ranges), tie);
         assert_eq!(spans[2].end(&live_ranges), later_use.next_point());
 
-        // Both halves of the tie resolve to the pinned read's class: the
-        // target (operand 1) because the sibling narrows it, and the
-        // definition (operand 2) because it is narrowed by the very same
-        // sibling. Agreeing is what keeps them in one bundle.
+        // Both halves of the tie resolve to the survivor's own class, which
+        // is what keeps them in one bundle. The pinned read beside them
+        // narrows neither, since its value is delivered into the reserved
+        // register rather than read out of the tie's location.
         test_input.with_input(|input| {
-            let pinned = reuse_aware_constraint(input, inst(1), 0);
-            let target = reuse_aware_constraint(input, inst(1), 1);
-            let def = reuse_aware_constraint(input, inst(1), 2);
-            assert_eq!(
-                target, pinned,
-                "the tie's target is narrowed to the pinned read beside it",
+            let pinned = reuse_aware_constraint(input.func, input.machine, inst(1), 0);
+            let target = reuse_aware_constraint(input.func, input.machine, inst(1), 1);
+            let def = reuse_aware_constraint(input.func, input.machine, inst(1), 2);
+            assert!(
+                fixed_operand_of(input.func, input.machine, inst(1), 0).is_some(),
+                "the plain read names a single register: {pinned:?}",
             );
             assert_eq!(def, target, "both halves of the tie must agree");
-            assert!(
-                target.is_fixed(input.machine),
-                "and that class is a single register: {target:?}",
+            assert_eq!(
+                target,
+                OperandConstraint::Reg(input.func.value(survivor).reg_class()),
+                "and on the survivor's own class, not the pinned read's",
             );
         });
-        assert!(
-            spans[1].has_fixed_use(&live_ranges),
-            "the overwritten piece holds a read pinned to one register: {:#?}",
-            spans[1],
-        );
+
+        // But the pinned read no longer pins the piece that holds it: one
+        // reservation holds the register over the read instead, and the piece
+        // answers to the tie alone.
+        test_input.with_input(|input| {
+            assert_eq!(
+                spans[1].constraint(&live_ranges, input),
+                OperandConstraint::Reg(input.func.value(survivor).reg_class()),
+                "the overwritten piece is constrained by the tie alone: {:#?}",
+                spans[1],
+            );
+        });
+        let held = reservations(&live_ranges);
+        assert_eq!(held.len(), 1, "{held:#?}");
+        assert_eq!(held[0], (held[0].0, tie, overwritten, true, false));
     }
 
     /// A read pinned elsewhere, at an *earlier* point, does not keep the run at
@@ -4003,8 +4233,8 @@ mod tests {
 
             // The pinned read and the tie want disjoint classes, so the piece
             // before the tie cannot satisfy both --- which is the whole point.
-            let pinned = reuse_aware_constraint(input, inst(1), 0);
-            let tie = reuse_aware_constraint(input, inst(2), 2);
+            let pinned = reuse_aware_constraint(input.func, input.machine, inst(1), 0);
+            let tie = reuse_aware_constraint(input.func, input.machine, inst(2), 2);
             assert!(
                 pinned.merge_resolved(&tie, input.machine).is_none(),
                 "{pinned:?} and {tie:?} should conflict",
@@ -4049,35 +4279,37 @@ mod tests {
         assert_eq!(points(spans[2]), vec![later_use]);
     }
 
-    /// A tie's target joins the sibling that pins its run, rather than folding
-    /// into an earlier piece pinned somewhere else.
+    /// Reads of one value pinned to two different registers, one of them
+    /// beside a tie, leave its span whole.
+    ///
+    /// Each read holds its own register and has the value delivered into it,
+    /// so neither pins the piece it is in and the tie's target has nothing to
+    /// fold into or stay out of.
     #[test]
-    fn a_reuse_target_joins_the_sibling_that_pins_its_run() {
+    fn reads_pinned_to_two_registers_leave_a_tie_unsplit() {
         let test_input = TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         // The reuse at `inst2` names operand 0; operand 1 reads the same value
-        // at the same point, and `inst1` read it at an earlier one.
+        // at the same point under a pin, and `inst1` read it under a different
+        // one at an earlier point.
         let survivor =
             test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val().unwrap());
         let spans: Vec<LiveSpan> = live_ranges
             .spans()
             .filter(|span| span.val(&live_ranges) == survivor)
             .collect();
-        assert_eq!(spans.len(), 2, "{spans:#?}");
+        assert_eq!(spans.len(), 1, "{spans:#?}");
 
         let def = LivePoint::new(inst(0), Position::Late);
         let pinned_read = LivePoint::new(inst(1), Position::Early);
         let tie = LivePoint::new(inst(2), Position::Early);
         let overwritten = LivePoint::new(inst(2), Position::Late);
 
-        // The earlier pinned read's piece stops at the tie ...
+        // One piece holds every read, and runs to the definition that
+        // overwrites the value's last one.
         assert_eq!(spans[0].start(&live_ranges), def);
-        assert_eq!(spans[0].end(&live_ranges), tie);
-        // ... and the doomed copy the definition overwrites holds *both* reads
-        // at the tie's point: the target and the sibling that pins it.
-        assert_eq!(spans[1].start(&live_ranges), tie);
-        assert_eq!(spans[1].end(&live_ranges), overwritten);
+        assert_eq!(spans[0].end(&live_ranges), overwritten);
 
         let uses = |span: LiveSpan| -> Vec<(usize, LivePoint<u32>)> {
             span.uses(&live_ranges)
@@ -4085,12 +4317,54 @@ mod tests {
                 .map(|u| (u.operand(&live_ranges), u.point(&live_ranges)))
                 .collect()
         };
-        assert_eq!(uses(spans[0]), vec![(0, def), (0, pinned_read)]);
         assert_eq!(
-            uses(spans[1]),
-            vec![(0, tie), (1, tie)],
-            "the tie's target did not stay behind in the pinned read's piece",
+            uses(spans[0]),
+            vec![(0, def), (0, pinned_read), (0, tie), (1, tie)],
         );
+
+        // Neither pin reaches it. All that does is the tie's own half, which
+        // asks for the value's own class: a tie has to name where its target
+        // is, so `Any` is not an answer it can give.
+        test_input.with_input(|input| {
+            assert_eq!(
+                spans[0].constraint(&live_ranges, input),
+                OperandConstraint::Reg(input.func.value(survivor).reg_class()),
+                "{:#?}",
+                spans[0],
+            );
+            for operand in [(inst(1), 0), (inst(2), 1)] {
+                let (inst, operand) = operand;
+                assert!(
+                    fixed_operand_of(input.func, input.machine, inst, operand).is_some(),
+                    "operand {operand} of {inst:?} names a single register",
+                );
+                assert_eq!(
+                    reservation_aware_constraint(input, inst, operand),
+                    OperandConstraint::Any,
+                    "and asks nothing of the piece that holds it",
+                );
+            }
+        });
+
+        // Each read holds its register over its own half instead, and the two
+        // of them hold different registers.
+        let held = reservations(&live_ranges);
+        assert_eq!(held.len(), 2, "{held:#?}");
+        assert_ne!(
+            held[0].0, held[1].0,
+            "the two reads name different registers: {held:#?}",
+        );
+        assert_eq!(
+            held[0],
+            (
+                held[0].0,
+                pinned_read,
+                pinned_read.next_point(),
+                true,
+                false
+            ),
+        );
+        assert_eq!(held[1], (held[1].0, tie, overwritten, true, false));
 
         // And so the definition's span can share a bundle with its target's:
         // the two constraints merge, which is what coalescing needs.
@@ -4101,7 +4375,7 @@ mod tests {
             .find(|span| span.val(&live_ranges) == tied)
             .unwrap();
         test_input.with_input(|input| {
-            let target = spans[1].constraint(&live_ranges, input);
+            let target = spans[0].constraint(&live_ranges, input);
             let definition = def_span.constraint(&live_ranges, input);
             assert!(
                 target.merge_resolved(&definition, input.machine).is_some(),
@@ -4110,62 +4384,90 @@ mod tests {
         });
     }
 
-    /// A tie's target that *dies* at it still needs its own span when an
-    /// earlier read pinned its piece to a narrower class: folding it in would
-    /// commit the tie to a register the definition cannot use, and coalescing
-    /// cannot undo that.
+    /// A tie's target that *dies* at it needs no span of its own when an
+    /// earlier read named a register the tie cannot use.
+    ///
+    /// That read holds the register for itself, so it never narrows the piece
+    /// it is in, and the tie's two halves are left free to agree on one
+    /// location the definition can also be read from.
     #[test]
-    fn split_a_span_around_a_reuse_of_a_dying_value_pinned_earlier() {
+    fn a_reuse_of_a_dying_value_pinned_earlier_is_not_split() {
         let test_input = TestInput::with_a_pinned_read_before_a_reuse_of_a_dying_value();
         let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
 
         // The reuse at `inst2` names operand 0, the value's last read; `inst1`
-        // read it earlier under a strictly narrower class.
+        // read it earlier under a pin the tie's own half cannot satisfy.
         let dying =
             test_input.with_input(|input| input.func.inst(inst(2)).operand(0).val().unwrap());
         test_input.with_input(|input| {
             assert_eq!(input.func.inst(inst(1)).operand(0).val(), Some(dying));
-            let pinned = reuse_aware_constraint(input, inst(1), 0);
-            let tie = reuse_aware_constraint(input, inst(2), 0);
+            let pinned = reuse_aware_constraint(input.func, input.machine, inst(1), 0);
+            let tie = reuse_aware_constraint(input.func, input.machine, inst(2), 0);
+            assert!(
+                fixed_operand_of(input.func, input.machine, inst(1), 0).is_some(),
+                "the earlier read names a single register: {pinned:?}",
+            );
             assert_eq!(
                 pinned.merge_resolved(&tie, input.machine),
                 Some(pinned),
-                "the fixture must narrow the tie, not conflict with it: \
-                 {pinned:?} and {tie:?}",
+                "one the tie's class holds, so the fixture asks for a \
+                 narrowing and not a conflict: {pinned:?} and {tie:?}",
             );
-            assert_ne!(pinned, tie, "and narrow it strictly");
+            assert_ne!(pinned, tie, "and strictly narrower than it");
+
+            // But a narrowing the piece never sees: the register is held for
+            // the read and the value moved into it.
+            assert_eq!(
+                reservation_aware_constraint(input, inst(1), 0),
+                OperandConstraint::Any,
+            );
         });
 
         let spans: Vec<LiveSpan> = live_ranges
             .spans()
             .filter(|span| span.val(&live_ranges) == dying)
             .collect();
-        assert_eq!(spans.len(), 2, "{spans:#?}");
+        assert_eq!(spans.len(), 1, "{spans:#?}");
 
         let def = LivePoint::new(inst(0), Position::Late);
         let pinned_read = LivePoint::new(inst(1), Position::Early);
         let tie = LivePoint::new(inst(2), Position::Early);
         let overwritten = LivePoint::new(inst(2), Position::Late);
 
-        // The pinned read's piece stops at the tie ...
+        // One piece holds both reads and ends where the tie overwrites the
+        // second of them.
         assert_eq!(spans[0].start(&live_ranges), def);
-        assert_eq!(spans[0].end(&live_ranges), tie);
-        // ... and the tied read gets the instruction's early half to itself,
-        // the same span a surviving target's doomed copy would have.
-        assert_eq!(spans[1].start(&live_ranges), tie);
-        assert_eq!(spans[1].end(&live_ranges), overwritten);
-
-        let points = |span: LiveSpan| -> Vec<LivePoint<u32>> {
-            span.uses(&live_ranges)
+        assert_eq!(spans[0].end(&live_ranges), overwritten);
+        assert_eq!(
+            spans[0]
+                .uses(&live_ranges)
                 .into_iter()
                 .map(|u| u.point(&live_ranges))
-                .collect()
-        };
-        assert_eq!(points(spans[0]), vec![def, pinned_read]);
+                .collect::<Vec<_>>(),
+            vec![def, pinned_read, tie],
+        );
+
+        // Each pinned read holds its register over its own half.
+        let held = reservations(&live_ranges);
+        assert_eq!(held.len(), 2, "{held:#?}");
+        assert_ne!(
+            held[0].0, held[1].0,
+            "the two reads name different registers: {held:#?}",
+        );
         assert_eq!(
-            points(spans[1]),
-            vec![tie],
-            "the tie's target did not stay behind in the pinned read's piece",
+            held[0],
+            (
+                held[0].0,
+                pinned_read,
+                pinned_read.next_point(),
+                true,
+                false
+            ),
+        );
+        let tied_read = LivePoint::new(inst(3), Position::Early);
+        assert_eq!(
+            held[1],
+            (held[1].0, tied_read, tied_read.next_point(), true, false),
         );
 
         // Which is what lets the tie coalesce: the target's span keeps the
@@ -4177,7 +4479,7 @@ mod tests {
             .find(|span| span.val(&live_ranges) == tied)
             .unwrap();
         test_input.with_input(|input| {
-            let target = spans[1].constraint(&live_ranges, input);
+            let target = spans[0].constraint(&live_ranges, input);
             let definition = def_span.constraint(&live_ranges, input);
             assert!(
                 target.merge_resolved(&definition, input.machine).is_some(),
@@ -4334,11 +4636,22 @@ mod tests {
     /// both have had their constraints recomputed from the spans they kept.
     #[test]
     fn split_bundle_keeps_storage_tiled() {
-        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let rc = |i: u8| OperandConstraint::Reg(RegClass::try_new(i.into()).unwrap());
+        let (first, second) = (
+            rc(TestMachine::FIRST_PAIR_CLASS),
+            rc(TestMachine::SECOND_PAIR_CLASS),
+        );
 
         // Alternating conflicting classes, so that span construction cuts the
         // one value into a span per use and there are several cuts to try.
-        let test_input = TestInput::with_use_constraints(&[rc(0), rc(1), rc(0), rc(1), rc(0)]);
+        // Neither class names a single register, which a use would reserve
+        // instead of constraining its span, leaving nothing to cut.
+        let test_input = TestInput::with_use_constraints_in(
+            TestMachine::four_registers(),
+            TestMachine::ALL_FOUR_REGS_CLASS,
+            OperandConstraint::Any,
+            &[first, second, first, second, first],
+        );
         let region = Region::try_new(0).unwrap();
 
         let build = || -> (LiveRanges<u32>, Vec<LiveSpan>) {
@@ -4477,11 +4790,6 @@ mod tests {
                     "constraint of {half:?} after splitting at {prefix_end}",
                 );
                 assert_eq!(
-                    half.has_fixed_uses(&live_ranges),
-                    want.has_fixed_uses(&reference),
-                    "has_fixed_uses of {half:?} after splitting at {prefix_end}",
-                );
-                assert_eq!(
                     half.spill_weight(&live_ranges),
                     want.spill_weight(&reference),
                     "spill_weight of {half:?} after splitting at {prefix_end}",
@@ -4513,15 +4821,26 @@ mod tests {
     /// alone.
     #[test]
     fn split_bundle_within_span() {
-        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let rc = |i: u8| OperandConstraint::Reg(RegClass::try_new(i.into()).unwrap());
+        let pairs = [
+            rc(TestMachine::FIRST_PAIR_CLASS),
+            rc(TestMachine::SECOND_PAIR_CLASS),
+        ];
         let any = OperandConstraint::Any;
 
         // Two conflicting classes, each held for three instructions at a time,
         // so that span construction cuts the value into spans that cover
         // several instructions and hold several uses. That gives every span an
         // interior instruction boundary to cut at, with uses on both sides.
-        let constraints: Vec<_> = (0..5).flat_map(|k| [rc(k % 2), any, any]).collect();
-        let test_input = TestInput::with_use_constraints(&constraints);
+        // Neither class names a single register, which a use would reserve
+        // instead of constraining its span, leaving nothing to cut.
+        let constraints: Vec<_> = (0..5).flat_map(|k| [pairs[k % 2], any, any]).collect();
+        let test_input = TestInput::with_use_constraints_in(
+            TestMachine::four_registers(),
+            TestMachine::ALL_FOUR_REGS_CLASS,
+            any,
+            &constraints,
+        );
         let region = Region::try_new(0).unwrap();
 
         // Neighbouring spans conflict, so as in `split_bundle_keeps_storage_tiled`
@@ -4613,7 +4932,6 @@ mod tests {
                     let divided = spans[i];
                     let (start, end) = (divided.start(&live_ranges), divided.end(&live_ranges));
                     let uses = divided.uses(&live_ranges).into_iter().collect::<Vec<_>>();
-                    let had_fixed_use = divided.has_fixed_use(&live_ranges);
                     let len_insts = |live_ranges: &LiveRanges<u32>, b: LiveBundle| {
                         b.spans(live_ranges)
                             .map(|s| s.len_insts(live_ranges))
@@ -4678,14 +4996,6 @@ mod tests {
                             );
                         }
                     }
-
-                    // A fixed use is still fixed and did not become one: it went
-                    // to whichever piece kept it.
-                    assert_eq!(
-                        divided.has_fixed_use(&live_ranges) || new_span.has_fixed_use(&live_ranges),
-                        had_fixed_use,
-                        "{context}",
-                    );
 
                     // Each half holds the spans it should, in order, and each
                     // span names the half that holds it.
@@ -4752,9 +5062,8 @@ mod tests {
                     // `push_bundle` would have computed for the same span list.
                     // Rebuilding in place is destructive, so this goes last.
                     for (half, run) in [(bundle, prefix_run), (suffix, suffix_run)] {
-                        let (constraint, has_fixed_uses, spill_weight, is_minimal) = (
+                        let (constraint, spill_weight, is_minimal) = (
                             half.constraint(&live_ranges),
-                            half.has_fixed_uses(&live_ranges),
                             half.spill_weight(&live_ranges),
                             half.is_minimal(&live_ranges),
                         );
@@ -4777,11 +5086,6 @@ mod tests {
                         });
 
                         assert_eq!(constraint, want.constraint(&live_ranges), "{context}");
-                        assert_eq!(
-                            has_fixed_uses,
-                            want.has_fixed_uses(&live_ranges),
-                            "{context}",
-                        );
                         assert_eq!(spill_weight, want.spill_weight(&live_ranges), "{context}");
                         assert_eq!(is_minimal, want.is_minimal(&live_ranges), "{context}");
                     }
@@ -4965,14 +5269,25 @@ mod tests {
     /// bundle pays full price, a bundle with gaps the discounted one.
     #[test]
     fn rematerializable_values_are_cheaper_to_hold() {
-        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
+        let rc = |i: u8| OperandConstraint::Reg(RegClass::try_new(i.into()).unwrap());
+        let (first, second) = (
+            rc(TestMachine::FIRST_PAIR_CLASS),
+            rc(TestMachine::SECOND_PAIR_CLASS),
+        );
 
         // A bundle over `pick`'s spans: weight, minimality, and the
         // undiscounted cost and length behind that weight.
         let weigh = |remat, pick: fn(Vec<LiveSpan>) -> Vec<LiveSpan>| -> (f32, bool, f32, usize) {
             // Alternating conflicting classes, so span construction cuts a
             // span per use at every remat cost, not just the always-remat one.
-            let mut test_input = TestInput::with_use_constraints(&[rc(0), rc(1), rc(0), rc(1)]);
+            // Neither class names a single register, which a use would reserve
+            // instead of constraining its span, leaving nothing to cut.
+            let mut test_input = TestInput::with_use_constraints_in(
+                TestMachine::four_registers(),
+                TestMachine::ALL_FOUR_REGS_CLASS,
+                OperandConstraint::Any,
+                &[first, second, first, second],
+            );
             test_input.set_remat_costs(remat);
 
             let (_liveness, mut live_ranges) = analyze_spans(&test_input).unwrap();
@@ -5063,41 +5378,46 @@ mod tests {
         );
     }
 
-    /// A use that names a class holding one register has no allocation choice
-    /// left, and the span that covers it says so.
+    /// A use that names a class holding one register does not constrain its
+    /// span at all: the register is held for it by a reservation instead.
     #[test]
-    fn a_use_that_names_one_register_is_a_fixed_use() {
+    fn a_use_that_names_one_register_becomes_a_reservation() {
         let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
 
-        let flags = |test_input: &TestInput| -> Vec<bool> {
+        let summarize = |test_input: &TestInput| -> (Vec<OperandConstraint>, usize) {
             let (_liveness, live_ranges) = analyze_spans(test_input).unwrap();
-            live_ranges
-                .spans()
-                .map(|s| s.has_fixed_use(&live_ranges))
-                .collect()
+            let constraints = test_input.with_input(|input| {
+                live_ranges
+                    .spans()
+                    .map(|s| s.constraint(&live_ranges, input))
+                    .collect::<Vec<_>>()
+            });
+            (constraints, live_ranges.reservations().count())
         };
 
-        // `rc0` holds exactly one of `two_registers`' two registers...
+        // `rc0` holds exactly one of `two_registers`' two registers, so the
+        // use is reserved out of the span's constraint entirely...
         assert_eq!(
-            flags(&TestInput::with_use_constraints(&[rc(0)])),
-            vec![true]
+            summarize(&TestInput::with_use_constraints(&[rc(0)])),
+            (vec![OperandConstraint::Any], 1),
         );
 
-        // ...while `rc2` holds both, so a use of it still has a choice.
+        // ...while `rc2` holds both, so the use still constrains its span and
+        // reserves nothing.
         assert_eq!(
-            flags(&TestInput::with_use_constraints(&[rc(2)])),
-            vec![false]
+            summarize(&TestInput::with_use_constraints(&[rc(2)])),
+            (vec![rc(2)], 0),
         );
 
-        // The flag is per span, not per value: a value whose stack use and
-        // fixed register use force a split only flags the piece that actually
-        // has the fixed one.
+        // A stack use and a fixed register use still split the value, because
+        // the stack use is a constraint like any other; only the fixed half
+        // becomes a reservation.
         assert_eq!(
-            flags(&TestInput::with_use_constraints(&[
+            summarize(&TestInput::with_use_constraints(&[
                 OperandConstraint::Stack,
                 rc(0),
             ])),
-            vec![false, true],
+            (vec![OperandConstraint::Stack, OperandConstraint::Any], 1),
         );
     }
 
@@ -5369,7 +5689,7 @@ mod tests {
                                 // came from, so that this is a check on where the
                                 // spans were cut and not on a second reading of the
                                 // same operands.
-                                let this = reuse_aware_constraint(
+                                let this = reservation_aware_constraint(
                                     input,
                                     use_data.point(&live_ranges).inst(),
                                     use_data.operand(&live_ranges),
@@ -5797,13 +6117,10 @@ mod tests {
                     }
 
                     // 10. Each use's weight is the cost model applied to that
-                    // use's own operand, in that use's own block, and a span flags
-                    // a fixed use exactly when one of its uses names a class that
-                    // holds a single register.
+                    // use's own operand, in that use's own block.
                     test_input.with_input(|input| -> Result<(), String> {
                         for span in live_ranges.spans() {
                             let val = span.val(&live_ranges);
-                            let mut any_fixed = false;
 
                             for u in span.uses(&live_ranges) {
                                 let point = u.point(&live_ranges);
@@ -5834,23 +6151,6 @@ mod tests {
                                         actual.as_f32(),
                                     ));
                                 }
-
-                                // A tie strengthens `Any` into the value's class,
-                                // which may hold one register, as construction saw.
-                                any_fixed |= match reuse_aware_constraint(input, point.inst(), operand)
-                                {
-                                    OperandConstraint::Reg(class) => class.is_singleton(input.machine),
-                                    _ => false,
-                                };
-                            }
-
-                            if span.has_fixed_use(&live_ranges) != any_fixed {
-                                return Err(format!(
-                                    "{span:?} reports has_fixed_use = {}, but {} of its uses names a \
-                                     class holding a single register",
-                                    span.has_fixed_use(&live_ranges),
-                                    if any_fixed { "one" } else { "none" },
-                                ));
                             }
                         }
                         Ok(())

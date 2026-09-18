@@ -21,12 +21,13 @@ use crate::{
         DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand,
         OperandConstraint, Position,
     },
-    live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST},
-    machine::Machine,
-    output::OutputInner,
+    live_ranges::{FixedOperand, MAX_INST_INDEX, MAX_OPERANDS_PER_INST, fixed_operand_of},
+    machine::{Machine, RegUnit},
+    output::{OutputInner, RegAllocation},
     timing::Timing,
 };
 use alloc::vec::Vec;
+use core::ops::Range;
 
 pub(crate) fn validate<E>(
     input: &Input<'_, impl InputFunction>,
@@ -514,8 +515,13 @@ where
         }
     }
 
+    // Reused by the per-instruction check, so it allocates once per function.
+    let mut scratch = FixedOperandScratch::default();
+
     for (block, _) in func.blocks() {
-        if let Err(e) = check_block_reg_classes(func, machine, &func.block(block), block) {
+        if let Err(e) =
+            check_block_reg_classes(func, machine, &mut scratch, &func.block(block), block)
+        {
             return output.error(e);
         }
     }
@@ -526,6 +532,7 @@ where
 fn check_block_reg_classes<'a>(
     func: &impl InputFunction,
     machine: &Machine,
+    scratch: &mut FixedOperandScratch,
     input_block: &impl InputBlock<'a>,
     block: Block,
 ) -> Result<()> {
@@ -587,6 +594,8 @@ fn check_block_reg_classes<'a>(
                 OperandConstraint::Any | OperandConstraint::Stack => {}
             }
         }
+
+        check_inst_fixed_operands(func, machine, scratch, inst, input_inst.operands_len())?;
     }
 
     for (i, successor) in input_block.successors().enumerate() {
@@ -604,6 +613,180 @@ fn check_block_reg_classes<'a>(
     }
 
     Ok(())
+}
+
+/// Check that no two of an instruction's fixed operands want the same register
+/// at the same time.
+pub(crate) fn check_inst_fixed_operands(
+    func: &impl InputFunction,
+    machine: &Machine,
+    scratch: &mut FixedOperandScratch,
+    inst: Inst,
+    num_operands: usize,
+) -> Result<()> {
+    let FixedOperandScratch { claims, holds } = scratch;
+    claims.clear();
+    holds.clear();
+
+    // One hold per (claim, register, half). Two claims want the same register
+    // at the same time exactly when two holds overlap.
+    for operand in 0..num_operands {
+        let Some(claim) = FixedClaim::of(func, machine, inst, operand) else {
+            continue;
+        };
+        let index = claims.len();
+        for units in claim.reg().units(machine) {
+            // A non-allocatable register covers no units, and so holds
+            // nothing anything else could contend for.
+            if units.start >= units.end {
+                continue;
+            }
+            for half in [Position::Early, Position::Late] {
+                if claim.covers(half) {
+                    holds.push(Hold {
+                        half,
+                        units: units.clone(),
+                        claim: index,
+                    });
+                }
+            }
+        }
+        claims.push((operand, claim));
+    }
+
+    // Sorted, so that the scan below is linear: overlapping holds are adjacent
+    // once the ones that ended are dropped.
+    holds.sort_unstable_by_key(|h| (h.half, h.units.start));
+
+    // The hold the scan is inside of: the end of its units and the claim that
+    // owns it. One is enough, since overlapping holds that do not conflict
+    // cover the very same units, and so are indistinguishable here.
+    let mut open: Option<(Position, RegUnit, usize)> = None;
+
+    for hold in holds.iter() {
+        if let Some((half, end, claim)) = open
+            && half == hold.half
+            && hold.units.start < end
+        {
+            if claim != hold.claim {
+                let (i, this) = claims[hold.claim];
+                let (j, other) = claims[claim];
+                if this.conflicts_with(machine, &other) {
+                    let (operand, conflicts_with) = (i.max(j), i.min(j));
+                    return Err(Error::ConflictingFixedOperands {
+                        inst,
+                        operand,
+                        conflicts_with,
+                    });
+                }
+            }
+            // Keep the earlier operand, the one worth naming.
+            open = Some((half, end.max(hold.units.end), claim.min(hold.claim)));
+        } else {
+            open = Some((hold.half, hold.units.end, hold.claim));
+        }
+    }
+
+    Ok(())
+}
+
+/// Scratch for `check_inst_fixed_operands`, reused across instructions.
+#[derive(Default)]
+pub(crate) struct FixedOperandScratch {
+    /// The instruction's fixed operands, each with the index of the operand it
+    /// came from, in operand order.
+    claims: Vec<(usize, FixedClaim)>,
+
+    /// One entry per claim, register of that claim, and half the claim covers.
+    holds: Vec<Hold>,
+}
+
+/// One claim's hold on the units of one of the registers it names, over one
+/// half of the instruction.
+struct Hold {
+    /// The half held, and the first part of the sort key.
+    half: Position,
+
+    /// The units held, which are the units of one register.
+    units: Range<RegUnit>,
+
+    /// The index in `FixedOperandScratch::claims` of the claim holding them.
+    claim: usize,
+}
+
+/// One fixed operand's claim on the register it names.
+#[derive(Clone, Copy)]
+struct FixedClaim {
+    /// What the operand names.
+    fixed: FixedOperand,
+
+    /// Whether the claim covers the instruction's early half.
+    early: bool,
+
+    /// Whether it covers the late half.
+    late: bool,
+}
+
+impl FixedClaim {
+    /// The claim `operand` makes, or `None` when it is not a fixed operand.
+    fn of(
+        func: &impl InputFunction,
+        machine: &Machine,
+        inst: Inst,
+        operand: usize,
+    ) -> Option<Self> {
+        let fixed = fixed_operand_of(func, machine, inst, operand)?;
+
+        // Asked of `FixedOperand`, so the halves checked here are exactly the
+        // ones `collect_block_reservations` would hold.
+        Some(FixedClaim {
+            fixed,
+            early: fixed.holds(inst, Position::Early),
+            late: fixed.holds(inst, Position::Late),
+        })
+    }
+
+    /// Does this claim cover `half` of the instruction?
+    fn covers(&self, half: Position) -> bool {
+        match half {
+            Position::Early => self.early,
+            Position::Late => self.late,
+        }
+    }
+
+    /// The register, or register group, this claim names.
+    fn reg(&self) -> RegAllocation {
+        self.fixed.reg
+    }
+
+    /// The value it reads out of, or writes into, that register.
+    fn val(&self) -> Val {
+        self.fixed.val
+    }
+
+    /// Do these two claims want the same register at the same time?
+    fn conflicts_with(&self, machine: &Machine, other: &Self) -> bool {
+        // Different halves, so no contest: a late definition may take the
+        // register an early read consumed.
+        if !((self.early && other.early) || (self.late && other.late)) {
+            return false;
+        }
+
+        // Two claims on one register for one value agree rather than compete;
+        // `collect_block_reservations` folds them into one hold.
+        if self.reg() == other.reg() && self.val() == other.val() {
+            return false;
+        }
+
+        // Compared unit by unit, since two registers that are not equal may
+        // still overlap: a register group and one of its members, say.
+        self.reg().units(machine).any(|a| {
+            other
+                .reg()
+                .units(machine)
+                .any(|b| a.start < b.end && b.start < a.end)
+        })
+    }
 }
 
 /// Check that the dominance information the input reports agrees with the

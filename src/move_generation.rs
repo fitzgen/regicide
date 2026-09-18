@@ -60,7 +60,7 @@ use crate::{
         DefUse, Input, InputBlock, InputFunction, InputInst as _, InputValue as _, Position,
         RematCost,
     },
-    live_ranges::{LivePoint, LiveRanges, LiveSpan},
+    live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation},
     liveness::{Liveness, block_last_inst},
     machine::{Interfere, Machine, Reg, RegBank},
     output::{
@@ -368,6 +368,38 @@ where
     val: Val<E>,
 }
 
+/// One of `generate`'s passes, in the order they must run.
+///
+/// The passes consume and mutate state produced by each other and rely on
+/// invariants created by each other that are easy to accidentally overlook. We
+/// use this for debug asserts; see `enter_pass`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MovePass {
+    /// No pass has run yet.
+    Start,
+    IndexFunction,
+    EmitHalfMoves,
+    EmitSpills,
+    EmitReservationHalfMoves,
+    Resolve,
+    Sequentialize,
+}
+
+impl MovePass {
+    /// The pass that must run after this one, if any.
+    fn next(self) -> Option<Self> {
+        match self {
+            MovePass::Start => Some(MovePass::IndexFunction),
+            MovePass::IndexFunction => Some(MovePass::EmitHalfMoves),
+            MovePass::EmitHalfMoves => Some(MovePass::EmitSpills),
+            MovePass::EmitSpills => Some(MovePass::EmitReservationHalfMoves),
+            MovePass::EmitReservationHalfMoves => Some(MovePass::Resolve),
+            MovePass::Resolve => Some(MovePass::Sequentialize),
+            MovePass::Sequentialize => None,
+        }
+    }
+}
+
 /// The move generation pass and its scratch space.
 pub(crate) struct MoveGeneration<E>
 where
@@ -398,6 +430,10 @@ where
     /// Scratch for the pass's walk over every value's spans.
     spans: Vec<LiveSpan<E>>,
 
+    /// Scratch, live only while visiting one block, sorted by the instruction
+    /// and value each entry answers for.
+    reservation_in_outs: Vec<ReservationInOut<E>>,
+
     /// Every move to make, sorted by position.
     batch_moves: Vec<(PackedMovePosition<E>, BatchMove<E>)>,
 
@@ -416,6 +452,9 @@ where
 
     /// The result of this pass: every edit, sorted by position.
     edits: Vec<(PackedMovePosition<E>, Edit<E>)>,
+
+    /// The last of `generate`'s passes to have started.
+    pass: MovePass,
 }
 
 impl<E> Default for MoveGeneration<E>
@@ -438,12 +477,14 @@ where
             edges: PrimaryMap::new(),
             param_of: SecondaryMap::new(None),
             spans: Vec::new(),
+            reservation_in_outs: Vec::new(),
             batch_moves: Vec::new(),
             expanded: Vec::new(),
             remats: Vec::new(),
             solved: Vec::new(),
             solver: ParallelMoveSolver::new(),
             edits: Vec::new(),
+            pass: MovePass::Start,
         }
     }
 
@@ -454,24 +495,28 @@ where
             edges,
             param_of,
             spans,
-            batch_moves: batch,
+            reservation_in_outs,
+            batch_moves,
             expanded,
             remats,
             solved,
             solver,
             edits,
+            pass,
         } = self;
         sources.clear();
         dests.clear();
         edges.reset();
         param_of.reset();
         spans.clear();
-        batch.clear();
+        reservation_in_outs.clear();
+        batch_moves.clear();
         expanded.clear();
         remats.clear();
         solved.clear();
         solver.reset();
         edits.clear();
+        *pass = MovePass::Start;
     }
 
     pub fn is_reset(&self) -> bool {
@@ -481,24 +526,38 @@ where
             edges,
             param_of,
             spans,
-            batch_moves: batch,
+            reservation_in_outs,
+            batch_moves,
             expanded,
             remats,
             solved,
             solver,
             edits,
+            pass,
         } = self;
         sources.is_empty()
             && dests.is_empty()
             && edges.is_reset()
             && param_of.is_reset()
             && spans.is_empty()
-            && batch.is_empty()
+            && reservation_in_outs.is_empty()
+            && batch_moves.is_empty()
             && expanded.is_empty()
             && remats.is_empty()
             && solved.is_empty()
             && solver.is_reset()
             && edits.is_empty()
+            && *pass == MovePass::Start
+    }
+
+    /// Record that `pass` is starting, and check the passes run in order.
+    fn enter_pass(&mut self, pass: MovePass) {
+        debug_assert_eq!(
+            Some(pass),
+            self.pass.next(),
+            "move generation's passes must run in order, and each exactly once",
+        );
+        self.pass = pass;
     }
 
     /// Get the edits this pass generated, sorted by position and then moves
@@ -573,6 +632,16 @@ where
             spill_placement,
             output,
         )?;
+        self.emit_reservation_half_moves(
+            input,
+            counts,
+            events,
+            rpo,
+            liveness,
+            live_ranges,
+            spill_slots,
+            output,
+        )?;
         self.resolve(input, counts, events);
         self.sequentialize(
             input,
@@ -591,6 +660,7 @@ where
         rpo: &Rpo<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
+        self.enter_pass(MovePass::IndexFunction);
         let func = input.func;
 
         for block in rpo.iter() {
@@ -661,6 +731,7 @@ where
         spill_slots: &SpillSlots<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
+        self.enter_pass(MovePass::EmitHalfMoves);
         let mut spans = core::mem::take(&mut self.spans);
         debug_assert!(spans.is_empty());
 
@@ -689,9 +760,72 @@ where
             Ok(())
         })();
 
-        spans.clear();
+        // `self.spans` is left populated and sorted for the reservation pass.
         self.spans = spans;
+
         result
+    }
+
+    /// The spans of `val`, in program order.
+    ///
+    /// Only valid while `self.spans` holds the sorted list `emit_half_moves`
+    /// and `emit_reservation_half_moves` share.
+    fn spans_of(&self, live_ranges: &LiveRanges<E>, val: Val<E>) -> &[LiveSpan<E>] {
+        let range = self.spans_range(live_ranges, val);
+        &self.spans[range]
+    }
+
+    /// The indices where the spans of `val` sit in `self.spans`.
+    fn spans_range(&self, live_ranges: &LiveRanges<E>, val: Val<E>) -> Range<usize> {
+        let spans = self.spans.as_slice();
+        let start = spans.partition_point(|s| s.val(live_ranges) < val);
+        let end = spans.partition_point(|s| s.val(live_ranges) <= val);
+        start..end
+    }
+
+    /// Does `span` only get its value in the gap where it begins, so that
+    /// reading out of it there would read it before it is filled?
+    fn arrives_in_the_gap(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+        span: LiveSpan<E>,
+        pos: PackedMovePosition<E>,
+        key_val: Val<E>,
+        held: Allocation<E>,
+    ) -> bool {
+        let func = input.func;
+        let val = span.val(live_ranges);
+        let start = span.start(live_ranges);
+        let block = span.block(func, live_ranges);
+
+        // At the top of a block the value arrives along the edges, either
+        // before this gap or as a source a predecessor records in it. What is
+        // left is a span no predecessor delivers to, as an `AlwaysRemat`
+        // value's is in a block that never mentions it: only `resolve`'s
+        // recomputation fills it, after this position's moves.
+        if start == block.start_point(input) {
+            return !self.sources.contains_key(&HalfMoveKey::new(pos, key_val))
+                && Self::should_remat(input, held, None, key_val);
+        }
+
+        // The instruction itself puts it in place.
+        if defines_val_at(func, val, start) {
+            return false;
+        }
+
+        // Otherwise a previous span of this block hands over to this one, and
+        // only a previous span that holds the value somewhere can.
+        incoming_allocation(
+            input,
+            live_ranges,
+            spill_slots,
+            self.spans_of(live_ranges, val),
+            block,
+            start,
+        )
+        .is_none()
     }
 
     fn emit_value_half_moves(
@@ -801,28 +935,14 @@ where
             // rather than let `resolve` join the halves together later. That
             // might be faster.
             if start != block.start_point(input) {
-                let incoming = value_spans[..i]
-                    .iter()
-                    .rev()
-                    .take_while(|prev| prev.block(func, live_ranges) == block)
-                    .filter(|prev| prev.start(live_ranges) < start)
-                    .find(|prev| {
-                        let reaches = start <= prev.end(live_ranges);
-                        debug_assert!(
-                            reaches
-                                || input.func.value(val.with_repr32()).remat_cost()
-                                    == Some(RematCost::AlwaysRemat),
-                            "{val:?}'s spans must overlap or abut, but {prev:?} ends at {:?}, \
-                             before {start:?}",
-                            prev.end(live_ranges),
-                        );
-                        reaches
-                    })
-                    .copied()
-                    // A previous piece holding its value nowhere does not flow
-                    // into this one: dropping it leaves the source-less
-                    // destination below, which `resolve` fills by recomputing.
-                    .and_then(|prev| prev.allocation(live_ranges, spill_slots));
+                let incoming = incoming_allocation(
+                    input,
+                    live_ranges,
+                    spill_slots,
+                    &value_spans[..i],
+                    block,
+                    start,
+                );
                 if let Some(prev_alloc) = incoming {
                     if prev_alloc != alloc {
                         debug_assert!(
@@ -1029,6 +1149,7 @@ where
         spill_placement: &SpillPlacement<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
+        self.enter_pass(MovePass::EmitSpills);
         let func = input.func;
 
         for spill_site in spill_placement.spills().iter().copied() {
@@ -1088,7 +1209,120 @@ where
 
         Ok(())
     }
+}
 
+/// Where one reservation's value is on either side of its instruction.
+#[derive(Clone, Copy)]
+struct ReservationInOut<E>
+where
+    E: EntityRepr,
+{
+    /// The instruction whose reservations this answers for.
+    inst: Inst<E>,
+
+    /// The value they hold a register for.
+    val: Val<E>,
+
+    /// The span the value is read out of, to be delivered into the register
+    /// before the instruction reads it.
+    read_from: Option<LiveSpan<E>>,
+
+    /// The span the value is written into, carrying it back out of the register
+    /// after the instruction writes it.
+    written_into: Option<LiveSpan<E>>,
+}
+
+/// Find the spans the value is in on either side of each reservation's
+/// instruction.
+fn find_reservation_in_outs<E>(
+    func: &impl InputFunction,
+    live_ranges: &LiveRanges<E>,
+    in_outs: &mut Vec<ReservationInOut<E>>,
+    block: Block<E>,
+    reservations: EntityRange<Reservation<E>>,
+) where
+    E: EntityRepr,
+{
+    debug_assert!(in_outs.is_empty());
+
+    in_outs.extend(reservations.into_iter().map(|r| ReservationInOut {
+        inst: r.start(live_ranges).inst(),
+        val: r.val(live_ranges),
+        read_from: None,
+        written_into: None,
+    }));
+    in_outs.sort_unstable_by_key(|p| (p.inst, p.val));
+    in_outs.dedup_by_key(|p| (p.inst, p.val));
+
+    for u in block.uses(live_ranges) {
+        let point = u.point(live_ranges);
+        let span = u.span(live_ranges);
+        let key = (point.inst(), span.val(live_ranges));
+        let Ok(entry) = in_outs.binary_search_by_key(&key, |p| (p.inst, p.val)) else {
+            continue;
+        };
+
+        let operand = func
+            .inst(point.inst().with_repr32())
+            .operand(u.operand(live_ranges));
+        match operand.kind() {
+            // The first one in this order.
+            DefUse::Use => _ = in_outs[entry].read_from.get_or_insert(span),
+            // A value is defined once, so there is only ever the one of these.
+            DefUse::Def => {
+                debug_assert!(in_outs[entry].written_into.is_none());
+                in_outs[entry].written_into = Some(span);
+            }
+        }
+    }
+}
+
+/// Where the value of the span starting at `start` in `block` comes from, when
+/// a previous span of the same value in the same block hands it over.
+///
+/// `val_spans` is a window of one value's spans in program order, as
+/// `MoveGeneration::pieces_of` hands it out. Spans at or after `start`, and
+/// spans belonging to other blocks, are not candidates.
+fn incoming_allocation<E>(
+    input: &Input<'_, impl InputFunction>,
+    live_ranges: &LiveRanges<E>,
+    spill_slots: &SpillSlots<E>,
+    val_spans: &[LiveSpan<E>],
+    block: Block<E>,
+    start: LivePoint<E>,
+) -> Option<Allocation<E>>
+where
+    E: EntityRepr,
+{
+    let func = input.func;
+    val_spans
+        .iter()
+        .rev()
+        .skip_while(|prev| prev.start(live_ranges) >= start)
+        .take_while(|prev| prev.block(func, live_ranges) == block)
+        // A value's spans within a block abut or overlap, so at most one of
+        // them reaches `start` and the first one found is the only one.
+        .find(|prev| {
+            let val = prev.val(live_ranges);
+            let reaches = start <= prev.end(live_ranges);
+            debug_assert!(
+                reaches
+                    || func.value(val.with_repr32()).remat_cost() == Some(RematCost::AlwaysRemat),
+                "{val:?}'s spans must overlap or abut, but {prev:?} ends at {:?}, before \
+                 {start:?}",
+                prev.end(live_ranges),
+            );
+            reaches
+        })
+        // A span holding its value nowhere does not flow into this one;
+        // `resolve` fills the source-less destination by recomputing.
+        .and_then(|prev| prev.allocation(live_ranges, spill_slots))
+}
+
+impl<E> MoveGeneration<E>
+where
+    E: EntityRepr,
+{
     /// Get the value a spill at `pos` in `block` should be filed under.
     ///
     /// Normally this is the given `val` itself, but block parameters are keyed
@@ -1115,6 +1349,297 @@ where
         Ok(val)
     }
 
+    /// Connect each register reserved for a fixed operand to wherever the
+    /// value's own span needs it.
+    ///
+    /// A fixed operand leaves its value's bundle unconstrained (see
+    /// `live_ranges::ReservationData`), so these moves make good on the
+    /// bundle's allocation.
+    fn emit_reservation_half_moves(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        rpo: &Rpo<E>,
+        liveness: &Liveness<E>,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        self.enter_pass(MovePass::EmitReservationHalfMoves);
+
+        debug_assert_eq!(self.spans.len(), live_ranges.spans().len());
+        debug_assert!(self.spans.is_sorted_by_key(|&span| (
+            span.val(live_ranges),
+            span.start(live_ranges),
+            span.end(live_ranges),
+        )));
+
+        for block in rpo.iter() {
+            let reservations = block.reservations(live_ranges);
+            if reservations.is_empty() {
+                continue;
+            }
+
+            find_reservation_in_outs(
+                input.func,
+                live_ranges,
+                &mut self.reservation_in_outs,
+                block,
+                reservations,
+            );
+
+            for reservation in reservations {
+                let val = reservation.val(live_ranges);
+                let held = Allocation::Reg(reservation.reg(live_ranges));
+
+                let key = (reservation.start(live_ranges).inst(), val);
+                let entry = self
+                    .reservation_in_outs
+                    .binary_search_by_key(&key, |p| (p.inst, p.val))
+                    .expect("`reservation_in_outs` has an entry for every reservation");
+                let ReservationInOut {
+                    read_from,
+                    written_into,
+                    ..
+                } = self.reservation_in_outs[entry];
+
+                if reservation.uses(live_ranges) {
+                    // At the top of a block the move sits on the incoming
+                    // edge, where a parameter goes by its predecessor's
+                    // argument.
+                    let pos = PackedMovePosition::point(reservation.start(live_ranges));
+                    let key_val = self.val_for_spill_key(input, output, block, val, pos)?;
+
+                    // A span filled in this very gap cannot be read out of
+                    // here.
+                    let arrives_here = read_from.is_some_and(|span| {
+                        span.start(live_ranges) >= reservation.start(live_ranges)
+                            && self.arrives_in_the_gap(
+                                input,
+                                live_ranges,
+                                spill_slots,
+                                span,
+                                pos,
+                                key_val,
+                                held,
+                            )
+                    });
+
+                    self.emit_reservation_arrival(
+                        counts,
+                        events,
+                        live_ranges,
+                        spill_slots,
+                        pos,
+                        key_val,
+                        held,
+                        read_from,
+                        arrives_here,
+                    );
+                }
+
+                if reservation.defs(live_ranges) {
+                    self.emit_reservation_departure(
+                        input,
+                        counts,
+                        events,
+                        liveness,
+                        live_ranges,
+                        spill_slots,
+                        output,
+                        block,
+                        reservation,
+                        val,
+                        held,
+                        written_into,
+                    )?;
+                }
+            }
+
+            self.reservation_in_outs.clear();
+        }
+
+        self.spans.clear();
+        Ok(())
+    }
+
+    /// Move `val` into the register reserved for the operands that read it
+    /// there.
+    fn emit_reservation_arrival(
+        &mut self,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+        pos: PackedMovePosition<E>,
+        key_val: Val<E>,
+        held: Allocation<E>,
+        read_from: Option<LiveSpan<E>>,
+        arrives_here: bool,
+    ) {
+        match read_from.and_then(|span| span.allocation(live_ranges, spill_slots)) {
+            // Already where it needs to be.
+            Some(alloc) if alloc == held => {}
+
+            // Where the value is over this gap, which loses to a span boundary
+            // here: that one knows where it *arrives*.
+            Some(alloc) if !arrives_here => {
+                self.emit_spill(counts, events, pos, key_val, alloc, held)
+            }
+
+            // A value held nowhere, or held only once this gap has filled it,
+            // is left to `resolve` to recompute.
+            _ => self.emit_dest(counts, events, pos, key_val, held),
+        }
+    }
+
+    /// Move `val` out of the register the instruction defining it wrote it to.
+    ///
+    /// The move goes in the gap after the instruction, or, on a terminator,
+    /// along the outgoing edges.
+    fn emit_reservation_departure(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        liveness: &Liveness<E>,
+        live_ranges: &LiveRanges<E>,
+        spill_slots: &SpillSlots<E>,
+        output: &mut OutputInner<E>,
+        block: Block<E>,
+        reservation: Reservation<E>,
+        val: Val<E>,
+        held: Allocation<E>,
+        written_into: Option<LiveSpan<E>>,
+    ) -> IResult<()> {
+        let Some(span) = written_into else {
+            // Nothing reads the value, so there is nowhere to put it.
+            return Ok(());
+        };
+
+        let end = reservation.end(live_ranges);
+
+        if end != block.end_point(input) {
+            // The value is in the register and nowhere else over this gap.
+            self.overwrite_source(counts, events, PackedMovePosition::point(end), val, held);
+
+            // And every place the value still has to be in, past this gap, is
+            // filled out of that register here, since the register is the only
+            // place it is.
+            let pos = PackedMovePosition::point(end);
+            for i in self.spans_range(live_ranges, val) {
+                let span = self.spans[i];
+                if span.start(live_ranges) > end || span.end(live_ranges) <= end {
+                    continue;
+                }
+                let Some(alloc) = span.allocation(live_ranges, spill_slots) else {
+                    continue;
+                };
+                if alloc != held {
+                    self.emit_dest(counts, events, pos, val, alloc);
+                }
+            }
+
+            // A span on the stack is wanted here even when it stops at this
+            // gap: spill placement declines its store, having no site where the
+            // value sits in a register of its own, so this definition owns it.
+            if let Some(alloc @ Allocation::Stack(_)) = span.allocation(live_ranges, spill_slots)
+                && alloc != held
+            {
+                self.emit_dest(counts, events, pos, val, alloc);
+            }
+        } else {
+            // The instruction terminates the block, so the gap after it is the
+            // outgoing edges.
+            if !span_is_live_out_of_block(input, liveness, val, block, span.end(live_ranges)) {
+                return Ok(());
+            }
+            let stack_home = match span.allocation(live_ranges, spill_slots) {
+                Some(alloc @ Allocation::Stack(_)) => Some(alloc),
+                _ => None,
+            };
+            let input_block = input.func.block(block.with_repr32());
+            for (index, succ) in input_block.successors().enumerate() {
+                let succ = output.with_repr::<E, _>(succ)?;
+                let pos = edge_position(
+                    input,
+                    EdgeData {
+                        succ,
+                        pred: block,
+                        index: u16::try_from(index).unwrap(),
+                    },
+                )?;
+                self.overwrite_source(counts, events, pos, val, held);
+
+                if let Some(alloc) = stack_home
+                    && succ.is_live_in(liveness, val)
+                {
+                    self.emit_dest(counts, events, pos, val, alloc);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Record that `val` is in `alloc` at `pos`, unless something better
+    /// informed already said where it is.
+    fn emit_source_if_unknown(
+        &mut self,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        pos: PackedMovePosition<E>,
+        val: Val<E>,
+        alloc: Allocation<E>,
+    ) {
+        if let Entry::Vacant(entry) = self.sources.entry(HalfMoveKey::new(pos, val)) {
+            trace!("move generation: emit source {val:?} at {pos:?} is {alloc:?}");
+            counts.half_move_sources.inc();
+            entry.insert(alloc);
+            event!(
+                events,
+                HalfMoveSource {
+                    pos,
+                    val,
+                    alloc,
+                    replaced: None
+                }
+            );
+        }
+    }
+
+    /// Record that `val` is in `alloc` at `pos`, regardless whatever else was
+    /// recorded there.
+    ///
+    /// `emit_source` keeps the better of two answers because a value can be in
+    /// several places at once (e.g. in a register and on the stack). A fixed
+    /// definition's register, however, is not one answer among several: the
+    /// instruction put the value there and nowhere else, so every other answer
+    /// at that point is stale.
+    fn overwrite_source(
+        &mut self,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        pos: PackedMovePosition<E>,
+        val: Val<E>,
+        alloc: Allocation<E>,
+    ) {
+        debug_assert_eq!(self.pass, MovePass::EmitReservationHalfMoves);
+        trace!("move generation: overwrite source {val:?} at {pos:?} is {alloc:?}");
+        counts.half_move_sources.inc();
+        let replaced = self.sources.insert(HalfMoveKey::new(pos, val), alloc);
+        event!(
+            events,
+            HalfMoveSource {
+                pos,
+                val,
+                alloc,
+                replaced
+            }
+        );
+    }
+
     /// Record the half moves for a single spill.
     fn emit_spill(
         &mut self,
@@ -1125,20 +1650,7 @@ where
         arrives_in: Allocation<E>,
         dst: Allocation<E>,
     ) {
-        if let Entry::Vacant(entry) = self.sources.entry(HalfMoveKey::new(pos, val)) {
-            trace!("move generation: emit source {val:?} at {pos:?} is {arrives_in:?}");
-            counts.half_move_sources.inc();
-            entry.insert(arrives_in);
-            event!(
-                events,
-                HalfMoveSource {
-                    pos,
-                    val,
-                    alloc: arrives_in,
-                    replaced: None
-                }
-            );
-        }
+        self.emit_source_if_unknown(counts, events, pos, val, arrives_in);
         self.emit_dest(counts, events, pos, val, dst);
     }
 
@@ -1150,6 +1662,7 @@ where
         counts: &mut Counts,
         events: &mut EventsLog<E>,
     ) {
+        self.enter_pass(MovePass::Resolve);
         let mut dests = core::mem::take(&mut self.dests);
 
         // One destination can be asked for multiple times: two spans beginning
@@ -1231,6 +1744,8 @@ where
         spill_slots: &mut SpillSlots<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
+        self.enter_pass(MovePass::Sequentialize);
+
         #[cfg(feature = "visualizer")]
         let events_start = events.len();
 
@@ -2009,6 +2524,24 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
 
+            // The registers held for fixed operands, which no span covers and
+            // which nothing else describes.
+            let reservations = func
+                .blocks()
+                .flat_map(|(block, _)| {
+                    block.reservations(live_ranges).into_iter().map(move |r| {
+                        (
+                            r.val(live_ranges),
+                            r.start(live_ranges),
+                            r.end(live_ranges),
+                            Allocation::Reg(r.reg(live_ranges)),
+                            r.uses(live_ranges),
+                            block,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
             // Where each of spill placement's stores lands, worked out from
             // the shape of the CFG the way `emit_spills` does. Checking the
             // slots against these is what keeps the seeding below from simply
@@ -2109,6 +2642,17 @@ mod tests {
                         }
                     }
                 }
+
+                // And the reserved registers, last: a reservation is what the
+                // instruction itself did with the register, and no span can
+                // say otherwise.
+                for &(val, start, end, alloc, _, _) in &reservations {
+                    if start < point && point <= end {
+                        for (alloc, part) in parts_of(val, alloc) {
+                            state.write(machine, alloc, Some(part));
+                        }
+                    }
+                }
                 state
             };
 
@@ -2128,6 +2672,17 @@ mod tests {
                         start <= point && point < end && !defines(val)
                     })
                     .flat_map(|&(val, _, _, alloc, _)| parts_of(val, alloc))
+                    // Plus every register held for a read. `defines` does not
+                    // apply: an instruction that both reads a register and
+                    // defines the same value into it still needs the read.
+                    .chain(
+                        reservations
+                            .iter()
+                            .filter(|&&(_, start, end, _, reads, _)| {
+                                reads && start <= point && point < end
+                            })
+                            .flat_map(|&(val, _, _, alloc, ..)| parts_of(val, alloc)),
+                    )
                     .collect::<Vec<_>>()
             };
 
@@ -2276,6 +2831,14 @@ mod tests {
                     }
                     needed.extend(parts_of(val, alloc));
                 }
+
+                // A fixed read of the entry block's first instruction is
+                // delivered here: that gap is the top of the block.
+                for &(val, start, end, alloc, reads, block) in &reservations {
+                    if block == entry && reads && start <= entry_start && entry_start < end {
+                        needed.extend(parts_of(val, alloc));
+                    }
+                }
                 check(&state, &needed, &(entry, "arrival"))?;
                 check(&state, &stored_at(pos, &|val| val), &(entry, "arrival"))?;
             }
@@ -2345,6 +2908,16 @@ mod tests {
                         }
                     }
 
+                    // A fixed operand of the terminator holds its register
+                    // right up to the edge, whatever the spans say.
+                    for &(val, _, end, alloc, _, block) in &reservations {
+                        if block == pred && end == pred.end_point(input) {
+                            for (alloc, part) in parts_of(val, alloc) {
+                                state.write(machine, alloc, Some(part));
+                            }
+                        }
+                    }
+
                     // Everything between the two blocks, in order: the end of
                     // the gap before the terminator, the edge itself, then the
                     // top of the successor.
@@ -2382,6 +2955,23 @@ mod tests {
                         if arg != val && matches!(alloc, Allocation::Stack(_)) {
                             seen.stack_params += 1;
                         }
+                        needed.extend(
+                            parts_of(val, alloc)
+                                .into_iter()
+                                .map(|(alloc, part)| (alloc, Part { val: arg, ..part })),
+                        );
+                    }
+
+                    // And the registers held for the fixed reads of the
+                    // successor's first instruction, delivered on this edge.
+                    for &(val, start, end, alloc, reads, block) in &reservations {
+                        if block != succ || !reads || start > entry || entry >= end {
+                            continue;
+                        }
+                        let arg = match params.iter().position(|&param| param == val) {
+                            Some(i) => args[i],
+                            None => val,
+                        };
                         needed.extend(
                             parts_of(val, alloc)
                                 .into_iter()

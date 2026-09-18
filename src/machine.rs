@@ -137,6 +137,7 @@
 use crate::{
     Entity, EntityRepr, Error, Result,
     entity::{FixedEntitySet, PrimaryMap, words_for},
+    output::RegAllocation,
     spill_slot_allocation::SpillSlotSize,
 };
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
@@ -332,10 +333,30 @@ impl RegClass {
 
     /// Does this class contain exactly one register (or one register group)?
     #[inline]
-    pub fn is_singleton(self, machine: &Machine) -> bool {
+    pub fn is_fixed_reg(self, machine: &Machine) -> bool {
+        self.fixed_reg(machine).is_some()
+    }
+
+    /// The single register, or register group, this class holds.
+    ///
+    /// Returns `None` if this is not a singleton class.
+    #[inline]
+    pub(crate) fn fixed_reg(self, machine: &Machine) -> Option<RegAllocation> {
         match self.members(machine) {
-            RegClassMembers::Regs(regs) => regs.len() == 1,
-            RegClassMembers::Groups(groups) => groups.len() == 1,
+            RegClassMembers::Regs(regs) => {
+                if regs.len() == 1 {
+                    Some(RegAllocation::Reg(regs[0]))
+                } else {
+                    None
+                }
+            }
+            RegClassMembers::Groups(groups) => {
+                if groups.len() == 1 {
+                    Some(RegAllocation::RegGroup(groups[0]))
+                } else {
+                    None
+                }
+            }
         }
     }
 

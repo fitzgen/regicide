@@ -100,8 +100,6 @@ where
         num_uses: usize,
         /// The merged constraint of those uses.
         constraint: OperandConstraint,
-        /// Does some use demand one particular register?
-        has_fixed_use: bool,
     },
 
     /// A span was split where carrying one more use would have cost the uses
@@ -657,7 +655,6 @@ mod viz_enabled {
                     block,
                     num_uses: _,
                     constraint,
-                    has_fixed_use: _,
                 } => {
                     f(EntityRef::Span(*span));
                     f(EntityRef::Val(*val));
@@ -1062,7 +1059,6 @@ mod viz_enabled {
             block: Block,
             num_uses: _,
             constraint: (CONSTRAINT),
-            has_fixed_use: _,
         }
         EagerSplit {
             val: Val,

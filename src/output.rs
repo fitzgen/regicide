@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::ops::Range;
 
 use crate::context::{Context, WhichContext};
 use crate::entity::{Block, Entity, EntityRange, EntityRepr, Inst, PrimaryMap, SecondaryMap, Val};
@@ -6,9 +7,9 @@ use crate::error::{IResult, InternalError};
 #[cfg(feature = "visualizer")]
 use crate::input::Input;
 use crate::input::{InputBlock, InputFunction, InputInst as _, OperandConstraint, Position};
-use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan};
+use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan, fixed_operand_of};
 use crate::liveness::block_inst_bounds;
-use crate::machine::{Interfere, Machine, Reg, RegClass, RegClassMembers, RegGroup};
+use crate::machine::{Interfere, Machine, Reg, RegClass, RegClassMembers, RegGroup, RegUnit};
 use crate::move_generation::{MoveGeneration, PackedMovePosition};
 use crate::rpo::Rpo;
 use crate::spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize, SpillSlots};
@@ -191,6 +192,21 @@ where
             RegAllocation::Reg(_) => 1,
             RegAllocation::RegGroup(group) => group.members(machine).len(),
         }
+    }
+
+    /// The register units this allocation covers, one range per register it
+    /// is made of.
+    pub(crate) fn units(
+        self,
+        machine: &Machine,
+    ) -> impl Iterator<Item = Range<RegUnit>> + Clone + '_ {
+        let (reg, group) = match self {
+            RegAllocation::Reg(reg) => (Some(reg), [].as_slice()),
+            RegAllocation::RegGroup(group) => (None, group.members(machine)),
+        };
+        reg.map(|reg| reg.units(machine))
+            .into_iter()
+            .chain(group.iter().map(|reg| reg.units(machine)))
     }
 
     /// The `i`th of the registers this allocation is made of.
@@ -990,12 +1006,18 @@ impl<E: EntityRepr> OutputInner<E> {
 
         self.operand_allocs.reserve(func.len_insts());
         for (block, input_block) in func.blocks() {
-            self.reserve_block_inst_allocs(machine, &input_block)?;
+            self.reserve_block_inst_allocs(func, machine, &input_block)?;
             self.reserve_block_param_allocs(block, &input_block)?;
         }
 
         for block in rpo.iter() {
             for u in block.uses(live_ranges) {
+                // A fixed operand's allocation was already filled in by
+                // `reserve_block_inst_allocs`.
+                if u.is_fixed(live_ranges, func, machine) {
+                    continue;
+                }
+
                 let inst = u.point(live_ranges).inst();
                 let operand = u.operand(live_ranges);
                 let alloc = u
@@ -1119,14 +1141,16 @@ impl<E: EntityRepr> OutputInner<E> {
     ///
     /// An operand that names no value gets its answer here rather than from
     /// the scatter: it has no span for the scatter to walk, because there is
-    /// no value to place.
+    /// no value to place. So does a fixed operand, whose answer is the
+    /// register held for it.
     fn reserve_block_inst_allocs<'a>(
         &mut self,
+        func: &impl InputFunction,
         machine: &Machine,
         input_block: &impl InputBlock<'a>,
     ) -> IResult<()> {
         for (inst, input_inst) in input_block.insts() {
-            let inst = self.with_repr::<E, _>(inst)?;
+            let e_inst = self.with_repr::<E, _>(inst)?;
 
             let start_index = self.operand_allocs.len();
             let end_index = start_index + input_inst.operands_len();
@@ -1134,16 +1158,22 @@ impl<E: EntityRepr> OutputInner<E> {
             let end = self.entity::<OperandAllocation<E>>(end_index)?;
 
             for i in start_index..end_index {
-                let operand = input_inst.operand(i - start_index);
+                let index = i - start_index;
+                let operand = input_inst.operand(index);
                 let alloc = match (operand.val(), operand.constraint()) {
                     (None, OperandConstraint::Reg(class)) => {
                         first_member(machine, class).unwrap_or(UNALLOCATED)
                     }
-                    _ => UNALLOCATED,
+                    // A fixed operand is reported in the register reserved
+                    // for it.
+                    _ => match fixed_operand_of(func, machine, inst, index) {
+                        Some(fixed) => Allocation::Reg(fixed.reg),
+                        None => UNALLOCATED,
+                    },
                 };
                 self.operand_allocs.push_unwrap(alloc);
             }
-            self.inst_allocs[inst] = EntityRange { start, end };
+            self.inst_allocs[e_inst] = EntityRange { start, end };
         }
         Ok(())
     }

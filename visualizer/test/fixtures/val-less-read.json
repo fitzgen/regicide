@@ -24,7 +24,6 @@
         "inst": 1,
         "pos": "late"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 2,
       "span": 0,

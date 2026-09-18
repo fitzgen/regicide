@@ -43,9 +43,11 @@ impl SplitScore {
     /// `max_interference` is the worst interference of its parts, and
     /// `min_use_weight` is the least use weight of its parts.
     ///
-    /// Both must be finite and greater than or equal to `0.0`.
+    /// Neither may be NaN and both must be at least `0.0`. `max_interference`
+    /// may be infinite: a register held for a fixed operand cannot be vacated
+    /// at any price.
     pub fn new(max_interference: f32, min_use_weight: f32) -> Self {
-        debug_assert!(max_interference.is_finite());
+        debug_assert!(!max_interference.is_nan());
         debug_assert!(min_use_weight.is_finite());
         debug_assert!(max_interference >= 0.0);
         debug_assert!(min_use_weight >= 0.0);
@@ -160,6 +162,9 @@ where
 
     /// Whether `clipped` comes before `whole` (suffix) or after it (prefix).
     clipped_first: bool,
+
+    /// Where the divided span sat in the slice this half was carved from.
+    clipped_index: usize,
 }
 
 impl<'a, E> HalfSpan<'a, E>
@@ -181,6 +186,7 @@ where
             clipped_start: spans[index].start,
             clipped_end: at,
             clipped_first: false,
+            clipped_index: index,
         }
     }
 
@@ -191,6 +197,7 @@ where
             clipped_start: at,
             clipped_end: spans[index].end,
             clipped_first: true,
+            clipped_index: index,
         }
     }
 
@@ -214,8 +221,27 @@ where
     }
 
     /// This half's spans, in ascending program order.
+    #[cfg(test)]
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone + '_ {
         (0..self.len()).map(|i| self.get(i))
+    }
+
+    /// Where this half's `i`th span sat in the slice the half was carved from.
+    fn original_index(&self, i: usize) -> usize {
+        debug_assert!(i < self.len());
+        if self.clipped_first {
+            self.clipped_index + i
+        } else {
+            i
+        }
+    }
+
+    /// This half's spans, each paired with its index in the slice the half was
+    /// carved from, in ascending program order.
+    pub fn iter_indexed(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (usize, Range<LivePoint<E>>)> + Clone + '_ {
+        (0..self.len()).map(|i| (self.original_index(i), self.get(i)))
     }
 }
 

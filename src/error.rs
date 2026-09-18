@@ -451,6 +451,29 @@ pub enum Error {
         operand: usize,
     },
 
+    /// Two of an instruction's fixed operands want the same register (or
+    /// register unit) at the same time.
+    ///
+    /// A fixed operand, one whose constraint resolves to a class holding a
+    /// single register or register group, does not choose a register but names
+    /// one, which the allocator holds for it. A read holds its register from
+    /// the gap before the instruction through the half the read happens in; a
+    /// definition holds it from its own half through the gap after. So an early
+    /// read and a late definition may name one register, but an early
+    /// definition and a read may not. Operands that want a register at the same
+    /// time are legal only as reads of the same value under the same
+    /// constraint.
+    ConflictingFixedOperands {
+        /// The instruction with the offending operands.
+        inst: Inst,
+
+        /// The index of the later of the two operands.
+        operand: usize,
+
+        /// The index of the earlier operand it conflicts with.
+        conflicts_with: usize,
+    },
+
     /// The function has an instruction index above the largest one supported.
     TooManyInsts {
         /// The first [`Inst`] found whose index is out of range.
@@ -669,6 +692,15 @@ impl fmt::Debug for Error {
             Self::ReuseOfOperandWithoutVal { inst, operand } => write!(
                 f,
                 "operand {operand} of {inst:?} reuses an operand that names no value"
+            ),
+            Self::ConflictingFixedOperands {
+                inst,
+                operand,
+                conflicts_with,
+            } => write!(
+                f,
+                "operands {conflicts_with} and {operand} of {inst:?} both name the same \
+                 register at the same time"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

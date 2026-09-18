@@ -1867,7 +1867,7 @@ where
         // operand asked for.
         let Some(val) = op.val() else {
             if let OperandConstraint::Reg(class) = op.constraint() {
-                if class.is_singleton(machine) {
+                if class.is_fixed_reg(machine) {
                     self.stats.fixed_operands += 1;
                 }
                 if matches!(alloc, Allocation::Reg(_)) {
@@ -1890,7 +1890,7 @@ where
             }
 
             OperandConstraint::Reg(class) => {
-                if class.is_singleton(machine) {
+                if class.is_fixed_reg(machine) {
                     self.stats.fixed_operands += 1;
                 }
                 if matches!(alloc, Allocation::Reg(_)) {
@@ -2465,19 +2465,45 @@ mod tests {
         }
     }
 
-    /// An early read pinned to the one register its own instruction's late
-    /// definition overwrites is satisfiable whenever the value outlives the
-    /// instruction, and construction's three-piece split is what expresses it:
-    /// the value keeps a register of its own across the instruction, and the
-    /// copy in the overwritten register lives only across the early half and
-    /// is destroyed by the definition.
+    /// Every input whose operands name a particular register is satisfiable,
+    /// and stays satisfiable.
     #[test]
-    fn a_read_overwritten_by_a_fixed_def_costs_no_extra_register() {
+    fn fixed_operands_cost_no_extra_register() {
         for (i, test_input) in [
-            // The reproducer from the report.
+            // The reproducer from report 000: a read pinned to the register
+            // its own instruction's definition overwrites.
             TestInput::with_a_read_overwritten_by_a_fixed_def(),
-            // Two reads at one point, which one doomed copy must serve.
+            // The same, with the value dying at the read.
+            TestInput::with_a_dying_read_overwritten_by_a_fixed_def(),
+            // Two reads at one point, which one reservation must serve.
             TestInput::with_two_reads_overwritten_by_a_fixed_def(),
+            // A definition pinned to a register, read out of it into a piece
+            // that takes over from another claiming the same register.
+            TestInput::with_a_fixed_def_before_a_reuse_of_its_pinned_read(),
+            // A `Reuse` definition tied to a pinned read.
+            TestInput::with_a_reuse_of_a_pinned_read(),
+            // A pinned read beside a tie, and before one.
+            TestInput::with_a_fixed_read_beside_a_reuse_of_a_surviving_value(),
+            TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
+            TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read(),
+            TestInput::with_a_pinned_read_before_a_reuse_of_a_dying_value(),
+            // A read of a register that holds no value of the function's, and
+            // so reserves nothing at all.
+            TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
+            TestInput::with_one_value_read_from_two_registers(),
+            TestInput::with_a_clobber_beside_a_live_through_value(),
+            TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Any),
+            TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Stack),
+            // A pinned definition whose own piece loses the register it is
+            // written into, so that the move out of the reservation is the
+            // only store of the value.
+            TestInput::with_a_fixed_def_spilled_beside_a_fixed_read(),
+            // A reload that lands where a reservation of the same value in the
+            // other register order already is.
+            TestInput::with_a_reload_under_a_reversed_group_reservation(),
+            // A pinned read of a value nothing delivers, which only the
+            // recomputation after the gap's moves can fill.
+            TestInput::with_a_recomputed_value_pinned_at_a_block_start(),
         ]
         .into_iter()
         .enumerate()
@@ -2487,21 +2513,215 @@ mod tests {
             assert_eq!(
                 stats.too_many_live_regs, 0,
                 "fixture {i} should fit on its machine: the value can keep a \
-                 register of its own while a doomed copy satisfies the pinned \
-                 read",
+                 register of its own while the reservation satisfies the \
+                 operand that names one",
             );
         }
     }
 
-    /// The neighbouring shapes that really are unsatisfiable must stay that
-    /// way: the fix is a new span shape for one specific conflict, not a
-    /// blanket decision to stop reporting conflicts.
+    /// `v0` is read from `r0` at the instruction's early half and `v1` is
+    /// written into `r0` at its late half, so across that instruction the two
+    /// values need both of the machine's registers at once. Holding `r0` for
+    /// each half in turn leaves `v0` free to live in `r1` and be moved into
+    /// `r0` in the gap before the instruction, which is the only assignment
+    /// that works.
     #[test]
-    fn unsatisfiable_neighbours_still_report_too_many_live_regs() {
+    fn a_read_overwritten_by_a_fixed_def_allocates_the_way_report_000_wants() {
+        let test_input = TestInput::with_a_read_overwritten_by_a_fixed_def();
+        let (r0, r1): (Reg, Reg) = (Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap());
+        let in_reg = |reg| Allocation::Reg(RegAllocation::Reg(reg));
+
+        test_input.with_input(|input| {
+            let mut context = Context::new();
+            let output = crate::run(&mut context, input).expect("the input allocates");
+            check(input, &output).expect("and the allocation is correct");
+
+            // `v0` lives in the register its read is *not* pinned to, and the
+            // definition that takes `r0` gets it.
+            let inst = |i| Inst::try_new(i).unwrap();
+            assert_eq!(output.inst_allocs(inst(0)), [in_reg(r1)]);
+            assert_eq!(output.inst_allocs(inst(1)), [in_reg(r0), in_reg(r0)]);
+            assert_eq!(output.inst_allocs(inst(2)), [in_reg(r1)]);
+
+            // And one move delivers it into the register the read names, in
+            // the gap before the instruction that reads it there.
+            let block = Block::try_new(0).unwrap();
+            let mut seen = Vec::new();
+            for item in output.block_insts_and_edits(input.func, block) {
+                match item {
+                    InstOrEdit::Inst(inst) => seen.push((inst, None)),
+                    InstOrEdit::Edit(edit) => {
+                        let (inst, _) = *seen.last().expect("no edit comes before `inst0`");
+                        seen.push((inst, Some(edit)));
+                    }
+                }
+            }
+            let edits: Vec<(Inst, Edit)> = seen
+                .into_iter()
+                .filter_map(|(inst, edit)| edit.map(|edit| (inst, edit)))
+                .collect();
+            assert_eq!(
+                edits,
+                [(inst(0), Edit::Move(Move::RegReg { from: r1, to: r0 }),)],
+                "one move, in the gap after `inst0` and so before `inst1`",
+            );
+        });
+    }
+
+    /// A definition pinned to a register is read out of it even when the
+    /// piece taking the value over claims the same register as the piece
+    /// before it.
+    #[test]
+    fn a_fixed_def_is_read_out_of_its_reservation_across_matching_pieces() {
+        let test_input = TestInput::with_a_fixed_def_before_a_reuse_of_its_pinned_read();
+        let (r0, r1): (Reg, Reg) = (Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap());
+        let in_reg = |reg| Allocation::Reg(RegAllocation::Reg(reg));
+
+        test_input.with_input(|input| {
+            let mut context = Context::new();
+            let output = crate::run(&mut context, input).expect("the input allocates");
+            check(input, &output).expect("and the allocation is correct");
+
+            // The pinned definition and the pinned read both name `r1`, and
+            // the tie takes it over; the surviving read finds `v0` in `r0`.
+            let inst = |i| Inst::try_new(i).unwrap();
+            assert_eq!(output.inst_allocs(inst(0)), [in_reg(r1)]);
+            assert_eq!(output.inst_allocs(inst(1)), [in_reg(r1), in_reg(r1)]);
+            assert_eq!(output.inst_allocs(inst(2)), [in_reg(r0)]);
+
+            // Which is where the definition's departure put it: one move, in
+            // the gap after `inst0`.
+            let block = Block::try_new(0).unwrap();
+            let mut edits = Vec::new();
+            let mut last = None;
+            for item in output.block_insts_and_edits(input.func, block) {
+                match item {
+                    InstOrEdit::Inst(inst) => last = Some(inst),
+                    InstOrEdit::Edit(edit) => {
+                        edits.push((last.expect("no edit comes before `inst0`"), edit))
+                    }
+                }
+            }
+            assert_eq!(
+                edits,
+                [(inst(0), Edit::Move(Move::RegReg { from: r1, to: r0 }))],
+                "the value is carried out of the register its definition held",
+            );
+        });
+    }
+
+    /// A reload lands in the register order its reservation holds, not the
+    /// other one.
+    #[test]
+    fn a_reload_takes_the_register_order_its_reservation_holds() {
+        let test_input = TestInput::with_a_reload_under_a_reversed_group_reservation();
+        let reversed = RegGroup::try_new(1).unwrap();
+        let in_group = Allocation::Reg(RegAllocation::RegGroup(reversed));
+        let (r0, r1): (Reg, Reg) = (Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap());
+        let slot = |i| SpillSlot::try_new(i).unwrap();
+
+        test_input.with_input(|input| {
+            let mut context = Context::new();
+            let output = crate::run(&mut context, input).expect("the input allocates");
+            check(input, &output).expect("and the allocation is correct");
+
+            // Both reads of the last instruction are answered by the reserved
+            // group: the one that may go in either order took the reserved
+            // one.
+            let inst = |i| Inst::try_new(i).unwrap();
+            assert_eq!(output.inst_allocs(inst(2)), [in_group, in_group]);
+
+            // So the only moves are the reload itself, which puts each half of
+            // the value in the register that order wants it in.
+            let block = Block::try_new(0).unwrap();
+            let mut seen = Vec::new();
+            for item in output.block_insts_and_edits(input.func, block) {
+                match item {
+                    InstOrEdit::Inst(inst) => seen.push((inst, None)),
+                    InstOrEdit::Edit(edit) => {
+                        let (inst, _) = *seen.last().expect("no edit comes before `inst0`");
+                        seen.push((inst, Some(edit)));
+                    }
+                }
+            }
+            let edits: Vec<(Inst, Edit)> = seen
+                .into_iter()
+                .filter_map(|(inst, edit)| edit.map(|edit| (inst, edit)))
+                .collect();
+            assert_eq!(
+                edits,
+                [
+                    (
+                        inst(1),
+                        Edit::Move(Move::Reload {
+                            from: slot(0),
+                            to: r1,
+                        }),
+                    ),
+                    (
+                        inst(1),
+                        Edit::Move(Move::Reload {
+                            from: slot(1),
+                            to: r0,
+                        }),
+                    ),
+                ],
+                "two reloads, in the gap after `inst1` and so before `inst2`, \
+                 and no move into the reservation on top of them",
+            );
+        });
+    }
+
+    /// A pinned read that nothing delivers its value to is recomputed into
+    /// the register its reservation holds, not moved out of the piece beside
+    /// it.
+    #[test]
+    fn a_pinned_read_no_one_delivers_is_recomputed_into_its_reservation() {
+        let test_input = TestInput::with_a_recomputed_value_pinned_at_a_block_start();
+        let (r0, r1): (Reg, Reg) = (Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap());
+        let in_reg = |r| Allocation::Reg(RegAllocation::Reg(r));
+
+        test_input.with_input(|input| {
+            let mut context = Context::new();
+            let output = crate::run(&mut context, input).expect("the input allocates");
+            check(input, &output).expect("and the allocation is correct");
+
+            // Each pinned read is answered by the register it names, and the
+            // free one by the register its piece took.
+            let inst = |i| Inst::try_new(i).unwrap();
+            assert_eq!(
+                output.inst_allocs(inst(7)),
+                [in_reg(r0), in_reg(r1), in_reg(r0)],
+            );
+
+            // Both registers are filled by recomputing the value, and neither
+            // by a move.
+            let val = Val::try_new(0).unwrap();
+            let block = Block::try_new(3).unwrap();
+            let items: Vec<InstOrEdit> = output.block_insts_and_edits(input.func, block).collect();
+            assert_eq!(
+                items,
+                [
+                    InstOrEdit::Edit(Edit::Remat(Remat { val, dest: r0 })),
+                    InstOrEdit::Edit(Edit::Remat(Remat { val, dest: r1 })),
+                    InstOrEdit::Inst(inst(7)),
+                    InstOrEdit::Inst(inst(8)),
+                ],
+                "two recomputations in the gap at the block's start, and no \
+                 move out of a register nothing has written yet",
+            );
+        });
+    }
+
+    /// The neighbouring shapes that really are unsatisfiable must stay that
+    /// way.
+    #[test]
+    fn unsatisfiable_neighbours_report_their_conflicting_operands() {
         for (i, test_input) in [
             TestInput::with_a_late_read_conflicting_with_an_early_read(),
             TestInput::with_an_early_def_overwritten_by_a_late_def(),
             TestInput::with_two_values_read_from_one_register(),
+            TestInput::with_a_group_read_overlapping_a_fixed_read(),
         ]
         .into_iter()
         .enumerate()
@@ -2511,11 +2731,73 @@ mod tests {
                 crate::run(&mut context, input).err()
             });
             assert!(
-                matches!(error, Some(crate::Error::TooManyLiveRegs)),
-                "fixture {i} is not satisfiable on its machine, so it should \
-                 still report `TooManyLiveRegs`; got {error:?}",
+                matches!(error, Some(crate::Error::ConflictingFixedOperands { .. })),
+                "fixture {i} names one register twice at one point, so it \
+                 should say so; got {error:?}",
             );
         }
+    }
+
+    /// A bundle can be constrained to a single register without any operand
+    /// having named one: two reads under classes that overlap in one register
+    /// fold to the derived class holding just that register. Nothing reserves
+    /// it, so the allocator has to find it the ordinary way, with the machine
+    /// otherwise full.
+    #[test]
+    fn allocates_a_value_read_under_overlapping_classes() {
+        let test_input = TestInput::with_a_value_read_under_overlapping_classes();
+
+        let error = test_input.with_input(|input| {
+            // The premise: the two classes the fixture reads under really do
+            // leave exactly one register between them.
+            let low = RegClass::try_new(crate::test::TestMachine::LOW_PAIR_CLASS.into()).unwrap();
+            let high = RegClass::try_new(crate::test::TestMachine::HIGH_PAIR_CLASS.into()).unwrap();
+            let both = low.intersect(input.machine, high).expect("the two overlap");
+            assert!(
+                both.is_fixed_reg(input.machine),
+                "the fixture's two classes must intersect to one register",
+            );
+
+            let mut context = crate::Context::new();
+            crate::run(&mut context, input).err()
+        });
+        assert!(
+            error.is_none(),
+            "three values live at once on a three-register machine, one of them \
+             needing a particular register: that allocates. Got {error:?}",
+        );
+
+        check_allocation(&test_input).unwrap();
+    }
+
+    /// A reuse tie whose target names one register is satisfied by the
+    /// reservation holding that register.
+    #[test]
+    fn allocates_a_pinned_reuse_tie_read_on_the_stack() {
+        let test_input = TestInput::with_a_pinned_reuse_tie_read_on_the_stack();
+
+        let error = test_input.with_input(|input| {
+            // The premise: the class the tie's target names really is one
+            // register, and so really is a fixed operand.
+            let first =
+                RegClass::try_new(crate::test::TestMachine::FIRST_REG_CLASS.into()).unwrap();
+            assert!(
+                first.is_fixed_reg(input.machine),
+                "the fixture's tie must name a single register",
+            );
+
+            let mut context = crate::Context::new();
+            crate::run(&mut context, input).err()
+        });
+        assert!(
+            error.is_none(),
+            "a tie in a held register, with the tied value read on the stack: \
+             that allocates. Got {error:?}",
+        );
+
+        // And the tie really landed: the checker is what verifies that a
+        // definition tied to an operand is in the same place as it.
+        check_allocation(&test_input).unwrap();
     }
 
     /// The only value of `test_input`, which the single-value fixtures define

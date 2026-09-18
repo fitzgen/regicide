@@ -7,20 +7,21 @@ mod assignments;
 mod splitting;
 
 use crate::{
-    Entity, Input, InputFunction, OperandConstraint, Position, RegSet,
+    Entity, Input, InputFunction, OperandConstraint, Position, RegSet, Val,
     context::ContextInner,
     counts::Counts,
     entity::{EntityRepr, Region, SecondaryMap},
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
     input::InputValue,
-    live_ranges::{LiveBundle, LivePoint, LiveRanges, SpillWeight},
+    live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
     machine::{Machine, Reg, RegClassMembers},
     output::{OutputInner, RegAllocation},
+    region_tree::RegionTree,
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
-use assignments::Assignments;
+use assignments::{Assignments, QuerySpan};
 use core::{fmt, marker::PhantomData, ops::Range};
 use splitting::{Cut, SplitUse, WithinSpanCut};
 
@@ -45,7 +46,15 @@ where
 
     // Reverse the pre-order so we visit children before parents.
     for region in region_tree.pre_order_iter().rev() {
-        region_allocation.allocate_region(input, live_ranges, counts, events, output, region)?;
+        region_allocation.allocate_region(
+            input,
+            region_tree,
+            live_ranges,
+            counts,
+            events,
+            output,
+            region,
+        )?;
     }
 
     counts.final_live_spans += live_ranges.len_spans();
@@ -80,6 +89,9 @@ where
     /// Scratch space holding the spans of the bundle being split.
     split_spans: Vec<Range<LivePoint<E>>>,
 
+    /// The value each of `split_spans` carries, at the same index.
+    split_span_vals: Vec<Val<E>>,
+
     /// Scratch space holding the uses of the bundle being split, likewise.
     split_uses: Vec<SplitUse<E>>,
 
@@ -104,6 +116,7 @@ where
             bundle_priority: SecondaryMap::new(Priority::ZERO),
             stack_bundles: Vec::new(),
             split_spans: Vec::new(),
+            split_span_vals: Vec::new(),
             split_uses: Vec::new(),
             minimal_cuts: Vec::new(),
             interference_scratch: Vec::new(),
@@ -118,6 +131,7 @@ where
             bundle_priority,
             stack_bundles,
             split_spans,
+            split_span_vals,
             split_uses,
             minimal_cuts,
             interference_scratch,
@@ -128,6 +142,7 @@ where
         bundle_priority.reset();
         stack_bundles.clear();
         split_spans.clear();
+        split_span_vals.clear();
         split_uses.clear();
         minimal_cuts.clear();
         interference_scratch.clear();
@@ -141,6 +156,7 @@ where
             bundle_priority,
             stack_bundles,
             split_spans,
+            split_span_vals,
             split_uses,
             minimal_cuts,
             interference_scratch,
@@ -151,6 +167,7 @@ where
             && bundle_priority.is_reset()
             && stack_bundles.is_empty()
             && split_spans.is_empty()
+            && split_span_vals.is_empty()
             && split_uses.is_empty()
             && minimal_cuts.is_empty()
             && interference_scratch.is_empty()
@@ -168,14 +185,16 @@ where
         reg: Reg<E>,
         span: Range<LivePoint<E>>,
     ) -> bool {
-        !self
-            .assignments
-            .conflicts(core::iter::once(reg.units(machine)), core::iter::once(span))
+        !self.assignments.conflicts(
+            core::iter::once(reg.units(machine)),
+            core::iter::once(QuerySpan::sees_all_reservations(span)),
+        )
     }
 
     fn allocate_region(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
@@ -183,6 +202,21 @@ where
         region: Region<E>,
     ) -> IResult<()> {
         debug_assert!(self.queue.is_empty());
+
+        // Hold each fixed operand's register for it before anything else can
+        // take it. Blocks partition across regions, so a reservation is
+        // region-local and rides this region's assignments into the global map
+        // below.
+        for block in region.blocks(region_tree) {
+            for reservation in block.reservations(live_ranges) {
+                self.region_assignments.insert_reservation(
+                    reservation.reg(live_ranges).units(input.machine),
+                    reservation.start(live_ranges)..reservation.end(live_ranges),
+                    // Porous to its own value: see `ReservationData`.
+                    Some(reservation.val(live_ranges)),
+                );
+            }
+        }
 
         // Insert each bundle in this region into the queue.
         //
@@ -328,9 +362,7 @@ where
             bundle,
             pref.iter(),
             |r| r.units(input.machine),
-            bundle
-                .spans(live_ranges)
-                .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+            bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
         );
 
         match assigned {
@@ -385,9 +417,7 @@ where
                     bundle,
                     regs.iter().copied().filter(|r| !pref.contains(*r)),
                     |r| r.units(input.machine),
-                    bundle
-                        .spans(live_ranges)
-                        .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+                    bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
                 )
                 .map(|reg| output.with_repr::<E, _>(reg).map(RegAllocation::Reg))
                 .transpose()?,
@@ -402,9 +432,7 @@ where
                                 .iter()
                                 .map(|r| r.units(input.machine))
                         },
-                        bundle
-                            .spans(live_ranges)
-                            .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+                        bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
                     )
                     .map(RegAllocation::RegGroup)
             }
@@ -469,10 +497,7 @@ where
         // hint to make room for a bundle that has none of its own.
         let max_cost = EvictionCost::new(0, SpillWeight::new(bundle.spill_weight(live_ranges)));
 
-        let bundle_spans = |b: LiveBundle<E>| {
-            b.spans(live_ranges)
-                .map(|s| s.start(live_ranges)..s.end(live_ranges))
-        };
+        let bundle_spans = |b: LiveBundle<E>| b.spans(live_ranges).map(|s| s.query(live_ranges));
 
         let evicted = match rc.members(machine) {
             RegClassMembers::Regs(regs) => self
@@ -559,12 +584,20 @@ where
         bundle: LiveBundle<E>,
     ) {
         debug_assert!(self.split_spans.is_empty());
+        debug_assert!(self.split_span_vals.is_empty());
         debug_assert!(self.split_uses.is_empty());
 
         self.split_spans.extend(
             bundle
                 .spans(live_ranges)
                 .map(|s| s.start(live_ranges)..s.end(live_ranges)),
+        );
+        self.split_span_vals
+            .extend(bundle.spans(live_ranges).map(|s| s.val(live_ranges)));
+        debug_assert_eq!(
+            self.split_spans.len(),
+            self.split_span_vals.len(),
+            "`split_span_vals` must stay parallel to `split_spans`",
         );
 
         let mut prev = None;
@@ -639,6 +672,7 @@ where
             let RegionAllocation {
                 region_assignments,
                 split_spans,
+                split_span_vals,
                 split_uses,
                 interference_scratch,
                 ..
@@ -653,7 +687,8 @@ where
                     |reg, half| {
                         region_assignments.interference_weight(
                             core::iter::once(reg.units(input.machine)),
-                            half.iter(),
+                            half.iter_indexed()
+                                .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
                             interference_scratch,
                             |victim| victim.spill_weight(live_ranges),
                         )
@@ -673,7 +708,8 @@ where
                                     .members(input.machine)
                                     .iter()
                                     .map(|r| r.units(input.machine)),
-                                half.iter(),
+                                half.iter_indexed()
+                                    .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
                                 interference_scratch,
                                 |victim| victim.spill_weight(live_ranges),
                             )
@@ -685,6 +721,7 @@ where
         };
 
         self.split_spans.clear();
+        self.split_span_vals.clear();
         self.split_uses.clear();
 
         let Some((index, winner)) = best else {
@@ -785,6 +822,7 @@ where
             let RegionAllocation {
                 region_assignments,
                 split_spans,
+                split_span_vals,
                 split_uses,
                 interference_scratch,
                 ..
@@ -800,7 +838,8 @@ where
                         |reg, half| {
                             region_assignments.interference_weight(
                                 core::iter::once(reg.units(input.machine)),
-                                half.iter(),
+                                half.iter_indexed()
+                                    .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
                                 interference_scratch,
                                 |victim| victim.spill_weight(live_ranges),
                             )
@@ -821,7 +860,8 @@ where
                                     .members(input.machine)
                                     .iter()
                                     .map(|r| r.units(input.machine)),
-                                half.iter(),
+                                half.iter_indexed()
+                                    .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
                                 interference_scratch,
                                 |victim| victim.spill_weight(live_ranges),
                             )
@@ -834,6 +874,7 @@ where
         };
 
         self.split_spans.clear();
+        self.split_span_vals.clear();
         self.split_uses.clear();
 
         // Name the span before the split rewrites it in place.
@@ -901,6 +942,7 @@ where
         self.fill_split_scratch(input, live_ranges, bundle);
         cuts.extend(splitting::minimal_cuts(&self.split_spans, &self.split_uses));
         self.split_spans.clear();
+        self.split_span_vals.clear();
         self.split_uses.clear();
 
         debug_assert_eq!(
@@ -1004,6 +1046,20 @@ where
     }
 }
 
+impl<E> LiveSpan<E>
+where
+    E: EntityRepr,
+{
+    /// This span as a query on the matrix, porous to the reservations held for
+    /// the value it carries.
+    fn query(self, live_ranges: &LiveRanges<E>) -> QuerySpan<E> {
+        QuerySpan::porous_to(
+            self.val(live_ranges),
+            self.start(live_ranges)..self.end(live_ranges),
+        )
+    }
+}
+
 impl<E> LiveBundle<E>
 where
     E: EntityRepr,
@@ -1045,7 +1101,6 @@ where
     E: EntityRepr,
 {
     Priority::new(
-        bundle.has_fixed_uses(live_ranges),
         bundle.is_minimal(live_ranges),
         bundle_group_size(input, live_ranges, bundle),
         bundle.spans(live_ranges).len(),
@@ -1150,24 +1205,21 @@ impl Phase {
 /// A bundle's allocation priority.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Priority {
-    ///    Bit:   31   ...  30   29                28             27  ...   25   24  ...  0
-    ///         +--------------+-----------------+--------------+--------------+------------+
-    /// Fields: | (reserved):2 | has_fixed_use:1 | is_minimal:1 | group_size:3 |   size:25  |
-    ///         +--------------+-----------------+--------------+--------------+------------+
+    ///    Bit:   31   ...  30   29             28  ...   26   25  ...  0
+    ///         +--------------+--------------+--------------+------------+
+    /// Fields: | (reserved):2 | is_minimal:1 | group_size:3 |   size:26  |
+    ///         +--------------+--------------+--------------+------------+
     ///
     /// Packed so that we sort/prioritize bundles by:
     ///
-    /// 1. Those with fixed register uses (as they have the hardest constraints
-    ///    to satisfy)
-    ///
-    /// 2. Minimal bundles (as these can't be split any further, so allocating
+    /// 1. Minimal bundles (as these can't be split any further, so allocating
     ///    to a register, rather than a spill slot, is now-or-never).
     ///
-    /// 3. The size of its register group constraint (because assigning a
+    /// 2. The size of its register group constraint (because assigning a
     ///    register groups assigns N registers at once, not just 1, so they are
     ///    harder to place and have more constraints than regular bundles).
     ///
-    /// 4. Finally, by the bundle's size (number of spans) because if we assign
+    /// 3. Finally, by the bundle's size (number of spans) because if we assign
     ///    a larger bundle, then we get fewer moves and better codegen (and if
     ///    assigning it fails, we can always split it and try again).
     ///
@@ -1176,7 +1228,7 @@ pub struct Priority {
     bits: u32,
 }
 
-const PRIORITY_SIZE_BITS: u32 = 25;
+const PRIORITY_SIZE_BITS: u32 = 26;
 const PRIORITY_SIZE_SHIFT: u32 = 0;
 const PRIORITY_SIZE_MASK: u32 = ((1 << PRIORITY_SIZE_BITS) - 1) << PRIORITY_SIZE_SHIFT;
 
@@ -1190,11 +1242,6 @@ const PRIORITY_IS_MINIMAL_BITS: u32 = 1;
 const PRIORITY_IS_MINIMAL_SHIFT: u32 = PRIORITY_GROUP_SIZE_SHIFT + PRIORITY_GROUP_SIZE_BITS;
 const PRIORITY_IS_MINIMAL_MASK: u32 =
     ((1 << PRIORITY_IS_MINIMAL_BITS) - 1) << PRIORITY_IS_MINIMAL_SHIFT;
-
-const PRIORITY_HAS_FIXED_USE_BITS: u32 = 1;
-const PRIORITY_HAS_FIXED_USE_SHIFT: u32 = PRIORITY_IS_MINIMAL_SHIFT + PRIORITY_IS_MINIMAL_BITS;
-const PRIORITY_HAS_FIXED_USE_MASK: u32 =
-    ((1 << PRIORITY_HAS_FIXED_USE_BITS) - 1) << PRIORITY_HAS_FIXED_USE_SHIFT;
 
 /// A priority queue entry.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1226,7 +1273,6 @@ const PQ_ENTRY_PHASE_MASK: u64 = ((1 << PQ_ENTRY_PHASE_BITS) - 1) << PQ_ENTRY_PH
 impl fmt::Debug for Priority {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Priority")
-            .field("has_fixed_use", &self.has_fixed_use())
             .field("is_minimal", &self.is_minimal())
             .field("group_size", &self.group_size())
             .field("size", &self.size())
@@ -1261,10 +1307,7 @@ impl Priority {
     /// The lowest possible priority.
     const ZERO: Priority = Priority { bits: 0 };
 
-    fn new(has_fixed_use: bool, is_minimal: bool, group_size: usize, size: usize) -> Self {
-        let has_fixed_use = u32::from(has_fixed_use) << PRIORITY_HAS_FIXED_USE_SHIFT;
-        debug_assert_eq!(has_fixed_use & PRIORITY_HAS_FIXED_USE_MASK, has_fixed_use);
-
+    fn new(is_minimal: bool, group_size: usize, size: usize) -> Self {
         let is_minimal = u32::from(is_minimal) << PRIORITY_IS_MINIMAL_SHIFT;
         debug_assert_eq!(is_minimal & PRIORITY_IS_MINIMAL_MASK, is_minimal);
 
@@ -1279,13 +1322,8 @@ impl Priority {
         debug_assert_eq!(size & PRIORITY_SIZE_MASK, size);
 
         Priority {
-            bits: has_fixed_use | is_minimal | group_size | size,
+            bits: is_minimal | group_size | size,
         }
-    }
-
-    #[inline]
-    fn has_fixed_use(&self) -> bool {
-        self.bits & PRIORITY_HAS_FIXED_USE_MASK != 0
     }
 
     #[inline]
@@ -1700,13 +1738,15 @@ mod tests {
     }
 
     /// A minimal bundle over an always-recomputable value still pays full
-    /// price for the register its use needs, so under pressure it takes one
-    /// from a bundle worth less rather than going to the stack: its use in the
-    /// hot block needs a register however the value got there, and a hot stack
-    /// access costs far more than the long, cool bundle it displaces.
+    /// price for the register its use needs, so under pressure it keeps one
+    /// and something worth less goes to the stack instead.
+    ///
+    /// It never evicts for it: minimal bundles leave the queue first, so the
+    /// long bundle is the one that arrives to find the register taken, splits,
+    /// and leaves its useless middle on the stack.
     #[cfg(feature = "visualizer")]
     #[test]
-    fn a_minimal_recomputable_bundle_evicts_rather_than_spilling() {
+    fn a_minimal_recomputable_bundle_keeps_a_register_rather_than_spilling() {
         let test_input = TestInput::with_a_recomputed_read_under_pressure();
         let context = allocate(&test_input)
             .expect("the input allocates")
@@ -1725,37 +1765,72 @@ mod tests {
                 })
             })
         };
+        let uses = |bundle: LiveBundle<u32>| {
+            bundle
+                .spans(live_ranges)
+                .map(|span| span.uses(live_ranges).into_iter().count())
+                .sum::<usize>()
+        };
 
-        let mut evictions = Vec::new();
+        let mut in_a_register = Vec::new();
+        let mut on_the_stack = Vec::new();
         for (_, event) in inner.events.iter() {
             match *event {
-                Event::BundleSpilledToStack { bundle, .. } => assert!(
-                    !holds_a_recomputable_value(bundle),
-                    "{bundle:?} holds a value cheaper to recompute than to spill, \
-                     and went to the stack anyway",
-                ),
-                Event::BundleAssignedViaEviction {
-                    bundle, evicted, ..
-                } if holds_a_recomputable_value(bundle) => evictions.push((bundle, evicted)),
+                Event::BundleAssignedPreferred { bundle, .. }
+                | Event::BundleAssignedNonPreferred { bundle, .. }
+                | Event::BundleAssignedViaEviction { bundle, .. } => in_a_register.push(bundle),
+                Event::BundleSpilledToStack { bundle, .. } => on_the_stack.push(bundle),
                 _ => {}
             }
         }
 
+        // Nothing recomputable was spilled: a reload costs more than a remat.
+        for &bundle in &on_the_stack {
+            assert!(
+                !holds_a_recomputable_value(bundle),
+                "{bundle:?} holds a value cheaper to recompute than to spill, \
+                 and went to the stack anyway",
+            );
+        }
+
+        // Every recomputable piece with a use got a register, and one of
+        // those pieces is minimal.
+        let mut minimal_recomputable_uses = 0;
+        for bundle in live_ranges.bundles() {
+            if !holds_a_recomputable_value(bundle) || uses(bundle) == 0 {
+                continue;
+            }
+            assert!(
+                in_a_register.contains(&bundle),
+                "{bundle:?} has a use that needs a register and did not get one",
+            );
+            if bundle.is_minimal(live_ranges) {
+                minimal_recomputable_uses += 1;
+            }
+        }
         assert!(
-            !evictions.is_empty(),
-            "nothing recomputable took a register from anything",
+            minimal_recomputable_uses > 0,
+            "no minimal recomputable piece had a use to hold a register for",
         );
-        for (bundle, evicted) in evictions {
-            assert!(
-                bundle.is_minimal(live_ranges),
-                "{bundle:?} is the minimal piece its value was eagerly split into",
-            );
-            assert!(
-                bundle.spill_weight(live_ranges) > evicted.spill_weight(live_ranges),
-                "{bundle:?} paid {} for {evicted:?}'s register, which was worth {}",
-                bundle.spill_weight(live_ranges),
-                evicted.spill_weight(live_ranges),
-            );
+
+        // And the pressure was real: something cheaper went to the stack.
+        assert!(
+            !on_the_stack.is_empty(),
+            "nothing was spilled, so nobody had to pay for a register",
+        );
+        for &spilled in &on_the_stack {
+            for bundle in live_ranges.bundles() {
+                if !holds_a_recomputable_value(bundle) || uses(bundle) == 0 {
+                    continue;
+                }
+                assert!(
+                    bundle.spill_weight(live_ranges) > spilled.spill_weight(live_ranges),
+                    "{bundle:?} is worth {}, no more than the {} of {spilled:?}, \
+                     which was spilled to make room for it",
+                    bundle.spill_weight(live_ranges),
+                    spilled.spill_weight(live_ranges),
+                );
+            }
         }
     }
 
@@ -1856,35 +1931,30 @@ mod tests {
     /// A priority's fields survive the round trip through its packed bits.
     #[test]
     fn priority_round_trips_its_fields() {
-        for has_fixed_use in [false, true] {
-            for is_minimal in [false, true] {
-                for group_size in [0, 1, 2, MAX_GROUP_SIZE, RegGroup::MAX_SIZE] {
-                    for size in [0, 1, 1000, MAX_SIZE] {
-                        let p = Priority::new(has_fixed_use, is_minimal, group_size, size);
-                        assert_eq!(p.has_fixed_use(), has_fixed_use, "{p:?}");
-                        assert_eq!(p.is_minimal(), is_minimal, "{p:?}");
-                        assert_eq!(p.group_size(), group_size.min(MAX_GROUP_SIZE), "{p:?}");
-                        assert_eq!(p.size(), size.min(MAX_SIZE), "{p:?}");
-                    }
+        for is_minimal in [false, true] {
+            for group_size in [0, 1, 2, MAX_GROUP_SIZE, RegGroup::MAX_SIZE] {
+                for size in [0, 1, 1000, MAX_SIZE] {
+                    let p = Priority::new(is_minimal, group_size, size);
+                    assert_eq!(p.is_minimal(), is_minimal, "{p:?}");
+                    assert_eq!(p.group_size(), group_size.min(MAX_GROUP_SIZE), "{p:?}");
+                    assert_eq!(p.size(), size.min(MAX_SIZE), "{p:?}");
                 }
             }
         }
     }
 
-    /// Priorities compare by fixed uses first, then minimality, then register
-    /// group size, and only then by the bundle's own size.
+    /// Priorities compare by minimality first, then register group size, and
+    /// only then by the bundle's own size.
     #[test]
     fn priority_compares_by_tier() {
         let ascending = [
-            Priority::new(false, false, 0, 0),
-            Priority::new(false, false, 0, 1),
-            Priority::new(false, false, 0, MAX_SIZE),
-            Priority::new(false, false, 1, 0),
-            Priority::new(false, false, MAX_GROUP_SIZE, MAX_SIZE),
-            Priority::new(false, true, 0, 0),
-            Priority::new(false, true, MAX_GROUP_SIZE, MAX_SIZE),
-            Priority::new(true, false, 0, 0),
-            Priority::new(true, true, MAX_GROUP_SIZE, MAX_SIZE),
+            Priority::new(false, 0, 0),
+            Priority::new(false, 0, 1),
+            Priority::new(false, 0, MAX_SIZE),
+            Priority::new(false, 1, 0),
+            Priority::new(false, MAX_GROUP_SIZE, MAX_SIZE),
+            Priority::new(true, 0, 0),
+            Priority::new(true, MAX_GROUP_SIZE, MAX_SIZE),
         ];
         for w in ascending.windows(2) {
             assert!(w[0] < w[1], "{:?} should sort below {:?}", w[0], w[1]);
@@ -1896,9 +1966,9 @@ mod tests {
     #[test]
     fn pq_entry_round_trips_its_fields() {
         let priorities = [
-            Priority::new(false, false, 0, 0),
-            Priority::new(true, true, MAX_GROUP_SIZE, MAX_SIZE),
-            Priority::new(false, true, 2, 1000),
+            Priority::new(false, 0, 0),
+            Priority::new(true, MAX_GROUP_SIZE, MAX_SIZE),
+            Priority::new(true, 2, 1000),
         ];
         for phase in PHASES {
             for priority in priorities {
@@ -1916,8 +1986,8 @@ mod tests {
     /// remaining ties with the bundle index.
     #[test]
     fn pq_entry_compares_by_phase_then_priority_then_bundle() {
-        let low = Priority::new(false, false, 0, 0);
-        let high = Priority::new(true, true, MAX_GROUP_SIZE, MAX_SIZE);
+        let low = Priority::new(false, 0, 0);
+        let high = Priority::new(true, MAX_GROUP_SIZE, MAX_SIZE);
         let max_index = LiveBundle::<u32>::MAX_REPRESENTABLE.index();
 
         let mut ascending = vec![

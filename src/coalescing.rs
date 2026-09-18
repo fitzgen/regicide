@@ -1,11 +1,11 @@
 //! Coalescing live spans into bundles.
 //!
 //! Merging spans into bundles is generally optional, and only exists to
-//! optimistically try and reuse the same register across a number of related
+//! optimistically try and allocate the same register across a number of related
 //! spans, which is good for both code quality (less spills and moves) and
-//! compile time (processes N spans all at once, instead of
-//! individually). However, there is one exception: two uses tied together by a
-//! `Reuse` constraint **must** be in the same bundle because they must be
+//! compile time (processes N spans all at once, instead of processing each of
+//! them individually). However, there is one exception: two uses tied together
+//! by a `Reuse` constraint **must** be in the same bundle because they must be
 //! allocated to the same register. In this scenario, each use is of a different
 //! value (because `Reuse` must define a new value) and therefore each use has a
 //! different span -- these spans **must** be coalesced together (and, later on,
@@ -76,6 +76,7 @@
 //! parents. Better to accept the cross-region move, and preserve good
 //! allocation within the child region, at that point.
 
+use crate::RegSet;
 use crate::context::ContextInner;
 use crate::entity::{Block, Entity, EntityRange, EntityRepr, Region, SecondaryMap, Val};
 use crate::error::IResult;
@@ -83,10 +84,10 @@ use crate::events::{Affinity, EventsLog, RefusedReason};
 use crate::input::{
     Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
 };
-use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan};
+use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation};
 use crate::liveness::{block_first_inst, block_last_inst};
-use crate::machine::Machine;
-use crate::output::OutputInner;
+use crate::machine::{Machine, RegClassMembers};
+use crate::output::{OutputInner, RegAllocation};
 use crate::region_tree::RegionTree;
 use crate::timing::Timing;
 use crate::union_find::UnionFind;
@@ -146,6 +147,10 @@ where
     /// We don't merge across regions, so these are set aside and turned into
     /// register hints after every region has been processed.
     cross_region_affinities: Vec<(LiveSpan<E>, LiveSpan<E>)>,
+
+    /// Scratch space holding one block's reservations in
+    /// `hint_reserved_registers`.
+    hint_scratch: Vec<(LivePoint<E>, Val<E>, Reservation<E>)>,
 }
 
 impl<E> Coalescing<E>
@@ -163,6 +168,7 @@ where
             val_exit_span: SecondaryMap::new(None),
             val_entry_span: SecondaryMap::new(None),
             cross_region_affinities: Vec::new(),
+            hint_scratch: Vec::new(),
         }
     }
 
@@ -177,6 +183,7 @@ where
             val_exit_span,
             val_entry_span,
             cross_region_affinities,
+            hint_scratch,
         } = self;
         span_sets.reset();
         next_span.reset();
@@ -187,6 +194,7 @@ where
         val_entry_span.reset();
         debug_assert!(region_blocks.is_empty());
         debug_assert!(cross_region_affinities.is_empty());
+        debug_assert!(hint_scratch.is_empty());
     }
 
     pub fn is_reset(&self) -> bool {
@@ -200,6 +208,7 @@ where
             val_exit_span,
             val_entry_span,
             cross_region_affinities,
+            hint_scratch,
         } = self;
         span_sets.is_reset()
             && next_span.is_reset()
@@ -210,6 +219,7 @@ where
             && val_exit_span.is_reset()
             && val_entry_span.is_reset()
             && cross_region_affinities.is_empty()
+            && hint_scratch.is_empty()
     }
 
     /// Put `span` in a set of its own.
@@ -478,8 +488,26 @@ where
         output,
     )?;
 
-    // And finally propagate hints across regions.
+    // Then propagate hints across regions.
     hint_across_regions(coalescing, region_tree, live_ranges, events, input.machine);
+
+    // And finally bias each reserved value's bundle towards its register.
+    for region in region_tree.pre_order_iter() {
+        for block in region.blocks(region_tree) {
+            let reservations = block.reservations(live_ranges);
+            if reservations.is_empty() {
+                continue;
+            }
+            hint_reserved_registers(
+                input,
+                live_ranges,
+                events,
+                &mut coalescing.hint_scratch,
+                block,
+                reservations,
+            );
+        }
+    }
 
     coalescing.cross_region_affinities.clear();
     coalescing.region_blocks.clear();
@@ -685,9 +713,7 @@ where
                     continue;
                 };
                 let target = input_inst.operand(i);
-                // Validation rejects a `Reuse` of an operand that names no
-                // value, and a `Reuse` is itself a definition, so both of
-                // these have one.
+
                 let target_val = target.val().unwrap();
                 debug_assert_eq!(
                     input
@@ -696,6 +722,7 @@ where
                         .reg_class(),
                     input.func.value(target_val).reg_class()
                 );
+
                 let target_val = output.with_repr(target_val)?;
                 let inst = output.with_repr(inst)?;
                 let (Some(a), Some(b)) = (
@@ -713,7 +740,14 @@ where
                     b,
                 );
                 debug_assert!(
-                    merged,
+                    merged
+                        || crate::live_ranges::fixed_operand_of(
+                            input.func,
+                            input.machine,
+                            inst.with_repr32(),
+                            i
+                        )
+                        .is_some(),
                     "operand {j} of {inst:?} reuses operand {i}, but their spans \
                      ({a:?} and {b:?}) could not be coalesced into one bundle"
                 );
@@ -725,28 +759,6 @@ where
                     events,
                     block,
                     target_val,
-                    LivePoint::new(inst, Position::Early),
-                );
-            }
-
-            // A read pinned to the one register a definition of this same
-            // instruction overwrites is split into the same three pieces, and
-            // its outer two want rejoining just as much.
-            for j in 0..input_inst.operands_len() {
-                if !crate::live_ranges::is_overwritten_read_that_splits(input, inst, j) {
-                    continue;
-                }
-                // The predicate only holds for a read, and a read of no value
-                // is not one.
-                let val = input_inst.operand(j).val().unwrap();
-                let val = output.with_repr(val)?;
-                let inst = output.with_repr(inst)?;
-                self.coalesce_across_overwrite_split(
-                    live_ranges,
-                    input,
-                    events,
-                    block,
-                    val,
                     LivePoint::new(inst, Position::Early),
                 );
             }
@@ -1011,6 +1023,83 @@ where
     Ok(())
 }
 
+/// Bias each reserved value's bundle towards the register held for it.
+///
+/// The bundle to bias is the one owning the span that records the fixed
+/// operand as a use, so walking the block's uses finds exactly them.
+///
+/// This hint is what usually elides the move connecting the value to its
+/// reserved register; nothing depends on it for correctness, however.
+fn hint_reserved_registers<E>(
+    input: &Input<'_, impl InputFunction>,
+    live_ranges: &mut LiveRanges<E>,
+    events: &mut EventsLog<E>,
+    scratch: &mut Vec<(LivePoint<E>, Val<E>, Reservation<E>)>,
+    block: Block<E>,
+    reservations: EntityRange<Reservation<E>>,
+) where
+    E: EntityRepr,
+{
+    // The join key, once, so the index and its lookups agree.
+    fn key<E>(live_ranges: &LiveRanges<E>, r: Reservation<E>) -> (LivePoint<E>, Val<E>)
+    where
+        E: EntityRepr,
+    {
+        (r.start(live_ranges), r.val(live_ranges))
+    }
+
+    debug_assert!(scratch.is_empty());
+
+    // Index the block's reservations by the join key.
+    scratch.extend(reservations.into_iter().filter_map(|r| {
+        // Can only hint for single-reg (not group) fixed uses.
+        let RegAllocation::Reg(_) = r.reg(live_ranges) else {
+            return None;
+        };
+        let (point, val) = key(live_ranges, r);
+        Some((point, val, r))
+    }));
+    scratch.sort_unstable_by_key(|&(point, val, _)| (point, val));
+
+    for u in block.uses(live_ranges) {
+        let span = u.span(live_ranges);
+        let bundle = span.bundle(live_ranges).unwrap();
+        let point = u.point(live_ranges);
+        let val = span.val(live_ranges);
+
+        // Every reservation this use matches, a run of the sorted index: one
+        // value may be delivered into several registers at once.
+        let first = scratch.partition_point(|&(p, v, _)| (p, v) < (point, val));
+        for &(_, _, reservation) in scratch[first..]
+            .iter()
+            .take_while(|&&(p, v, _)| (p, v) == (point, val))
+        {
+            let RegAllocation::Reg(reg) = reservation.reg(live_ranges) else {
+                unreachable!("groups were filtered out of the index");
+            };
+
+            let class = match bundle.constraint(live_ranges) {
+                OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
+                OperandConstraint::Reg(rc) => rc,
+                OperandConstraint::Stack => continue,
+                OperandConstraint::Reuse(_) => unreachable!("constraints are already resolved"),
+            };
+            let RegClassMembers::Regs(members) = class.members(input.machine) else {
+                continue;
+            };
+            if !members.contains(&reg.with_repr32()) {
+                continue;
+            }
+
+            let mut hint = RegSet::new();
+            hint.insert(reg.with_repr32());
+            bundle.add_hint(live_ranges, events, &hint, None);
+        }
+    }
+
+    scratch.clear();
+}
+
 /// Bias each parent region's bundle towards the registers its child region's
 /// bundle wants.
 ///
@@ -1069,7 +1158,7 @@ mod tests {
         LiveBundle, is_minimal_bundle, normalize_spill_weight, remat_scale,
         round_bundle_spill_weight, touch_mid_inst,
     };
-    use crate::test::{TestFunction, TestInput};
+    use crate::test::{TestFunction, TestInput, TestMachine};
     use mutatis::{
         check::{Check, CheckResult},
         mutators as m,
@@ -1243,7 +1332,6 @@ mod tests {
     fn all_affinities(
         live_ranges: &LiveRanges<u32>,
         func: &TestFunction,
-        input: &Input<'_, impl InputFunction>,
     ) -> Vec<(LiveSpan, LiveSpan, bool)> {
         let mut affinities = Vec::new();
 
@@ -1271,20 +1359,6 @@ mod tests {
                         input_inst.operand(i).val().unwrap(),
                         &mut affinities,
                     );
-                }
-
-                // The same split, made for a read pinned to the one register
-                // a definition of this instruction overwrites.
-                for j in 0..input_inst.operands_len() {
-                    if crate::live_ranges::is_overwritten_read_that_splits(input, inst, j) {
-                        across_the_overwrite_split(
-                            live_ranges,
-                            block,
-                            inst,
-                            input_inst.operand(j).val().unwrap(),
-                            &mut affinities,
-                        );
-                    }
                 }
             }
 
@@ -1479,7 +1553,7 @@ mod tests {
                 // reasons -- but it is only legitimate if it still shows up as a
                 // conflict now, since bundles only ever grow.
                 test_input.with_input(|input| -> Result<(), String> {
-                    for (a, b, mergeable) in all_affinities(live_ranges, func, input) {
+                    for (a, b, mergeable) in all_affinities(live_ranges, func) {
                         let (Some(ba), Some(bb)) = (a.bundle(live_ranges), b.bundle(live_ranges))
                         else {
                             return Err("an affinity's span has no bundle".to_string());
@@ -1511,10 +1585,11 @@ mod tests {
                     Ok(())
                 })?;
 
-                // 7b. And it did it for every reuse tie, with no excuses.
-                // Property 7 waives an affinity whose bundles' constraints
-                // conflict; a tie cannot be waived, because one bundle is the
-                // only thing that satisfies it and no later pass repairs one.
+                // 7b. And it did it for every reuse tie it had to. Property 7
+                // waives an affinity whose bundles' constraints conflict; a tie
+                // cannot be waived, since one bundle is the only thing that
+                // satisfies it, unless a reservation satisfies it instead.
+                test_input.with_input(|input| -> Result<(), String> {
                 for (block, input_block) in func.blocks() {
                     for (inst, input_inst) in input_block.insts() {
                         for j in 0..input_inst.operands_len() {
@@ -1522,6 +1597,16 @@ mod tests {
                             else {
                                 continue;
                             };
+                            if crate::live_ranges::fixed_operand_of(
+                                input.func,
+                                input.machine,
+                                inst,
+                                i,
+                            )
+                            .is_some()
+                            {
+                                continue;
+                            }
                             let (Some(a), Some(b)) = (
                                 operand_span(live_ranges, block, inst, j),
                                 operand_span(live_ranges, block, inst, i),
@@ -1539,12 +1624,14 @@ mod tests {
                         }
                     }
                 }
+                Ok(())
+                })?;
 
                 // 8. A register hint never widens what a bundle may be
-                // allocated to, and only a cross-region affinity can put one
-                // there in the first place.
+                // allocated to, and only a cross-region affinity or a
+                // reservation can put one there in the first place.
                 let cross_region: Vec<(LiveBundle, LiveBundle)> = test_input.with_input(|input| {
-                    all_affinities(live_ranges, func, input)
+                    all_affinities(live_ranges, func)
                         .into_iter()
                         .filter_map(|(a, b, _)| {
                             let (ba, bb) = (
@@ -1589,10 +1676,21 @@ mod tests {
                                 ));
                             }
                         }
-                        if !cross_region.iter().any(|&(parent, _)| parent == bundle) {
+                        let reserved = bundle.spans(live_ranges).any(|span| {
+                            let val = span.val(live_ranges);
+                            span.uses(live_ranges).into_iter().any(|u| {
+                                let point = u.point(live_ranges);
+                                live_ranges.reservations().any(|r| {
+                                    matches!(r.reg(live_ranges), RegAllocation::Reg(_))
+                                        && r.start(live_ranges) == point
+                                        && r.val(live_ranges) == val
+                                })
+                            })
+                        });
+                        if !reserved && !cross_region.iter().any(|&(parent, _)| parent == bundle) {
                             return Err(format!(
-                                "{bundle:?} has a register hint but no cross-region affinity \
-                                 that could have given it one",
+                                "{bundle:?} has a register hint but no cross-region affinity or \
+                                 reservation that could have given it one",
                             ));
                         }
                     }
@@ -1674,7 +1772,6 @@ mod tests {
                 // approximation.
                 test_input.with_input(|input| -> Result<(), String> {
                 for bundle in live_ranges.bundles() {
-                    let mut expected_fixed = false;
                     let mut total_cost = 0.0;
                     let mut discounted_cost = 0.0;
                     let mut num_insts = 0;
@@ -1690,7 +1787,6 @@ mod tests {
                     let mut prev: Option<LiveSpan> = None;
 
                     for span in bundle.spans(live_ranges) {
-                        expected_fixed |= span.has_fixed_use(live_ranges);
                         let uses = span.uses(live_ranges);
                         num_uses += uses.len();
                         let span_cost = uses
@@ -1712,15 +1808,6 @@ mod tests {
                             }
                         }
                         prev = Some(span);
-                    }
-
-                    if bundle.has_fixed_uses(live_ranges) != expected_fixed {
-                        return Err(format!(
-                            "{bundle:?} reports has_fixed_uses = {}, but {} of its spans has a \
-                             fixed use",
-                            bundle.has_fixed_uses(live_ranges),
-                            if expected_fixed { "one" } else { "none" },
-                        ));
                     }
 
                     let distinct_insts = num_insts - shared_insts;
@@ -1814,23 +1901,30 @@ mod tests {
         );
     }
 
-    /// ... but not when the two ends want registers that no single register
+    /// ... but not when the two ends want locations that no single location
     /// satisfies.
+    ///
+    /// The conflict must be between constraints the bundles actually carry: a
+    /// fixed operand holds its register instead of constraining its value's
+    /// bundle.
     #[test]
     fn a_block_argument_with_a_conflicting_parameter_is_not_coalesced() {
-        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
-        let input = TestInput::with_block_arg_constraints(rc(0), rc(1));
+        let both = OperandConstraint::Reg(
+            RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+        );
+        let input = TestInput::with_block_arg_constraints(both, OperandConstraint::Stack);
         let context = coalesce_input(&input).unwrap();
         let live_ranges = &context.context32.live_ranges;
 
         let arg = only_span(live_ranges, 0, 0);
         let param = only_span(live_ranges, 1, 1);
         let arg_bundle = arg.bundle(live_ranges).unwrap();
-        assert_eq!(arg_bundle.constraint(live_ranges), rc(0));
+        assert_eq!(arg_bundle.constraint(live_ranges), both);
         assert_ne!(
             arg.bundle(live_ranges),
             param.bundle(live_ranges),
-            "`rc0` and `rc1` are disjoint, so these may not share a location",
+            "a register and the stack are disjoint, so these may not share a \
+             location",
         );
     }
 
@@ -1941,17 +2035,14 @@ mod tests {
         );
     }
 
-    /// The same three pieces, made for a read pinned to the one register its
-    /// own instruction's definition overwrites: the outer two go together, so
-    /// the surviving value pays no move to get back where it already was.
+    /// A read pinned to the one register its own instruction's definition
+    /// overwrites leaves coalescing nothing to do.
     ///
-    /// The middle piece does *not* join the overwriting definition here, as it
-    /// would under a `Reuse`. That definition holds a different value, so the
-    /// two spans merely abut, and a bundle whose spans touch mid-instruction
-    /// without being tied has a gap a cut may go in --- which splitting would
-    /// take straight back apart. Both are pinned to the one register anyway.
+    /// The read used to be split into three pieces, two of which had to be
+    /// coalesced back together. A reservation holds the register now, so the
+    /// value is never cut up.
     #[test]
-    fn the_pieces_on_either_side_of_a_fixed_overwrite_are_coalesced() {
+    fn a_fixed_overwrite_leaves_nothing_to_coalesce() {
         let input = TestInput::with_a_read_overwritten_by_a_fixed_def();
 
         // `inst1` reads the survivor from the register its own operand 1
@@ -1968,32 +2059,18 @@ mod tests {
         let live_ranges = &context.context32.live_ranges;
         let block = Block::try_new(0).unwrap();
 
-        let mut pieces: Vec<LiveSpan> = block
+        let pieces: Vec<LiveSpan> = block
             .spans(live_ranges)
             .into_iter()
             .filter(|&span| span.val(live_ranges) == survivor)
             .collect();
-        pieces.sort_by_key(|span| (span.start(live_ranges), span.end(live_ranges)));
-        assert_eq!(pieces.len(), 3, "{pieces:#?}");
-        let (span1, span2, span3) = (pieces[0], pieces[1], pieces[2]);
+        assert_eq!(pieces.len(), 1, "{pieces:#?}");
 
-        assert_eq!(
-            span1.bundle(live_ranges),
-            span3.bundle(live_ranges),
-            "the pieces on either side of the overwritten read should share a \
-             bundle",
-        );
         assert_ne!(
-            span1.bundle(live_ranges),
-            span2.bundle(live_ranges),
-            "the surviving value and the doomed copy of it may not share a \
-             location",
-        );
-        assert_ne!(
-            span2.bundle(live_ranges),
+            pieces[0].bundle(live_ranges),
             only_span(live_ranges, 0, defined.index()).bundle(live_ranges),
-            "the doomed copy holds another value than the definition that \
-             overwrites it, so the two only abut",
+            "the survivor is live across the definition that takes the \
+             register from it, so the two may not share a location",
         );
     }
 
@@ -2054,8 +2131,10 @@ mod tests {
     /// and each is judged on its own.
     #[test]
     fn a_conflict_split_leaves_one_minimal_piece_and_one_that_is_not() {
-        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
-        let input = TestInput::with_use_constraints(&[rc(0), rc(1)]);
+        let both = OperandConstraint::Reg(
+            RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+        );
+        let input = TestInput::with_use_constraints(&[both, OperandConstraint::Stack]);
         let context = coalesce_input(&input).unwrap();
         let live_ranges = &context.context32.live_ranges;
 
@@ -2076,7 +2155,8 @@ mod tests {
 
         assert_ne!(
             first_bundle, second_bundle,
-            "`rc0` and `rc1` are disjoint, so the pieces cannot share a bundle",
+            "a register and the stack are disjoint, so the pieces cannot share \
+             a bundle",
         );
     }
 
@@ -2118,8 +2198,10 @@ mod tests {
     fn refused_coalesces_are_logged() {
         use crate::events::Event;
 
-        let rc = |i| OperandConstraint::Reg(RegClass::try_new(i).unwrap());
-        let input = TestInput::with_block_arg_constraints(rc(0), rc(1));
+        let both = OperandConstraint::Reg(
+            RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap(),
+        );
+        let input = TestInput::with_block_arg_constraints(both, OperandConstraint::Stack);
         let context = coalesce_input(&input).unwrap();
         let live_ranges = &context.context32.live_ranges;
 

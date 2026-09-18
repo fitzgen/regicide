@@ -1,7 +1,7 @@
 //! The set of assignments of live bundles to register units.
 
 use crate::{
-    Entity, Reg, RegGroup, RegUnit,
+    Entity, Reg, RegGroup, RegUnit, Val,
     entity::{EntityRepr, SecondaryMap},
     live_ranges::{LiveBundle, LivePoint},
     region_allocation::EvictionCost,
@@ -9,11 +9,66 @@ use crate::{
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::{iter, ops::ControlFlow, ops::Range};
 
+/// A span offered to the matrix, together with which reservations it may see
+/// through.
+///
+/// A reservation holds one register for one value, so that value's own span
+/// may sit underneath it and no other may.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct QuerySpan<E>
+where
+    E: EntityRepr,
+{
+    /// The value this span carries, when a reservation held for that value is
+    /// one this span may share a register with.
+    porous_to: Option<Val<E>>,
+
+    /// The range of the span itself.
+    range: Range<LivePoint<E>>,
+}
+
+impl<E> QuerySpan<E>
+where
+    E: EntityRepr,
+{
+    /// A span carrying `val`, which may share a register with a reservation
+    /// holding that register for `val`.
+    pub(crate) fn porous_to(val: Val<E>, range: Range<LivePoint<E>>) -> Self {
+        QuerySpan {
+            porous_to: Some(val),
+            range,
+        }
+    }
+
+    /// A span that may share a register with no reservation at all, which is
+    /// what a question about a bare register wants.
+    pub(crate) fn sees_all_reservations(range: Range<LivePoint<E>>) -> Self {
+        QuerySpan {
+            porous_to: None,
+            range,
+        }
+    }
+
+    /// The value a reservation must be held for to be porous to this span, if
+    /// any.
+    pub(crate) fn val(&self) -> Option<Val<E>> {
+        self.porous_to
+    }
+
+    /// The range this span covers.
+    pub(crate) fn range(&self) -> Range<LivePoint<E>> {
+        self.range.clone()
+    }
+}
+
 /// The key by which a register unit's assignments are ordered.
 ///
 /// The spans inside one `RegUnitAssignments` can never overlap, as that would
 /// represent a conflicting assignment, so we key by just the spans' start
 /// points.
+///
+/// Reservations are the same, in a map of their own: a reservation may overlap
+/// an assignment, but never another reservation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct AssignmentKey<E>
 where
@@ -52,20 +107,85 @@ where
 /// `RegUnitAssignments` for each span in that bundle.
 type RegUnitAssignments<E> = BTreeMap<AssignmentKey<E>, Assignment<E>>;
 
+/// A register unit held for a fixed operand.
+///
+/// Rather than let the value's bundle compete for the register the operand
+/// names, we take it out of circulation for the half-instruction the operand
+/// owns and move-connect the value to it.
+///
+/// Reservations are never evicted and never removed: no amount of splitting or
+/// spilling can change where a fixed operand must live.
+#[derive(Clone, Debug)]
+struct ReservationEntry<E>
+where
+    E: EntityRepr,
+{
+    /// The end of the reserved range, whose start is `AssignmentKey::start`.
+    end: LivePoint<E>,
+
+    /// Who this reservation is for, if any.
+    ///
+    /// This is the only value part that this reservation may share its
+    /// associated unit with.
+    porous_to: Option<PorousTo<E>>,
+}
+
+/// What a reservation may share one of its register units with.
+///
+/// Sharing takes the same *piece* of the same value in the same place: a span
+/// assigned the group `(r0, r2)` may not sit under a reservation of `(r1, r0)`
+/// even for its own value, since each wants a different piece of it in `r0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct PorousTo<E>
+where
+    E: EntityRepr,
+{
+    /// The value the reservation holds the register for.
+    val: Val<E>,
+
+    /// Which piece of `val` belongs in this unit: the index of the member of
+    /// the reserved register group that covers it, and zero for a plain
+    /// register.
+    ///
+    /// Comparing indices is enough to compare pieces: both allocations hold
+    /// the same value, so both draw on one register bank, whose registers have
+    /// disjoint units.
+    member: usize,
+}
+
+/// A map of all the reservations on a register unit.
+type RegUnitReservations<E> = BTreeMap<AssignmentKey<E>, ReservationEntry<E>>;
+
+/// Something already occupying a register unit over a span.
+enum Conflict<'a, E>
+where
+    E: EntityRepr,
+{
+    /// A bundle's assignment, which can be evicted or split around.
+    Assignment(&'a Assignment<E>),
+
+    /// A register held for a fixed operand, which can be neither.
+    Reservation,
+}
+
 pub struct Assignments<E>
 where
     E: EntityRepr,
 {
     assignments: SecondaryMap<RegUnit, RegUnitAssignments<E>>,
+    reservations: SecondaryMap<RegUnit, RegUnitReservations<E>>,
+}
+
+/// The units one register covers.
+fn units_in(units: Range<RegUnit>) -> impl Iterator<Item = RegUnit> {
+    debug_assert!(units.start <= units.end);
+    (units.start.to_bits()..units.end.to_bits()).map(|i| RegUnit::from_bits(i))
 }
 
 fn iter_reg_units(
     reg_units: impl Iterator<Item = Range<RegUnit>>,
 ) -> impl Iterator<Item = RegUnit> {
-    reg_units.flat_map(|units| {
-        debug_assert!(units.start <= units.end);
-        (units.start.to_bits()..units.end.to_bits()).map(|i| RegUnit::from_bits(i))
-    })
+    reg_units.flat_map(units_in)
 }
 
 impl<E> Assignments<E>
@@ -75,17 +195,25 @@ where
     pub const fn new() -> Self {
         Self {
             assignments: SecondaryMap::new(RegUnitAssignments::new()),
+            reservations: SecondaryMap::new(RegUnitReservations::new()),
         }
     }
 
     pub fn reset(&mut self) {
-        let Self { assignments } = self;
+        let Self {
+            assignments,
+            reservations,
+        } = self;
         assignments.reset();
+        reservations.reset();
     }
 
     pub fn is_reset(&self) -> bool {
-        let Self { assignments } = self;
-        assignments.is_reset()
+        let Self {
+            assignments,
+            reservations,
+        } = self;
+        assignments.is_reset() && reservations.is_reset()
     }
 
     /// Iterate over the existing assignments in `unit` that overlap `span`.
@@ -105,19 +233,55 @@ where
             .map(|(_, existing)| existing)
     }
 
-    /// Call `f` on every existing assignment that overlaps one of the given
-    /// spans.
+    /// Iterate over the reservations on `unit` that overlap `span`.
+    fn overlapping_reservations(
+        &self,
+        unit: RegUnit,
+        span: Range<LivePoint<E>>,
+    ) -> impl Iterator<Item = &ReservationEntry<E>> {
+        let (start, end) = (span.start, span.end);
+        self.reservations[unit]
+            .range(..AssignmentKey::new(end))
+            .rev()
+            .take_while(move |(_, existing)| start < existing.end)
+            .filter(move |(existing_key, existing)| {
+                LivePoint::spans_overlap(start, end, existing_key.start, existing.end)
+            })
+            .map(|(_, existing)| existing)
+    }
+
+    /// Call `f` on everything already occupying one of `reg_units` over one of
+    /// the given spans.
+    ///
+    /// A reservation the querying span's value may share is skipped; see
+    /// `ReservationEntry::porous_to`.
+    ///
+    /// `reg_units` is one candidate allocation's units member by member, since
+    /// which member a unit belongs to is part of the porosity question.
     fn for_each_overlapping<T>(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
-        mut f: impl FnMut(&Assignment<E>) -> ControlFlow<T>,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        mut f: impl FnMut(Conflict<'_, E>) -> ControlFlow<T>,
     ) -> Option<T> {
-        for unit in iter_reg_units(reg_units) {
-            for span in spans.clone() {
-                for existing in self.overlapping(unit, span) {
-                    if let ControlFlow::Break(result) = f(existing) {
-                        return Some(result);
+        for (member, units) in reg_units.enumerate() {
+            for unit in units_in(units) {
+                for span in spans.clone() {
+                    let val = span.val();
+                    let range = span.range();
+                    let porous_to = val.map(|val| PorousTo { val, member });
+                    for existing in self.overlapping_reservations(unit, range.clone()) {
+                        if porous_to.is_some() && existing.porous_to == porous_to {
+                            continue;
+                        }
+                        if let ControlFlow::Break(result) = f(Conflict::Reservation) {
+                            return Some(result);
+                        }
+                    }
+                    for existing in self.overlapping(unit, range) {
+                        if let ControlFlow::Break(result) = f(Conflict::Assignment(existing)) {
+                            return Some(result);
+                        }
                     }
                 }
             }
@@ -129,19 +293,30 @@ where
     /// that overlap `spans`.
     ///
     /// This is what it would cost to make room for `spans` in `reg_units`.
+    ///
+    /// A reservation cannot be evicted at any price, so a span running into
+    /// one costs infinitely much to place there.
     pub fn interference_weight(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
         scratch: &mut Vec<LiveBundle<E>>,
         weight_of: impl Fn(LiveBundle<E>) -> f32,
     ) -> f32 {
         debug_assert!(scratch.is_empty());
 
-        self.for_each_overlapping::<()>(reg_units, spans, |existing| {
-            scratch.push(existing.bundle);
-            ControlFlow::Continue(())
+        let reserved = self.for_each_overlapping(reg_units, spans, |existing| match existing {
+            Conflict::Assignment(existing) => {
+                scratch.push(existing.bundle);
+                ControlFlow::Continue(())
+            }
+            Conflict::Reservation => ControlFlow::Break(()),
         });
+
+        if reserved.is_some() {
+            scratch.clear();
+            return f32::INFINITY;
+        }
 
         scratch.sort_unstable();
         scratch.dedup();
@@ -151,18 +326,22 @@ where
         weight
     }
 
-    /// Do the given spans conflict with any existing assignments in `reg_units`?
+    /// Do the given spans conflict with any existing assignment or reservation
+    /// in `reg_units`?
     pub(crate) fn conflicts(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> bool {
         self.for_each_overlapping(reg_units, spans, |_| ControlFlow::Break(()))
             .is_some()
     }
 
     /// The one and only bundle whose existing assignments in `reg_units`
-    /// conflict with the given spans, if there is exactly one such bundle.
+    /// conflict with the given spans.
+    ///
+    /// Returns `None` when there is no single conflicting assignment or there
+    /// is a conflicting reservation.
     ///
     /// TODO: support evicting multiple bundles if that is still cheaper. will
     /// require an `&mut Vec<LiveBundle>` out parameter to these methods for
@@ -170,15 +349,20 @@ where
     fn sole_conflicting_bundle(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> Option<LiveBundle<E>> {
         let mut sole = None;
-        let too_many = self.for_each_overlapping(reg_units, spans, |existing| match sole {
-            Some(bundle) if bundle == existing.bundle => ControlFlow::Continue(()),
-            Some(_) => ControlFlow::Break(()),
-            None => {
-                sole = Some(existing.bundle);
-                ControlFlow::Continue(())
+        let too_many = self.for_each_overlapping(reg_units, spans, |existing| {
+            let Conflict::Assignment(existing) = existing else {
+                return ControlFlow::Break(());
+            };
+            match sole {
+                Some(bundle) if bundle == existing.bundle => ControlFlow::Continue(()),
+                Some(_) => ControlFlow::Break(()),
+                None => {
+                    sole = Some(existing.bundle);
+                    ControlFlow::Continue(())
+                }
             }
         });
         if too_many.is_some() { None } else { sole }
@@ -190,11 +374,11 @@ where
     fn remove_assignment(
         &mut self,
         bundle: LiveBundle<E>,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) {
         for (_unit, unit_assignments) in self.assignments.iter_mut() {
             for span in spans.clone() {
-                let key = AssignmentKey::new(span.start);
+                let key = AssignmentKey::new(span.range().start);
                 if unit_assignments
                     .get(&key)
                     .is_some_and(|existing| existing.bundle == bundle)
@@ -213,16 +397,56 @@ where
         &mut self,
         bundle: LiveBundle<E>,
         reg_units: impl Iterator<Item = Range<RegUnit>> + Clone,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) {
         debug_assert!(!self.conflicts(reg_units.clone(), spans.clone()));
         for unit in iter_reg_units(reg_units) {
             for span in spans.clone() {
+                let range = span.range();
                 let old_entry = self.assignments[unit].insert(
-                    AssignmentKey::new(span.start),
+                    AssignmentKey::new(range.start),
                     Assignment {
-                        end: span.end,
+                        end: range.end,
                         bundle,
+                    },
+                );
+                debug_assert!(old_entry.is_none());
+            }
+        }
+    }
+
+    /// Hold `reg_units` over `span` for a fixed operand.
+    ///
+    /// `porous_to` is the value the reservation holds the register for, and
+    /// `None` when nothing may share it; see `ReservationEntry::porous_to`.
+    ///
+    /// `reg_units` is the reserved allocation's units member by member, which
+    /// says which piece of the value each unit is porous to.
+    ///
+    /// No two reservations on a unit may overlap.
+    pub fn insert_reservation(
+        &mut self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        span: Range<LivePoint<E>>,
+        porous_to: Option<Val<E>>,
+    ) {
+        debug_assert!(span.start < span.end);
+        for (member, units) in reg_units.enumerate() {
+            let porous_to = porous_to.map(|val| PorousTo { val, member });
+            for unit in units_in(units) {
+                debug_assert!(
+                    self.overlapping_reservations(unit, span.clone())
+                        .next()
+                        .is_none(),
+                    "reserving {:?}..{:?} of {unit:?} overlaps an existing reservation",
+                    span.start,
+                    span.end,
+                );
+                let old_entry = self.reservations[unit].insert(
+                    AssignmentKey::new(span.start),
+                    ReservationEntry {
+                        end: span.end,
+                        porous_to,
                     },
                 );
                 debug_assert!(old_entry.is_none());
@@ -241,7 +465,7 @@ where
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = Reg>,
         reg_units: impl Fn(Reg) -> Range<RegUnit>,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> Option<Reg> {
         debug_assert!(spans.len() > 0);
 
@@ -268,7 +492,7 @@ where
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = RegGroup>,
         group_units: impl Fn(RegGroup) -> GroupUnits,
-        spans: impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> Option<RegGroup>
     where
         GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
@@ -298,7 +522,7 @@ where
     where
         C: Copy,
         Units: Iterator<Item = Range<RegUnit>> + Clone,
-        Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        Spans: ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     {
         let spans = bundle_spans(bundle);
         debug_assert!(spans.len() > 0);
@@ -357,7 +581,7 @@ where
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
     ) -> Option<(Reg, LiveBundle<E>)>
     where
-        Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        Spans: ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     {
         self.try_evict_and_assign(
             bundle,
@@ -381,7 +605,7 @@ where
     ) -> Option<(RegGroup, LiveBundle<E>)>
     where
         GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
-        Spans: ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone,
+        Spans: ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     {
         self.try_evict_and_assign(
             bundle,
@@ -393,10 +617,11 @@ where
         )
     }
 
-    /// Merge all of `other`'s assignments into `self`.
+    /// Merge all of `other`'s assignments and reservations into `self`.
     ///
     /// None of `other`'s assignments may conflict with any assignment already
-    /// in `self`.
+    /// in `self`, and none of its reservations with any reservation already in
+    /// `self`.
     pub fn merge(&mut self, other: &Self) {
         for (unit, other_unit_assignments) in other.assignments.iter() {
             if other_unit_assignments.is_empty() {
@@ -423,6 +648,32 @@ where
             let unit_assignments = &mut self.assignments[unit];
             for (key, assignment) in other_unit_assignments {
                 let old_entry = unit_assignments.insert(*key, assignment.clone());
+                debug_assert!(old_entry.is_none());
+            }
+        }
+
+        for (unit, other_unit_reservations) in other.reservations.iter() {
+            if other_unit_reservations.is_empty() {
+                continue;
+            }
+
+            if cfg!(debug_assertions) {
+                for (key, reservation) in other_unit_reservations {
+                    debug_assert!(
+                        self.overlapping_reservations(unit, key.start..reservation.end)
+                            .next()
+                            .is_none(),
+                        "merging a reservation of {:?}..{:?} on {unit:?} conflicts with an \
+                         existing reservation",
+                        key.start,
+                        reservation.end,
+                    );
+                }
+            }
+
+            let unit_reservations = &mut self.reservations[unit];
+            for (key, reservation) in other_unit_reservations {
+                let old_entry = unit_reservations.insert(*key, reservation.clone());
                 debug_assert!(old_entry.is_none());
             }
         }
@@ -564,6 +815,44 @@ mod tests {
         point(start)..point(end)
     }
 
+    /// The number of distinct values a generated span may carry.
+    ///
+    /// Small on purpose: we want the same value to turn up on both sides of a
+    /// porosity question often enough to exercise it.
+    const NUM_VALS: u8 = 3;
+
+    fn val(index: u8) -> Val<u32> {
+        Val::try_new(usize::from(index)).unwrap()
+    }
+
+    /// Decode a test op's value selector.
+    ///
+    /// Zero is the question a bare register asks, porous to nothing; the rest
+    /// name a value.
+    fn val_of(index: u8) -> Option<Val<u32>> {
+        debug_assert!(index <= NUM_VALS);
+        (index > 0).then(|| val(index - 1))
+    }
+
+    /// A span as the test ops name it: a start point, an end point, and a
+    /// value selector.
+    type TestSpan = (u8, u8, u8);
+
+    fn query_span(&(start, end, v): &TestSpan) -> QuerySpan<u32> {
+        match val_of(v) {
+            Some(val) => QuerySpan::porous_to(val, span(start, end)),
+            None => QuerySpan::sees_all_reservations(span(start, end)),
+        }
+    }
+
+    fn query_spans(spans: &[TestSpan]) -> Vec<QuerySpan<u32>> {
+        spans.iter().map(query_span).collect()
+    }
+
+    fn qspan(start: u8, end: u8, v: u8) -> QuerySpan<u32> {
+        query_span(&(start, end, v))
+    }
+
     /// One assignment as the oracle records it: one entry per (unit, span) pair.
     #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
     struct OracleEntry {
@@ -573,26 +862,83 @@ mod tests {
         bundle: LiveBundle<u32>,
     }
 
-    /// Brute-force check whether assigning `spans` to `reg_units` would
-    /// conflict.
-    fn oracle_conflicts(
-        oracle: &[OracleEntry],
+    /// One reservation as the oracle records it: one entry per (unit, span)
+    /// pair, exactly as for an assignment.
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+    struct OracleReservation {
+        unit: RegUnit,
+        start: LivePoint<u32>,
+        end: LivePoint<u32>,
+        porous_to: Option<PorousTo<u32>>,
+    }
+
+    /// Everything the matrix is supposed to be holding, in a shape that is
+    /// obviously right rather than efficient.
+    #[derive(Clone, Debug, Default)]
+    struct Oracle {
+        assignments: Vec<OracleEntry>,
+        reservations: Vec<OracleReservation>,
+    }
+
+    impl Oracle {
+        fn clear(&mut self) {
+            self.assignments.clear();
+            self.reservations.clear();
+        }
+
+        fn is_empty(&self) -> bool {
+            self.assignments.is_empty() && self.reservations.is_empty()
+        }
+    }
+
+    fn overlaps(span: &Range<LivePoint<u32>>, start: LivePoint<u32>, end: LivePoint<u32>) -> bool {
+        LivePoint::spans_overlap(span.start, span.end, start, end)
+    }
+
+    /// Which member of `reg_units` covers `unit`, if any of them does.
+    fn member_covering(reg_units: &[Range<RegUnit>], unit: RegUnit) -> Option<usize> {
+        reg_units.iter().position(|units| units.contains(&unit))
+    }
+
+    /// Brute-force check whether any reservation stands in the way of putting
+    /// `spans` in `reg_units`.
+    fn oracle_reserved(
+        oracle: &Oracle,
         reg_units: &[Range<RegUnit>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
     ) -> bool {
-        oracle.iter().any(|existing| {
-            reg_units.iter().any(|units| units.contains(&existing.unit))
-                && spans.iter().any(|span| {
-                    LivePoint::spans_overlap(span.start, span.end, existing.start, existing.end)
-                })
+        oracle.reservations.iter().any(|existing| {
+            let Some(member) = member_covering(reg_units, existing.unit) else {
+                return false;
+            };
+            spans.iter().any(|span| {
+                let porous_to = span.val().map(|val| PorousTo { val, member });
+                !(porous_to.is_some() && existing.porous_to == porous_to)
+                    && overlaps(&span.range(), existing.start, existing.end)
+            })
         })
     }
 
+    /// Brute-force check whether assigning `spans` to `reg_units` would
+    /// conflict.
+    fn oracle_conflicts(
+        oracle: &Oracle,
+        reg_units: &[Range<RegUnit>],
+        spans: &[QuerySpan<u32>],
+    ) -> bool {
+        oracle.assignments.iter().any(|existing| {
+            reg_units.iter().any(|units| units.contains(&existing.unit))
+                && spans
+                    .iter()
+                    .any(|span| overlaps(&span.range(), existing.start, existing.end))
+        }) || oracle_reserved(oracle, reg_units, spans)
+    }
+
     fn oracle_insert(
-        oracle: &mut Vec<OracleEntry>,
+        oracle: &mut Oracle,
         bundle: LiveBundle<u32>,
         reg_units: &[Range<RegUnit>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
     ) {
         for index in 0..NUM_UNITS {
             let unit = unit(index);
@@ -600,14 +946,50 @@ mod tests {
                 continue;
             }
             for span in spans {
-                oracle.push(OracleEntry {
+                let range = span.range();
+                oracle.assignments.push(OracleEntry {
                     unit,
-                    start: span.start,
-                    end: span.end,
+                    start: range.start,
+                    end: range.end,
                     bundle,
                 });
             }
         }
+    }
+
+    fn oracle_insert_reservation(
+        oracle: &mut Oracle,
+        reg_units: &[Range<RegUnit>],
+        span: &Range<LivePoint<u32>>,
+        porous_to: Option<Val<u32>>,
+    ) {
+        for index in 0..NUM_UNITS {
+            let unit = unit(index);
+            let Some(member) = member_covering(reg_units, unit) else {
+                continue;
+            };
+            oracle.reservations.push(OracleReservation {
+                unit,
+                start: span.start,
+                end: span.end,
+                porous_to: porous_to.map(|val| PorousTo { val, member }),
+            });
+        }
+    }
+
+    /// Would reserving `span` on `reg_units` collide with a reservation that
+    /// is already there?
+    ///
+    /// `insert_reservation` forbids it, so the test declines to make the call.
+    fn oracle_reservation_would_overlap(
+        oracle: &Oracle,
+        reg_units: &[Range<RegUnit>],
+        span: &Range<LivePoint<u32>>,
+    ) -> bool {
+        oracle.reservations.iter().any(|existing| {
+            reg_units.iter().any(|units| units.contains(&existing.unit))
+                && overlaps(span, existing.start, existing.end)
+        })
     }
 
     /// Brute-force version of `Assignments::try_assign_to_reg` and
@@ -615,10 +997,10 @@ mod tests {
     ///
     /// Returns the index of the candidate that the bundle was assigned to.
     fn oracle_try_assign(
-        oracle: &mut Vec<OracleEntry>,
+        oracle: &mut Oracle,
         bundle: LiveBundle<u32>,
         candidates: &[Vec<Range<RegUnit>>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
     ) -> Option<usize> {
         let index = candidates
             .iter()
@@ -634,11 +1016,14 @@ mod tests {
     /// assigned with now, rather than any it happens to already hold. In the
     /// allocator proper this all comes straight off the bundle, whose spans do
     /// not change while it is assigned.
+    ///
+    /// A victim's spans carry no value, faithfully: `remove_assignment` never
+    /// looks at one.
     fn spans_by_bundle(
-        oracle: &[OracleEntry],
+        oracle: &Oracle,
         incoming: LiveBundle<u32>,
-        incoming_spans: &[Range<LivePoint<u32>>],
-    ) -> Vec<Vec<Range<LivePoint<u32>>>> {
+        incoming_spans: &[QuerySpan<u32>],
+    ) -> Vec<Vec<QuerySpan<u32>>> {
         (0..usize::from(NUM_BUNDLES))
             .map(|index| {
                 let b = bundle(index);
@@ -646,6 +1031,7 @@ mod tests {
                     return incoming_spans.to_vec();
                 }
                 let mut spans: Vec<_> = oracle
+                    .assignments
                     .iter()
                     .filter(|existing| existing.bundle == b)
                     .map(|existing| existing.start..existing.end)
@@ -653,6 +1039,9 @@ mod tests {
                 spans.sort_unstable_by_key(|span| (span.start, span.end));
                 spans.dedup();
                 spans
+                    .into_iter()
+                    .map(QuerySpan::sees_all_reservations)
+                    .collect()
             })
             .collect()
     }
@@ -664,10 +1053,10 @@ mod tests {
     /// evicted from. Returns the bundle that was evicted and the index of the
     /// candidate the incoming bundle took, if any.
     fn oracle_try_evict_and_assign(
-        oracle: &mut Vec<OracleEntry>,
+        oracle: &mut Oracle,
         bundle: LiveBundle<u32>,
         candidates: &[Vec<Range<RegUnit>>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
         max_cost: EvictionCost,
         cost: impl Fn(LiveBundle<u32>, usize) -> EvictionCost,
     ) -> Option<(LiveBundle<u32>, usize)> {
@@ -675,20 +1064,21 @@ mod tests {
         let mut best_cost = max_cost;
 
         for (index, units) in candidates.iter().enumerate() {
+            // A reservation cannot be evicted, so no eviction clears this.
+            if oracle_reserved(oracle, units, spans) {
+                continue;
+            }
+
             // The distinct bundles in the way, of which there must be exactly
             // one for a single eviction to make room here.
             let mut conflicting: Vec<LiveBundle<u32>> = oracle
+                .assignments
                 .iter()
                 .filter(|existing| {
                     units.iter().any(|units| units.contains(&existing.unit))
-                        && spans.iter().any(|span| {
-                            LivePoint::spans_overlap(
-                                span.start,
-                                span.end,
-                                existing.start,
-                                existing.end,
-                            )
-                        })
+                        && spans
+                            .iter()
+                            .any(|span| overlaps(&span.range(), existing.start, existing.end))
                 })
                 .map(|existing| existing.bundle)
                 .collect();
@@ -707,18 +1097,21 @@ mod tests {
         }
 
         let (victim, index) = best?;
-        oracle.retain(|existing| existing.bundle != victim);
+        oracle
+            .assignments
+            .retain(|existing| existing.bundle != victim);
         oracle_insert(oracle, bundle, &candidates[index], spans);
         Some((victim, index))
     }
 
     /// Check that `assignments` records exactly what `oracle` does.
-    fn check_agree(assignments: &Assignments<u32>, oracle: &[OracleEntry]) -> Result<(), String> {
+    fn check_agree(assignments: &Assignments<u32>, oracle: &Oracle) -> Result<(), String> {
         if assignments.is_reset() != oracle.is_empty() {
             return Err(format!(
-                "`is_reset` is {} but the oracle holds {} assignments",
+                "`is_reset` is {} but the oracle holds {} assignments and {} reservations",
                 assignments.is_reset(),
-                oracle.len(),
+                oracle.assignments.len(),
+                oracle.reservations.len(),
             ));
         }
 
@@ -727,6 +1120,13 @@ mod tests {
             return Err(format!(
                 "the map has grown to hold {} units, but this test only names {NUM_UNITS}",
                 assignments.assignments.len(),
+            ));
+        }
+        if assignments.reservations.len() > NUM_UNITS {
+            return Err(format!(
+                "the reservation map has grown to hold {} units, but this test only names \
+                 {NUM_UNITS}",
+                assignments.reservations.len(),
             ));
         }
 
@@ -745,12 +1145,34 @@ mod tests {
         }
         actual.sort_unstable();
 
-        let mut expected = oracle.to_vec();
+        let mut expected = oracle.assignments.clone();
         expected.sort_unstable();
 
         if actual != expected {
             return Err(format!(
                 "the assignments are {actual:?} but should be {expected:?}"
+            ));
+        }
+
+        let mut actual = Vec::new();
+        for (unit, unit_reservations) in assignments.reservations.iter() {
+            for (key, reservation) in unit_reservations {
+                actual.push(OracleReservation {
+                    unit,
+                    start: key.start,
+                    end: reservation.end,
+                    porous_to: reservation.porous_to,
+                });
+            }
+        }
+        actual.sort_unstable();
+
+        let mut expected = oracle.reservations.clone();
+        expected.sort_unstable();
+
+        if actual != expected {
+            return Err(format!(
+                "the reservations are {actual:?} but should be {expected:?}"
             ));
         }
 
@@ -783,6 +1205,33 @@ mod tests {
                 previous = Some(key.start..assignment.end);
             }
         }
+
+        for (unit, unit_reservations) in assignments.reservations.iter() {
+            let mut previous: Option<Range<LivePoint<u32>>> = None;
+            for (key, reservation) in unit_reservations {
+                if key.start >= reservation.end {
+                    return Err(format!(
+                        "{unit:?} reserves the empty span {:?}..{:?}",
+                        key.start, reservation.end,
+                    ));
+                }
+                if let Some(previous) = &previous
+                    && LivePoint::spans_overlap(
+                        previous.start,
+                        previous.end,
+                        key.start,
+                        reservation.end,
+                    )
+                {
+                    return Err(format!(
+                        "{unit:?} reserves the overlapping spans {previous:?} and {:?}..{:?}",
+                        key.start, reservation.end,
+                    ));
+                }
+                previous = Some(key.start..reservation.end);
+            }
+        }
+
         Ok(())
     }
 
@@ -809,12 +1258,15 @@ mod tests {
 
     fn check_conflicts_agree(
         assignments: &Assignments<u32>,
-        oracle: &[OracleEntry],
+        oracle: &Oracle,
     ) -> Result<(), String> {
         for (index, units) in probe_unit_sets().iter().enumerate() {
             for start in 0..NUM_POINTS {
                 for end in start + 1..=NUM_POINTS {
-                    let probe = [span(start, end)];
+                    // The querying value decides which reservations are in
+                    // the way, so rotate it across the grid rather than
+                    // sweeping every value at every point.
+                    let probe = [query_span(&(start, end, (start + end) % (NUM_VALS + 1)))];
                     let actual =
                         assignments.conflicts(units.iter().cloned(), probe.iter().cloned());
                     let expected = oracle_conflicts(oracle, units, &probe);
@@ -838,18 +1290,24 @@ mod tests {
 
     /// Brute-force version of `Assignments::interference_weight`.
     fn oracle_interference_weight(
-        oracle: &[OracleEntry],
+        oracle: &Oracle,
         reg_units: &[Range<RegUnit>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
         weight_of: impl Fn(LiveBundle<u32>) -> f32,
     ) -> f32 {
+        // Nothing can buy out a reservation, so there is no finite price.
+        if oracle_reserved(oracle, reg_units, spans) {
+            return f32::INFINITY;
+        }
+
         let mut conflicting: Vec<LiveBundle<u32>> = oracle
+            .assignments
             .iter()
             .filter(|existing| {
                 reg_units.iter().any(|units| units.contains(&existing.unit))
-                    && spans.iter().any(|span| {
-                        LivePoint::spans_overlap(span.start, span.end, existing.start, existing.end)
-                    })
+                    && spans
+                        .iter()
+                        .any(|span| overlaps(&span.range(), existing.start, existing.end))
             })
             .map(|existing| existing.bundle)
             .collect();
@@ -859,30 +1317,39 @@ mod tests {
     }
 
     /// The span sets that `interference_weight` is probed with.
-    fn probe_span_sets() -> Vec<Vec<Range<LivePoint<u32>>>> {
+    ///
+    /// Each set asks on behalf of a different value, including no value at
+    /// all, since that decides which reservations are in the way.
+    fn probe_span_sets() -> Vec<Vec<QuerySpan<u32>>> {
+        let v = &mut 0;
+        let mut s = move |start, end| {
+            let span = query_span(&(start, end, *v % (NUM_VALS + 1)));
+            *v += 1;
+            span
+        };
         vec![
-            vec![span(0, 8)],
-            vec![span(3, 5)],
-            vec![span(2, 3)],
-            vec![span(0, 1), span(2, 3)],
-            vec![span(0, 1), span(3, 4)],
-            vec![span(0, 2), span(4, 6)],
-            vec![span(0, 1), span(7, 8)],
-            vec![span(1, 2), span(3, 5), span(6, 8)],
-            vec![span(0, 4), span(4, 8)],
+            vec![s(0, 8)],
+            vec![s(3, 5)],
+            vec![s(2, 3)],
+            vec![s(0, 1), s(2, 3)],
+            vec![s(0, 1), s(3, 4)],
+            vec![s(0, 2), s(4, 6)],
+            vec![s(0, 1), s(7, 8)],
+            vec![s(1, 2), s(3, 5), s(6, 8)],
+            vec![s(0, 4), s(4, 8)],
         ]
     }
 
     fn check_interference_weight_agrees(
         assignments: &Assignments<u32>,
-        oracle: &[OracleEntry],
+        oracle: &Oracle,
     ) -> Result<(), String> {
         let scratch = &mut Vec::new();
         let weight_of = |b: LiveBundle<u32>| WEIGHTS[b.index()];
         let span_sets = probe_span_sets();
 
         for (index, units) in probe_unit_sets().iter().enumerate() {
-            let weigh = |spans: &[Range<LivePoint<u32>>],
+            let weigh = |spans: &[QuerySpan<u32>],
                          scratch: &mut Vec<LiveBundle<u32>>,
                          weight_of: &dyn Fn(LiveBundle<u32>) -> f32| {
                 assignments.interference_weight(
@@ -930,8 +1397,8 @@ mod tests {
             // Two adjacent ranges cover exactly what the single range they tile
             // does, so they must cost exactly what it does: no bundle in the way
             // of both may be charged twice for straddling the seam.
-            let split = weigh(&[span(0, 4), span(4, 8)], scratch, &weight_of);
-            let whole = weigh(&[span(0, 8)], scratch, &weight_of);
+            let split = weigh(&[qspan(0, 4, 1), qspan(4, 8, 1)], scratch, &weight_of);
+            let whole = weigh(&[qspan(0, 8, 1)], scratch, &weight_of);
             if split != whole {
                 return Err(format!(
                     "`interference_weight({}, ..)` is {split} for two adjacent halves but \
@@ -961,7 +1428,7 @@ mod tests {
         assignments: &Assignments<u32>,
         what: &str,
         candidates: &[Vec<Range<RegUnit>>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
         actual: Option<usize>,
         expected: Option<usize>,
     ) -> Result<(), String> {
@@ -998,7 +1465,7 @@ mod tests {
         assignments: &Assignments<u32>,
         what: &str,
         candidates: &[Vec<Range<RegUnit>>],
-        spans: &[Range<LivePoint<u32>>],
+        spans: &[QuerySpan<u32>],
         actual: Option<(LiveBundle<u32>, usize)>,
         expected: Option<(LiveBundle<u32>, usize)>,
     ) -> Result<(), String> {
@@ -1036,17 +1503,17 @@ mod tests {
         TryAssign {
             bundle: u8,
             candidates: Vec<u8>,
-            spans: Vec<(u8, u8)>,
+            spans: Vec<TestSpan>,
         },
         TryAssignGroup {
             bundle: u8,
             candidates: Vec<u8>,
-            spans: Vec<(u8, u8)>,
+            spans: Vec<TestSpan>,
         },
         TryEvictAndAssign {
             bundle: u8,
             candidates: Vec<u8>,
-            spans: Vec<(u8, u8)>,
+            spans: Vec<TestSpan>,
             /// Each bundle's spill weight, indexed by bundle.
             weights: Vec<u8>,
             /// Each bundle's preferred candidate, indexed by bundle. Evicting a
@@ -1057,9 +1524,19 @@ mod tests {
         TryEvictGroupAndAssign {
             bundle: u8,
             candidates: Vec<u8>,
-            spans: Vec<(u8, u8)>,
+            spans: Vec<TestSpan>,
             weights: Vec<u8>,
             hints: Vec<u8>,
+        },
+        /// Reserve a register over one span, porous to the span's value
+        /// selector; zero makes it a hard wall.
+        Reserve {
+            candidate: u8,
+            span: TestSpan,
+        },
+        ReserveGroup {
+            candidate: u8,
+            span: TestSpan,
         },
         Reset,
     }
@@ -1074,22 +1551,29 @@ mod tests {
         }
     }
 
+    /// Ensure that a single span is in-range.
+    fn fixup_span(span: &mut TestSpan) {
+        let (start, end, v) = span;
+        *start %= NUM_POINTS;
+        if !(*start < *end && *end <= NUM_POINTS) {
+            *end = *start + 1 + (*end % (NUM_POINTS - *start));
+        }
+        *v %= NUM_VALS + 1;
+    }
+
     /// Ensure that the spans are in-range.
-    fn fixup_spans(spans: &mut Vec<(u8, u8)>) {
+    fn fixup_spans(spans: &mut Vec<TestSpan>) {
         spans.truncate(MAX_SPANS);
 
-        for (start, end) in spans.iter_mut() {
-            *start %= NUM_POINTS;
-            if !(*start < *end && *end <= NUM_POINTS) {
-                *end = *start + 1 + (*end % (NUM_POINTS - *start));
-            }
+        for span in spans.iter_mut() {
+            fixup_span(span);
         }
 
         spans.sort_unstable();
 
         // Remove overlapping spans.
         let mut previous_end = 0;
-        spans.retain(|&(start, end)| {
+        spans.retain(|&(start, end, _)| {
             let keep = start >= previous_end;
             if keep {
                 previous_end = end;
@@ -1099,7 +1583,7 @@ mod tests {
 
         // Ensure we always have at least one span.
         if spans.is_empty() {
-            spans.push((0, 1));
+            spans.push((0, 1, 1));
         }
     }
 
@@ -1157,6 +1641,16 @@ mod tests {
                     Some((weights, hints)),
                     num_groups,
                 ),
+                Op::Reserve { candidate, span } => {
+                    *candidate %= num_regs;
+                    fixup_span(span);
+                    continue;
+                }
+                Op::ReserveGroup { candidate, span } => {
+                    *candidate %= num_groups;
+                    fixup_span(span);
+                    continue;
+                }
                 Op::Reset => continue,
             };
             *bundle %= NUM_BUNDLES;
@@ -1171,7 +1665,15 @@ mod tests {
         }
     }
 
-    fn try_assign(bundle: u8, candidates: &[u8], spans: &[(u8, u8)]) -> Op {
+    fn reserve(candidate: u8, span: TestSpan) -> Op {
+        Op::Reserve { candidate, span }
+    }
+
+    fn reserve_group(candidate: u8, span: TestSpan) -> Op {
+        Op::ReserveGroup { candidate, span }
+    }
+
+    fn try_assign(bundle: u8, candidates: &[u8], spans: &[TestSpan]) -> Op {
         Op::TryAssign {
             bundle,
             candidates: candidates.to_vec(),
@@ -1179,7 +1681,7 @@ mod tests {
         }
     }
 
-    fn try_assign_group(bundle: u8, candidates: &[u8], spans: &[(u8, u8)]) -> Op {
+    fn try_assign_group(bundle: u8, candidates: &[u8], spans: &[TestSpan]) -> Op {
         Op::TryAssignGroup {
             bundle,
             candidates: candidates.to_vec(),
@@ -1190,7 +1692,7 @@ mod tests {
     fn try_evict(
         bundle: u8,
         candidates: &[u8],
-        spans: &[(u8, u8)],
+        spans: &[TestSpan],
         weights: &[u8],
         hints: &[u8],
     ) -> Op {
@@ -1206,7 +1708,7 @@ mod tests {
     fn try_evict_group(
         bundle: u8,
         candidates: &[u8],
-        spans: &[(u8, u8)],
+        spans: &[TestSpan],
         weights: &[u8],
         hints: &[u8],
     ) -> Op {
@@ -1228,299 +1730,378 @@ mod tests {
             // aliases, and as an assignment that has to fall through to a
             // second candidate.
             vec![
-                try_assign(0, &[R4], &[(0, 6)]),
-                try_assign(1, &[R4], &[(2, 4)]),
-                try_assign(2, &[R0], &[(2, 4)]),
-                try_assign(3, &[R1, R2], &[(2, 4)]),
+                try_assign(0, &[R4], &[(0, 6, 1)]),
+                try_assign(1, &[R4], &[(2, 4, 1)]),
+                try_assign(2, &[R0], &[(2, 4, 1)]),
+                try_assign(3, &[R1, R2], &[(2, 4, 1)]),
             ],
             // Exact-boundary abutment: `[0, 3)` ends where `[3, 6)` begins, so
             // the two do not conflict and both fit in one unit. This is the
             // case that an over-eager fix to `conflicts` gets wrong. The span
             // that reaches one point further does conflict.
             vec![
-                try_assign(0, &[R0], &[(0, 3)]),
-                try_assign(1, &[R0], &[(3, 6)]),
-                try_assign(2, &[R0], &[(2, 4)]),
+                try_assign(0, &[R0], &[(0, 3, 1)]),
+                try_assign(1, &[R0], &[(3, 6, 1)]),
+                try_assign(2, &[R0], &[(2, 4, 1)]),
             ],
             // The identical span twice: the second attempt conflicts on the
             // same register and on one that aliases it, and succeeds on one
             // whose units are disjoint.
             vec![
-                try_assign(0, &[R1], &[(1, 4)]),
-                try_assign(1, &[R1], &[(1, 4)]),
-                try_assign(2, &[R4], &[(1, 4)]),
-                try_assign(3, &[R3], &[(1, 4)]),
+                try_assign(0, &[R1], &[(1, 4, 1)]),
+                try_assign(1, &[R1], &[(1, 4, 1)]),
+                try_assign(2, &[R4], &[(1, 4, 1)]),
+                try_assign(3, &[R3], &[(1, 4, 1)]),
             ],
             // Aliasing in the other direction: a wide register first, then the
             // narrow ones it covers and the ones it does not.
             vec![
-                try_assign(0, &[R5], &[(0, 6)]),
-                try_assign(1, &[R2], &[(0, 6)]),
-                try_assign(2, &[R3], &[(0, 6)]),
-                try_assign(3, &[R0, R1], &[(0, 6)]),
+                try_assign(0, &[R5], &[(0, 6, 1)]),
+                try_assign(1, &[R2], &[(0, 6, 1)]),
+                try_assign(2, &[R3], &[(0, 6, 1)]),
+                try_assign(3, &[R0, R1], &[(0, 6, 1)]),
             ],
             // Spans one program point wide, and their immediate neighbors,
             // which must not conflict with them.
             vec![
-                try_assign(0, &[R2], &[(2, 3)]),
-                try_assign(1, &[R5], &[(1, 2), (3, 4)]),
-                try_assign(2, &[R5], &[(2, 3)]),
+                try_assign(0, &[R2], &[(2, 3, 1)]),
+                try_assign(1, &[R5], &[(1, 2, 1), (3, 4, 1)]),
+                try_assign(2, &[R5], &[(2, 3, 1)]),
             ],
             // A bundle of two spans with a hole between them, which something
             // else can be assigned to, and then a span covering the whole
             // thing, which cannot.
             vec![
-                try_assign(0, &[R0], &[(0, 2), (4, 6)]),
-                try_assign(1, &[R0], &[(2, 4)]),
-                try_assign(2, &[R0], &[(0, 6)]),
+                try_assign(0, &[R0], &[(0, 2, 1), (4, 6, 1)]),
+                try_assign(1, &[R0], &[(2, 4, 1)]),
+                try_assign(2, &[R0], &[(0, 6, 1)]),
             ],
             // Preference order: the first candidate is taken, so the second one
             // wins; and an empty candidate list assigns nothing at all.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign(1, &[R0, R1], &[(0, 6)]),
-                try_assign(2, &[R4, R2], &[(0, 6)]),
-                try_assign(3, &[], &[(0, 6)]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign(1, &[R0, R1], &[(0, 6, 1)]),
+                try_assign(2, &[R4, R2], &[(0, 6, 1)]),
+                try_assign(3, &[], &[(0, 6, 1)]),
             ],
             // The register with no units, which has nothing to conflict with,
             // and so "succeeds" while recording nothing and standing in nobody
             // else's way.
             vec![
-                try_assign(0, &[R6], &[(0, 6)]),
-                try_assign(1, &[R6], &[(0, 6)]),
-                try_assign(2, &[R6, R4], &[(0, 6)]),
+                try_assign(0, &[R6], &[(0, 6, 1)]),
+                try_assign(1, &[R6], &[(0, 6, 1)]),
+                try_assign(2, &[R6, R4], &[(0, 6, 1)]),
             ],
             // Reset and start over: what was taken is free again.
             vec![
-                try_assign(0, &[R4], &[(0, 6)]),
+                try_assign(0, &[R4], &[(0, 6, 1)]),
                 Op::Reset,
-                try_assign(0, &[R4], &[(0, 6)]),
+                try_assign(0, &[R4], &[(0, 6, 1)]),
             ],
             // A register blocks every group that contains it, but leaves a
             // group whose members are all disjoint from it alone.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign_group(1, &[G0], &[(0, 6)]),
-                try_assign_group(2, &[G1], &[(0, 6)]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign_group(1, &[G0], &[(0, 6, 1)]),
+                try_assign_group(2, &[G1], &[(0, 6, 1)]),
             ],
             // And the other way around: a group blocks each of its members and
             // the wide register that covers them, but nothing else.
             vec![
-                try_assign_group(0, &[G0], &[(0, 6)]),
-                try_assign(1, &[R0], &[(0, 6)]),
-                try_assign(2, &[R1], &[(0, 6)]),
-                try_assign(3, &[R4], &[(0, 6)]),
-                try_assign(0, &[R2], &[(0, 6)]),
+                try_assign_group(0, &[G0], &[(0, 6, 1)]),
+                try_assign(1, &[R0], &[(0, 6, 1)]),
+                try_assign(2, &[R1], &[(0, 6, 1)]),
+                try_assign(3, &[R4], &[(0, 6, 1)]),
+                try_assign(0, &[R2], &[(0, 6, 1)]),
             ],
             // Only the *second* member of the group is taken, so the group as a
             // whole is unusable and we fall through to the next candidate.
             vec![
-                try_assign(0, &[R1], &[(0, 6)]),
-                try_assign_group(1, &[G0, G1], &[(0, 6)]),
+                try_assign(0, &[R1], &[(0, 6, 1)]),
+                try_assign_group(1, &[G0, G1], &[(0, 6, 1)]),
             ],
             // Aliasing through the wide registers: r4 covers exactly g0's
             // units, so it blocks g0 and g4, but leaves g1 alone.
             vec![
-                try_assign(0, &[R4], &[(0, 6)]),
-                try_assign_group(1, &[G0], &[(0, 6)]),
-                try_assign_group(2, &[G4], &[(0, 6)]),
-                try_assign_group(3, &[G1], &[(0, 6)]),
+                try_assign(0, &[R4], &[(0, 6, 1)]),
+                try_assign_group(1, &[G0], &[(0, 6, 1)]),
+                try_assign_group(2, &[G4], &[(0, 6, 1)]),
+                try_assign_group(3, &[G1], &[(0, 6, 1)]),
             ],
             // A group whose members are out of unit order and not adjacent,
             // against the registers it covers and the ones it leaves between
             // them.
             vec![
-                try_assign_group(0, &[G3], &[(0, 6)]),
-                try_assign(1, &[R0], &[(0, 6)]),
-                try_assign(2, &[R3], &[(0, 6)]),
-                try_assign_group(3, &[G2], &[(0, 6)]),
+                try_assign_group(0, &[G3], &[(0, 6, 1)]),
+                try_assign(1, &[R0], &[(0, 6, 1)]),
+                try_assign(2, &[R3], &[(0, 6, 1)]),
+                try_assign_group(3, &[G2], &[(0, 6, 1)]),
             ],
             // A group with a member that covers no units. Unlike the bare
             // register r6, which never conflicts with anything, g5 records r0's
             // unit and so conflicts with itself the second time around.
             vec![
-                try_assign_group(0, &[G5], &[(0, 6)]),
-                try_assign_group(1, &[G5], &[(0, 6)]),
-                try_assign(2, &[R6], &[(0, 6)]),
-                try_assign(3, &[R1], &[(0, 6)]),
+                try_assign_group(0, &[G5], &[(0, 6, 1)]),
+                try_assign_group(1, &[G5], &[(0, 6, 1)]),
+                try_assign(2, &[R6], &[(0, 6, 1)]),
+                try_assign(3, &[R1], &[(0, 6, 1)]),
             ],
             // Exact-boundary abutment, for groups: `[0, 3)` ends where `[3, 6)`
             // begins, so both fit in g0; the span that reaches one point
             // further does conflict.
             vec![
-                try_assign_group(0, &[G0], &[(0, 3)]),
-                try_assign_group(1, &[G0], &[(3, 6)]),
-                try_assign_group(2, &[G0], &[(2, 4)]),
+                try_assign_group(0, &[G0], &[(0, 3, 1)]),
+                try_assign_group(1, &[G0], &[(3, 6, 1)]),
+                try_assign_group(2, &[G0], &[(2, 4, 1)]),
             ],
             // A group assignment that *encloses* the queried span -- the case a
             // forward range query cannot see -- probed on the group itself, on
             // one of its members, and on a group that overlaps it in part.
             vec![
-                try_assign_group(0, &[G0], &[(0, 6)]),
-                try_assign_group(1, &[G0], &[(2, 4)]),
-                try_assign(2, &[R1], &[(2, 4)]),
-                try_assign_group(3, &[G2], &[(2, 4)]),
+                try_assign_group(0, &[G0], &[(0, 6, 1)]),
+                try_assign_group(1, &[G0], &[(2, 4, 1)]),
+                try_assign(2, &[R1], &[(2, 4, 1)]),
+                try_assign_group(3, &[G2], &[(2, 4, 1)]),
             ],
             // A group bundle with a hole between its spans, which a register
             // can slot into, and then a span covering the whole thing, which
             // cannot.
             vec![
-                try_assign_group(0, &[G1], &[(0, 2), (4, 6)]),
-                try_assign(1, &[R2], &[(2, 4)]),
-                try_assign_group(2, &[G1], &[(0, 6)]),
+                try_assign_group(0, &[G1], &[(0, 2, 1), (4, 6, 1)]),
+                try_assign(1, &[R2], &[(2, 4, 1)]),
+                try_assign_group(2, &[G1], &[(0, 6, 1)]),
             ],
             // Preference order for groups: the first candidate is taken, so the
             // second one wins; and an empty candidate list assigns nothing.
             vec![
-                try_assign_group(0, &[G0], &[(0, 6)]),
-                try_assign_group(1, &[G0, G1], &[(0, 6)]),
-                try_assign_group(2, &[], &[(0, 6)]),
-                try_assign(3, &[R3], &[(0, 6)]),
+                try_assign_group(0, &[G0], &[(0, 6, 1)]),
+                try_assign_group(1, &[G0, G1], &[(0, 6, 1)]),
+                try_assign_group(2, &[], &[(0, 6, 1)]),
+                try_assign(3, &[R3], &[(0, 6, 1)]),
             ],
             // A three-member group, and what it does and does not leave free.
             vec![
-                try_assign_group(0, &[G6], &[(0, 6)]),
-                try_assign(1, &[R3], &[(0, 6)]),
-                try_assign_group(2, &[G1], &[(0, 6)]),
-                try_assign_group(3, &[G4], &[(0, 6)]),
+                try_assign_group(0, &[G6], &[(0, 6, 1)]),
+                try_assign(1, &[R3], &[(0, 6, 1)]),
+                try_assign_group(2, &[G1], &[(0, 6, 1)]),
+                try_assign_group(3, &[G4], &[(0, 6, 1)]),
             ],
             // Two three-member groups.
             vec![
-                try_assign_group(0, &[G6, G7], &[(0, 3)]),
-                try_assign(1, &[R0, R1, R2, R3], &[(0, 4)]),
-                try_assign_group(2, &[G6, G7], &[(3, 6)]),
-                try_assign(3, &[R0, R1, R2, R3], &[(4, 6)]),
+                try_assign_group(0, &[G6, G7], &[(0, 3, 1)]),
+                try_assign(1, &[R0, R1, R2, R3], &[(0, 4, 1)]),
+                try_assign_group(2, &[G6, G7], &[(3, 6, 1)]),
+                try_assign(3, &[R0, R1, R2, R3], &[(4, 6, 1)]),
             ],
             // Reset frees a group's units again, just as it does a register's.
             vec![
-                try_assign_group(0, &[G4], &[(0, 6)]),
-                try_assign(1, &[R0], &[(0, 6)]),
+                try_assign_group(0, &[G4], &[(0, 6, 1)]),
+                try_assign(1, &[R0], &[(0, 6, 1)]),
                 Op::Reset,
-                try_assign_group(0, &[G4], &[(0, 6)]),
+                try_assign_group(0, &[G4], &[(0, 6, 1)]),
             ],
             // The whole point: a bundle worth more than the one in its way
             // takes the register, and one worth less does not.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 2], &[]),
             ],
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[3, 2], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[3, 2], &[]),
             ],
             // Two bundles are in the way, so evicting either one still leaves
             // the other and this register is no candidate at all, no matter how
             // cheap they both are.
             vec![
-                try_assign(0, &[R0], &[(0, 2)]),
-                try_assign(1, &[R0], &[(2, 4)]),
-                try_evict(2, &[R0], &[(0, 4)], &[1, 1, 5], &[]),
+                try_assign(0, &[R0], &[(0, 2, 1)]),
+                try_assign(1, &[R0], &[(2, 4, 1)]),
+                try_evict(2, &[R0], &[(0, 4, 1)], &[1, 1, 5], &[]),
             ],
             // Given a choice, we evict the cheaper of the two victims, even
             // though the more expensive one is in the earlier candidate.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign(1, &[R1], &[(0, 6)]),
-                try_evict(2, &[R0, R1], &[(0, 6)], &[3, 1, 5], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign(1, &[R1], &[(0, 6, 1)]),
+                try_evict(2, &[R0, R1], &[(0, 6, 1)], &[3, 1, 5], &[]),
             ],
             // Equally cheap victims go to the earlier candidate.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign(1, &[R1], &[(0, 6)]),
-                try_evict(2, &[R1, R0], &[(0, 6)], &[1, 1, 5], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign(1, &[R1], &[(0, 6, 1)]),
+                try_evict(2, &[R1, R0], &[(0, 6, 1)], &[1, 1, 5], &[]),
             ],
             // Broken hints outweigh spill weight: the cheap victim sits in the
             // register it prefers, so we take the expensive one instead.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign(1, &[R1], &[(0, 6)]),
-                try_evict(2, &[R0, R1], &[(0, 6)], &[1, 3, 5], &[R0]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign(1, &[R1], &[(0, 6, 1)]),
+                try_evict(2, &[R0, R1], &[(0, 6, 1)], &[1, 3, 5], &[R0]),
             ],
             // And when breaking a hint is the only option, we do not take it,
             // however light the victim.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 5], &[R0]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 5], &[R0]),
             ],
             // A hint only counts against the register it actually names, so
             // evicting this bundle from a *different* register is free.
             vec![
-                try_assign(0, &[R1], &[(0, 6)]),
-                try_evict(1, &[R1], &[(0, 6)], &[1, 2], &[R0]),
+                try_assign(0, &[R1], &[(0, 6, 1)]),
+                try_evict(1, &[R1], &[(0, 6, 1)], &[1, 2], &[R0]),
             ],
             // The victim holds a wide register, so evicting it has to free
             // every one of its units, not just the one we wanted.
             vec![
-                try_assign(0, &[R4], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
-                try_assign(2, &[R1], &[(0, 6)]),
+                try_assign(0, &[R4], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 2], &[]),
+                try_assign(2, &[R1], &[(0, 6, 1)]),
             ],
             // Likewise, evicting a victim has to free every one of its spans,
             // not just the one that was in the way.
             vec![
-                try_assign(0, &[R0], &[(0, 2), (4, 6)]),
-                try_evict(1, &[R0], &[(1, 3)], &[1, 2], &[]),
-                try_assign(2, &[R0], &[(4, 6)]),
+                try_assign(0, &[R0], &[(0, 2, 1), (4, 6, 1)]),
+                try_evict(1, &[R0], &[(1, 3, 1)], &[1, 2], &[]),
+                try_assign(2, &[R0], &[(4, 6, 1)]),
             ],
             // A bundle can never evict itself, however the weights fall.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_evict(0, &[R0], &[(0, 6)], &[1], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(0, &[R0], &[(0, 6, 1)], &[1], &[]),
             ],
             // The bundle doing the evicting already holds a register of its
             // own, and keeps it.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign(1, &[R1], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign(1, &[R1], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 2], &[]),
             ],
             // A victim can in turn be evicted by the next bundle along.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
-                try_evict(2, &[R0], &[(0, 6)], &[1, 2, 3], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 2], &[]),
+                try_evict(2, &[R0], &[(0, 6, 1)], &[1, 2, 3], &[]),
             ],
             // Reset after an eviction: everything is free again.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 2], &[]),
                 Op::Reset,
-                try_assign(0, &[R0], &[(0, 6)]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
             ],
             // A register in the way of a group, and the group's other member
             // left free.
             vec![
-                try_assign(0, &[R1], &[(0, 6)]),
-                try_evict_group(1, &[G0], &[(0, 6)], &[1, 2], &[]),
-                try_assign(2, &[R2], &[(0, 6)]),
+                try_assign(0, &[R1], &[(0, 6, 1)]),
+                try_evict_group(1, &[G0], &[(0, 6, 1)], &[1, 2], &[]),
+                try_assign(2, &[R2], &[(0, 6, 1)]),
             ],
             // A group victim spanning every unit, evicted for a group that
             // needs only half of them.
             vec![
-                try_assign_group(0, &[G4], &[(0, 6)]),
-                try_evict_group(1, &[G1], &[(0, 6)], &[1, 2], &[]),
-                try_assign(2, &[R0], &[(0, 6)]),
+                try_assign_group(0, &[G4], &[(0, 6, 1)]),
+                try_evict_group(1, &[G1], &[(0, 6, 1)], &[1, 2], &[]),
+                try_assign(2, &[R0], &[(0, 6, 1)]),
             ],
             // A group victim evicted by a plain register assignment.
             vec![
-                try_assign_group(0, &[G0], &[(0, 6)]),
-                try_evict(1, &[R0], &[(0, 6)], &[1, 2], &[]),
-                try_assign(2, &[R1], &[(0, 6)]),
+                try_assign_group(0, &[G0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 1)], &[1, 2], &[]),
+                try_assign(2, &[R1], &[(0, 6, 1)]),
             ],
             // Two different bundles in one group's way, so no single eviction
             // frees it, but each of them alone frees a group of its own.
             vec![
-                try_assign(0, &[R0], &[(0, 6)]),
-                try_assign(1, &[R1], &[(0, 6)]),
-                try_evict_group(2, &[G0], &[(0, 6)], &[1, 1, 5], &[]),
-                try_evict_group(3, &[G2], &[(0, 6)], &[1, 1, 5, 5], &[]),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_assign(1, &[R1], &[(0, 6, 1)]),
+                try_evict_group(2, &[G0], &[(0, 6, 1)], &[1, 1, 5], &[]),
+                try_evict_group(3, &[G2], &[(0, 6, 1)], &[1, 1, 5, 5], &[]),
             ],
             // Broken hints for groups: the cheap victim prefers the first
             // group, so the expensive one in the second group goes instead.
             vec![
-                try_assign_group(0, &[G0], &[(0, 6)]),
-                try_assign_group(1, &[G1], &[(0, 6)]),
-                try_evict_group(2, &[G0, G1], &[(0, 6)], &[1, 3, 5], &[G0]),
+                try_assign_group(0, &[G0], &[(0, 6, 1)]),
+                try_assign_group(1, &[G1], &[(0, 6, 1)]),
+                try_evict_group(2, &[G0, G1], &[(0, 6, 1)], &[1, 3, 5], &[G0]),
+            ],
+            // A hard reservation keeps every value out of the register it
+            // holds and the ones that alias it, but not out of abutting spans
+            // or disjoint registers.
+            vec![
+                reserve(R0, (2, 4, 0)),
+                try_assign(0, &[R0], &[(2, 4, 1)]),
+                try_assign(1, &[R4], &[(2, 4, 2)]),
+                try_assign(2, &[R0], &[(0, 2, 1)]),
+                try_assign(3, &[R1], &[(2, 4, 1)]),
+            ],
+            // A porous reservation lets exactly one value through: the one it
+            // was made to deliver.
+            vec![
+                reserve(R0, (2, 4, 1)),
+                try_assign(0, &[R0], &[(2, 4, 2)]),
+                try_assign(1, &[R0], &[(2, 4, 1)]),
+                try_assign(2, &[R0], &[(2, 4, 0)]),
+            ],
+            // Porosity is per span, not per bundle: the overlapping span is
+            // the one that has to carry the reserved value.
+            vec![
+                reserve(R0, (4, 6, 1)),
+                try_assign(0, &[R0], &[(0, 2, 1), (4, 6, 2)]),
+                try_assign(1, &[R0], &[(0, 2, 2), (4, 6, 1)]),
+            ],
+            // Nothing evicts a reservation; the second candidate, holding
+            // only a bundle, is taken instead.
+            vec![
+                reserve(R0, (0, 6, 0)),
+                try_assign(0, &[R1], &[(0, 6, 1)]),
+                try_evict(1, &[R0, R1], &[(0, 6, 1)], &[1, 5], &[]),
+            ],
+            // A reservation and an assignment overlap when the value matches,
+            // and the reservation still blocks evicting a different value in.
+            vec![
+                reserve(R0, (0, 6, 1)),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                try_evict(1, &[R0], &[(0, 6, 2)], &[1, 5], &[]),
+            ],
+            // Abutting reservations, the shape a fixed use and fixed def of
+            // one register take: the register is unusable across both.
+            vec![
+                reserve(R0, (2, 3, 1)),
+                reserve(R0, (3, 4, 0)),
+                try_assign(0, &[R0], &[(2, 4, 1)]),
+                try_assign(1, &[R0], &[(2, 3, 1)]),
+                try_assign(2, &[R0], &[(3, 4, 1)]),
+            ],
+            // Reset clears reservations too.
+            vec![
+                reserve(R0, (0, 6, 0)),
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                Op::Reset,
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+            ],
+            // A group reservation holds all its members' units, so it blocks
+            // each member, the wide register over them, and any overlapping
+            // group.
+            vec![
+                reserve_group(G0, (0, 6, 1)),
+                try_assign(0, &[R0], &[(0, 6, 2)]),
+                try_assign(1, &[R4], &[(0, 6, 2)]),
+                try_assign_group(2, &[G2], &[(0, 6, 2)]),
+                try_assign_group(3, &[G0], &[(0, 6, 1)]),
+            ],
+            // The register with no units reserves nothing and stands in
+            // nobody's way, just as assigning it records nothing.
+            vec![
+                reserve(R6, (0, 6, 0)),
+                try_assign(0, &[R6], &[(0, 6, 1)]),
+                try_assign(1, &[R0], &[(0, 6, 1)]),
+            ],
+            // A reservation made *after* the register is already assigned:
+            // legal when the value matches, and the two coexist.
+            vec![
+                try_assign(0, &[R0], &[(0, 6, 1)]),
+                reserve(R0, (2, 4, 1)),
+                try_assign(1, &[R0], &[(0, 6, 2)]),
             ],
         ];
         for ops in seeds.iter_mut() {
@@ -1541,7 +2122,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(mutator, seeds(), |ops: &Vec<Op>| -> Result<(), String> {
                 let mut assignments = Assignments::<u32>::new();
-                let mut oracle = Vec::new();
+                let mut oracle = Oracle::default();
 
                 if !assignments.is_reset() {
                     return Err("new assignments are not reset".to_string());
@@ -1559,8 +2140,7 @@ mod tests {
                             let b = bundle(usize::from(*b));
                             let candidates: Vec<Reg> =
                                 candidates.iter().map(|&index| reg(index)).collect();
-                            let spans: Vec<Range<LivePoint<u32>>> =
-                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+                            let spans = query_spans(spans);
                             let units: Vec<Vec<Range<RegUnit>>> =
                                 candidates.iter().map(|&r| vec![reg_units(r)]).collect();
 
@@ -1591,8 +2171,7 @@ mod tests {
                             let b = bundle(usize::from(*b));
                             let candidates: Vec<RegGroup> =
                                 candidates.iter().map(|&index| group(index)).collect();
-                            let spans: Vec<Range<LivePoint<u32>>> =
-                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+                            let spans = query_spans(spans);
                             let units: Vec<Vec<Range<RegUnit>>> = candidates
                                 .iter()
                                 .map(|&g| group_units(g).collect())
@@ -1625,8 +2204,7 @@ mod tests {
                             hints,
                         } => {
                             let b = bundle(usize::from(*b));
-                            let spans: Vec<Range<LivePoint<u32>>> =
-                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+                            let spans = query_spans(spans);
 
                             // Every candidate must already be in conflict, so
                             // filter out the ones that are not: this method is
@@ -1693,8 +2271,7 @@ mod tests {
                             hints,
                         } => {
                             let b = bundle(usize::from(*b));
-                            let spans: Vec<Range<LivePoint<u32>>> =
-                                spans.iter().map(|&(start, end)| span(start, end)).collect();
+                            let spans = query_spans(spans);
 
                             let candidates: Vec<RegGroup> = candidates
                                 .iter()
@@ -1754,6 +2331,50 @@ mod tests {
                             )?;
                         }
 
+                        Op::Reserve {
+                            candidate,
+                            span: sp,
+                        } => {
+                            let r = reg(*candidate);
+                            let units = vec![reg_units(r)];
+                            let q = query_span(sp);
+                            let (porous_to, sp) = (q.val(), q.range());
+
+                            // Two reservations may never overlap on a unit, so
+                            // decline to make a call that is not allowed.
+                            if oracle_reservation_would_overlap(&oracle, &units, &sp) {
+                                continue;
+                            }
+
+                            assignments.insert_reservation(
+                                units.iter().cloned(),
+                                sp.clone(),
+                                porous_to,
+                            );
+                            oracle_insert_reservation(&mut oracle, &units, &sp, porous_to);
+                        }
+
+                        Op::ReserveGroup {
+                            candidate,
+                            span: sp,
+                        } => {
+                            let g = group(*candidate);
+                            let units: Vec<Range<RegUnit>> = group_units(g).collect();
+                            let q = query_span(sp);
+                            let (porous_to, sp) = (q.val(), q.range());
+
+                            if oracle_reservation_would_overlap(&oracle, &units, &sp) {
+                                continue;
+                            }
+
+                            assignments.insert_reservation(
+                                units.iter().cloned(),
+                                sp.clone(),
+                                porous_to,
+                            );
+                            oracle_insert_reservation(&mut oracle, &units, &sp, porous_to);
+                        }
+
                         Op::Reset => {
                             assignments.reset();
                             oracle.clear();
@@ -1789,25 +2410,98 @@ mod tests {
             })
     }
 
+    /// A reservation is porous to its own value only in the register order it
+    /// holds.
+    #[test]
+    fn a_reservation_is_porous_only_in_its_own_register_order() {
+        let mut assignments = Assignments::<u32>::new();
+        let reserved = val(0);
+        assignments.insert_reservation(group_units(group(G3)), span(2, 4), Some(reserved));
+
+        // The reserved group itself: every piece lines up.
+        assert!(
+            !assignments.conflicts(group_units(group(G3)), [qspan(2, 4, 1)].into_iter()),
+            "the reserved value may sit in the order the reservation holds",
+        );
+
+        // The other order of the same two registers: `r0` is this span's first
+        // piece and the reservation's second.
+        assert!(
+            assignments.conflicts(group_units(group(G0)), [qspan(2, 4, 1)].into_iter()),
+            "and may not sit in the other order, which wants a different \
+             piece of it in `r0`",
+        );
+
+        // Unit by unit, not group by group: `r0` alone is this span's first
+        // piece and the reservation's second.
+        assert!(
+            assignments.conflicts(
+                core::iter::once(reg_units(reg(R0))),
+                [qspan(2, 4, 1)].into_iter()
+            ),
+            "nor alone in a register the reservation holds a later piece in",
+        );
+        assert!(
+            !assignments.conflicts(
+                core::iter::once(reg_units(reg(R3))),
+                [qspan(2, 4, 1)].into_iter()
+            ),
+            "and may sit alone in the register holding its first piece",
+        );
+
+        // Another value is refused everywhere the reservation reaches, and the
+        // reservation reaches nothing outside its own span.
+        assert!(
+            assignments.conflicts(group_units(group(G3)), [qspan(2, 4, 2)].into_iter()),
+            "another value may not share the reservation at all",
+        );
+        assert!(
+            !assignments.conflicts(group_units(group(G3)), [qspan(0, 2, 2)].into_iter()),
+            "and the reservation holds nothing before it starts",
+        );
+
+        // The oracle agrees on all of it.
+        let mut oracle = Oracle::default();
+        oracle_insert_reservation(
+            &mut oracle,
+            &group_units(group(G3)).collect::<Vec<_>>(),
+            &span(2, 4),
+            Some(reserved),
+        );
+        check_agree(&assignments, &oracle).unwrap();
+        check_no_overlaps(&assignments).unwrap();
+        check_conflicts_agree(&assignments, &oracle).unwrap();
+    }
+
     #[test]
     fn merge_disjoint() {
         let mut a = Assignments::<u32>::new();
         let mut b = Assignments::<u32>::new();
 
         assert!(
-            a.try_assign_to_reg(bundle(0), [reg(R0)], reg_units, [span(0, 2)].into_iter())
-                .is_some()
+            a.try_assign_to_reg(
+                bundle(0),
+                [reg(R0)],
+                reg_units,
+                [qspan(0, 2, 1)].into_iter()
+            )
+            .is_some()
         );
         assert!(
-            b.try_assign_to_reg(bundle(1), [reg(R0)], reg_units, [span(2, 4)].into_iter())
-                .is_some()
+            b.try_assign_to_reg(
+                bundle(1),
+                [reg(R0)],
+                reg_units,
+                [qspan(2, 4, 1)].into_iter()
+            )
+            .is_some()
         );
         assert!(
             b.try_assign_to_reg_group(
                 bundle(2),
                 [group(G1)],
                 group_units,
-                [span(0, 6)].into_iter(),
+                [qspan(0, 6, 1)].into_iter(),
             )
             .is_some()
         );
@@ -1815,32 +2509,42 @@ mod tests {
         a.merge(&b);
 
         // `a` now holds exactly the union of what the two of them held.
-        let mut oracle = Vec::new();
-        oracle_insert(&mut oracle, bundle(0), &[reg_units(reg(R0))], &[span(0, 2)]);
-        oracle_insert(&mut oracle, bundle(1), &[reg_units(reg(R0))], &[span(2, 4)]);
+        let mut oracle = Oracle::default();
+        oracle_insert(
+            &mut oracle,
+            bundle(0),
+            &[reg_units(reg(R0))],
+            &[qspan(0, 2, 1)],
+        );
+        oracle_insert(
+            &mut oracle,
+            bundle(1),
+            &[reg_units(reg(R0))],
+            &[qspan(2, 4, 1)],
+        );
         oracle_insert(
             &mut oracle,
             bundle(2),
             &group_units(group(G1)).collect::<Vec<_>>(),
-            &[span(0, 6)],
+            &[qspan(0, 6, 1)],
         );
         check_agree(&a, &oracle).unwrap();
         check_no_overlaps(&a).unwrap();
         check_conflicts_agree(&a, &oracle).unwrap();
 
         // The merge left `b` alone.
-        let mut b_oracle = Vec::new();
+        let mut b_oracle = Oracle::default();
         oracle_insert(
             &mut b_oracle,
             bundle(1),
             &[reg_units(reg(R0))],
-            &[span(2, 4)],
+            &[qspan(2, 4, 1)],
         );
         oracle_insert(
             &mut b_oracle,
             bundle(2),
             &group_units(group(G1)).collect::<Vec<_>>(),
-            &[span(0, 6)],
+            &[qspan(0, 6, 1)],
         );
         check_agree(&b, &b_oracle).unwrap();
     }
@@ -1857,12 +2561,22 @@ mod tests {
         let mut b = Assignments::<u32>::new();
 
         assert!(
-            a.try_assign_to_reg(bundle(0), [reg(R4)], reg_units, [span(0, 6)].into_iter())
-                .is_some()
+            a.try_assign_to_reg(
+                bundle(0),
+                [reg(R4)],
+                reg_units,
+                [qspan(0, 6, 1)].into_iter()
+            )
+            .is_some()
         );
         assert!(
-            b.try_assign_to_reg(bundle(1), [reg(R1)], reg_units, [span(2, 4)].into_iter())
-                .is_some()
+            b.try_assign_to_reg(
+                bundle(1),
+                [reg(R1)],
+                reg_units,
+                [qspan(2, 4, 1)].into_iter()
+            )
+            .is_some()
         );
 
         a.merge(&b);

@@ -26,7 +26,6 @@
         "inst": 2,
         "pos": "early"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 1,
@@ -56,7 +55,6 @@
         "inst": 3,
         "pos": "early"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 3,
@@ -88,7 +86,6 @@
         "inst": 3,
         "pos": "late"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 5,
@@ -107,7 +104,6 @@
         "inst": 2,
         "pos": "early"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 0,
@@ -137,7 +133,6 @@
         "inst": 3,
         "pos": "early"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 2,
@@ -169,7 +164,6 @@
         "inst": 3,
         "pos": "late"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 4,
@@ -246,42 +240,42 @@
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
       "bundle": 2,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
       "bundle": 3,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
       "bundle": 4,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
       "bundle": 5,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
       "bundle": 5,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
@@ -296,7 +290,7 @@
       "bundle": 4,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
@@ -311,7 +305,7 @@
       "bundle": 3,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
@@ -324,7 +318,7 @@
       "bundle": 2,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
@@ -337,7 +331,7 @@
       "bundle": 1,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 0
     },
     {
@@ -763,7 +757,7 @@
         "spans": [
           1
         ],
-        "spillWeight": 0.038461536
+        "spillWeight": 0.03846154
       },
       {
         "allocation": null,
@@ -803,7 +797,7 @@
         "spans": [
           4
         ],
-        "spillWeight": 0.038461536
+        "spillWeight": 0.03846154
       },
       {
         "allocation": {
@@ -819,7 +813,7 @@
         "spans": [
           5
         ],
-        "spillWeight": 0.038461536
+        "spillWeight": 0.03846154
       }
     ],
     "insts": [

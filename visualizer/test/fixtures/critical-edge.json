@@ -19,14 +19,11 @@
   "events": [
     {
       "block": 0,
-      "constraint": {
-        "reg": 1
-      },
+      "constraint": "stack",
       "end": {
         "inst": 3,
         "pos": "early"
       },
-      "has_fixed_use": true,
       "kind": "SpanConstructed",
       "num_uses": 2,
       "span": 0,
@@ -43,7 +40,6 @@
         "inst": 4,
         "pos": "early"
       },
-      "has_fixed_use": false,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 2,
@@ -56,13 +52,12 @@
     {
       "block": 1,
       "constraint": {
-        "reg": 0
+        "reg": 2
       },
       "end": {
         "inst": 6,
         "pos": "early"
       },
-      "has_fixed_use": true,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 1,
@@ -75,13 +70,12 @@
     {
       "block": 2,
       "constraint": {
-        "reg": 0
+        "reg": 2
       },
       "end": {
         "inst": 6,
         "pos": "late"
       },
-      "has_fixed_use": true,
       "kind": "SpanConstructed",
       "num_uses": 1,
       "span": 3,
@@ -113,9 +107,7 @@
     },
     {
       "bundle": 0,
-      "constraint": {
-        "reg": 1
-      },
+      "constraint": "stack",
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
@@ -124,7 +116,7 @@
     {
       "bundle": 1,
       "constraint": {
-        "reg": 0
+        "reg": 2
       },
       "kind": "BundleConstructed",
       "num_spans": 2,
@@ -143,33 +135,48 @@
       "bundle": 0,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 536870913,
+      "priority": 1,
       "region": 2
     },
     {
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 536870914,
+      "priority": 2,
       "region": 2
     },
     {
       "bundle": 2,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 268435457,
+      "priority": 536870913,
       "region": 2
     },
     {
-      "bundle": 1,
+      "bundle": 2,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 536870914,
+      "priority": 536870913,
       "region": 2
     },
     {
       "alloc": {
         "reg": 0
+      },
+      "bundle": 2,
+      "kind": "BundleAssignedNonPreferred",
+      "preference": []
+    },
+    {
+      "bundle": 1,
+      "kind": "BundleQueuePopped",
+      "phase": "assignEvict",
+      "priority": 2,
+      "region": 2
+    },
+    {
+      "alloc": {
+        "reg": 1
       },
       "bundle": 1,
       "kind": "BundleAssignedNonPreferred",
@@ -179,35 +186,36 @@
       "bundle": 0,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 536870913,
+      "priority": 1,
       "region": 2
     },
     {
-      "alloc": {
-        "reg": 1
-      },
       "bundle": 0,
-      "kind": "BundleAssignedNonPreferred",
-      "preference": []
-    },
-    {
-      "bundle": 2,
-      "kind": "BundleQueuePopped",
-      "phase": "assignEvict",
-      "priority": 268435457,
+      "forced": true,
+      "kind": "BundleSpilledToStack",
       "region": 2
     },
     {
-      "alloc": {
-        "reg": 1
+      "kind": "ValueSpilled",
+      "num_spans": 1,
+      "val": 0
+    },
+    {
+      "emergency": false,
+      "kind": "SpillSlotCreated",
+      "size": 8,
+      "slot": 0
+    },
+    {
+      "kind": "SpillSlotAssigned",
+      "slot": {
+        "slot": 0
       },
-      "bundle": 2,
-      "kind": "BundleAssignedNonPreferred",
-      "preference": []
+      "val": 0
     },
     {
       "alloc": {
-        "reg": 1
+        "slot": 0
       },
       "kind": "HalfMoveSource",
       "pos": {
@@ -221,7 +229,7 @@
     },
     {
       "alloc": {
-        "reg": 1
+        "slot": 0
       },
       "kind": "HalfMoveSource",
       "pos": {
@@ -235,7 +243,7 @@
     },
     {
       "alloc": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "HalfMoveDest",
       "pos": {
@@ -248,7 +256,7 @@
     },
     {
       "alloc": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "HalfMoveSource",
       "pos": {
@@ -262,7 +270,7 @@
     },
     {
       "alloc": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "HalfMoveDest",
       "pos": {
@@ -275,7 +283,7 @@
     },
     {
       "alloc": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "HalfMoveDest",
       "pos": {
@@ -288,7 +296,7 @@
     },
     {
       "dst": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "MoveResolved",
       "pos": {
@@ -298,13 +306,13 @@
         }
       },
       "src": {
-        "reg": 1
+        "slot": 0
       },
       "val": 0
     },
     {
       "dst": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "MoveResolved",
       "pos": {
@@ -314,13 +322,13 @@
         }
       },
       "src": {
-        "reg": 0
+        "reg": 1
       },
       "val": 0
     },
     {
       "dst": {
-        "reg": 0
+        "reg": 1
       },
       "kind": "MoveResolved",
       "pos": {
@@ -330,7 +338,7 @@
         }
       },
       "src": {
-        "reg": 1
+        "slot": 0
       },
       "val": 0
     },
@@ -349,9 +357,9 @@
       "index": 0,
       "kind": "MoveEmitted",
       "move": {
-        "regReg": {
-          "from": 1,
-          "to": 0
+        "reload": {
+          "from": 0,
+          "to": 1
         }
       },
       "pos": {
@@ -387,9 +395,9 @@
       "index": 1,
       "kind": "MoveEmitted",
       "move": {
-        "regReg": {
-          "from": 1,
-          "to": 0
+        "reload": {
+          "from": 0,
+          "to": 1
         }
       },
       "pos": {
@@ -402,9 +410,9 @@
     {
       "edit": {
         "move": {
-          "regReg": {
-            "from": 1,
-            "to": 0
+          "reload": {
+            "from": 0,
+            "to": 1
           }
         }
       },
@@ -429,9 +437,9 @@
               "criticalEdge": {
                 "edit": {
                   "move": {
-                    "regReg": {
-                      "from": 1,
-                      "to": 0
+                    "reload": {
+                      "from": 0,
+                      "to": 1
                     }
                   }
                 },
@@ -527,12 +535,8 @@
     ],
     "bundles": [
       {
-        "allocation": {
-          "reg": 1
-        },
-        "constraint": {
-          "reg": 1
-        },
+        "allocation": null,
+        "constraint": "stack",
         "isMinimal": false,
         "parent": null,
         "preference": [],
@@ -540,14 +544,14 @@
         "spans": [
           0
         ],
-        "spillWeight": 0.053571425
+        "spillWeight": 0.017857144
       },
       {
         "allocation": {
-          "reg": 0
+          "reg": 1
         },
         "constraint": {
-          "reg": 0
+          "reg": 2
         },
         "isMinimal": false,
         "parent": null,
@@ -557,11 +561,11 @@
           1,
           3
         ],
-        "spillWeight": 0.06896551
+        "spillWeight": 0.06896552
       },
       {
         "allocation": {
-          "reg": 1
+          "reg": 0
         },
         "constraint": "any",
         "isMinimal": true,
@@ -571,7 +575,7 @@
         "spans": [
           2
         ],
-        "spillWeight": 0.019230768
+        "spillWeight": 0.01923077
       }
     ],
     "insts": [
@@ -592,9 +596,7 @@
         "edits": [],
         "operands": [
           {
-            "constraint": {
-              "reg": 1
-            },
+            "constraint": "stack",
             "defUse": "use",
             "pos": "early",
             "val": 0
@@ -616,9 +618,9 @@
             },
             "edit": {
               "move": {
-                "regReg": {
-                  "from": 1,
-                  "to": 0
+                "reload": {
+                  "from": 0,
+                  "to": 1
                 }
               }
             }
@@ -639,7 +641,7 @@
         "operands": [
           {
             "constraint": {
-              "reg": 0
+              "reg": 2
             },
             "defUse": "use",
             "pos": "early",
@@ -658,7 +660,7 @@
         "operands": [
           {
             "constraint": {
-              "reg": 0
+              "reg": 2
             },
             "defUse": "use",
             "pos": "early",
@@ -694,13 +696,11 @@
     "spans": [
       {
         "allocation": {
-          "reg": 1
+          "slot": 0
         },
         "block": 0,
         "bundle": 0,
-        "constraint": {
-          "reg": 1
-        },
+        "constraint": "stack",
         "end": {
           "inst": 3,
           "pos": "early"
@@ -718,12 +718,12 @@
       },
       {
         "allocation": {
-          "reg": 0
+          "reg": 1
         },
         "block": 1,
         "bundle": 1,
         "constraint": {
-          "reg": 0
+          "reg": 2
         },
         "end": {
           "inst": 6,
@@ -741,7 +741,7 @@
       },
       {
         "allocation": {
-          "reg": 1
+          "reg": 0
         },
         "block": 1,
         "bundle": 2,
@@ -762,12 +762,12 @@
       },
       {
         "allocation": {
-          "reg": 0
+          "reg": 1
         },
         "block": 2,
         "bundle": 1,
         "constraint": {
-          "reg": 0
+          "reg": 2
         },
         "end": {
           "inst": 6,
@@ -784,7 +784,13 @@
         "val": 2
       }
     ],
-    "spillSlots": [],
+    "spillSlots": [
+      {
+        "emergency": false,
+        "group": null,
+        "size": 8
+      }
+    ],
     "uses": [
       {
         "operand": 0,
@@ -802,7 +808,7 @@
           "pos": "early"
         },
         "span": 0,
-        "weight": 1.0
+        "weight": 0.0
       },
       {
         "operand": 0,
@@ -1422,12 +1428,12 @@
         "values": [
           [
             0,
-            20,
             23,
-            27,
-            31,
-            32,
-            33
+            26,
+            30,
+            34,
+            35,
+            36
           ],
           [
             1,
@@ -1435,7 +1441,7 @@
           ],
           [
             3,
-            33
+            36
           ]
         ]
       },
@@ -1451,20 +1457,20 @@
             0,
             1,
             2,
-            19,
-            21,
-            25,
+            22,
+            24,
             28,
-            29
+            31,
+            32
           ],
           [
             1
           ],
           [
-            22,
-            24,
-            26,
-            30
+            25,
+            27,
+            29,
+            33
           ],
           [
             2,
@@ -1478,20 +1484,20 @@
           [
             7,
             10,
-            15,
-            16
+            17,
+            18
           ],
           [
             8,
             11,
-            13,
-            14
+            15,
+            16
           ],
           [
             9,
             12,
-            17,
-            18
+            13,
+            14
           ]
         ]
       },
@@ -1522,42 +1528,32 @@
         "default": [],
         "values": [
           [
-            14,
-            21,
-            22,
-            23,
+            14
+          ],
+          [
+            16,
             24,
             25,
             26,
             27,
+            28,
             29,
+            30,
             32,
-            33
-          ],
-          [
-            16,
-            18,
-            19,
-            20,
-            25,
-            27,
-            29,
-            32,
-            33
+            35,
+            36
           ]
         ]
       },
       "RegClass": {
         "default": [],
         "values": [
+          [],
+          [],
           [
             2,
             3,
             8
-          ],
-          [
-            0,
-            7
           ]
         ]
       },
@@ -1579,13 +1575,26 @@
             12,
             13,
             15,
-            17
+            17,
+            18
           ]
         ]
       },
       "SpillSlot": {
         "default": [],
-        "values": []
+        "values": [
+          [
+            20,
+            21,
+            22,
+            23,
+            28,
+            30,
+            32,
+            35,
+            36
+          ]
+        ]
       },
       "SpillSlotGroup": {
         "default": [],
@@ -1602,14 +1611,16 @@
             0,
             2,
             19,
-            20,
             21,
             22,
             23,
             24,
             25,
             26,
-            27
+            27,
+            28,
+            29,
+            30
           ],
           [
             1
@@ -1623,8 +1634,7 @@
     "byKind": {
       "BundleAssignedNonPreferred": [
         14,
-        16,
-        18
+        16
       ],
       "BundleConstructed": [
         7,
@@ -1641,36 +1651,39 @@
         11,
         12
       ],
+      "BundleSpilledToStack": [
+        18
+      ],
       "CoalesceRefused": [
         5,
         6
       ],
       "CriticalEdgeEdit": [
-        33
+        36
       ],
       "HalfMoveDest": [
-        21,
-        23,
-        24
-      ],
-      "HalfMoveSource": [
-        19,
-        20,
-        22
-      ],
-      "MoveEmitted": [
-        29,
-        32
-      ],
-      "MoveResolved": [
-        25,
+        24,
         26,
         27
       ],
-      "ParallelMoveBatchSolved": [
+      "HalfMoveSource": [
+        22,
+        23,
+        25
+      ],
+      "MoveEmitted": [
+        32,
+        35
+      ],
+      "MoveResolved": [
         28,
-        30,
-        31
+        29,
+        30
+      ],
+      "ParallelMoveBatchSolved": [
+        31,
+        33,
+        34
       ],
       "SpanConstructed": [
         0,
@@ -1680,6 +1693,15 @@
       ],
       "SpansCoalesced": [
         4
+      ],
+      "SpillSlotAssigned": [
+        21
+      ],
+      "SpillSlotCreated": [
+        20
+      ],
+      "ValueSpilled": [
+        19
       ]
     },
     "spanParents": {
