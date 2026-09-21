@@ -12,7 +12,7 @@ use core::{
 
 #[derive(Clone, Hash)]
 #[cfg_attr(
-    any(test, fuzzing, feature = "visualizer", feature = "test-utils"),
+    any(test, feature = "visualizer", feature = "test-utils"),
     derive(mutatis::Mutate)
 )]
 pub struct PrimaryMap<K, V> {

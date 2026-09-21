@@ -57,7 +57,7 @@ pub mod deserialize;
 #[cfg(feature = "serialize")]
 pub mod serialize;
 
-#[cfg(any(test, fuzzing, feature = "test-utils"))]
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub mod test;
 
