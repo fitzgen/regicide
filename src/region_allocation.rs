@@ -255,9 +255,7 @@ where
                 continue;
             }
 
-            if phase <= Phase::AssignEvict
-                && self.assign_via_eviction(input, live_ranges, events, output, entry)?
-            {
+            if self.assign_via_eviction(input, live_ranges, events, output, entry)? {
                 counts.evictions.inc();
                 continue;
             }
@@ -463,6 +461,12 @@ where
     /// victim is strictly cheaper than this bundle. Otherwise, two bundles
     /// could evict each other forever.
     ///
+    /// "Cheaper" is the whole `EvictionCost` order, not just spill weight: a
+    /// bundle that still has somewhere else to go is cheaper to displace than
+    /// one that does not, however much the first is worth. That is what lets a
+    /// minimal bundle that must have a register take one from a bundle the
+    /// stack could hold instead.
+    ///
     /// Eviction does not mean that the victim is split or spilled. Instead, it
     /// is pushed back onto the queue to compete with the other unassigned
     /// bundles. The re-enqueued victim will never evict this bundle because, as
@@ -495,7 +499,12 @@ where
         // The most we are willing to pay for eviction. This bundle holds no
         // register, so evicting it doesn't break any hints. We never break a
         // hint to make room for a bundle that has none of its own.
-        let max_cost = EvictionCost::new(0, SpillWeight::new(bundle.spill_weight(live_ranges)));
+        let max_cost = EvictionCost::new(
+            bundle.stickiness(input, live_ranges),
+            bundle.is_minimal(live_ranges),
+            0,
+            SpillWeight::new(bundle.spill_weight(live_ranges)),
+        );
 
         let bundle_spans = |b: LiveBundle<E>| b.spans(live_ranges).map(|s| s.query(live_ranges));
 
@@ -512,6 +521,8 @@ where
                         let broken_hints =
                             usize::from(victim.preference(live_ranges).contains(reg));
                         EvictionCost::new(
+                            victim.stickiness(input, live_ranges),
+                            victim.is_minimal(live_ranges),
                             broken_hints,
                             SpillWeight::new(victim.spill_weight(live_ranges)),
                         )
@@ -540,6 +551,8 @@ where
                                     .is_empty(),
                             );
                             EvictionCost::new(
+                                victim.stickiness(input, live_ranges),
+                                victim.is_minimal(live_ranges),
                                 broken_hints,
                                 SpillWeight::new(victim.spill_weight(live_ranges)),
                             )
@@ -1078,6 +1091,36 @@ where
                 && !val.is_passed_to_a_successor(input.func, span.block(input.func, live_ranges))
         })
     }
+
+    /// How "sticky" is this bundle in a register?
+    ///
+    /// Zero for bundles that can be assigned to the stack if need be, highest
+    /// for bundles that require a single, fixed register.
+    fn stickiness(
+        self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+    ) -> usize {
+        let rc = match self.constraint(live_ranges) {
+            OperandConstraint::Reg(rc) => rc,
+
+            // These can (or must) be allocated to the stack, so they are not
+            // sticky in registers.
+            OperandConstraint::Any | OperandConstraint::Stack => return 0,
+
+            OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
+        };
+
+        let places = match rc.members(input.machine) {
+            RegClassMembers::Regs(regs) => regs.len(),
+            RegClassMembers::Groups(groups) => groups.len(),
+        };
+
+        // Counting down from the width of the class, and never all the way to
+        // zero, so that a narrower class is stickier than a wider one and even
+        // the widest one is stickier than a bundle the stack could hold.
+        EVICTION_COST_STICKINESS_MAX - places.clamp(1, EVICTION_COST_STICKINESS_MAX - 1)
+    }
 }
 
 /// Where `bundle`'s first span begins.
@@ -1131,13 +1174,17 @@ where
 }
 
 /// What phase of allocation is the associated bundle in?
+///
+/// A phase records how far down the *splitting* ladder a bundle has already
+/// been pushed, so that we don't redo a split we have already done. Assignment
+/// and eviction are not splits, and are attempted at every phase.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Phase {
     /// The initial phase.
     ///
-    /// Try to assign the bundle, evicting another lower-priority bundle if
-    /// necessary.
+    /// Nothing has been tried for this bundle yet, so every split below is
+    /// still open to it.
     #[default]
     AssignEvict = 0,
 
@@ -1393,13 +1440,33 @@ where
 /// What it would cost us to evict one or more bundles from a register.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct EvictionCost {
-    ///  Bits:   31    ...    16   15      ...       0
-    ///        +-----------------+---------------------+
-    /// Field: | broken_hints:16 | max_spill_weight:16 |
-    ///        +-----------------+---------------------+
+    ///  Bit:    31   ...  29   28   ...  25   24             23    ...   16   15      ...       0
+    ///        +--------------+--------------+--------------+----------------+---------------------+
+    /// Field: | (reserved):3 | stickiness:4 | is_minimal:1 | broken_hints:8 | max_spill_weight:16 |
+    ///        +--------------+--------------+--------------+----------------+---------------------+
     ///
-    /// Note: `broken_hints` comes first so we sort by that first and then
-    /// `max_spill_weight` second.
+    /// Packed so that we price a victim by, in order:
+    ///
+    /// 1. How few places it has left to go (see `LiveBundle::stickiness`). A
+    ///    bundle the stack could hold is never stuck, so it is always the
+    ///    cheapest thing to displace, however much it is worth; among bundles
+    ///    that all need a register, the one with the widest class to choose
+    ///    from is cheapest.
+    ///
+    /// 2. Whether it is minimal, because splitting is the only escape route
+    ///    left to a bundle the stack cannot hold, and a minimal bundle does not
+    ///    have it. This is what lets a minimal bundle take a register from a
+    ///    splittable one in the same class.
+    ///
+    /// 3. How many hints evicting it would break, and finally
+    ///
+    /// 4. Its spill weight. Between two bundles that are equally stuck, take
+    ///    the cheaper bundle.
+    ///
+    /// The budget `assign_via_eviction` compares against is the placing
+    /// bundle's own cost under this same order, and it only ever takes a
+    /// *strictly* cheaper victim, so the victim can never turn around and evict
+    /// it back.
     bits: u32,
 }
 
@@ -1408,16 +1475,31 @@ const EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT: u32 = 0;
 const EVICTION_COST_MAX_SPILL_WEIGHT_MASK: u32 =
     ((1 << EVICTION_COST_MAX_SPILL_WEIGHT_BITS) - 1) << EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT;
 
-const EVICTION_COST_BROKEN_HINTS_BITS: u32 = 16;
+const EVICTION_COST_BROKEN_HINTS_BITS: u32 = 8;
 const EVICTION_COST_BROKEN_HINTS_SHIFT: u32 =
     EVICTION_COST_MAX_SPILL_WEIGHT_SHIFT + EVICTION_COST_MAX_SPILL_WEIGHT_BITS;
 const EVICTION_COST_BROKEN_HINTS_MASK: u32 =
     ((1 << EVICTION_COST_BROKEN_HINTS_BITS) - 1) << EVICTION_COST_BROKEN_HINTS_SHIFT;
 const EVICTION_COST_BROKEN_HINTS_MAX: usize = (1 << EVICTION_COST_BROKEN_HINTS_BITS) - 1;
 
+const EVICTION_COST_IS_MINIMAL_BITS: u32 = 1;
+const EVICTION_COST_IS_MINIMAL_SHIFT: u32 =
+    EVICTION_COST_BROKEN_HINTS_SHIFT + EVICTION_COST_BROKEN_HINTS_BITS;
+const EVICTION_COST_IS_MINIMAL_MASK: u32 =
+    ((1 << EVICTION_COST_IS_MINIMAL_BITS) - 1) << EVICTION_COST_IS_MINIMAL_SHIFT;
+
+const EVICTION_COST_STICKINESS_BITS: u32 = 4;
+const EVICTION_COST_STICKINESS_SHIFT: u32 =
+    EVICTION_COST_IS_MINIMAL_SHIFT + EVICTION_COST_IS_MINIMAL_BITS;
+const EVICTION_COST_STICKINESS_MASK: u32 =
+    ((1 << EVICTION_COST_STICKINESS_BITS) - 1) << EVICTION_COST_STICKINESS_SHIFT;
+const EVICTION_COST_STICKINESS_MAX: usize = (1 << EVICTION_COST_STICKINESS_BITS) - 1;
+
 impl fmt::Debug for EvictionCost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EvictionCost")
+            .field("stickiness", &self.stickiness())
+            .field("is_minimal", &self.is_minimal())
             .field("broken_hints", &self.broken_hints())
             .field("max_spill_weight", &self.max_spill_weight())
             .finish()
@@ -1425,7 +1507,19 @@ impl fmt::Debug for EvictionCost {
 }
 
 impl EvictionCost {
-    fn new(broken_hints: usize, max_spill_weight: SpillWeight) -> Self {
+    fn new(
+        stickiness: usize,
+        is_minimal: bool,
+        broken_hints: usize,
+        max_spill_weight: SpillWeight,
+    ) -> Self {
+        let stickiness = u32::try_from(stickiness.min(EVICTION_COST_STICKINESS_MAX)).unwrap();
+        let stickiness = stickiness << EVICTION_COST_STICKINESS_SHIFT;
+        debug_assert_eq!(stickiness & EVICTION_COST_STICKINESS_MASK, stickiness);
+
+        let is_minimal = u32::from(is_minimal) << EVICTION_COST_IS_MINIMAL_SHIFT;
+        debug_assert_eq!(is_minimal & EVICTION_COST_IS_MINIMAL_MASK, is_minimal);
+
         let broken_hints = u32::try_from(broken_hints.min(EVICTION_COST_BROKEN_HINTS_MAX)).unwrap();
         let broken_hints = broken_hints << EVICTION_COST_BROKEN_HINTS_SHIFT;
         debug_assert_eq!(broken_hints & EVICTION_COST_BROKEN_HINTS_MASK, broken_hints);
@@ -1438,8 +1532,20 @@ impl EvictionCost {
         );
 
         EvictionCost {
-            bits: broken_hints | max_spill_weight,
+            bits: stickiness | is_minimal | broken_hints | max_spill_weight,
         }
+    }
+
+    #[inline]
+    fn stickiness(self) -> usize {
+        let stickiness =
+            (self.bits & EVICTION_COST_STICKINESS_MASK) >> EVICTION_COST_STICKINESS_SHIFT;
+        usize::try_from(stickiness).unwrap()
+    }
+
+    #[inline]
+    fn is_minimal(self) -> bool {
+        self.bits & EVICTION_COST_IS_MINIMAL_MASK != 0
     }
 
     #[inline]
@@ -1837,6 +1943,7 @@ mod tests {
     const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
     const MAX_GROUP_SIZE: usize = PRIORITY_GROUP_SIZE_MAX;
     const MAX_BROKEN_HINTS: usize = EVICTION_COST_BROKEN_HINTS_MAX;
+    const MAX_STICKINESS: usize = EVICTION_COST_STICKINESS_MAX;
 
     /// Every phase, in ascending order.
     const PHASES: [Phase; 4] = [
@@ -2013,57 +2120,181 @@ mod tests {
     }
 
     /// An eviction cost's fields survive the round trip through its packed
-    /// bits, up to the saturation of the one and the lossiness of the other.
+    /// bits, up to the saturation of some and the lossiness of another.
     #[test]
     fn eviction_cost_round_trips_its_fields() {
-        for broken_hints in [
+        for stickiness in [
             0,
             1,
-            2,
-            1000,
-            MAX_BROKEN_HINTS - 1,
-            MAX_BROKEN_HINTS,
-            MAX_BROKEN_HINTS + 1,
+            MAX_STICKINESS - 1,
+            MAX_STICKINESS,
+            MAX_STICKINESS + 1,
             usize::MAX,
         ] {
-            for weight in [0.0, 1.0, 3.25, 1e20, f32::INFINITY] {
-                let weight = SpillWeight::new(weight);
-                let cost = EvictionCost::new(broken_hints, weight);
-                assert_eq!(
-                    cost.broken_hints(),
-                    broken_hints.min(MAX_BROKEN_HINTS),
-                    "{cost:?}",
-                );
-                // A `SpillWeight` is already packed, so it survives exactly.
-                assert_eq!(cost.max_spill_weight(), weight, "{cost:?}");
+            for is_minimal in [false, true] {
+                for broken_hints in [
+                    0,
+                    1,
+                    2,
+                    1000,
+                    MAX_BROKEN_HINTS - 1,
+                    MAX_BROKEN_HINTS,
+                    MAX_BROKEN_HINTS + 1,
+                    usize::MAX,
+                ] {
+                    for weight in [0.0, 1.0, 3.25, 1e20, f32::INFINITY] {
+                        let weight = SpillWeight::new(weight);
+                        let cost = EvictionCost::new(stickiness, is_minimal, broken_hints, weight);
+                        assert_eq!(
+                            cost.stickiness(),
+                            stickiness.min(MAX_STICKINESS),
+                            "{cost:?}",
+                        );
+                        assert_eq!(cost.is_minimal(), is_minimal, "{cost:?}");
+                        assert_eq!(
+                            cost.broken_hints(),
+                            broken_hints.min(MAX_BROKEN_HINTS),
+                            "{cost:?}",
+                        );
+                        // A `SpillWeight` is already packed, so it survives
+                        // exactly.
+                        assert_eq!(cost.max_spill_weight(), weight, "{cost:?}");
+                    }
+                }
             }
         }
     }
 
-    /// Eviction costs compare by broken hints first: any number of them
-    /// outweighs any spill weight at all.
+    /// Eviction costs compare field by field, in the order they are packed:
+    /// being one step stickier outweighs every other field put together, being
+    /// minimal outweighs the two below it, and a broken hint outweighs any
+    /// spill weight at all.
     #[test]
-    fn eviction_cost_compares_by_broken_hints_then_spill_weight() {
+    fn eviction_costs_compare_field_by_field() {
         let ascending = [
-            EvictionCost::new(0, SpillWeight::new(0.0)),
-            EvictionCost::new(0, SpillWeight::new(1.0)),
-            EvictionCost::new(0, SpillWeight::new(1e20)),
-            EvictionCost::new(0, SpillWeight::new(f32::INFINITY)),
-            EvictionCost::new(1, SpillWeight::new(0.0)),
-            EvictionCost::new(1, SpillWeight::new(f32::INFINITY)),
-            EvictionCost::new(2, SpillWeight::new(0.0)),
-            EvictionCost::new(MAX_BROKEN_HINTS, SpillWeight::new(0.0)),
-            EvictionCost::new(MAX_BROKEN_HINTS, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(0, false, 0, SpillWeight::new(0.0)),
+            EvictionCost::new(0, false, 0, SpillWeight::new(1.0)),
+            EvictionCost::new(0, false, 0, SpillWeight::new(1e20)),
+            EvictionCost::new(0, false, 0, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(0, false, 1, SpillWeight::new(0.0)),
+            EvictionCost::new(0, false, 1, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(0, false, 2, SpillWeight::new(0.0)),
+            EvictionCost::new(0, false, MAX_BROKEN_HINTS, SpillWeight::new(0.0)),
+            EvictionCost::new(0, false, MAX_BROKEN_HINTS, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(0, true, 0, SpillWeight::new(0.0)),
+            EvictionCost::new(0, true, MAX_BROKEN_HINTS, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(1, false, 0, SpillWeight::new(0.0)),
+            EvictionCost::new(1, true, MAX_BROKEN_HINTS, SpillWeight::new(f32::INFINITY)),
+            EvictionCost::new(2, false, 0, SpillWeight::new(0.0)),
+            EvictionCost::new(MAX_STICKINESS, false, 0, SpillWeight::new(0.0)),
+            EvictionCost::new(
+                MAX_STICKINESS,
+                true,
+                MAX_BROKEN_HINTS,
+                SpillWeight::new(f32::INFINITY),
+            ),
         ];
         for w in ascending.windows(2) {
             assert!(w[0] < w[1], "{:?} should sort below {:?}", w[0], w[1]);
         }
 
-        // And saturation makes the top of the range a plateau, rather than
-        // wrapping back around to the bottom of it.
+        // And saturation makes the top of each range a plateau, rather than
+        // wrapping back around to the bottom of it -- or, worse, into the
+        // field above.
         assert_eq!(
-            EvictionCost::new(MAX_BROKEN_HINTS, SpillWeight::new(0.0)),
-            EvictionCost::new(usize::MAX, SpillWeight::new(0.0)),
+            EvictionCost::new(0, false, MAX_BROKEN_HINTS, SpillWeight::new(0.0)),
+            EvictionCost::new(0, false, usize::MAX, SpillWeight::new(0.0)),
         );
+        assert_eq!(
+            EvictionCost::new(MAX_STICKINESS, false, 0, SpillWeight::new(0.0)),
+            EvictionCost::new(usize::MAX, false, 0, SpillWeight::new(0.0)),
+        );
+    }
+
+    /// Among bundles that are equally stuck, minimality is what decides: the
+    /// budget an ordinary bundle brings to `assign_via_eviction` can never
+    /// afford a minimal victim, whatever the two weigh, and a minimal bundle's
+    /// budget can never afford a dearer minimal victim.
+    ///
+    /// Splitting is the only escape route left to a bundle the stack cannot
+    /// hold, and a minimal bundle does not have it, so between two bundles
+    /// with the same number of places to go the one that can still split is
+    /// the one that should move. `try_evict_and_assign` takes a victim only
+    /// when its cost is *strictly* cheaper than the budget, so "cannot afford"
+    /// is `!(cost < budget)`.
+    ///
+    /// Stickiness outranks all of this, and is the one thing the rule gives
+    /// way to: a victim with somewhere to go is affordable to anybody,
+    /// however minimal it is and however little the bundle displacing it is
+    /// worth.
+    #[test]
+    fn minimality_decides_between_equally_stuck_bundles() {
+        let weights = [0.0, 1.0, 3.25, 1e20, f32::INFINITY].map(SpillWeight::new);
+
+        for stickiness in [0, 1, MAX_STICKINESS - 1, MAX_STICKINESS] {
+            for ours in weights {
+                // A budget is built with no broken hints: we hold no register,
+                // so evicting us breaks nothing.
+                let ordinary = EvictionCost::new(stickiness, false, 0, ours);
+                let minimal = EvictionCost::new(stickiness, true, 0, ours);
+
+                for theirs in weights {
+                    for broken_hints in [0, 1] {
+                        let victim = EvictionCost::new(stickiness, true, broken_hints, theirs);
+                        assert!(
+                            !(victim < ordinary),
+                            "an ordinary bundle at {ours:?} must not afford {victim:?}",
+                        );
+
+                        // A minimal bundle affords another minimal one only
+                        // when that one is strictly cheaper, which is the same
+                        // well-founded descent the whole ladder relies on.
+                        assert_eq!(
+                            victim < minimal,
+                            (broken_hints, theirs) < (0, ours),
+                            "a minimal bundle at {ours:?} against {victim:?}",
+                        );
+
+                        // But one place to go is enough to make it affordable
+                        // to either of them.
+                        if stickiness > 0 {
+                            let unstuck =
+                                EvictionCost::new(stickiness - 1, true, broken_hints, theirs);
+                            assert!(
+                                unstuck < ordinary && unstuck < minimal,
+                                "{unstuck:?} has somewhere to go and must be affordable to \
+                                 both {ordinary:?} and {minimal:?}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A minimal bundle that must have a register gets one, even when every
+    /// register is held by a bundle that is dearer than it is.
+    ///
+    /// Those holders do not *need* a register -- an `Any` bundle can live on
+    /// the stack at every one of its uses -- so they are the least sticky thing
+    /// on the machine, and ordinary eviction takes one of their registers
+    /// without any regard for what it is worth. The victim is requeued rather
+    /// than spilled outright, so it can split around the minimal bundle and
+    /// keep a register for its hot read.
+    ///
+    /// Deliberately not routed through `crate::test::check_allocation`, which
+    /// answers `Ok` to `TooManyLiveRegs` on the grounds that not every function
+    /// fits on every machine. This one fits.
+    #[test]
+    fn a_minimal_register_read_takes_a_register_from_a_stackable_bundle() {
+        let test_input =
+            crate::test::TestInput::with_a_minimal_register_read_among_stackable_values();
+        let mut context = crate::Context::new();
+
+        test_input.with_input(|input| {
+            let output =
+                crate::run(&mut context, input).expect("this function fits on this machine");
+            crate::checker::check(input, &output).expect("and the allocation it gets is correct");
+        });
     }
 }

@@ -5644,6 +5644,120 @@ impl TestInput {
         input
     }
 
+    /// A read that must be in a register, at a point where every register is
+    /// held by a value that would rather keep one but does not need one.
+    ///
+    /// ```ignore
+    /// block0: inst0  late def v0 (any)
+    ///         inst1  late def v1 (any)
+    ///         inst2  late def v2 (any)
+    ///         inst3  early use v2 (reg)   // minimal: nowhere left to split
+    ///         inst4  --> block1
+    /// block1: inst5  early use v0 (any)   // a hundred times as often as
+    ///         inst6  early use v1 (any)   // block0, so neither of these is
+    ///         inst7  returns              // cheap enough to evict
+    /// ```
+    ///
+    /// v0 and v1 hold both registers across inst3, and their hot reads make
+    /// them dearer than v2, which is as cheap as a bundle gets. Spill weight
+    /// alone would leave v2 with nothing to buy a register with, because
+    /// eviction only takes a victim strictly cheaper than the bundle being
+    /// placed and there is nothing cheaper than minimal. But v2 is pinned to a
+    /// register and v0 and v1 are not -- they are free to live on the stack at
+    /// every one of their uses -- so the function does fit on the machine, and
+    /// eviction has to weigh how stuck a bundle is ahead of what it is worth.
+    pub fn with_a_minimal_register_read_among_stackable_values() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let any = OperandConstraint::Any;
+        let reg =
+            OperandConstraint::Reg(RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap());
+
+        func.values = PrimaryMap::new();
+        for def in [0, 1, 2] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: inst(def),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let def = |v| InstData::Op {
+            operands: vec![Operand::new(Position::Late, DefUse::Def, any, Some(val(v)))],
+            side_effects: true,
+        };
+        let read = |v, constraint| InstData::Op {
+            operands: vec![Operand::new(
+                Position::Early,
+                DefUse::Use,
+                constraint,
+                Some(val(v)),
+            )],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            def(0),
+            def(1),
+            def(2),
+            read(2, reg),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target: block(1),
+                    args: vec![],
+                }],
+            },
+            read(0, any),
+            read(1, any),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1), inst(2), inst(3), inst(4)],
+            vec![inst(5), inst(6), inst(7)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input.set_block_frequency(block(1), BlockFrequency::HOT);
+        input
+    }
+
     /// A chain of four blocks defining one value in the first and reading it in
     /// two of the others, so that it is live across all of them and every block
     /// after the definition holds it differently: read at its first point and
@@ -7466,6 +7580,9 @@ pub fn corpus() -> Vec<TestInput> {
         // A value we always recompute, read where both registers are spoken
         // for: recomputing is still no reason to deny its use a register.
         TestInput::with_a_recomputed_read_under_pressure(),
+        // Every register held by a value that does not need one, and a
+        // minimal read that does: the register has to come from somewhere.
+        TestInput::with_a_minimal_register_read_among_stackable_values(),
         // A value carried past a block that wants every register, cheap enough
         // to recompute that the crossing piece gets no location at all.
         {

@@ -2225,12 +2225,20 @@ mod tests {
                             let cost = |victim: LiveBundle<u32>, r: Reg| {
                                 let broken_hints =
                                     usize::from(usize::from(hints[victim.index()]) == r.index());
+                                // Stickiness and minimality are the
+                                // bundle-shaped half of the cost, and this
+                                // test has no bundle shapes: the fields'
+                                // ordering is covered where they are defined.
                                 EvictionCost::new(
+                                    0,
+                                    false,
                                     broken_hints,
                                     SpillWeight::new(f32::from(weights[victim.index()])),
                                 )
                             };
                             let max_cost = EvictionCost::new(
+                                0,
+                                false,
                                 0,
                                 SpillWeight::new(f32::from(weights[b.index()])),
                             );
@@ -2293,12 +2301,20 @@ mod tests {
                             let cost = |victim: LiveBundle<u32>, g: RegGroup| {
                                 let broken_hints =
                                     usize::from(usize::from(hints[victim.index()]) == g.index());
+                                // Stickiness and minimality are the
+                                // bundle-shaped half of the cost, and this
+                                // test has no bundle shapes: the fields'
+                                // ordering is covered where they are defined.
                                 EvictionCost::new(
+                                    0,
+                                    false,
                                     broken_hints,
                                     SpillWeight::new(f32::from(weights[victim.index()])),
                                 )
                             };
                             let max_cost = EvictionCost::new(
+                                0,
+                                false,
                                 0,
                                 SpillWeight::new(f32::from(weights[b.index()])),
                             );

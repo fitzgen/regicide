@@ -1878,7 +1878,6 @@ where
 
     /// Is this bundle minimal, i.e. too small to be split any further?
     #[inline]
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn is_minimal(self, live_ranges: &LiveRanges<E>) -> bool {
         live_ranges.bundles[self].weight_and_flags & BUNDLE_MINIMAL != 0
     }
