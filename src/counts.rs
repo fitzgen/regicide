@@ -90,6 +90,8 @@ pub struct Counts {
     pub half_move_dests: Count,
     pub moves_emitted: Count,
     pub remats_emitted: Count,
+    pub moves_eliminated: Count,
+    pub remats_eliminated: Count,
     pub critical_edge_edits: Count,
     pub move_cycles_broken: Count,
     pub cycles_parked_on_the_stack: Count,
@@ -131,6 +133,8 @@ impl Counts {
             half_move_dests: Count::new(),
             moves_emitted: Count::new(),
             remats_emitted: Count::new(),
+            moves_eliminated: Count::new(),
+            remats_eliminated: Count::new(),
             critical_edge_edits: Count::new(),
             move_cycles_broken: Count::new(),
             cycles_parked_on_the_stack: Count::new(),
@@ -176,6 +180,8 @@ impl Counts {
             half_move_dests,
             moves_emitted,
             remats_emitted,
+            moves_eliminated,
+            remats_eliminated,
             critical_edge_edits: critical_edge_moves,
             move_cycles_broken,
             cycles_parked_on_the_stack,
@@ -213,6 +219,8 @@ impl Counts {
             && half_move_dests.is_reset()
             && moves_emitted.is_reset()
             && remats_emitted.is_reset()
+            && moves_eliminated.is_reset()
+            && remats_eliminated.is_reset()
             && critical_edge_moves.is_reset()
             && move_cycles_broken.is_reset()
             && cycles_parked_on_the_stack.is_reset()

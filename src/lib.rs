@@ -33,11 +33,11 @@ mod input;
 mod live_ranges;
 mod liveness;
 mod machine;
-mod move_elimination;
 mod move_generation;
 mod output;
 mod packed_float;
 mod parallel_moves;
+mod redundant_move_elimination;
 mod region_allocation;
 mod region_tree;
 mod rpo;
@@ -208,7 +208,6 @@ where
     spill_slot_allocation::allocate_spill_slots(context, input)?;
     spill_placement::place_spills(context, input)?;
     move_generation::generate_moves(context, input)?;
-    move_elimination::eliminate_moves(context, input)?;
 
     {
         let ContextInner {
@@ -220,6 +219,8 @@ where
         } = &mut *context;
         output.construct(input.func, input.machine, rpo, live_ranges, spill_slots)?;
     }
+
+    redundant_move_elimination::eliminate_redundant_moves(context, input)?;
 
     trace!(
         "====== register allocation output ======\n\

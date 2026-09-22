@@ -1,7 +1,8 @@
 use crate::{
     coalescing::Coalescing, counts::Counts, dfs::Dfs, entity::EntityRepr, events::EventsLog,
     live_ranges::LiveRanges, liveness::Liveness, move_generation::MoveGeneration,
-    output::OutputInner, region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
+    output::OutputInner, redundant_move_elimination::RedundantMoveElimination,
+    region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
     spill_placement::SpillPlacement, spill_slot_allocation::SpillSlots,
 };
 
@@ -99,6 +100,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub spill_slots: SpillSlots<E>,
     pub spill_placement: SpillPlacement<E>,
     pub move_generation: MoveGeneration<E>,
+    pub redundant_move_elimination: RedundantMoveElimination<E>,
     pub output: OutputInner<E>,
 }
 
@@ -117,6 +119,7 @@ impl<E: EntityRepr> ContextInner<E> {
             spill_slots: SpillSlots::new(),
             spill_placement: SpillPlacement::new(),
             move_generation: MoveGeneration::new(),
+            redundant_move_elimination: RedundantMoveElimination::new(),
             output: OutputInner::new(),
         }
     }
@@ -135,6 +138,7 @@ impl<E: EntityRepr> ContextInner<E> {
             spill_slots,
             spill_placement,
             move_generation,
+            redundant_move_elimination,
             output,
         } = self;
         counts.reset();
@@ -149,6 +153,7 @@ impl<E: EntityRepr> ContextInner<E> {
         spill_slots.reset();
         spill_placement.reset();
         move_generation.reset();
+        redundant_move_elimination.reset();
         output.reset();
     }
 
@@ -166,6 +171,7 @@ impl<E: EntityRepr> ContextInner<E> {
             spill_slots,
             spill_placement,
             move_generation,
+            redundant_move_elimination,
             output,
         } = self;
         counts.is_reset()
@@ -180,6 +186,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && spill_slots.is_reset()
             && spill_placement.is_reset()
             && move_generation.is_reset()
+            && redundant_move_elimination.is_reset()
             && output.is_reset()
     }
 }

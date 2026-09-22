@@ -2218,7 +2218,7 @@ mod tests {
         Entity as _,
         context::{Context, WhichContext},
         error::Error,
-        input::{Position, RematCost},
+        input::{MoveEliminationLevel, Position, RematCost},
         machine::{RegClassMembers, RegGroup},
         test::{TestInput, TestMachine},
     };
@@ -2987,6 +2987,9 @@ mod tests {
             OperandConstraint::Reg(class),
         ]);
         test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        // The value is still in the register the remat targets, so elimination
+        // would drop the very edit this test perturbs.
+        test_input.options.move_elimination_level = MoveEliminationLevel::None;
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -2997,12 +3000,23 @@ mod tests {
         assert!(error.contains("rematerialization cost"), "{error}");
     }
 
+    /// [`TestInput::with_a_rematerialized_block_arg`], with move elimination
+    /// turned off.
+    ///
+    /// The register the remat targets already holds the value, so elimination
+    /// is right to drop it --- but the tests below need the remat there.
+    fn rematerialized_block_arg_without_move_elimination() -> TestInput {
+        let mut test_input = TestInput::with_a_rematerialized_block_arg();
+        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input
+    }
+
     /// A parameter filled by rematerializing its argument is still the
     /// parameter: the remat names the argument, so the rename that follows it
     /// is what makes the register read as the parameter.
     #[test]
     fn a_rematerialized_block_argument_defines_the_parameter() {
-        let test_input = TestInput::with_a_rematerialized_block_arg();
+        let test_input = rematerialized_block_arg_without_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(
             stats.remats > 0,
@@ -3026,6 +3040,7 @@ mod tests {
             &[OperandConstraint::Stack, OperandConstraint::Reg(wide)],
         );
         test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        test_input.options.move_elimination_level = MoveEliminationLevel::None;
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -3195,7 +3210,7 @@ mod tests {
     fn checks_that_a_rematerialized_value_is_computed_from_nothing() {
         // The parameter half: point the remat at the value the edge defines
         // rather than the argument it carries.
-        let test_input = TestInput::with_a_rematerialized_block_arg();
+        let test_input = rematerialized_block_arg_without_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -3219,7 +3234,7 @@ mod tests {
         // which is reported as well; `check_against` does not validate the
         // copy it checks, and this is the only way to reach a definition that
         // reads from a fixture whose definitions do not.
-        let mut test_input = TestInput::with_a_rematerialized_block_arg();
+        let mut test_input = rematerialized_block_arg_without_move_elimination();
         let allocated = test_input.clone();
         let def = Inst::try_new(0).unwrap();
         let arg = first_val(&test_input);
@@ -3495,6 +3510,7 @@ mod tests {
             &[OperandConstraint::Stack, OperandConstraint::Reg(narrow)],
         );
         test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
+        test_input.options.move_elimination_level = MoveEliminationLevel::None;
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -3673,7 +3689,7 @@ mod tests {
     /// never one of them.
     #[test]
     fn checks_that_no_critical_edge_edit_sits_atop_a_block() {
-        let test_input = TestInput::with_a_rematerialized_block_arg();
+        let test_input = rematerialized_block_arg_without_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(
             stats.deferred_renames > 0,
@@ -3772,11 +3788,23 @@ mod tests {
         );
     }
 
+    /// [`TestInput::with_values_in_two_banks_spilled_and_reloaded`], with move
+    /// elimination turned off.
+    ///
+    /// Nothing wants the registers while the values sit on the stack, so
+    /// elimination is right to drop the reloads --- but the tests below perturb
+    /// a reload and watch the checker object.
+    fn spilled_and_reloaded_without_move_elimination() -> TestInput {
+        let mut test_input = TestInput::with_values_in_two_banks_spilled_and_reloaded();
+        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input
+    }
+
     /// A reload's slot is the size of the register it fills. Nothing else asks
     /// this: the per-value checks look only at where a move *writes*.
     #[test]
     fn checks_the_size_of_the_slot_a_move_reads() {
-        let test_input = TestInput::with_values_in_two_banks_spilled_and_reloaded();
+        let test_input = spilled_and_reloaded_without_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(
             stats.reloads > 0,
@@ -3808,7 +3836,7 @@ mod tests {
     /// and not in one that cannot hold it.
     #[test]
     fn checks_the_bank_of_a_register_a_move_targets() {
-        let test_input = TestInput::with_values_in_two_banks_spilled_and_reloaded();
+        let test_input = spilled_and_reloaded_without_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(
             stats.reloads > 0,
@@ -3976,10 +4004,12 @@ mod tests {
     #[test]
     fn checks_a_register_group_member_by_member() {
         let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
-        let test_input = TestInput::with_group_use_constraints(&[
+        let mut test_input = TestInput::with_group_use_constraints(&[
             OperandConstraint::Stack,
             OperandConstraint::Reg(group_class),
         ]);
+        // Elimination would drop the very reloads this test perturbs.
+        test_input.options.move_elimination_level = MoveEliminationLevel::None;
         let stats = check_allocation(&test_input).unwrap();
         assert!(
             stats.reg_group_operands > 0,
@@ -4078,6 +4108,18 @@ mod tests {
     #[test]
     fn a_reuse_follows_its_target_past_an_earlier_pinned_read() {
         let test_input = TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read();
+        check_allocation(&test_input).unwrap();
+    }
+
+    /// [`a_reuse_lands_where_its_target_is_actually_read`], with the tie
+    /// naming the *first* of the two reads.
+    ///
+    /// Only the reads before a tie can share its span, so the pinned read here
+    /// has no claim on where the definition goes; pinning it away from its
+    /// target would break the tie. Found by `checker_properties`.
+    #[test]
+    fn a_reuse_lands_where_its_target_is_read_when_the_tie_comes_first() {
+        let test_input = TestInput::with_a_pinned_read_after_a_reuse_target();
         check_allocation(&test_input).unwrap();
     }
 

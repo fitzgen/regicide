@@ -537,6 +537,11 @@ impl_enum_with_repr32! {
         Remat(remat) => Edit::Remat(remat.with_repr32()),
         CriticalEdge(edit) => Edit::CriticalEdge(edit.with_repr32()),
     }
+
+    InstOrEdit {
+        Inst(inst) => InstOrEdit::Inst(inst.with_repr32()),
+        Edit(edit) => InstOrEdit::Edit(edit.with_repr32()),
+    }
 }
 
 impl<E> Remat<E>
@@ -728,12 +733,15 @@ impl<'a> Output<'a> {
 
 /// One element of the stream [`Output::block_insts_and_edits`] yields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstOrEdit {
+pub enum InstOrEdit<E = u32>
+where
+    E: EntityRepr,
+{
     /// An instruction of the original function, which stays where it is.
-    Inst(Inst),
+    Inst(Inst<E>),
 
     /// An edit to insert at this point in the block.
-    Edit(Edit),
+    Edit(Edit<E>),
 }
 
 #[cfg(feature = "visualizer")]
@@ -782,7 +790,7 @@ impl Iterator for OutputIter<'_> {
 
 /// Build the instruction-and-edit stream for `block` out of the edits that move
 /// generation left under the `E` representation.
-fn block_iter<'a, E>(
+pub(crate) fn block_iter<'a, E>(
     move_generation: &'a MoveGeneration<E>,
     func: &impl InputFunction,
     block: Block,
@@ -799,36 +807,49 @@ where
     let first = first.with_repr::<E>().unwrap();
     let last = last.with_repr::<E>().unwrap();
 
+    let points = move_generation.block_point_edit_range(first, last);
+    let edges = move_generation.block_edge_edit_range(block);
+
     BlockInstsAndEdits {
         insts,
-        point_edits: move_generation.block_point_edits(first, last),
-        edge_edits: move_generation.block_edge_edits(block),
+        point_base: points.start,
+        point_edits: &move_generation.edits()[points],
+        edge_base: edges.start,
+        edge_edits: &move_generation.edits()[edges],
     }
 }
 
 /// One representation's worth of [`OutputIter`].
-struct BlockInstsAndEdits<'a, E>
+pub(crate) struct BlockInstsAndEdits<'a, E>
 where
     E: EntityRepr,
 {
     /// The indices of the block's instructions that have not been yielded yet.
     insts: core::ops::Range<usize>,
 
+    /// Where `point_edits[0]` sits in the whole edit list.
+    point_base: usize,
+
     /// The block's edits at program points inside it, in program order.
     point_edits: &'a [(PackedMovePosition<E>, Edit<E>)],
+
+    /// Where `edge_edits[0]` sits in the whole edit list.
+    edge_base: usize,
 
     /// The edits on critical edges leaving the block, which the client must
     /// split before it can place them.
     edge_edits: &'a [(PackedMovePosition<E>, Edit<E>)],
 }
 
-impl<E> Iterator for BlockInstsAndEdits<'_, E>
+impl<E> BlockInstsAndEdits<'_, E>
 where
     E: EntityRepr,
 {
-    type Item = InstOrEdit;
-
-    fn next(&mut self) -> Option<InstOrEdit> {
+    /// The next item, and, for an edit, where it sits in the whole edit list.
+    ///
+    /// Elimination removes edits by index and must interleave them exactly as
+    /// the client sees them, so the two come from the same place.
+    pub(crate) fn next_indexed(&mut self) -> Option<(InstOrEdit<E>, Option<usize>)> {
         if !self.insts.is_empty() {
             let inst = Inst::<E>::try_new(self.insts.start)
                 .expect("the block's instructions all fit in `E`");
@@ -839,24 +860,41 @@ where
             if let Some((&(pos, edit), rest)) = self.point_edits.split_first() {
                 if pos.is_at_or_before(LivePoint::new(inst, Position::Early)) {
                     self.point_edits = rest;
-                    return Some(InstOrEdit::Edit(edit.with_repr32()));
+                    let index = self.point_base;
+                    self.point_base += 1;
+                    return Some((InstOrEdit::Edit(edit), Some(index)));
                 }
             }
 
             self.insts.start += 1;
-            return Some(InstOrEdit::Inst(inst.with_repr32()));
+            return Some((InstOrEdit::Inst(inst), None));
         }
 
         // The block's instructions are exhausted, so everything still left goes
         // after all of them.
         if let Some((&(_, edit), rest)) = self.point_edits.split_first() {
             self.point_edits = rest;
-            return Some(InstOrEdit::Edit(edit.with_repr32()));
+            let index = self.point_base;
+            self.point_base += 1;
+            return Some((InstOrEdit::Edit(edit), Some(index)));
         }
 
         let (&(_, edit), rest) = self.edge_edits.split_first()?;
         self.edge_edits = rest;
-        Some(InstOrEdit::Edit(edit.with_repr32()))
+        let index = self.edge_base;
+        self.edge_base += 1;
+        Some((InstOrEdit::Edit(edit), Some(index)))
+    }
+}
+
+impl<E> Iterator for BlockInstsAndEdits<'_, E>
+where
+    E: EntityRepr,
+{
+    type Item = InstOrEdit;
+
+    fn next(&mut self) -> Option<InstOrEdit> {
+        self.next_indexed().map(|(item, _)| item.with_repr32())
     }
 }
 

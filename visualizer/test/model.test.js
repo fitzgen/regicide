@@ -787,6 +787,31 @@ test("an event summary names its entities as clickable parts", () => {
   );
 });
 
+test("an eliminated edit summarizes the edit that is not happening", () => {
+  // The one event kind reporting something the allocation does *not* contain,
+  // so the log is the only place it appears.
+  const blob = fixture("eliminated-edits");
+  const model = modelOf(blob);
+  const found = model
+    .details({ kind: "Reg", index: 0 })
+    .events.filter((event) => event.kind === "EditEliminated");
+  assert.equal(found.length, 2, "the fixture drops two reloads into r0");
+  assert.equal(
+    flat(found[0].summary),
+    "EditEliminated edit=move reload {from: stack0, to: r0} index=1 pos=point inst3:early",
+  );
+  // The reload's ends are reached through the nested `edit`, the way
+  // `CriticalEdgeEdit` reaches its own.
+  assert.deepEqual(
+    found[0].summary.filter((part) => part.entity).map((part) => part.entity),
+    [
+      { kind: "SpillSlot", index: 0 },
+      { kind: "Reg", index: 0 },
+      { kind: "Inst", index: 3 },
+    ],
+  );
+});
+
 test("a list's count is the true total and its value is what survived the cap", () => {
   // The pane says "200 of 1204", so the two disagree exactly when a list was
   // truncated. Anything reading `value.length` as the total is wrong.
@@ -856,7 +881,13 @@ test("every entity every pane names is a real one, labeled by `entities.js`", ()
   // The sweep: every field of every entity in every fixture. A part whose ref
   // is out of range is a dead link, and `details` returning null for it is
   // exactly what the pane would hit when the user clicked.
-  for (const name of ["spills-and-reloads", "critical-edge", "spilled-merge-param", "block-kinds"]) {
+  for (const name of [
+    "spills-and-reloads",
+    "critical-edge",
+    "spilled-merge-param",
+    "block-kinds",
+    "eliminated-edits",
+  ]) {
     const blob = fixture(name);
     const model = modelOf(blob);
     let panes = 0;

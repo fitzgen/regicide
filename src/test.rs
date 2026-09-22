@@ -3141,6 +3141,102 @@ impl TestInput {
         input
     }
 
+    /// One value spilled in the entry block and reloaded past a diamond: a
+    /// stack-constrained read puts it on the stack, both arms leave it alone,
+    /// and a register-constrained read in the merge block brings it back. The
+    /// reload is redundant, but only a reader who looks past the merge block
+    /// can tell.
+    pub fn with_a_value_reloaded_past_a_diamond() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let merge = block(3);
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            side_effects: true,
+        };
+        let branch = |targets: &[Block]| InstData::Branch {
+            operands: vec![],
+            targets: targets
+                .iter()
+                .map(|&target| BlockCall {
+                    target,
+                    args: Vec::new(),
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`: define the value in a register --- pinned, so the
+            // definition does not land on the stack and make the store free ---
+            // read it on the stack, and fork.
+            op(Position::Late, DefUse::Def, OperandConstraint::Reg(class)),
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+            branch(&[block(1), block(2)]),
+            // `block1` and `block2`: a way to the merge, touching nothing.
+            branch(&[merge]),
+            branch(&[merge]),
+            // `block3`: read it in a register again, asking for the reload.
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            // A terminator of its own, so `ensure_terminators` leaves the read
+            // alone.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for (insts, params) in [
+            (vec![inst(0), inst(1), inst(2)], vec![]),
+            (vec![inst(3)], vec![]),
+            (vec![inst(4)], vec![]),
+            (vec![inst(5), inst(6)], vec![]),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input with one instruction that ties a def to a use: the
     /// def carries a `Reuse` naming the use operand, whose own constraint is
     /// `use_constraint`.
@@ -6587,6 +6683,258 @@ impl TestInput {
         input
     }
 
+    /// A straight-line chain of `links` blocks, each taking one parameter and
+    /// passing it straight on to the next.
+    pub fn with_a_parameter_chain(links: usize) -> Self {
+        assert!(links >= 1);
+
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let block = |i: usize| Block::try_new(i).unwrap();
+        let inst = |i: usize| Inst::try_new(i).unwrap();
+        let val = |i: usize| Val::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        // `v0` is defined in the entry block; `v1..=vlinks` are the parameters
+        // of `block1..=blocklinks`.
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: inst(0),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+        for i in 1..=links {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::BlockParam {
+                            block: block(i),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let branch = |target, arg| InstData::Branch {
+            operands: vec![],
+            targets: vec![BlockCall {
+                target,
+                args: vec![arg],
+            }],
+        };
+
+        // `block0` defines the value and hands it on; each `blocki` passes its
+        // parameter along. The last reads its parameter in a register, then
+        // ends in an instruction of its own so `ensure_terminators` leaves the
+        // read alone.
+        func.insts = PrimaryMap::new();
+        func.insts
+            .push(
+                &mut output,
+                InstData::Op {
+                    operands: vec![Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(class),
+                        Some(val(0)),
+                    )],
+                    side_effects: true,
+                },
+            )
+            .unwrap();
+        for i in 0..links {
+            func.insts
+                .push(&mut output, branch(block(i + 1), val(i)))
+                .unwrap();
+        }
+        for inst_data in [
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(class),
+                    Some(val(links)),
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: vec![inst(0), inst(1)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+        for i in 1..links {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![val(i)],
+                        insts: vec![inst(i + 1)],
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![val(links)],
+                    insts: vec![inst(links + 1), inst(links + 2)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A read pinned to `r1` sharing a point with the reuse target it follows.
+    ///
+    /// `v0` is read twice at `inst1`'s early half, unconstrained and then
+    /// pinned to `r1`. The tie names the first, so the pinned read cannot join
+    /// its span and has no say in where the definition goes; the earlier read
+    /// pinned to `r0` is what makes the two disagree if it is let speak.
+    ///
+    /// The mirror of [`TestInput::with_a_reuse_of_a_pinned_read`], where the
+    /// tie names the second read; see
+    /// `checker::tests::a_reuse_lands_where_its_target_is_read_when_the_tie_comes_first`.
+    pub fn with_a_pinned_read_after_a_reuse_target() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let inst = |i: usize| Inst::try_new(i).unwrap();
+        let val = |i: usize| Val::try_new(i).unwrap();
+        let first = RegClass::try_new(usize::from(TestMachine::FIRST_REG_CLASS)).unwrap();
+        let second = RegClass::try_new(usize::from(TestMachine::SECOND_REG_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::BlockParam {
+                        block: Block::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: inst(1),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // The read that makes `rc0` look like the place to be.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Reg(first),
+                    Some(val(0)),
+                )],
+                side_effects: true,
+            },
+            // The tie, and the sibling read that contradicts it.
+            InstData::Op {
+                operands: vec![
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Any,
+                        Some(val(0)),
+                    ),
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(second),
+                        Some(val(0)),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reuse(0),
+                        Some(val(1)),
+                    ),
+                ],
+                side_effects: true,
+            },
+            // A terminator of its own, so `ensure_terminators` leaves the tied
+            // instruction alone.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![val(0)],
+                    insts: vec![inst(0), inst(1), inst(2)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// An input with a move placed just before a block's terminator.
     ///
     /// Two predecessors of a merge block pass *different* values for its one
@@ -8165,6 +8513,7 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_pinned_read_before_a_reuse_that_reads_twice(),
         TestInput::with_a_pinned_read_before_a_reuse_of_an_unpinned_read(),
         TestInput::with_a_pinned_read_before_a_reuse_of_a_dying_value(),
+        TestInput::with_a_pinned_read_after_a_reuse_target(),
         TestInput::with_a_reuse_of_a_live_in_value(),
         TestInput::with_two_reuses_at_one_point(),
         TestInput::with_two_reuses_of_a_dying_value(),
@@ -8193,6 +8542,7 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_def_only_value_under_pressure(),
         TestInput::with_a_stack_constrained_value_under_pressure(),
         TestInput::with_three_values_needing_two_register_groups(),
+        TestInput::with_a_value_reloaded_past_a_diamond(),
         TestInput::with_an_entry_param_read_two_ways(),
         TestInput::with_two_entry_params(),
         TestInput::with_entry_params_in_two_banks(),

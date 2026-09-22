@@ -483,14 +483,22 @@ where
         /// The move.
         #[cfg_attr(feature = "serialize", serde(rename = "move"))]
         move_: Move<E>,
-        /// Its index in the finished edit list, so that the visualizer can
-        /// map an edit it renders back to the event that made it.
-        //
-        // Recorded as the position in `self.edits` at the time of emission,
-        // then renumbered once the edits are sorted. Stable only because move
-        // elimination never removes an edit; if it ever does, add a
-        // `MoveEliminated { index }` event and fold it in the visualizer
-        // rather than renumbering again here.
+        /// Its index in the edit list as move generation left it, not in the
+        /// list the allocation results hand out.
+        index: usize,
+    },
+
+    /// A move or rematerialization was dropped because its destination already
+    /// held its value.
+    EditEliminated {
+        /// Where the edit was.
+        pos: PackedMovePosition<E>,
+
+        /// The edit that is not happening.
+        edit: EdgeEdit<E>,
+
+        /// Which edit it was, with the same numbering `Event::MoveEmitted`
+        /// uses.
         index: usize,
     },
 
@@ -623,6 +631,7 @@ mod viz_enabled {
                 Self::ScratchRegBorrowed { .. } => "ScratchRegBorrowed",
                 Self::ParallelMoveBatchSolved { .. } => "ParallelMoveBatchSolved",
                 Self::MoveEmitted { .. } => "MoveEmitted",
+                Self::EditEliminated { .. } => "EditEliminated",
                 Self::CriticalEdgeEdit { .. } => "CriticalEdgeEdit",
             }
         }
@@ -966,6 +975,15 @@ mod viz_enabled {
                     visit_move(*move_, f);
                 }
 
+                Self::EditEliminated {
+                    pos,
+                    edit,
+                    index: _,
+                } => {
+                    visit_move_position(*pos, f);
+                    visit_edge_edit(*edit, f);
+                }
+
                 Self::CriticalEdgeEdit {
                     pred,
                     succ: _,
@@ -1236,6 +1254,11 @@ mod viz_enabled {
         MoveEmitted {
             pos: (MOVE_POSITION),
             move_ as "move": (MOVE),
+            index: _,
+        }
+        EditEliminated {
+            pos: (MOVE_POSITION),
+            edit: (EDGE_EDIT),
             index: _,
         }
         CriticalEdgeEdit {

@@ -668,7 +668,6 @@ where
 
     /// Get the edits this pass generated, sorted by position and then moves
     /// before rematerializations.
-    #[allow(dead_code, reason = "consumed by the phases that are still to come")]
     pub(crate) fn edits(&self) -> &[(PackedMovePosition<E>, Edit<E>)] {
         &self.edits
     }
@@ -680,27 +679,66 @@ where
         &mut self.edits
     }
 
+    /// Where in the whole edit list the edits at program points inside the
+    /// block whose instructions run from `first` to `last` sit.
+    pub(crate) fn block_point_edit_range(&self, first: Inst<E>, last: Inst<E>) -> Range<usize> {
+        let start = PackedMovePosition::point(LivePoint::new(first, Position::Early));
+        let end = PackedMovePosition::point(LivePoint::new(last, Position::Late).next_point());
+        let lo = self.edits.partition_point(|&(pos, _)| pos < start);
+        let hi = self.edits.partition_point(|&(pos, _)| pos < end);
+        lo..hi
+    }
+
+    /// Where in the whole edit list `pred`'s outgoing critical-edge edits sit.
+    pub(crate) fn block_edge_edit_range(&self, pred: Block<E>) -> Range<usize> {
+        let start = PackedMovePosition::<E>::pack(1, pred.index(), 0);
+        let end = PackedMovePosition::<E>::pack(1, pred.index() + 1, 0);
+        let lo = self.edits.partition_point(|&(pos, _)| pos < start);
+        let hi = self.edits.partition_point(|&(pos, _)| pos < end);
+        lo..hi
+    }
+
     /// The edits at program points inside the block whose instructions run from
     /// `first` to `last`, in program order.
+    #[cfg(feature = "visualizer")]
     pub(crate) fn block_point_edits(
         &self,
         first: Inst<E>,
         last: Inst<E>,
     ) -> &[(PackedMovePosition<E>, Edit<E>)] {
-        let start = PackedMovePosition::point(LivePoint::new(first, Position::Early));
-        let end = PackedMovePosition::point(LivePoint::new(last, Position::Late).next_point());
-        let lo = self.edits.partition_point(|&(pos, _)| pos < start);
-        let hi = self.edits.partition_point(|&(pos, _)| pos < end);
-        &self.edits[lo..hi]
+        &self.edits[self.block_point_edit_range(first, last)]
     }
 
     /// The edits on critical edges leaving `pred`, in outgoing-edge order.
+    #[cfg(feature = "visualizer")]
     pub(crate) fn block_edge_edits(&self, pred: Block<E>) -> &[(PackedMovePosition<E>, Edit<E>)] {
-        let start = PackedMovePosition::<E>::pack(1, pred.index(), 0);
-        let end = PackedMovePosition::<E>::pack(1, pred.index() + 1, 0);
-        let lo = self.edits.partition_point(|&(pos, _)| pos < start);
-        let hi = self.edits.partition_point(|&(pos, _)| pos < end);
-        &self.edits[lo..hi]
+        &self.edits[self.block_edge_edit_range(pred)]
+    }
+
+    /// Drop the edits at `indices`, which must be strictly increasing and in
+    /// bounds.
+    pub(crate) fn remove_edits(&mut self, indices: &[usize]) {
+        debug_assert!(
+            indices.windows(2).all(|w| w[0] < w[1]),
+            "the indices to remove must be strictly increasing and free of duplicates",
+        );
+        debug_assert!(
+            indices.last().is_none_or(|&last| last < self.edits.len()),
+            "every index to remove must address an edit",
+        );
+
+        // Use `retain`, rather than e.g. `swap_remove`, to keep the edits
+        // sorted.
+        let mut remove_indices = indices.iter().copied().peekable();
+        let mut edit_index = 0;
+        self.edits.retain(|_| {
+            let remove_edit = remove_indices.peek() == Some(&edit_index);
+            if remove_edit {
+                let _ = remove_indices.next();
+            }
+            edit_index += 1;
+            !remove_edit
+        });
     }
 
     fn generate(

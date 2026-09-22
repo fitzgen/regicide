@@ -679,9 +679,20 @@ mod tests {
     #[test]
     fn fixtures_are_up_to_date() {
         let fixtures: &[(&str, fn() -> TestInput)] = &[
+            // The one fixture with both directions of slot traffic. Its
+            // reloads are redundant, so elimination is off here to keep a
+            // reload in the blob and its rendering covered.
+            ("spills-and-reloads", || {
+                let mut test = TestInput::with_values_in_two_banks_spilled_and_reloaded();
+                test.options.move_elimination_level = crate::input::MoveEliminationLevel::None;
+                test
+            }),
+            // The only fixture with an `EditEliminated` event: every other one
+            // runs at the default level with nothing to drop, so without this
+            // the kind would be in each schema and in no log.
             (
-                "spills-and-reloads",
-                TestInput::with_values_in_two_banks_spilled_and_reloaded,
+                "eliminated-edits",
+                TestInput::with_a_value_reloaded_past_a_diamond,
             ),
             ("critical-edge", TestInput::with_a_critical_edge),
             // The one operand shape no allocation produces: a read of a
