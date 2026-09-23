@@ -37,3 +37,9 @@ name = "allocate"
 path = "fuzz_targets/allocate.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "parallel_moves"
+path = "fuzz_targets/parallel_moves.rs"
+test = false
+doc = false

@@ -18,6 +18,8 @@ use mutatis::{DefaultMutate, Generate, Mutate};
 
 /// A location a generated move can read or write.
 #[derive(Clone, Copy, Debug, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub enum TestLocation {
     /// A register, by *name*. Two names can alias the same physical register,
     /// so a name is not the register's identity.
@@ -35,6 +37,8 @@ impl Default for TestLocation {
 
 /// One generated move, `dst := src`.
 #[derive(Clone, Copy, Debug, Default, Hash, Mutate)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestMove {
     pub src: TestLocation,
     pub dst: TestLocation,
@@ -50,6 +54,8 @@ pub struct TestMove {
 /// `overlaps` is then reflexive and symmetric but not transitive, which is all
 /// the solver may assume of it.
 #[derive(Clone, Debug, Hash)]
+#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
+#[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 pub struct TestParallelMoves {
     /// For each register name, the range of register units it covers, as a
     /// width of one or two units and a start. See [`TestParallelMoves::decode`].
@@ -160,7 +166,7 @@ impl TestParallelMoves {
 
     /// Clamp the model machine's size, bring every name and index in range,
     /// and drop moves the solver's preconditions do not allow.
-    fn fixup(&mut self) {
+    pub fn fixup(&mut self) {
         self.regs.truncate(Self::MAX_REG_NAMES);
         if self.regs.is_empty() {
             self.regs.push(Self::encode(0, 1));
@@ -222,8 +228,7 @@ impl TestParallelMoves {
 
     /// A `regs` table naming every register unit once, so that no two names
     /// overlap.
-    #[cfg(test)]
-    pub(crate) fn disjoint_regs() -> Vec<u8> {
+    pub fn disjoint_regs() -> Vec<u8> {
         (0..Self::NUM_UNITS).map(|s| Self::encode(s, 1)).collect()
     }
 
@@ -232,8 +237,7 @@ impl TestParallelMoves {
     }
 
     /// The moves in this batch.
-    #[cfg(test)]
-    pub(crate) fn moves(&self) -> &[TestMove] {
+    pub fn moves(&self) -> &[TestMove] {
         &self.moves
     }
 
@@ -506,6 +510,86 @@ impl TestParallelMoves {
             refused,
         })
     }
+
+    /// Names that alias *partially*: name 0 covers unit `0..1`, name 1 covers
+    /// `1..2`, and name 2 spans both, so name 2's value is destroyed by two
+    /// writes that do not touch each other. Slot 2 is one of the wide ones,
+    /// and so is where a two-unit value spills.
+    pub fn partially_aliasing_names() -> Self {
+        Self::new(
+            vec![0, 2, 1],
+            vec![
+                mv(reg(2), slot(2)),
+                mv(slot(0), reg(0)),
+                mv(slot(1), reg(1)),
+            ],
+            true,
+        )
+    }
+
+    /// Two cycles that share a source covered by two disjoint writes, so that
+    /// breaking one of them does not free the other.
+    pub fn two_concurrent_cycle_breaks() -> Self {
+        Self::new(
+            vec![0, 2, 1, 5, 4],
+            vec![
+                mv(reg(0), slot(1)),
+                mv(slot(1), reg(1)),
+                mv(reg(2), reg(3)),
+                mv(reg(4), reg(0)),
+            ],
+            true,
+        )
+    }
+
+    /// This batch written as the `TestParallelMoves::new` call that rebuilds
+    /// it.
+    pub fn as_test_case(&self) -> String {
+        fn render(loc: TestLocation) -> String {
+            match loc {
+                TestLocation::Reg(name) => format!("reg({name})"),
+                TestLocation::Slot(slot) => format!("slot({slot})"),
+            }
+        }
+
+        let mut s = String::from("TestParallelMoves::new(\n    vec![");
+        for (i, byte) in self.regs.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&byte.to_string());
+        }
+        s.push_str("],\n");
+
+        if self.moves.is_empty() {
+            s.push_str("    vec![],\n");
+        } else {
+            s.push_str("    vec![\n");
+            for m in &self.moves {
+                s.push_str(&format!(
+                    "        mv({}, {}),\n",
+                    render(m.src),
+                    render(m.dst)
+                ));
+            }
+            s.push_str("    ],\n");
+        }
+
+        s.push_str(&format!("    {},\n)", self.provide_scratch));
+        s
+    }
+}
+
+fn reg(name: u8) -> TestLocation {
+    TestLocation::Reg(name)
+}
+
+fn slot(index: u8) -> TestLocation {
+    TestLocation::Slot(index)
+}
+
+fn mv(src: TestLocation, dst: TestLocation) -> TestMove {
+    TestMove { src, dst }
 }
 
 #[derive(Default)]
@@ -546,4 +630,58 @@ impl Generate<TestParallelMoves> for TestParallelMovesMutator {
 
 impl DefaultMutate for TestParallelMoves {
     type DefaultMutate = TestParallelMovesMutator;
+}
+
+/// The fixtures that `parallel_move_properties` and the `parallel_moves` fuzz
+/// target both start from.
+///
+/// Each entry is a shape the solver has to get right: a chain, a swap, a
+/// three-cycle, two disjoint cycles, a chain feeding a cycle, a move between
+/// spill slots, a cycle with no scratch to break it with, etc...
+pub fn parallel_moves_corpus() -> Vec<TestParallelMoves> {
+    let regs = TestParallelMoves::disjoint_regs();
+    let with = |moves: Vec<TestMove>| TestParallelMoves::new(regs.clone(), moves, true);
+    vec![
+        with(vec![]),
+        with(vec![mv(reg(0), reg(0))]),
+        with(vec![mv(reg(0), reg(1)), mv(reg(1), reg(2))]),
+        with(vec![mv(reg(0), reg(1)), mv(reg(1), reg(0))]),
+        with(vec![
+            mv(reg(0), reg(1)),
+            mv(reg(1), reg(2)),
+            mv(reg(2), reg(0)),
+        ]),
+        with(vec![
+            mv(reg(0), reg(1)),
+            mv(reg(1), reg(0)),
+            mv(reg(2), reg(3)),
+            mv(reg(3), reg(2)),
+        ]),
+        with(vec![
+            mv(reg(0), reg(1)),
+            mv(reg(1), reg(0)),
+            mv(reg(0), reg(2)),
+        ]),
+        with(vec![mv(slot(0), reg(0)), mv(reg(0), slot(1))]),
+        with(vec![mv(slot(0), slot(1))]),
+        with(vec![
+            mv(slot(0), slot(1)),
+            mv(slot(1), reg(0)),
+            mv(reg(0), slot(0)),
+        ]),
+        TestParallelMoves::new(regs.clone(), vec![mv(slot(0), slot(1))], false),
+        TestParallelMoves::new(
+            regs.clone(),
+            vec![mv(reg(0), reg(1)), mv(reg(1), reg(0))],
+            false,
+        ),
+        TestParallelMoves::new(
+            vec![0, 0, 2],
+            vec![mv(reg(0), reg(2)), mv(reg(2), reg(1))],
+            true,
+        ),
+        TestParallelMoves::partially_aliasing_names(),
+        TestParallelMoves::two_concurrent_cycle_breaks(),
+        with(vec![mv(slot(2), slot(3))]),
+    ]
 }

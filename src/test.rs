@@ -9135,24 +9135,26 @@ mod tests {
         assert_invalid!(&lying, Error::InconsistentInst { inst: i } if i == lie_about);
     }
 
-    /// Seed the fuzz target's corpus from [`corpus`].
+    /// Seed a fuzz target's corpus from a set of fixtures.
     ///
     /// Keeping this in `cargo test` rather than in a separate step means a new
     /// fixture reaches the fuzzer without a second edit. The write is
     /// idempotent, and `fuzz/corpus/` is gitignored.
-    #[test]
-    fn write_fuzz_corpus() {
+    fn write_fuzz_corpus_for<T>(target: &str, entries: Vec<T>, fixup: impl Fn(&mut T))
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fuzz")
             .join("corpus")
-            .join("allocate");
+            .join(target);
         std::fs::create_dir_all(&dir).unwrap();
 
-        for (i, input) in corpus().into_iter().enumerate() {
-            let encoded = postcard::to_allocvec(&input).unwrap();
+        for (i, entry) in entries.into_iter().enumerate() {
+            let encoded = postcard::to_allocvec(&entry).unwrap();
 
-            let (mut decoded, rest) = postcard::take_from_bytes::<TestInput>(&encoded)
-                .unwrap_or_else(|e| {
+            let (mut decoded, rest) =
+                postcard::take_from_bytes::<T>(&encoded).unwrap_or_else(|e| {
                     panic!("corpus entry {i} does not decode: {e}");
                 });
             assert!(
@@ -9164,7 +9166,7 @@ mod tests {
             // `fixup` is what rebuilds the derived state that the encoding
             // deliberately omits; it is exactly what the fuzz target does
             // after decoding.
-            decoded.fixup();
+            fixup(&mut decoded);
             assert_eq!(
                 postcard::to_allocvec(&decoded).unwrap(),
                 encoded,
@@ -9173,5 +9175,22 @@ mod tests {
 
             std::fs::write(dir.join(std::format!("{i}.postcard")), &encoded).unwrap();
         }
+    }
+
+    /// Seed the `allocate` fuzz target's corpus from [`corpus`].
+    #[test]
+    fn write_fuzz_corpus() {
+        write_fuzz_corpus_for("allocate", corpus(), TestInput::fixup);
+    }
+
+    /// Seed the `parallel_moves` fuzz target's corpus from
+    /// [`parallel_moves_corpus`].
+    #[test]
+    fn write_parallel_moves_fuzz_corpus() {
+        write_fuzz_corpus_for(
+            "parallel_moves",
+            parallel_moves_corpus(),
+            TestParallelMoves::fixup,
+        );
     }
 }

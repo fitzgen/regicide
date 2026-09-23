@@ -1161,106 +1161,11 @@ mod tests {
         assert_eq!(out[2], parallel_move(reg(0), reg(1)));
     }
 
-    fn seeds() -> Vec<TestParallelMoves> {
-        let regs = distinct_regs();
-        let with = |moves: Vec<TestMove>| TestParallelMoves::new(regs.clone(), moves, true);
-        vec![
-            with(vec![]),
-            with(vec![mv(reg(0), reg(0))]),
-            with(vec![mv(reg(0), reg(1)), mv(reg(1), reg(2))]),
-            with(vec![mv(reg(0), reg(1)), mv(reg(1), reg(0))]),
-            with(vec![
-                mv(reg(0), reg(1)),
-                mv(reg(1), reg(2)),
-                mv(reg(2), reg(0)),
-            ]),
-            with(vec![
-                mv(reg(0), reg(1)),
-                mv(reg(1), reg(0)),
-                mv(reg(2), reg(3)),
-                mv(reg(3), reg(2)),
-            ]),
-            with(vec![
-                mv(reg(0), reg(1)),
-                mv(reg(1), reg(0)),
-                mv(reg(0), reg(2)),
-            ]),
-            with(vec![mv(slot(0), reg(0)), mv(reg(0), slot(1))]),
-            with(vec![mv(slot(0), slot(1))]),
-            with(vec![
-                mv(slot(0), slot(1)),
-                mv(slot(1), reg(0)),
-                mv(reg(0), slot(0)),
-            ]),
-            TestParallelMoves::new(regs.clone(), vec![mv(slot(0), slot(1))], false),
-            TestParallelMoves::new(
-                regs.clone(),
-                vec![mv(reg(0), reg(1)), mv(reg(1), reg(0))],
-                false,
-            ),
-            TestParallelMoves::new(
-                vec![0, 0, 2],
-                vec![mv(reg(0), reg(2)), mv(reg(2), reg(1))],
-                true,
-            ),
-            partially_aliasing_names(),
-            two_concurrent_cycle_breaks(),
-            with(vec![mv(slot(2), slot(3))]),
-        ]
-    }
-
-    /// Names that alias *partially*: name 0 covers unit `0..1`, name 1 covers
-    /// `1..2`, and name 2 spans both, so name 2's value is destroyed by two
-    /// writes that do not touch each other. Slot 2 is one of the wide ones,
-    /// and so is where a two-unit value spills.
-    ///
-    /// A seed rather than only a test, because this is the corner the search
-    /// will not stumble into on its own: every other seed's names either alias
-    /// exactly or not at all, and no mutation of one of those reaches here.
-    fn partially_aliasing_names() -> TestParallelMoves {
-        TestParallelMoves::new(
-            vec![0, 2, 1],
-            vec![
-                mv(reg(2), slot(2)),
-                mv(slot(0), reg(0)),
-                mv(slot(1), reg(1)),
-            ],
-            true,
-        )
-    }
-
-    /// Two cycles that share a source covered by two disjoint writes, so that
-    /// breaking one of them does not free the other: the solver holds two
-    /// scratches at once, the behavior `two_cycle_breaks_are_live_at_once`
-    /// pins down by hand.
-    ///
-    /// Names 0, 1 and 2 cover units `0..1`, `1..2` and `0..2`, so name 2's
-    /// value is destroyed by two writes that do not touch each other, and
-    /// names 3 and 4 cover `2..4` and `2..3` to give the second cycle
-    /// somewhere to put a two-unit value.
-    ///
-    /// A seed rather than only a test: the shape is vanishingly rare under
-    /// random mutation — of the batches the search reaches on its own,
-    /// essentially none breaks a second cycle while the first is still
-    /// parked — so without this the whole behavior that `parked`, `scratches`
-    /// and the multi-element `avoid` exist for would go unsearched.
-    fn two_concurrent_cycle_breaks() -> TestParallelMoves {
-        TestParallelMoves::new(
-            vec![0, 2, 1, 5, 4],
-            vec![
-                mv(reg(0), slot(1)),
-                mv(slot(1), reg(1)),
-                mv(reg(2), reg(3)),
-                mv(reg(4), reg(0)),
-            ],
-            true,
-        )
-    }
-
-    /// The seed above really does park two values at once.
+    /// `TestParallelMoves::two_concurrent_cycle_breaks` really does park
+    /// two values at once.
     #[test]
     fn two_cycles_break_at_once() {
-        let moves = two_concurrent_cycle_breaks();
+        let moves = TestParallelMoves::two_concurrent_cycle_breaks();
         assert_eq!(moves.moves().len(), 4, "the fixup keeps all four moves");
         assert!(moves.has_a_source_covered_twice());
 
@@ -1290,7 +1195,7 @@ mod tests {
     /// read before both of them. The whole batch solves with no scratch.
     #[test]
     fn a_source_covered_by_two_disjoint_writes() {
-        let moves = partially_aliasing_names();
+        let moves = TestParallelMoves::partially_aliasing_names();
         assert_eq!(moves.moves().len(), 3, "the fixup keeps all three moves");
         assert!(
             moves.has_a_source_covered_twice(),
@@ -1322,7 +1227,7 @@ mod tests {
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
                 m::default::<TestParallelMoves>(),
-                seeds(),
+                crate::test::parallel_moves_corpus(),
                 |moves: &TestParallelMoves| -> Result<(), String> {
                     let outcome = moves.check()?;
 
