@@ -10,7 +10,7 @@ use crate::{
     output::RegAllocation,
     output::StackAllocation,
     output::{Allocation, Move, ScalarAllocation},
-    parallel_moves::ParallelMove,
+    parallel_moves::{ParallelMove, ScratchReason},
     region_allocation::{Phase, Priority},
     spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize},
 };
@@ -53,18 +53,6 @@ pub enum SplitKind {
 
     /// Cutting a bundle between two uses inside one of its spans.
     WithinSpan,
-}
-
-/// Why a scratch location was needed while sequentializing a batch of moves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serialize", derive(serde::Serialize))]
-pub enum ScratchReason {
-    /// Neither end of the move is a register, and the machine cannot move
-    /// memory to memory directly.
-    StackToStack,
-
-    /// The move is part of a cycle, which has to be broken somewhere.
-    CycleBreak,
 }
 
 /// Something the register allocator did.
@@ -460,19 +448,22 @@ where
         pos: PackedMovePosition<E>,
         /// The move that needed the scratch.
         mv: ParallelMove<E>,
-        /// The scratch location, which is a stack slot when no register was
-        /// free.
+        /// Where the value went: a register, or a slot when the batch leaves
+        /// no register free.
         scratch: ScalarAllocation<E>,
         /// Why it was needed.
         reason: ScratchReason,
     },
 
-    /// No scratch location could be found, which fails the whole allocation.
-    ScratchRegUnavailable {
+    /// A scratch register was borrowed from whatever was holding it, which is
+    /// saved to a slot before the batch and put back after it.
+    ScratchRegBorrowed {
         /// Where the batch is.
         pos: PackedMovePosition<E>,
-        /// The move that needed the scratch.
-        mv: ParallelMove<E>,
+        /// The register borrowed.
+        reg: Reg<E>,
+        /// The slot holding its contents for the length of the batch.
+        slot: SpillSlot<E>,
     },
 
     /// A position's parallel moves were sequentialized.
@@ -629,7 +620,7 @@ mod viz_enabled {
                 Self::MoveResolved { .. } => "MoveResolved",
                 Self::RematEmitted { .. } => "RematEmitted",
                 Self::ScratchRegChosen { .. } => "ScratchRegChosen",
-                Self::ScratchRegUnavailable { .. } => "ScratchRegUnavailable",
+                Self::ScratchRegBorrowed { .. } => "ScratchRegBorrowed",
                 Self::ParallelMoveBatchSolved { .. } => "ParallelMoveBatchSolved",
                 Self::MoveEmitted { .. } => "MoveEmitted",
                 Self::CriticalEdgeEdit { .. } => "CriticalEdgeEdit",
@@ -952,9 +943,10 @@ mod viz_enabled {
                     visit_scalar_allocation(*scratch, f);
                 }
 
-                Self::ScratchRegUnavailable { pos, mv } => {
+                Self::ScratchRegBorrowed { pos, reg, slot } => {
                     visit_move_position(*pos, f);
-                    visit_parallel_move(*mv, f);
+                    f(EntityRef::Reg(reg.with_repr32()));
+                    f(EntityRef::SpillSlot(*slot));
                 }
 
                 Self::ParallelMoveBatchSolved {
@@ -1231,9 +1223,10 @@ mod viz_enabled {
             scratch: (SCALAR_ALLOCATION),
             reason: _,
         }
-        ScratchRegUnavailable {
+        ScratchRegBorrowed {
             pos: (MOVE_POSITION),
-            mv: (PARALLEL_MOVE),
+            reg: Reg,
+            slot: SpillSlot,
         }
         ParallelMoveBatchSolved {
             pos: (MOVE_POSITION),
@@ -1340,9 +1333,11 @@ mod viz_enabled {
     where
         E: EntityRepr,
     {
-        let ParallelMove { src, dst } = mv;
-        visit_scalar_allocation(src, f);
-        visit_scalar_allocation(dst, f);
+        visit_scalar_allocation(mv.src(), f);
+        visit_scalar_allocation(mv.dst(), f);
+        if let Some(val) = mv.val() {
+            f(EntityRef::Val(val));
+        }
     }
 
     fn visit_move<E>(move_: Move<E>, f: &mut impl FnMut(EntityRef<E>))

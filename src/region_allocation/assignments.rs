@@ -4,6 +4,7 @@ use crate::{
     Entity, Reg, RegGroup, RegUnit, Val,
     entity::{EntityRepr, SecondaryMap},
     live_ranges::{LiveBundle, LivePoint},
+    output::RegAllocation,
     region_allocation::EvictionCost,
 };
 use alloc::{collections::BTreeMap, vec::Vec};
@@ -123,6 +124,9 @@ where
     /// The end of the reserved range, whose start is `AssignmentKey::start`.
     end: LivePoint<E>,
 
+    /// What occupies these units over the reserved range.
+    held: RegAllocation<E>,
+
     /// Who this reservation is for, if any.
     ///
     /// This is the only value part that this reservation may share its
@@ -156,7 +160,7 @@ where
 /// A map of all the reservations on a register unit.
 type RegUnitReservations<E> = BTreeMap<AssignmentKey<E>, ReservationEntry<E>>;
 
-/// Something already occupying a register unit over a span.
+/// A conflict at a register unit over a span.
 enum Conflict<'a, E>
 where
     E: EntityRepr,
@@ -164,8 +168,21 @@ where
     /// A bundle's assignment, which can be evicted or split around.
     Assignment(&'a Assignment<E>),
 
-    /// A register held for a fixed operand, which can be neither.
-    Reservation,
+    /// A register held for a fixed operand, which can be neither, and what it
+    /// holds.
+    Reservation(RegAllocation<E>),
+}
+
+/// The entity occupying a register unit over a span.
+pub(crate) enum Occupant<E>
+where
+    E: EntityRepr,
+{
+    /// A bundle assigned here.
+    Bundle(LiveBundle<E>),
+
+    /// A fixed-register operand reservation.
+    Reserved(RegAllocation<E>),
 }
 
 pub struct Assignments<E>
@@ -274,7 +291,8 @@ where
                         if porous_to.is_some() && existing.porous_to == porous_to {
                             continue;
                         }
-                        if let ControlFlow::Break(result) = f(Conflict::Reservation) {
+                        if let ControlFlow::Break(result) = f(Conflict::Reservation(existing.held))
+                        {
                             return Some(result);
                         }
                     }
@@ -310,7 +328,7 @@ where
                 scratch.push(existing.bundle);
                 ControlFlow::Continue(())
             }
-            Conflict::Reservation => ControlFlow::Break(()),
+            Conflict::Reservation(_) => ControlFlow::Break(()),
         });
 
         if reserved.is_some() {
@@ -346,7 +364,7 @@ where
     /// TODO: support evicting multiple bundles if that is still cheaper. will
     /// require an `&mut Vec<LiveBundle>` out parameter to these methods for
     /// writing the evicted bundles into.
-    fn sole_conflicting_bundle(
+    pub(crate) fn sole_conflicting_bundle(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
@@ -366,6 +384,24 @@ where
             }
         });
         if too_many.is_some() { None } else { sole }
+    }
+
+    /// Call `f` with everything already occupying any of `reg_units` over
+    /// `spans`, possibly more than once for the same occupant.
+    pub(crate) fn for_each_occupant(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        mut f: impl FnMut(Occupant<E>),
+    ) {
+        let never: Option<()> = self.for_each_overlapping(reg_units, spans, |existing| {
+            match existing {
+                Conflict::Assignment(existing) => f(Occupant::Bundle(existing.bundle)),
+                Conflict::Reservation(held) => f(Occupant::Reserved(held)),
+            }
+            ControlFlow::Continue(())
+        });
+        debug_assert!(never.is_none());
     }
 
     /// Remove all of `bundle`'s assignments.
@@ -417,6 +453,9 @@ where
 
     /// Hold `reg_units` over `span` for a fixed operand.
     ///
+    /// `held` is the allocation the units are held for, so that a reservation
+    /// can answer who occupies a register.
+    ///
     /// `porous_to` is the value the reservation holds the register for, and
     /// `None` when nothing may share it; see `ReservationEntry::porous_to`.
     ///
@@ -428,6 +467,7 @@ where
         &mut self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
         span: Range<LivePoint<E>>,
+        held: RegAllocation<E>,
         porous_to: Option<Val<E>>,
     ) {
         debug_assert!(span.start < span.end);
@@ -446,6 +486,7 @@ where
                     AssignmentKey::new(span.start),
                     ReservationEntry {
                         end: span.end,
+                        held,
                         porous_to,
                     },
                 );
@@ -2365,6 +2406,7 @@ mod tests {
                             assignments.insert_reservation(
                                 units.iter().cloned(),
                                 sp.clone(),
+                                RegAllocation::Reg(r),
                                 porous_to,
                             );
                             oracle_insert_reservation(&mut oracle, &units, &sp, porous_to);
@@ -2386,6 +2428,7 @@ mod tests {
                             assignments.insert_reservation(
                                 units.iter().cloned(),
                                 sp.clone(),
+                                RegAllocation::RegGroup(g),
                                 porous_to,
                             );
                             oracle_insert_reservation(&mut oracle, &units, &sp, porous_to);
@@ -2432,7 +2475,12 @@ mod tests {
     fn a_reservation_is_porous_only_in_its_own_register_order() {
         let mut assignments = Assignments::<u32>::new();
         let reserved = val(0);
-        assignments.insert_reservation(group_units(group(G3)), span(2, 4), Some(reserved));
+        assignments.insert_reservation(
+            group_units(group(G3)),
+            span(2, 4),
+            RegAllocation::RegGroup(group(G3)),
+            Some(reserved),
+        );
 
         // The reserved group itself: every piece lines up.
         assert!(

@@ -891,7 +891,6 @@ where
     E: EntityRepr,
 {
     /// The size of the values this slot holds.
-    #[cfg(any(test, feature = "visualizer"))]
     pub(crate) fn size(self, spill_slots: &SpillSlots<E>) -> SpillSlotSize {
         spill_slots.slots[self]
     }

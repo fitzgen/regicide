@@ -78,30 +78,32 @@ test("the outline renders the shape the spec describes", () => {
     render(outlineOf(fixture("critical-edge"))),
     [
       "function {",
+      "    stack0: 8 bytes",
+      "",
       "    region2 {",
       "        entry block0:",
       "            inst0 early:",
-      "                   late: def v0[r1]",
-      "            inst1 early: use v0[r1]",
+      "                   late: def v0[stack0]",
+      "            inst1 early: use v0[stack0]",
       "                   late:",
       "            inst2 early:",
       "                   late:",
       "                --> block1",
-      "                --> block2(v0[r1])",
-      "                    move r1 to r0",
+      "                --> block2(v0[stack0])",
+      "                    move stack0 to r1",
       "",
       "        block1:",
-      "            move r1 to r0",
+      "            move stack0 to r1",
       "            inst3 early:",
-      "                   late: def v1[r1]",
-      "            inst4 early: use v0[r0]",
+      "                   late: def v1[r0]",
+      "            inst4 early: use v0[r1]",
       "                   late:",
       "            inst5 early:",
       "                   late:",
-      "                --> block2(v0[r0])",
+      "                --> block2(v0[r1])",
       "",
-      "        block2(v2[r0]):",
-      "            inst6 early: use v2[r0]",
+      "        block2(v2[r1]):",
+      "            inst6 early: use v2[r1]",
       "                   late:",
       "            inst7 early:",
       "                   late:",
@@ -133,8 +135,10 @@ test("a single-block function renders its slots and its return", () => {
       "            move r4 to stack1",
       "            inst2 early: use v0[stack0], use v1[stack1]",
       "                   late:",
-      "            move stack0 to r1",
+      // Neither reload reads what the other writes, so their order is
+      // arbitrary.
       "            move stack1 to r4",
+      "            move stack0 to r1",
       "            inst3 early: use v0[r1], use v1[r4]",
       "                   late:",
       "            inst4 early:",
@@ -163,7 +167,7 @@ test("a block is prefixed by what the embedder called it", () => {
   const plain = outlineOf(fixture("critical-edge"))
     .lines.filter((line) => line.kind === "block")
     .map((line) => text(line));
-  assert.deepEqual(plain, ["entry block0:", "block1:", "block2(v2[r0]):"]);
+  assert.deepEqual(plain, ["entry block0:", "block1:", "block2(v2[r1]):"]);
 });
 
 test("a value with nowhere to be is drawn bare", () => {
@@ -507,7 +511,7 @@ test("a block's predecessors carry their arguments and its successors their para
     Instructions: "inst6, inst7",
     Predecessors: "block0(v0), block1(v0)",
     Successors: "none",
-    "Live-in spans": "span3(v2[r0])",
+    "Live-in spans": "span3(v2[r1])",
     "Live-out spans": "none",
   });
   assert.equal(shown(model.details({ kind: "Block", index: 0 })).Successors, "block1(), block2(v2)");
@@ -616,7 +620,7 @@ test("an edge argument whose span has just ended has no allocation", () => {
   const edges = (b) =>
     outlineOf(b).lines.filter((line) => line.kind === "edge").map(text);
   assert.deepEqual(blob.function.spans[1].end, { inst: 6, pos: "early" });
-  assert.equal(edges(blob)[2], "--> block2(v0[r0])");
+  assert.equal(edges(blob)[2], "--> block2(v0[r1])");
 
   blob.function.spans[1].end = { inst: 5, pos: "late" };
   assert.equal(edges(blob)[2], "--> block2(v0)");
@@ -721,7 +725,8 @@ test("a slot's pane names the instructions and edges whose edits touch it", () =
     Group: "none",
   });
 
-  // And an edge's edit counts as a user, named by the edge it sits on.
+  // And an edge's edit counts as a user, named by the edge it sits on rather
+  // than by the block or the instruction that edge hangs off.
   const edges = fixture("critical-edge");
   edges.function.blocks[0].edgeEdits[0].edit.criticalEdge.edit = {
     move: { spill: { from: 1, to: 0 } },
@@ -729,7 +734,7 @@ test("a slot's pane names the instructions and edges whose edits touch it", () =
   edges.function.spillSlots = [{ emergency: false, group: null, size: 8 }];
   assert.equal(
     shown(modelOf(edges).details({ kind: "SpillSlot", index: 0 }))["Used by"],
-    "block0 edge 1",
+    "inst3, block0 edge 1",
   );
 });
 

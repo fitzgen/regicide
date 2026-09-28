@@ -2644,10 +2644,16 @@ mod tests {
                     }
                 }
             }
-            let edits: Vec<(Inst, Edit)> = seen
+            let mut edits: Vec<(Inst, Edit)> = seen
                 .into_iter()
                 .filter_map(|(inst, edit)| edit.map(|edit| (inst, edit)))
                 .collect();
+            // Neither reload reads what the other writes, so their order is
+            // arbitrary. Sort by slot to pin down the pairing alone.
+            edits.sort_by_key(|(_, edit)| match edit {
+                Edit::Move(Move::Reload { from, .. }) => from.index(),
+                _ => usize::MAX,
+            });
             assert_eq!(
                 edits,
                 [

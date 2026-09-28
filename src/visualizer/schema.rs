@@ -164,8 +164,11 @@ pub(crate) const SCALAR_ALLOCATION: Descriptor =
     Obj(&[("reg", Entity("Reg")), ("slot", Entity("SpillSlot"))]);
 
 /// A `crate::parallel_moves::ParallelMove`.
-pub(crate) const PARALLEL_MOVE: Descriptor =
-    Obj(&[("src", SCALAR_ALLOCATION), ("dst", SCALAR_ALLOCATION)]);
+pub(crate) const PARALLEL_MOVE: Descriptor = Obj(&[
+    ("src", SCALAR_ALLOCATION),
+    ("dst", SCALAR_ALLOCATION),
+    ("val", Entity("Val")),
+]);
 
 /// A `crate::output::Move`.
 pub(crate) const MOVE: Descriptor = Obj(&[

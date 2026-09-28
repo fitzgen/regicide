@@ -2133,6 +2133,15 @@
         },
         "val": "Val"
       },
+      "ScratchRegBorrowed": {
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "reg": "Reg",
+        "slot": "SpillSlot"
+      },
       "ScratchRegChosen": {
         "mv": {
           "dst": {
@@ -2142,7 +2151,8 @@
           "src": {
             "reg": "Reg",
             "slot": "SpillSlot"
-          }
+          },
+          "val": "Val"
         },
         "pos": {
           "criticalEdge": {
@@ -2152,23 +2162,6 @@
         "scratch": {
           "reg": "Reg",
           "slot": "SpillSlot"
-        }
-      },
-      "ScratchRegUnavailable": {
-        "mv": {
-          "dst": {
-            "reg": "Reg",
-            "slot": "SpillSlot"
-          },
-          "src": {
-            "reg": "Reg",
-            "slot": "SpillSlot"
-          }
-        },
-        "pos": {
-          "criticalEdge": {
-            "pred": "Block"
-          }
         }
       },
       "SpanConstructed": {

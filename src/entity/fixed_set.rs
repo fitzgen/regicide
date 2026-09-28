@@ -306,7 +306,10 @@ mod tests {
 
     type TestSet = FixedEntitySet<Val, { words_for(128) }>;
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "the test set's capacity is 128"
+    )]
     const CAPACITY: u32 = TestSet::CAPACITY as u32;
 
     #[derive(Clone, Debug, Mutate)]

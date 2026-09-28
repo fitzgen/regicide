@@ -53,25 +53,25 @@ use crate::{
     context::ContextInner,
     counts::Counts,
     entity::{EntityRange, EntityRepr, PrimaryMap, SecondaryMap},
-    error::{Error, IResult, InternalError},
-    events::{EventsLog, ScratchReason},
+    error::{IResult, InternalError},
+    events::EventsLog,
     hash_map::{Entry, FxHashMap},
     input::{
         DefUse, Input, InputBlock, InputFunction, InputInst as _, InputValue as _, Position,
         RematCost,
     },
     live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation},
-    liveness::{Liveness, block_last_inst},
+    liveness::{Liveness, block_first_inst, block_last_inst},
     machine::{Interfere, Machine, Reg, RegBank},
     output::{
         Allocation, CriticalEdgeEdit, EdgeEdit, Edit, Move, OutputInner, RegAllocation, Remat,
-        ScalarAllocation,
+        ScalarAllocation, StackAllocation,
     },
-    parallel_moves::{ParallelMove, ParallelMoveSolver, SolveError},
+    parallel_moves::{ParallelMove, ParallelMoveSolver, ScratchReason, ScratchSource, SolveError},
     region_allocation::RegionAllocation,
     rpo::Rpo,
     spill_placement::SpillPlacement,
-    spill_slot_allocation::{SpillSlot, SpillSlots},
+    spill_slot_allocation::{SpillSlot, SpillSlotSize, SpillSlots},
     timing::Timing,
 };
 use alloc::vec::Vec;
@@ -283,8 +283,12 @@ where
         }
     }
 
-    fn range(self, input: &Input<'_, impl InputFunction>) -> Range<LivePoint<E>> {
-        self.unpack().range(input)
+    fn borrow_range(self, input: &Input<'_, impl InputFunction>) -> Range<LivePoint<E>> {
+        self.unpack().borrow_range(input)
+    }
+
+    fn occupancy_range(self, input: &Input<'_, impl InputFunction>) -> Range<LivePoint<E>> {
+        self.unpack().occupancy_range(input)
     }
 }
 
@@ -294,12 +298,52 @@ where
 {
     /// The live range a scratch register borrowed at this position must be
     /// free over.
-    pub(crate) fn range(self, input: &Input<'_, impl InputFunction>) -> Range<LivePoint<E>> {
+    pub(crate) fn borrow_range(self, input: &Input<'_, impl InputFunction>) -> Range<LivePoint<E>> {
         let point = match self {
             MovePosition::Point(point) | MovePosition::Departure(point) => point,
             MovePosition::CriticalEdge { pred, .. } => pred.end_point(input).prev_point(),
         };
         point..point.next_point()
+    }
+
+    /// The live range a value must cover to still be in its register while
+    /// the moves at this position run.
+    pub(crate) fn occupancy_range(
+        self,
+        input: &Input<'_, impl InputFunction>,
+    ) -> Range<LivePoint<E>> {
+        let point = match self {
+            MovePosition::Point(point) | MovePosition::Departure(point) => point,
+            MovePosition::CriticalEdge { .. } => return self.borrow_range(input),
+        };
+
+        let is_first_inst_in_block = || {
+            let block = input.func.inst(point.inst().with_repr32()).block();
+            block_first_inst(&input.func.block(block)) == point.inst().with_repr32()
+        };
+
+        match point.pos() {
+            // Moving before the first instruction of the block.
+            //
+            // No shift, unlike moves before other instructions in this block,
+            // since a value live into the block starts its span right here.
+            // This also covers an early def here, which is conservative and
+            // costs us only a scratch candidate.
+            Position::Early if is_first_inst_in_block() => point..point.next_point(),
+
+            // Moving before a non-first instruction.
+            //
+            // A span starting here does not have its value in its register
+            // until the moves complete, so shift the range back.
+            Position::Early => point.prev_point()..point,
+
+            // Moving after an instruction.
+            //
+            // These run after the late half and before the next point begins,
+            // so what is in the register is what covers the point, and the
+            // range needs no shift.
+            Position::Late => point..point.next_point(),
+        }
     }
 }
 
@@ -439,7 +483,7 @@ where
 
     /// One position's worth of `batch`, with groups expanded into scalar
     /// locations.
-    expanded: Vec<(ParallelMove<E>, Val<E>)>,
+    expanded: Vec<ParallelMove<E>>,
 
     /// Every rematerialization to perform, sorted by position.
     remats: Vec<(PackedMovePosition<E>, Remat<E>)>,
@@ -447,13 +491,50 @@ where
     /// One position's worth of sequentialized parallel moves.
     solved: Vec<ParallelMove<E>>,
 
+    /// The registers that writing one candidate scratch would evict, while we
+    /// are working out whether it is a candidate we can use.
+    ///
+    /// Each carries the bracket it would get, and whether something is still
+    /// living in it when the batch ends, which together say whether another
+    /// register's reload may land on top of it.
+    scratch_eviction_regs: Occupants<E>,
+
+    /// Scratch space for `BatchScratch::choose`: what the best candidate so
+    /// far would evict, held aside while later candidates overwrite
+    /// `scratch_eviction_regs`.
+    scratch_settled_regs: Occupants<E>,
+
+    /// The registers we had to evict while solving one position's batch, so
+    /// that a second scratch does not land on one of them.
+    ///
+    /// Only the evictions under a wide bracket, since the solver hands the
+    /// tight ones back the moment it is done with them.
+    wide_evicted_regs: Vec<Reg<E>>,
+
+    /// The slots those evicted registers' contents went to, so that a second
+    /// scratch does not land on one of those either.
+    ///
+    /// Also any slot a cycle parked in: the solver is done with one of those
+    /// once the park move is out, but a wide save sits above the whole batch,
+    /// where it would write over the parked value.
+    wide_evicted_slots: Vec<SpillSlot<E>>,
+
+    /// The slots used by tight evictions, so that a wide one does not land on
+    /// one of them.
+    ///
+    /// Kept apart from `wide_evicted_slots` because two tight stays can share
+    /// a slot and a wide one can share with nobody: tight brackets never
+    /// overlap one another, while a wide one encloses every tight stay, so a
+    /// save landing inside it writes over what it is holding.
+    tight_evicted_slots: Vec<SpillSlot<E>>,
+
     /// The parallel-move solver.
     solver: ParallelMoveSolver<E>,
 
     /// The result of this pass: every edit, sorted by position.
     edits: Vec<(PackedMovePosition<E>, Edit<E>)>,
 
-    /// The last of `generate`'s passes to have started.
+    /// The current sub-pass within move generation.
     pass: MovePass,
 }
 
@@ -482,6 +563,11 @@ where
             expanded: Vec::new(),
             remats: Vec::new(),
             solved: Vec::new(),
+            scratch_eviction_regs: Occupants::new(),
+            scratch_settled_regs: Occupants::new(),
+            wide_evicted_regs: Vec::new(),
+            wide_evicted_slots: Vec::new(),
+            tight_evicted_slots: Vec::new(),
             solver: ParallelMoveSolver::new(),
             edits: Vec::new(),
             pass: MovePass::Start,
@@ -500,6 +586,11 @@ where
             expanded,
             remats,
             solved,
+            scratch_eviction_regs: eviction_regs,
+            scratch_settled_regs: settled_regs,
+            wide_evicted_regs,
+            wide_evicted_slots,
+            tight_evicted_slots,
             solver,
             edits,
             pass,
@@ -514,6 +605,11 @@ where
         expanded.clear();
         remats.clear();
         solved.clear();
+        eviction_regs.clear();
+        settled_regs.clear();
+        wide_evicted_regs.clear();
+        wide_evicted_slots.clear();
+        tight_evicted_slots.clear();
         solver.reset();
         edits.clear();
         *pass = MovePass::Start;
@@ -531,6 +627,11 @@ where
             expanded,
             remats,
             solved,
+            scratch_eviction_regs: eviction_regs,
+            scratch_settled_regs: settled_regs,
+            wide_evicted_regs,
+            wide_evicted_slots,
+            tight_evicted_slots,
             solver,
             edits,
             pass,
@@ -545,6 +646,11 @@ where
             && expanded.is_empty()
             && remats.is_empty()
             && solved.is_empty()
+            && eviction_regs.is_empty()
+            && settled_regs.is_empty()
+            && wide_evicted_regs.is_empty()
+            && wide_evicted_slots.is_empty()
+            && tight_evicted_slots.is_empty()
             && solver.is_reset()
             && edits.is_empty()
             && *pass == MovePass::Start
@@ -647,6 +753,7 @@ where
             input,
             counts,
             events,
+            live_ranges,
             region_allocation,
             spill_slots,
             output,
@@ -1740,6 +1847,7 @@ where
         input: &Input<'_, impl InputFunction>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
+        live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
         output: &mut OutputInner<E>,
@@ -1759,6 +1867,7 @@ where
                     input,
                     counts,
                     events,
+                    live_ranges,
                     region_allocation,
                     spill_slots,
                     output,
@@ -1800,24 +1909,45 @@ where
     }
 
     /// Sequentialize the batch of moves at a single position.
-    fn sequentialize_batch(
+    fn sequentialize_batch<F>(
         &mut self,
-        input: &Input<'_, impl InputFunction>,
+        input: &Input<'_, F>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
+        live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
         output: &mut OutputInner<E>,
         chunk: &[(PackedMovePosition<E>, BatchMove<E>)],
-    ) -> IResult<()> {
+    ) -> IResult<()>
+    where
+        F: InputFunction,
+    {
         let machine = input.machine;
         let pos = chunk[0].0;
-        let span = pos.range(input);
+        let borrowed_range = pos.borrow_range(input);
+
+        // What a register actually holds while these moves run, which is not
+        // the same question as what a scratch register has to be free over.
+        let occupied_range = pos.occupancy_range(input);
 
         let mut expanded = core::mem::take(&mut self.expanded);
         let mut solved = core::mem::take(&mut self.solved);
+        let mut eviction_regs =
+            core::mem::replace(&mut self.scratch_eviction_regs, Occupants::new());
+        let mut settled_regs = core::mem::replace(&mut self.scratch_settled_regs, Occupants::new());
+        let mut wide_evicted_regs = core::mem::take(&mut self.wide_evicted_regs);
+        let mut wide_evicted_slots = core::mem::take(&mut self.wide_evicted_slots);
+        let mut tight_evicted_slots = core::mem::take(&mut self.tight_evicted_slots);
         let mut solver = core::mem::replace(&mut self.solver, ParallelMoveSolver::new());
         debug_assert!(expanded.is_empty() && solved.is_empty());
+        debug_assert!(
+            wide_evicted_regs.is_empty()
+                && wide_evicted_slots.is_empty()
+                && tight_evicted_slots.is_empty()
+        );
+        eviction_regs.clear();
+        settled_regs.clear();
 
         let result = (|| -> IResult<()> {
             for &(_, batch_move) in chunk {
@@ -1826,122 +1956,32 @@ where
 
             // Expanding batch moves into scalar moves can result in duplicates.
             expanded.sort_unstable();
-            expanded.dedup_by_key(|&mut (move_, _)| move_);
+            expanded.dedup_by_key(|m| (m.src(), m.dst()));
 
-            let overlaps = |a: ScalarAllocation<E>, b: ScalarAllocation<E>| {
-                Interfere::interfere(machine, a, b)
-            };
-
-            let mut scratch_failed = false;
-            let scratch = |mv: ParallelMove<E>,
-                           avoid: &[ScalarAllocation<E>]|
-             -> Option<ScalarAllocation<E>> {
-                // Get the move's value's register bank
-                let i = expanded.binary_search_by_key(&mv, |&(m, _)| m).unwrap();
-                let bank = expanded[i].1.reg_bank(input);
-
-                debug_assert!(
-                    match (mv.src, mv.dst) {
-                        (ScalarAllocation::Reg(reg), _) | (_, ScalarAllocation::Reg(reg)) =>
-                            reg.with_repr32().bank(machine) == bank,
-                        _ => true,
-                    },
-                    "{mv:?} names a register from a different bank than the value it moves",
-                );
-
-                // We are either breaking a move cycle or picking a temporary
-                // register in a stack-to-stack move; select the appropriate
-                // counter.
-                let stack_to_stack = matches!(
-                    (mv.src, mv.dst),
-                    (ScalarAllocation::Stack(_), ScalarAllocation::Stack(_))
-                );
-                let (counter, reason) = if stack_to_stack {
-                    (
-                        &mut counts.stack_to_stack_moves,
-                        ScratchReason::StackToStack,
-                    )
-                } else {
-                    (&mut counts.move_cycles_broken, ScratchReason::CycleBreak)
-                };
-
-                // If we have a register available, then use it.
-                if let Some(reg) = find_scratch_reg(
+            let result = {
+                let mut source = BatchScratch {
+                    input,
                     machine,
                     region_allocation,
-                    span.clone(),
-                    bank,
-                    |reg: Reg<E>| {
-                        avoid
-                            .iter()
-                            .any(|&a| ScalarAllocation::interfere(machine, reg.into(), a))
-                            // TODO: investigate whether lazily caching a
-                            // `RegSet` of all the registers used in this batch
-                            // improves perf.
-                            || batch_uses_reg(machine, &expanded, reg)
-                    },
-                ) {
-                    counter.inc();
-                    let scratch = ScalarAllocation::Reg(reg);
-                    event!(
-                        events,
-                        ScratchRegChosen {
-                            pos,
-                            mv,
-                            scratch,
-                            reason
-                        }
-                    );
-                    return Some(scratch);
-                }
-
-                // No register is available, so we have to do an emergency spill
-                // to memory. But we cannot spill to memory if that would itself
-                // introduce a stack-to-stack move, so in this case we simply
-                // cannot solve the register constraints.
-                if matches!(mv.src, ScalarAllocation::Stack(_))
-                    || matches!(mv.dst, ScalarAllocation::Stack(_))
-                {
-                    scratch_failed = true;
-                    event!(events, ScratchRegUnavailable { pos, mv });
-                    return None;
-                }
-
-                let Ok(slot) = spill_slots.emergency_slot(
+                    live_ranges,
+                    spill_slots,
+                    output,
                     counts,
                     events,
-                    output,
-                    bank.size(machine),
-                    |slot: SpillSlot<E>| avoid.contains(&ScalarAllocation::Stack(slot)),
-                ) else {
-                    scratch_failed = true;
-                    event!(events, ScratchRegUnavailable { pos, mv });
-                    return None;
+                    pos,
+                    borrowed_range: borrowed_range.clone(),
+                    occupied_range: occupied_range.clone(),
+                    expanded: &expanded,
+                    wide_evicted_regs: &mut wide_evicted_regs,
+                    wide_evicted_slots: &mut wide_evicted_slots,
+                    tight_evicted_slots: &mut tight_evicted_slots,
+                    eviction_regs: &mut eviction_regs,
+                    settled_regs: &mut settled_regs,
                 };
-
-                let scratch = ScalarAllocation::Stack(slot);
-                counts.move_cycles_broken.inc();
-                // An emergency slot is only ever reached from a cycle: a
-                // stack-to-stack move returned above.
-                event!(
-                    events,
-                    ScratchRegChosen {
-                        pos,
-                        mv,
-                        scratch,
-                        reason: ScratchReason::CycleBreak
-                    }
-                );
-                Some(scratch)
+                solver.solve(expanded.iter().copied(), &mut source, &mut solved)
             };
-
-            let moves = expanded.iter().map(|&(mv, _)| mv);
-            match solver.solve(moves, overlaps, scratch, &mut solved) {
+            match result {
                 Ok(()) => {}
-                Err(SolveError::NoScratch) => {
-                    debug_assert!(scratch_failed);
-                    return output.error(Error::TooManyLiveRegs);
-                }
                 Err(SolveError::EntityReprTooSmall) => {
                     return output.error(InternalError::EntityReprTooSmall);
                 }
@@ -1956,18 +1996,36 @@ where
                 }
             );
 
-            for mv in &solved {
-                self.emit_move(input, counts, events, output, pos, into_move(*mv))?;
+            for &mv in &solved {
+                self.emit_move(input, counts, events, output, pos, into_move(mv))?;
             }
 
             Ok(())
         })();
 
         expanded.clear();
-        solved.clear();
         self.expanded = expanded;
+
+        solved.clear();
         self.solved = solved;
+
+        eviction_regs.clear();
+        self.scratch_eviction_regs = eviction_regs;
+
+        settled_regs.clear();
+        self.scratch_settled_regs = settled_regs;
+
+        wide_evicted_regs.clear();
+        self.wide_evicted_regs = wide_evicted_regs;
+
+        wide_evicted_slots.clear();
+        self.wide_evicted_slots = wide_evicted_slots;
+
+        tight_evicted_slots.clear();
+        self.tight_evicted_slots = tight_evicted_slots;
+
         self.solver = solver;
+
         result
     }
 
@@ -1995,6 +2053,845 @@ where
         let edit = edit_at_position(input, counts, events, output, pos, EdgeEdit::Move(move_))?;
         self.edits.push((pos, edit));
         Ok(())
+    }
+}
+
+/// Everything the parallel-move solver needs to know about the machine while
+/// it sequentializes one position's batch.
+struct BatchScratch<'a, 'i, E, F>
+where
+    E: EntityRepr,
+    F: InputFunction,
+{
+    input: &'a Input<'i, F>,
+    machine: &'a Machine,
+    region_allocation: &'a RegionAllocation<E>,
+    live_ranges: &'a LiveRanges<E>,
+    spill_slots: &'a mut SpillSlots<E>,
+    output: &'a mut OutputInner<E>,
+    counts: &'a mut Counts,
+    events: &'a mut EventsLog<E>,
+
+    /// Where the batch sits, and the two ranges its questions are asked over.
+    pos: PackedMovePosition<E>,
+
+    /// What is wanted from a register at or after the point these moves feed.
+    borrowed_range: Range<LivePoint<E>>,
+
+    /// What a register actually holds while these moves run, which is not the
+    /// same question.
+    occupied_range: Range<LivePoint<E>>,
+
+    /// The batch itself, groups already expanded into scalar moves.
+    expanded: &'a [ParallelMove<E>],
+
+    /// The registers we have evicted for the whole length of the batch, so that
+    /// a second scratch does not land on one of them.
+    wide_evicted_regs: &'a mut Vec<Reg<E>>,
+
+    /// The slots those evictions are sitting in, likewise.
+    wide_evicted_slots: &'a mut Vec<SpillSlot<E>>,
+
+    /// The slots the tight evictions have used, likewise.
+    tight_evicted_slots: &'a mut Vec<SpillSlot<E>>,
+
+    /// Scratch space for `occupants`: the registers that writing one candidate
+    /// would evict, while we work out whether it is one we can use.
+    eviction_regs: &'a mut Occupants<E>,
+
+    /// Scratch space for `choose`: what the best candidate so far would
+    /// evict.
+    settled_regs: &'a mut Occupants<E>,
+}
+
+/// How long an evicted register stays saved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Bracket {
+    /// Saved and reloaded around just the two moves being staged, because the
+    /// batch wants those units back before it is over.
+    Tight,
+
+    /// Saved ahead of the whole batch and put back after it, because putting
+    /// it back writes over the register we took.
+    Wide,
+}
+
+/// One register that writing a candidate scratch would clobber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Occupant<E>
+where
+    E: EntityRepr,
+{
+    /// The register holding the value.
+    reg: Reg<E>,
+
+    /// How long it would have to stay saved.
+    bracket: Bracket,
+
+    /// Whether something is still living in it when the batch ends, which is
+    /// what decides whether another register's reload may land on top of it.
+    outlives: bool,
+}
+
+/// What evicting one candidate scratch register would put out, while we work
+/// out whether it is a candidate we can use.
+///
+/// At most one entry per register: a register named twice keeps the stronger
+/// `outlives` claim rather than appearing twice with different ones.
+struct Occupants<E>
+where
+    E: EntityRepr,
+{
+    occupants: Vec<Occupant<E>>,
+}
+
+impl<E> Occupants<E>
+where
+    E: EntityRepr,
+{
+    const fn new() -> Self {
+        Occupants {
+            occupants: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.occupants.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.occupants.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Occupant<E>> {
+        self.occupants.iter().copied()
+    }
+
+    /// Claim `reg`, keeping the stronger `outlives` claim when something
+    /// already claimed it.
+    ///
+    /// `bracket` is only consulted for a register nobody has claimed yet,
+    /// since working one out means scanning the batch.
+    fn note(&mut self, reg: Reg<E>, outlives: bool, bracket: impl FnOnce() -> Bracket) {
+        match self.occupants.iter_mut().find(|o| o.reg == reg) {
+            Some(seen) => seen.outlives |= outlives,
+            None => self.occupants.push(Occupant {
+                reg,
+                bracket: bracket(),
+                outlives,
+            }),
+        }
+    }
+
+    /// Drop everything nobody is going to read.
+    ///
+    /// Bracketing a dead value costs something real: two registers sharing a
+    /// unit cannot both be restored, so a dead one crowding out a live one
+    /// makes the register unusable for no gain.
+    fn drop_dead(&mut self) {
+        self.occupants
+            .retain(|o| o.outlives || o.bracket == Bracket::Tight);
+    }
+
+    /// Whether anything here needs a tight bracket.
+    fn any_tight(&self) -> bool {
+        self.iter().any(|o| o.bracket == Bracket::Tight)
+    }
+
+    /// Whether every pair sharing a unit is a pair `may_share` allows.
+    fn pairs_may_share(&self, overlap: &dyn Fn(Reg<E>, Reg<E>) -> bool) -> bool {
+        self.occupants.iter().enumerate().all(|(i, a)| {
+            self.occupants[i + 1..].iter().all(|b| {
+                !overlap(a.reg, b.reg) || may_share(a.bracket, b.bracket, a.outlives, b.outlives)
+            })
+        })
+    }
+}
+
+/// May two evicted registers that share a unit both be put back?
+///
+/// Only if their reloads sit at different depths: the wide one lands on top of
+/// the tight one, so whatever the tight one holds has to be finished with by
+/// then, which is what `outlives` says it is not.
+fn may_share(a: Bracket, b: Bracket, a_outlives: bool, b_outlives: bool) -> bool {
+    match (a, b) {
+        (Bracket::Tight, Bracket::Wide) => !a_outlives,
+        (Bracket::Wide, Bracket::Tight) => !b_outlives,
+        (Bracket::Tight, Bracket::Tight) | (Bracket::Wide, Bracket::Wide) => false,
+    }
+}
+
+/// Is `slot` one that nothing may sit in for the length of an eviction?
+///
+/// The slot has to last as long as the eviction, so it cannot be one the batch
+/// is already reading or writing, nor one another eviction has taken.
+///
+/// A wide bracket is the only one that clashes with a tight one, since every
+/// tight stay runs inside it. Two tight stays never overlap and may share.
+///
+/// `taken` is the eviction being arranged, whose earlier entries have slots
+/// but are recorded nowhere else yet.
+fn slot_is_taken<E>(
+    expanded: &[ParallelMove<E>],
+    wide_evicted_slots: &[SpillSlot<E>],
+    tight_evicted_slots: &[SpillSlot<E>],
+    bracket: Bracket,
+    unavailable: &[ScalarAllocation<E>],
+    slot: SpillSlot<E>,
+    taken: &[(Reg<E>, SpillSlot<E>)],
+) -> bool
+where
+    E: EntityRepr,
+{
+    if wide_evicted_slots.contains(&slot) || taken.iter().any(|&(_, s)| s == slot) {
+        return true;
+    }
+    if bracket == Bracket::Wide && tight_evicted_slots.contains(&slot) {
+        return true;
+    }
+    let slot = ScalarAllocation::Stack(slot);
+    unavailable.contains(&slot) || expanded.iter().any(|&m| m.src() == slot || m.dst() == slot)
+}
+
+/// Whether `BatchScratch::choose` may hold out for a candidate whose evicted
+/// values can all be saved into the stack homes they already have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HomePreference {
+    /// Prefer such a candidate, settling for any eligible one when none turns
+    /// up.
+    PreferHomes,
+
+    /// Take the first eligible candidate.
+    IgnoreHomes,
+}
+
+impl<E, F> BatchScratch<'_, '_, E, F>
+where
+    E: EntityRepr,
+    F: InputFunction,
+{
+    /// The bank of the value `mv` moves.
+    fn bank(&self, mv: ParallelMove<E>) -> RegBank {
+        let bank = move_bank(self.input, mv);
+        debug_assert!(
+            match (mv.src(), mv.dst()) {
+                (ScalarAllocation::Reg(reg), _) | (_, ScalarAllocation::Reg(reg)) =>
+                    reg.with_repr32().bank(self.machine) == bank,
+                _ => true,
+            },
+            "{mv:?} names a register from a different bank than the value it moves",
+        );
+        bank
+    }
+
+    fn inc_count(&mut self, reason: ScratchReason) {
+        match reason {
+            ScratchReason::StackToStack => self.counts.stack_to_stack_moves.inc(),
+            ScratchReason::CycleBreak => self.counts.move_cycles_broken.inc(),
+        }
+    }
+
+    /// Record that `scratch` is what `mv` gets.
+    fn chosen(&mut self, mv: ParallelMove<E>, reason: ScratchReason, scratch: ScalarAllocation<E>) {
+        self.inc_count(reason);
+        let pos = self.pos;
+        event!(
+            self.events,
+            ScratchRegChosen {
+                pos,
+                mv,
+                scratch,
+                reason
+            }
+        );
+    }
+
+    /// Is this a move where the source and destination do not overlap?
+    fn is_not_self_move(&self, m: ParallelMove<E>) -> bool {
+        !Interfere::interfere(self.machine, m.src(), m.dst())
+    }
+
+    /// Whether `reg` is off limits because this batch or an outstanding
+    /// scratch is already using it.
+    fn is_used(&self, reg: Reg<E>, unavailable: &[ScalarAllocation<E>]) -> bool {
+        unavailable
+            .iter()
+            .any(|&a| ScalarAllocation::interfere(self.machine, reg.into(), a))
+            // TODO: investigate whether lazily caching a `RegSet` of all the
+            // registers used in this batch improves perf.
+            || batch_uses_reg(self.machine, self.expanded, reg)
+    }
+
+    /// Whether nothing here is using `reg`, so we may evict whatever is in it
+    /// for the duration of the batch.
+    fn is_idle(&self, reg: Reg<E>, unavailable: &[ScalarAllocation<E>]) -> bool {
+        // `reg` must not interfere with any of the `unavailable` locations.
+        !unavailable
+            .iter()
+            .any(|&a| ScalarAllocation::interfere(self.machine, reg.into(), a))
+            // And the batch must not move through `reg`.
+            && !batch_moves_through_reg(self.machine, self.expanded, reg)
+            // And we must not have already evicted `reg` for the duration of
+            // this batch.
+            && !self.wide_evicted_regs.iter().any(|&other: &Reg<E>| {
+                Interfere::interfere(
+                    self.machine,
+                    ScalarAllocation::Reg(reg),
+                    ScalarAllocation::Reg(other),
+                )
+            })
+    }
+
+    fn slot_is_taken(
+        &self,
+        bracket: Bracket,
+        unavailable: &[ScalarAllocation<E>],
+        slot: SpillSlot<E>,
+        taken: &[(Reg<E>, SpillSlot<E>)],
+    ) -> bool {
+        slot_is_taken(
+            self.expanded,
+            self.wide_evicted_slots,
+            self.tight_evicted_slots,
+            bracket,
+            unavailable,
+            slot,
+            taken,
+        )
+    }
+
+    /// Get or create a slot nothing else is looking at, big enough for `size`.
+    fn emergency_slot(
+        &mut self,
+        size: SpillSlotSize,
+        bracket: Bracket,
+        unavailable: &[ScalarAllocation<E>],
+        taken: &[(Reg<E>, SpillSlot<E>)],
+    ) -> Result<SpillSlot<E>, SolveError> {
+        let Self {
+            spill_slots,
+            output,
+            counts,
+            events,
+            expanded,
+            wide_evicted_slots,
+            tight_evicted_slots,
+            ..
+        } = self;
+        spill_slots
+            .emergency_slot(counts, events, output, size, |slot| {
+                slot_is_taken(
+                    expanded,
+                    wide_evicted_slots,
+                    tight_evicted_slots,
+                    bracket,
+                    unavailable,
+                    slot,
+                    taken,
+                )
+            })
+            .map_err(|()| SolveError::EntityReprTooSmall)
+    }
+
+    /// Get the stack-home for the sole occupant of `reg` across this batch, if
+    /// any.
+    fn stack_home(
+        &self,
+        reg: Reg<E>,
+        unavailable: &[ScalarAllocation<E>],
+        taken: &[(Reg<E>, SpillSlot<E>)],
+    ) -> Option<SpillSlot<E>> {
+        if !reg.stands_alone(self.machine) || !self.is_idle(reg, unavailable) {
+            return None;
+        }
+
+        let val = self.region_allocation.sole_reg_occupant(
+            self.machine,
+            self.live_ranges,
+            reg,
+            self.borrowed_range.clone(),
+        )?;
+
+        let Some(StackAllocation::SpillSlot(slot)) = val.stack_home(self.spill_slots) else {
+            return None;
+        };
+
+        let size = reg.with_repr32().bank(self.machine).size(self.machine);
+        let bracket = self.bracket(reg, unavailable);
+        (slot.size(self.spill_slots) == size
+            && !self.slot_is_taken(bracket, unavailable, slot, taken))
+        .then_some(slot)
+    }
+
+    /// How wide a bracket the solver puts around `reg` when we evict it.
+    fn bracket(&self, reg: Reg<E>, unavailable: &[ScalarAllocation<E>]) -> Bracket {
+        if self.is_named_in_batch(reg, unavailable) {
+            Bracket::Tight
+        } else {
+            Bracket::Wide
+        }
+    }
+
+    /// Whether this batch names `reg`.
+    fn is_named_in_batch(&self, reg: Reg<E>, unavailable: &[ScalarAllocation<E>]) -> bool {
+        let loc = ScalarAllocation::Reg(reg);
+
+        // Is it named in the batch of parallel-moves itself?
+        if self.expanded.iter().any(|&m| {
+            self.is_not_self_move(m)
+                && (m.src() == loc
+                    || m.dst() == loc
+                    || Interfere::interfere(self.machine, loc, m.dst()))
+        }) {
+            return true;
+        }
+
+        // Or else, is it otherwise unavailable?
+        unavailable.contains(&loc)
+    }
+
+    /// Gather everything that would be clobbered by writing to `reg`, including
+    /// anything live in another register that shares units with it.
+    ///
+    /// The resulting set is written into `out`.
+    ///
+    /// Answers `Err(())` when we cannot name everything that would be
+    /// clobbered, e.g. due to fixed-register constraints' reservations, or
+    /// when what we did name cannot all be put back afterwards. Either way
+    /// `reg` is no use to us and `out` is left empty.
+    fn collect_occupants(
+        &self,
+        reg: Reg<E>,
+        unavailable: &[ScalarAllocation<E>],
+        spent: &[Reg<E>],
+        out: &mut Occupants<E>,
+    ) -> Result<(), ()> {
+        out.clear();
+
+        let result = (|| {
+            self.note_named_occupants(reg, unavailable, spent, out);
+            self.note_parked_occupants(reg, unavailable, out);
+            self.note_allocated_occupants(reg, unavailable, out)?;
+            out.drop_dead();
+            self.occupants_are_restorable(out)
+        })();
+
+        if result.is_err() {
+            out.clear();
+        }
+
+        result
+    }
+
+    /// Add `other` to `out` as a holder of units `reg` covers, if it overlaps
+    /// `reg`.
+    ///
+    /// `outlives` says something is still living in it when the batch ends. A
+    /// register only the batch names is empty by then, having been read and
+    /// its result put elsewhere, and an empty register is one another reload
+    /// may write over.
+    fn note_occupant(
+        &self,
+        reg: Reg<E>,
+        other: Reg<E>,
+        outlives: bool,
+        unavailable: &[ScalarAllocation<E>],
+        out: &mut Occupants<E>,
+    ) {
+        let reg_loc = ScalarAllocation::Reg(reg);
+        let other_loc = ScalarAllocation::Reg(other);
+        if !Interfere::interfere(self.machine, reg_loc, other_loc) {
+            return;
+        }
+        out.note(other, outlives, || self.bracket(other, unavailable));
+    }
+
+    /// Add what the batch itself is holding in units `reg` covers, minus what
+    /// it has already finished with.
+    fn note_named_occupants(
+        &self,
+        reg: Reg<E>,
+        unavailable: &[ScalarAllocation<E>],
+        spent: &[Reg<E>],
+        out: &mut Occupants<E>,
+    ) {
+        for &m in self.expanded.iter() {
+            let is_self_move = !self.is_not_self_move(m);
+            for (loc, written) in [(m.src(), false), (m.dst(), true)] {
+                if let ScalarAllocation::Reg(other) = loc {
+                    if self.wide_evicted_regs.contains(&other) || spent.contains(&other) {
+                        continue;
+                    }
+                    self.note_occupant(reg, other, written || is_self_move, unavailable, out);
+                }
+            }
+        }
+    }
+
+    /// Add what the solver has parked in units `reg` covers.
+    fn note_parked_occupants(
+        &self,
+        reg: Reg<E>,
+        unavailable: &[ScalarAllocation<E>],
+        out: &mut Occupants<E>,
+    ) {
+        for &loc in unavailable {
+            if let ScalarAllocation::Reg(other) = loc {
+                self.note_occupant(reg, other, false, unavailable, out);
+            }
+        }
+    }
+
+    /// Add what region allocation has in units `reg` covers, minus whatever
+    /// the batch is going to write over anyway.
+    ///
+    /// Answers `Err(())` if the allocator named a holder we cannot, which
+    /// makes the whole set untrustworthy.
+    fn note_allocated_occupants(
+        &self,
+        reg: Reg<E>,
+        unavailable: &[ScalarAllocation<E>],
+        out: &mut Occupants<E>,
+    ) -> Result<(), ()> {
+        let mut result = Ok(());
+
+        // Two ranges, two different questions. `occupied` is what is
+        // physically in the register while the moves run, so it decides
+        // whether writing over it loses anything. `span` is what is wanted at
+        // or after the point they feed, so it decides whether it has to
+        // survive them. A dead def answers only the first; a span cut at a
+        // block edge answers only the second.
+        for (range, outlives) in [
+            (self.occupied_range.clone(), false),
+            (self.borrowed_range.clone(), true),
+        ] {
+            self.region_allocation.for_each_reg_occupant(
+                self.machine,
+                self.live_ranges,
+                reg,
+                range,
+                |alloc| {
+                    for other in self.holders_of(alloc, &mut result) {
+                        self.note_allocated_occupant(reg, other, outlives, unavailable, out);
+                    }
+                },
+            );
+        }
+
+        result
+    }
+
+    /// The registers an allocation puts a value in, failing `complete` if it
+    /// names one we cannot.
+    fn holders_of(
+        &self,
+        alloc: RegAllocation<E>,
+        result: &mut Result<(), ()>,
+    ) -> impl Iterator<Item = Reg<E>> {
+        let (one, group) = match alloc {
+            RegAllocation::Reg(other) => (Some(other), &[][..]),
+            RegAllocation::RegGroup(group) => (None, group.members(self.machine)),
+        };
+        one.into_iter().chain(group.iter().filter_map(|other| {
+            // A group's members are in the machine's own numbering, so one that
+            // does not fit ours is a holder we cannot name, and a set missing a
+            // holder is not one we can act on.
+            let other = other.with_repr::<E>();
+            if other.is_none() {
+                *result = Err(());
+            }
+            other
+        }))
+    }
+
+    /// Add one register region allocation reports, unless the batch is about
+    /// to write over it or we have already lent it out.
+    fn note_allocated_occupant(
+        &self,
+        reg: Reg<E>,
+        other: Reg<E>,
+        outlives: bool,
+        unavailable: &[ScalarAllocation<E>],
+        out: &mut Occupants<E>,
+    ) {
+        if self.wide_evicted_regs.contains(&other) {
+            return;
+        }
+
+        let other_loc = ScalarAllocation::Reg(other);
+        let is_overwritten = self.expanded.iter().any(|&mv| {
+            self.is_not_self_move(mv) && Interfere::interfere(self.machine, mv.dst(), other_loc)
+        });
+        if !is_overwritten {
+            self.note_occupant(reg, other, outlives, unavailable, out);
+        }
+    }
+
+    /// Whether every holder in `out` can be put back afterwards.
+    fn occupants_are_restorable(&self, out: &Occupants<E>) -> Result<(), ()> {
+        let overlap = |a: Reg<E>, b: Reg<E>| Interfere::interfere(self.machine, a, b);
+
+        // A register evicted earlier has a reload waiting at the end, which
+        // writes over everything sharing a unit with it. Only a tight bracket
+        // fits under that, since it is empty once it closes.
+        let clear_of_evicted = out.iter().all(|o| {
+            self.wide_evicted_regs.iter().all(|&other| {
+                !overlap(o.reg, other)
+                    || (o.bracket == Bracket::Tight && (other == o.reg || !o.outlives))
+            })
+        });
+
+        if clear_of_evicted && out.pairs_may_share(&overlap) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Choose an eligible scratch register.
+    ///
+    /// Whatever we had to evict, if anything, is pushed to `out`.
+    fn choose(
+        &self,
+        bank: RegBank,
+        reason: ScratchReason,
+        eligible: &dyn Fn(Reg<E>) -> bool,
+        homes: HomePreference,
+        unavailable: &[ScalarAllocation<E>],
+        spent: &[Reg<E>],
+        out: &mut Occupants<E>,
+        settled: &mut Occupants<E>,
+    ) -> Option<Reg<E>> {
+        let allocatable = bank.stack_to_stack_move_regs(self.machine);
+        let candidates = || allocatable.iter().filter_map(|reg| reg.with_repr::<E>());
+
+        let mut settle_for = None;
+        for reg in candidates() {
+            if !eligible(reg)
+                || self
+                    .collect_occupants(reg, unavailable, spent, out)
+                    .is_err()
+            {
+                continue;
+            }
+
+            // A cycle break holds its scratch from here until the parked move
+            // fills it back in, with the cycle's other moves in between, so it
+            // must be wide bracketed. If anything this register evicts wants
+            // a tight bracket instead, the pair cannot be arranged and the
+            // register is no use for this.
+            if reason == ScratchReason::CycleBreak && out.any_tight() {
+                continue;
+            }
+
+            match homes {
+                HomePreference::PreferHomes => {
+                    if out
+                        .iter()
+                        .all(|o| self.stack_home(o.reg, unavailable, &[]).is_some())
+                    {
+                        return Some(reg);
+                    }
+
+                    if settle_for.is_none() {
+                        settle_for = Some(reg);
+                        core::mem::swap(out, settled);
+                    }
+                }
+                HomePreference::IgnoreHomes => {
+                    return Some(reg);
+                }
+            }
+        }
+
+        // `out` holds the last candidate we looked at, which is not the one we
+        // settled on; that one was put aside when we settled on it.
+        let reg = settle_for?;
+        core::mem::swap(out, settled);
+        Some(reg)
+    }
+
+    /// Find each evicted value somewhere to sit, and remember wide-brackted
+    /// ones that last the whole batch.
+    fn finish_eviction(
+        &mut self,
+        mv: ParallelMove<E>,
+        reason: ScratchReason,
+        unavailable: &[ScalarAllocation<E>],
+        victim: Option<Reg<E>>,
+        eviction_regs: &Occupants<E>,
+        evicting: &mut Vec<(Reg<E>, SpillSlot<E>)>,
+    ) -> Result<Option<Reg<E>>, SolveError> {
+        let Some(reg) = victim else {
+            return Ok(None);
+        };
+
+        // Find each evicted value somewhere to sit. The slot has to fit that
+        // register, which need not be one of the move's own bank: the
+        // neighbours we put out can belong to any bank sharing units with it.
+        for Occupant {
+            reg: other,
+            bracket,
+            ..
+        } in eviction_regs.iter()
+        {
+            let slot = match self.stack_home(other, unavailable, evicting) {
+                Some(slot) => {
+                    self.counts.scratch_reg_homes_reused.inc();
+                    slot
+                }
+                None => {
+                    let size = other.bank(self.machine).size(self.machine);
+                    self.emergency_slot(size, bracket, unavailable, evicting)?
+                }
+            };
+            self.counts.borrowed_scratch_regs.inc();
+            let pos = self.pos;
+            event!(
+                self.events,
+                ScratchRegBorrowed {
+                    pos,
+                    reg: other,
+                    slot
+                }
+            );
+            trace!("move generation: evicting {other:?} into {slot:?}");
+            evicting.push((other, slot));
+        }
+
+        // A tight bracket is over as soon as the two moves it wraps are, so
+        // the register is nobody's after that and there is nothing to
+        // remember about it. Its slot is another matter: it holds something
+        // for a stretch of the batch, which is a stretch of every wide
+        // bracket, so no wide bracket may be given it. A wide one is
+        // outstanding until the batch ends, and nothing else may land on
+        // either the register or the slot while it is.
+        //
+        // Which of the two a register gets is the solver's decision, and
+        // `bracket` is that same decision made here.
+        for &(other, slot) in evicting.iter() {
+            if self.bracket(other, unavailable) == Bracket::Tight {
+                self.tight_evicted_slots.push(slot);
+            } else {
+                self.wide_evicted_regs.push(other);
+                self.wide_evicted_slots.push(slot);
+            }
+        }
+        trace!("move generation: borrowing {reg:?} as a scratch");
+        self.chosen(mv, reason, reg.into());
+
+        Ok(Some(reg))
+    }
+}
+
+impl<E, F> ScratchSource<E> for BatchScratch<'_, '_, E, F>
+where
+    E: EntityRepr,
+    F: InputFunction,
+{
+    fn overlaps(&self, a: ScalarAllocation<E>, b: ScalarAllocation<E>) -> bool {
+        Interfere::interfere(self.machine, a, b)
+    }
+
+    fn is_suitable(&mut self, mv: ParallelMove<E>, reason: ScratchReason, reg: Reg<E>) -> bool {
+        let bank = move_bank(self.input, mv);
+
+        let reg32 = reg.with_repr32();
+        if reg32.bank(self.machine) != bank || reg32.is_non_allocatable(self.machine) {
+            return false;
+        }
+
+        self.chosen(mv, reason, reg.into());
+        true
+    }
+
+    #[cfg(debug_assertions)]
+    fn predicted_tight(&self, reg: Reg<E>, unavailable: &[ScalarAllocation<E>]) -> Option<bool> {
+        Some(self.bracket(reg, unavailable) == Bracket::Tight)
+    }
+
+    fn find_free(
+        &mut self,
+        mv: ParallelMove<E>,
+        reason: ScratchReason,
+        unavailable: &[ScalarAllocation<E>],
+    ) -> Option<Reg<E>> {
+        let bank = self.bank(mv);
+        let reg = find_scratch_reg(
+            self.machine,
+            self.region_allocation,
+            self.borrowed_range.clone(),
+            bank,
+            |reg| self.is_used(reg, unavailable),
+        )?;
+        self.chosen(mv, reason, reg.into());
+        Some(reg)
+    }
+
+    fn evict(
+        &mut self,
+        mv: ParallelMove<E>,
+        reason: ScratchReason,
+        unavailable: &[ScalarAllocation<E>],
+        spent: &[Reg<E>],
+        evicting: &mut Vec<(Reg<E>, SpillSlot<E>)>,
+    ) -> Result<Option<Reg<E>>, SolveError> {
+        let bank = self.bank(mv);
+
+        let mut out = core::mem::replace(self.eviction_regs, Occupants::new());
+        let mut settled = core::mem::replace(self.settled_regs, Occupants::new());
+
+        let victim = self
+            .choose(
+                bank,
+                reason,
+                &|reg| self.is_idle(reg, unavailable),
+                HomePreference::PreferHomes,
+                unavailable,
+                spent,
+                &mut out,
+                &mut settled,
+            )
+            .or_else(|| {
+                if reason != ScratchReason::StackToStack {
+                    return None;
+                }
+                self.choose(
+                    bank,
+                    reason,
+                    &|reg| !self.is_idle(reg, unavailable),
+                    HomePreference::IgnoreHomes,
+                    unavailable,
+                    spent,
+                    &mut out,
+                    &mut settled,
+                )
+            });
+
+        let result = self.finish_eviction(mv, reason, unavailable, victim, &out, evicting);
+
+        out.clear();
+        *self.eviction_regs = out;
+
+        settled.clear();
+        *self.settled_regs = settled;
+
+        result
+    }
+
+    fn emergency_slot(
+        &mut self,
+        mv: ParallelMove<E>,
+        reason: ScratchReason,
+        unavailable: &[ScalarAllocation<E>],
+    ) -> Result<SpillSlot<E>, SolveError> {
+        let size = self.bank(mv).size(self.machine);
+        let slot = self.emergency_slot(size, Bracket::Tight, unavailable, &[])?;
+        self.wide_evicted_slots.push(slot);
+        self.counts.cycles_parked_on_the_stack.inc();
+        trace!("move generation: breaking a move-cycle with {slot:?}");
+        self.chosen(mv, reason, ScalarAllocation::Stack(slot));
+        Ok(slot)
     }
 }
 
@@ -2179,14 +3076,43 @@ where
     Ok(PackedMovePosition::critical_edge(edge.pred, edge.index))
 }
 
-/// Does anything in `moves` read or write `reg`?
-fn batch_uses_reg<E>(machine: &Machine, moves: &[(ParallelMove<E>, Val<E>)], reg: Reg<E>) -> bool
+/// The register bank of the value `mv` moves.
+fn move_bank<E>(input: &Input<'_, impl InputFunction>, mv: ParallelMove<E>) -> RegBank
+where
+    E: EntityRepr,
+{
+    mv.val()
+        .expect("a scratch is only ever wanted for one of the batch's own moves")
+        .reg_bank(input)
+}
+
+/// Does anything in `moves` read or write `reg`, including indirectly?
+fn batch_uses_reg<E>(machine: &Machine, moves: &[ParallelMove<E>], reg: Reg<E>) -> bool
 where
     E: EntityRepr,
 {
     let reg = ScalarAllocation::Reg(reg);
-    moves.iter().any(|(m, _)| {
-        Interfere::interfere(machine, m.src, reg) || Interfere::interfere(machine, m.dst, reg)
+    moves.iter().any(|m| {
+        Interfere::interfere(machine, m.src(), reg) || Interfere::interfere(machine, m.dst(), reg)
+    })
+}
+
+/// Like `batch_uses_reg`, but not counting a move from a location to itself.
+///
+/// The solver throws self-moves away, so they are not moves it has to make.
+/// What they do say is that the register comes out of the batch holding what
+/// it went in holding, which evicting it and putting it back afterwards
+/// delivers. So a register only a self-move names is one we can borrow, even
+/// though it is not one we can simply take.
+fn batch_moves_through_reg<E>(machine: &Machine, moves: &[ParallelMove<E>], reg: Reg<E>) -> bool
+where
+    E: EntityRepr,
+{
+    let reg = ScalarAllocation::Reg(reg);
+    moves.iter().any(|m| {
+        !Interfere::interfere(machine, m.src(), m.dst())
+            && (Interfere::interfere(machine, m.src(), reg)
+                || Interfere::interfere(machine, m.dst(), reg))
     })
 }
 
@@ -2215,7 +3141,7 @@ fn expand_groups<E>(
     spill_slots: &SpillSlots<E>,
     output: &mut OutputInner<E>,
     batch_move: BatchMove<E>,
-    out: &mut Vec<(ParallelMove<E>, Val<E>)>,
+    out: &mut Vec<ParallelMove<E>>,
 ) -> IResult<()>
 where
     E: EntityRepr,
@@ -2226,12 +3152,10 @@ where
     debug_assert_eq!(len, dst.len_scalars(machine, spill_slots));
 
     for i in 0..len {
-        out.push((
-            ParallelMove {
-                src: src.nth_scalar(machine, spill_slots, output, i)?,
-                dst: dst.nth_scalar(machine, spill_slots, output, i)?,
-            },
+        out.push(ParallelMove::new(
             val,
+            src.nth_scalar(machine, spill_slots, output, i)?,
+            dst.nth_scalar(machine, spill_slots, output, i)?,
         ));
     }
 
@@ -2242,7 +3166,7 @@ fn into_move<E>(mv: ParallelMove<E>) -> Move<E>
 where
     E: EntityRepr,
 {
-    match (mv.src, mv.dst) {
+    match (mv.src(), mv.dst()) {
         (ScalarAllocation::Reg(from), ScalarAllocation::Reg(to)) => Move::RegReg { from, to },
         (ScalarAllocation::Reg(from), ScalarAllocation::Stack(to)) => Move::Spill { from, to },
         (ScalarAllocation::Stack(from), ScalarAllocation::Reg(to)) => Move::Reload { from, to },
@@ -3121,6 +4045,395 @@ mod tests {
             assert_eq!(back, via, "the store writes back what the reload read");
             assert_eq!(to, param);
         });
+    }
+
+    /// A cycle of moves from one spill slot to another when the machine has
+    /// no free register to break it with: the allocator takes the one
+    /// register off whatever is holding it, parks the cycle in it, and gives
+    /// it back afterwards.
+    ///
+    /// The register serves twice over: once to hold the parked value for the
+    /// length of the cycle, and once to stage the slot-to-slot move that frees
+    /// it. So the second borrow sits inside the first and brackets only its
+    /// own two moves.
+    ///
+    /// Run by hand rather than through `crate::test::check_allocation`, for
+    /// the same reason as the test below: that helper answers `Ok(())` to
+    /// `Error::TooManyLiveRegs`, and giving up is exactly the bug.
+    #[test]
+    fn a_cycle_of_stack_moves_evicts_a_register_when_none_is_free() {
+        let test_input = TestInput::with_a_cycle_of_stack_moves_and_no_free_register();
+
+        let mut context = Context::new();
+        test_input.with_input(|input| {
+            let output = crate::run(&mut context, input)
+                .expect("the cycle can be broken, by evicting the one register");
+            crate::checker::check(input, &output).expect("and the result is a correct allocation");
+        });
+
+        // The moves put every value where the allocation says it belongs.
+        check_moves(&test_input).unwrap();
+
+        // And these are the moves, on the first of the two edges that need
+        // them: the register's own value out of the way, the cycle rotated
+        // through the register, and the value back where it was.
+        let context = generate(&test_input)
+            .unwrap()
+            .expect("allocation succeeded");
+        let ctx = &context.context32;
+        let edits = ctx.move_generation.edits();
+        let pos = edits.first().expect("the edges need moves").0;
+        let edits = edits
+            .iter()
+            .filter(|&&(p, _)| p == pos)
+            .map(|&(_, edit)| match edit {
+                Edit::CriticalEdge(CriticalEdgeEdit {
+                    edit: EdgeEdit::Move(mv),
+                    ..
+                }) => mv,
+                edit => panic!("the moves go on the edge, got {edit:?}"),
+            })
+            .collect::<Vec<_>>();
+        let [
+            Move::Spill {
+                from: lent,
+                to: saved,
+            },
+            Move::Reload {
+                from: first,
+                to: via,
+            },
+            Move::Spill {
+                from: staging,
+                to: parked,
+            },
+            Move::Reload {
+                from: second,
+                to: staged,
+            },
+            Move::Spill {
+                from: stored,
+                to: fills_first,
+            },
+            Move::Reload {
+                from: unparked,
+                to: restaged,
+            },
+            Move::Spill {
+                from: written,
+                to: fills_second,
+            },
+            Move::Reload {
+                from: unsaved,
+                to: returned,
+            },
+        ] = edits[..]
+        else {
+            panic!("expected a cycle rotated through one borrowed register, got {edits:?}");
+        };
+
+        // Every one of the eight moves goes through the same register.
+        for reg in [lent, staging, staged, stored, restaged, written, returned] {
+            assert_eq!(reg, via, "the machine has only the one register to use");
+        }
+
+        // The outer borrow spans the batch; the inner one only the two moves
+        // that stage the second slot-to-slot move, and needs a slot of its
+        // own so as not to tread on the parked value.
+        assert_eq!(unsaved, saved, "the register's own value comes back");
+        assert_eq!(unparked, parked, "and so does the parked one");
+        assert_ne!(saved, parked, "from somewhere else entirely");
+
+        // The cycle: each slot is read before the other is written over it.
+        assert_eq!(
+            fills_first, first,
+            "the second value lands in the first slot"
+        );
+        assert_eq!(
+            fills_second, second,
+            "and the first value in the second slot",
+        );
+        assert_ne!(first, second, "which is what made it a cycle");
+        for slot in [saved, parked] {
+            assert_ne!(slot, first);
+            assert_ne!(slot, second, "the borrows do not touch the cycle's slots");
+        }
+    }
+
+    /// A move from one spill slot to another when the machine has no free
+    /// register to stage it through: the allocator takes one off whatever is
+    /// holding it, and that value goes to a slot and comes back around the
+    /// move.
+    ///
+    /// Run by hand rather than through `crate::test::check_allocation`, which
+    /// answers `Ok(())` to `Error::TooManyLiveRegs` on the grounds that not
+    /// every function fits on every machine. Behind that helper this fixture
+    /// would pass whether the move was made or given up on, and giving up is
+    /// exactly the bug.
+    #[test]
+    fn a_stack_to_stack_move_evicts_a_register_when_none_is_free() {
+        let test_input = TestInput::with_a_stack_to_stack_move_and_no_free_register();
+
+        let mut context = Context::new();
+        test_input.with_input(|input| {
+            let output = crate::run(&mut context, input)
+                .expect("the move can be made, by evicting the one register");
+            crate::checker::check(input, &output).expect("and the result is a correct allocation");
+        });
+
+        // The moves put every value where the allocation says it belongs.
+        check_moves(&test_input).unwrap();
+
+        // And these are the moves: the register's own value parked in a slot,
+        // the slot-to-slot move staged through it, and the value put back.
+        let context = generate(&test_input)
+            .unwrap()
+            .expect("allocation succeeded");
+        let ctx = &context.context32;
+        let home = |i| match Val::<u32>::try_new(i).unwrap().stack_home(&ctx.spill_slots) {
+            Some(StackAllocation::SpillSlot(slot)) => slot,
+            home => panic!("v{i} lives in a single slot, got {home:?}"),
+        };
+        let arg = home(0);
+        let param = home(2);
+
+        let edits = ctx.move_generation.edits();
+        let pos = edits.first().expect("the edge needs moves").0;
+        assert!(
+            edits.iter().all(|&(p, _)| p == pos),
+            "the whole borrow happens in the one gap, got {edits:?}",
+        );
+        let edits = edits.iter().map(|&(_, edit)| edit).collect::<Vec<_>>();
+        let [
+            Edit::Move(Move::Spill {
+                from: lent,
+                to: parked,
+            }),
+            Edit::Move(Move::Reload {
+                from: read,
+                to: via,
+            }),
+            Edit::Move(Move::Spill {
+                from: wrote,
+                to: filled,
+            }),
+            Edit::Move(Move::Reload {
+                from: restored,
+                to: back,
+            }),
+        ] = edits[..]
+        else {
+            panic!("expected one staged move bracketed by a borrow, got {edits:?}");
+        };
+        assert_eq!(lent, via, "the register saved is the one lent out");
+        assert_eq!(via, wrote, "which the move is staged through");
+        assert_eq!(via, back, "and which its own value comes back to");
+        assert_eq!(parked, restored, "from where it was parked");
+        assert_ne!(parked, arg);
+        assert_ne!(parked, param, "somewhere the move itself does not touch");
+        assert_eq!(read, arg, "the argument's slot is read");
+        assert_eq!(filled, param, "and the parameter's slot is filled");
+    }
+
+    /// A cycle of register-to-register moves running through every register
+    /// the bank has. There is nothing free to break it with, and nothing
+    /// worth evicting either: a save would have to go above the very move
+    /// that fills the victim, which is in the cycle too. The broken cycle
+    /// waits on the stack instead.
+    ///
+    /// Run by hand rather than through `crate::test::check_allocation`, for
+    /// the same reason as the tests above: that helper answers `Ok(())` to
+    /// `Error::TooManyLiveRegs`, and giving up is exactly the bug.
+    #[test]
+    fn a_cycle_through_every_register_parks_on_the_stack() {
+        let test_input = TestInput::with_a_cycle_through_every_register();
+
+        let mut context = Context::new();
+        test_input.with_input(|input| {
+            let output = crate::run(&mut context, input)
+                .expect("the cycle can be broken, by parking it on the stack");
+            crate::checker::check(input, &output).expect("and the result is a correct allocation");
+        });
+
+        // The moves put every value where the allocation says it belongs.
+        check_moves(&test_input).unwrap();
+
+        // And these are the moves: one end of the cycle parked in a slot, the
+        // other rotated into the register it leaves, and the parked value read
+        // back into the register that freed up behind it.
+        let context = generate(&test_input)
+            .unwrap()
+            .expect("allocation succeeded");
+        let ctx = &context.context32;
+
+        let edits = ctx.move_generation.edits();
+        let pos = edits.first().expect("the edge needs moves").0;
+        assert!(
+            edits.iter().all(|&(p, _)| p == pos),
+            "the whole swap happens in the one gap, got {edits:?}",
+        );
+        let edits = edits.iter().map(|&(_, edit)| edit).collect::<Vec<_>>();
+        let [
+            Edit::Move(Move::Spill {
+                from: parked,
+                to: slot,
+            }),
+            Edit::Move(Move::RegReg {
+                from: rotated,
+                to: vacated,
+            }),
+            Edit::Move(Move::Reload {
+                from: read,
+                to: filled,
+            }),
+        ] = edits[..]
+        else {
+            panic!("expected a swap staged through a slot, got {edits:?}");
+        };
+        assert_eq!(slot, read, "the value comes back out of where it parked");
+        assert_eq!(
+            parked, vacated,
+            "and into the register the rotation wrote over",
+        );
+        assert_eq!(
+            rotated, filled,
+            "while the other register takes the parked value's place",
+        );
+        assert_ne!(parked, rotated, "the two ends of a swap are distinct");
+    }
+
+    /// How long an evicted value sits in its slot, which is what decides who
+    /// else may have that slot.
+    ///
+    /// Two evicted registers sharing a unit can both be put back only when
+    /// one bracket nests inside the other and the inner register is empty by
+    /// the time the outer reload lands on it.
+    #[test]
+    fn only_a_spent_tight_bracket_may_nest_inside_a_wide_one() {
+        use Bracket::{Tight, Wide};
+
+        for outlives in [false, true] {
+            assert!(
+                !may_share(Tight, Tight, outlives, outlives),
+                "two tight brackets sit at the same depth, so the second save \
+                 writes over the first (outlives: {outlives})",
+            );
+            assert!(
+                !may_share(Wide, Wide, outlives, outlives),
+                "so do two wide ones (outlives: {outlives})",
+            );
+        }
+
+        for (a, b) in [(Tight, Wide), (Wide, Tight)] {
+            let tight_first = a == Tight;
+            assert!(
+                may_share(a, b, false, false),
+                "a tight bracket nests inside a wide one, and an empty \
+                 register takes the wide reload harmlessly (tight first: \
+                 {tight_first})",
+            );
+            assert!(
+                !may_share(a, b, tight_first, !tight_first),
+                "unless the tight bracket's register is still holding \
+                 something the wide reload would destroy (tight first: \
+                 {tight_first})",
+            );
+            assert!(
+                may_share(a, b, !tight_first, tight_first),
+                "the wide bracket's own register outliving the batch is \
+                 expected and decides nothing (tight first: {tight_first})",
+            );
+        }
+    }
+
+    /// Tight and wide brackets are not symmetric, and the asymmetry is the
+    /// whole rule: the wide one opens before the batch's first move and closes
+    /// after its last, so every tight bracket runs inside it and a save of
+    /// theirs lands on top of what it is holding. Tight brackets never overlap
+    /// one another, since `push_move` pushes each tight save straight after the
+    /// two halves its reload opened with nothing in between, so they are free
+    /// to share.
+    ///
+    /// Getting this backwards is a silent miscompile, not a panic: the wide
+    /// reload simply puts back whatever the tight save left there. So it is
+    /// pinned here on the plain slices `slot_is_taken` takes, where the rule is
+    /// visible without a machine to arrange around it.
+    #[test]
+    fn a_wide_eviction_may_not_share_a_slot_with_a_tight_one() {
+        let slot = |i| SpillSlot::<u32>::try_new(i).unwrap();
+
+        // A slot some tight bracket has already used, and a batch that names
+        // nothing at all, so `slot_is_taken` answers out of the tight/wide
+        // rule alone.
+        let used = slot(0);
+        let tight_evicted_slots = &[used][..];
+
+        assert!(
+            !slot_is_taken::<u32>(
+                &[],
+                &[],
+                tight_evicted_slots,
+                Bracket::Tight,
+                &[],
+                used,
+                &[]
+            ),
+            "two tight brackets never run at once, so the second is free to reuse \
+             what the first has finished with",
+        );
+        assert!(
+            slot_is_taken::<u32>(&[], &[], tight_evicted_slots, Bracket::Wide, &[], used, &[]),
+            "but a wide one is open across every tight bracket, so a tight save \
+             would write over what it is holding",
+        );
+
+        // A slot nobody has touched is nobody's, whichever kind of stay is
+        // asking: the rule above is about the slots in `tight_evicted_slots`, not
+        // about wide brackets being fussy in general.
+        let fresh = slot(1);
+        for bracket in [Bracket::Tight, Bracket::Wide] {
+            assert!(
+                !slot_is_taken::<u32>(&[], &[], tight_evicted_slots, bracket, &[], fresh, &[]),
+                "a slot no bracket has used is free ({bracket:?})",
+            );
+        }
+
+        // A wide bracket's slot, by contrast, is off limits to everything:
+        // it is still holding its value when any later stay would run.
+        let wide_evicted_slots = &[used][..];
+        for bracket in [Bracket::Tight, Bracket::Wide] {
+            assert!(
+                slot_is_taken::<u32>(&[], wide_evicted_slots, &[], bracket, &[], used, &[]),
+                "a slot evicted for the whole batch is nobody else's ({bracket:?})",
+            );
+        }
+    }
+
+    /// A slot a broken cycle is parked in is off limits to an eviction of
+    /// either width.
+    ///
+    /// The park holds its value from before the bracket opens until after it
+    /// closes, so however short the stay, it is a stay inside the park's.
+    /// This one the solver also asserts, in
+    /// `debug_assert_tight_eviction_is_sound`; here is the caller's side of
+    /// it, which is what keeps the assertion from ever firing.
+    #[test]
+    fn an_eviction_may_not_land_on_a_parked_cycle() {
+        let slot = |i| SpillSlot::<u32>::try_new(i).unwrap();
+
+        let parked = slot(0);
+        let unavailable = &[ScalarAllocation::Stack(parked)][..];
+
+        for bracket in [Bracket::Tight, Bracket::Wide] {
+            assert!(
+                slot_is_taken::<u32>(&[], &[], &[], bracket, unavailable, parked, &[]),
+                "a parked cycle's slot is nobody else's ({bracket:?})",
+            );
+            assert!(
+                !slot_is_taken::<u32>(&[], &[], &[], bracket, unavailable, slot(1), &[]),
+                "but only that slot ({bracket:?})",
+            );
+        }
     }
 
     /// The moves put every value where the allocation says it belongs, at

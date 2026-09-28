@@ -2018,6 +2018,42 @@ impl TestMachine {
         machine
     }
 
+    /// The class `rc0` of [`TestMachine::two_aliasing_banks`]: bank 0's only
+    /// register, two units wide.
+    pub const WIDE_ALIAS_CLASS: u8 = 0;
+
+    /// The class `rc1` of [`TestMachine::two_aliasing_banks`]: bank 1's only
+    /// register, which sits inside bank 0's.
+    pub const NARROW_ALIAS_CLASS: u8 = 1;
+
+    /// Two banks of one register each, with bank 1's register sitting inside
+    /// bank 0's.
+    ///
+    /// Units are numbered from zero in every bank, so bank 1's one-unit
+    /// register covers the first of bank 0's two and the pair interfere.
+    /// Neither bank holds anything else, so freeing either register evicts
+    /// the other, and the two evictions cannot share a bracket.
+    ///
+    /// Both banks hold four-byte registers, so they share a spill slot pool.
+    pub fn two_aliasing_banks() -> Self {
+        let one_reg = |units, spill_cost| TestBank {
+            log2_size: 2,
+            regs: vec![units],
+            non_allocatable: 0,
+            groups: Vec::new(),
+            classes: vec![TestClass {
+                members: TestClassMembers::Regs(vec![0]),
+                spill_cost,
+            }],
+        };
+        let mut machine = TestMachine {
+            banks: vec![one_reg(2, 29), one_reg(1, 41)],
+            regs_per_bank: None,
+        };
+        machine.fixup();
+        machine
+    }
+
     /// Give `bank` one more register that the allocator does not own, and
     /// answer which [`Reg`] it will be once the machine is built.
     ///
@@ -7370,6 +7406,619 @@ impl TestInput {
         input
     }
 
+    /// A move from one spill slot to another with nowhere to stage it.
+    pub fn with_a_stack_to_stack_move_and_no_free_register() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let arg_val = Val::try_new(0).unwrap();
+        let resident_val = Val::try_new(1).unwrap();
+        let param_val = Val::try_new(2).unwrap();
+        let target = Block::try_new(1).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(1).unwrap(),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: target,
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand = |pos, kind, constraint, val| Operand::new(pos, kind, constraint, Some(val));
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![operand(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the argument and the resident value, read the
+            // argument off the stack so that it is there at the branch, and
+            // pass it along. The branch's read of the resident value pins it
+            // to the register on this side of the edge.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, arg_val),
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                resident_val,
+            ),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                arg_val,
+            ),
+            InstData::Branch {
+                operands: vec![operand(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(both),
+                    resident_val,
+                )],
+                targets: vec![BlockCall {
+                    target,
+                    args: vec![arg_val],
+                }],
+            },
+            // block1: the parameter off the stack beside the resident value
+            // back in the register, pinning it there on this side of the edge
+            // too. Then the argument off the stack again, so that it is still
+            // live and cannot share the parameter's slot.
+            InstData::Op {
+                operands: vec![
+                    operand(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Stack,
+                        param_val,
+                    ),
+                    operand(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(both),
+                        resident_val,
+                    ),
+                ],
+                side_effects: true,
+            },
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                arg_val,
+            ),
+            // A terminator of the block's own, so that `ensure_terminators`
+            // does not take the reads away.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2), inst(3)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param_val],
+                insts: vec![inst(4), inst(5), inst(6)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut machine = TestMachine::two_registers();
+        machine.set_regs_per_bank(1);
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine,
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A cycle of moves from one spill slot to another with nothing free to
+    /// break it with.
+    pub fn with_a_cycle_of_stack_moves_and_no_free_register() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let resident_val = Val::try_new(0).unwrap();
+        let first_val = Val::try_new(1).unwrap();
+        let second_val = Val::try_new(2).unwrap();
+        let first_param = Val::try_new(3).unwrap();
+        let second_param = Val::try_new(4).unwrap();
+        let header = Block::try_new(1).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(1).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(2).unwrap(),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: header,
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: header,
+                i: 1,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand = |pos, kind, constraint, val| Operand::new(pos, kind, constraint, Some(val));
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![operand(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+        let stack_use = |val| operand(Position::Early, DefUse::Use, OperandConstraint::Stack, val);
+        let reg_use = |val| {
+            operand(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(both),
+                val,
+            )
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the value that occupies the register and the two
+            // the loop starts with, read the latter two off the stack so that
+            // they have slots, and enter the loop. The branch reads the
+            // resident value out of the register.
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                resident_val,
+            ),
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                first_val,
+            ),
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                second_val,
+            ),
+            InstData::Op {
+                operands: vec![stack_use(first_val), stack_use(second_val)],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![reg_use(resident_val)],
+                targets: vec![BlockCall {
+                    target: header,
+                    args: vec![first_val, second_val],
+                }],
+            },
+            // block1, the loop header: read both parameters off the stack,
+            // which is what keeps them in slots, and test whether to go round
+            // again.
+            InstData::Op {
+                operands: vec![
+                    stack_use(first_param),
+                    stack_use(second_param),
+                    reg_use(resident_val),
+                ],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: Block::try_new(2).unwrap(),
+                        args: vec![],
+                    },
+                    BlockCall {
+                        target: Block::try_new(3).unwrap(),
+                        args: vec![],
+                    },
+                ],
+            },
+            // block2, the loop body: hand the two parameters back the other
+            // way round. Its branch reads the resident value too, so the
+            // register is taken over the edge that carries the swap.
+            InstData::Branch {
+                operands: vec![reg_use(resident_val)],
+                targets: vec![BlockCall {
+                    target: header,
+                    args: vec![second_param, first_param],
+                }],
+            },
+            // block3, the exit.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2), inst(3), inst(4)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![first_param, second_param],
+                insts: vec![inst(5), inst(6)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(7)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(8)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut machine = TestMachine::two_registers();
+        machine.set_regs_per_bank(1);
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine,
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A cycle of register-to-register moves running through every register
+    /// the bank has, so that there is nothing free to break it with and
+    /// nothing worth evicting either: a save would have to go above the very
+    /// move that fills the victim. The cycle has to park on the stack.
+    pub fn with_a_cycle_through_every_register() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first_val = Val::try_new(0).unwrap();
+        let second_val = Val::try_new(1).unwrap();
+        let first_param = Val::try_new(2).unwrap();
+        let second_param = Val::try_new(3).unwrap();
+        let header = Block::try_new(1).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(1).unwrap(),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: header,
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: header,
+                i: 1,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand = |pos, kind, constraint, val| Operand::new(pos, kind, constraint, Some(val));
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![operand(pos, kind, constraint, val)],
+            side_effects: true,
+        };
+        let reg_use = |val| {
+            operand(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(both),
+                val,
+            )
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the two values the loop starts with and enter it.
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                first_val,
+            ),
+            op(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                second_val,
+            ),
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target: header,
+                    args: vec![first_val, second_val],
+                }],
+            },
+            // block1, the loop header: read both parameters out of registers,
+            // which is what keeps them there, and test whether to go round
+            // again.
+            InstData::Op {
+                operands: vec![reg_use(first_param), reg_use(second_param)],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: Block::try_new(2).unwrap(),
+                        args: vec![],
+                    },
+                    BlockCall {
+                        target: Block::try_new(3).unwrap(),
+                        args: vec![],
+                    },
+                ],
+            },
+            // block2, the loop body: read both parameters out of registers
+            // again, then hand them back the other way round. Both ends of
+            // both moves are registers, and between them they are every
+            // register the machine has.
+            InstData::Op {
+                operands: vec![reg_use(first_param), reg_use(second_param)],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![BlockCall {
+                    target: header,
+                    args: vec![second_param, first_param],
+                }],
+            },
+            // block3, the exit.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![first_param, second_param],
+                insts: vec![inst(3), inst(4)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(5), inst(6)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(7)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A loop whose back edge swaps two values held in slots, on the machine
+    /// whose two banks alias exactly, with a third value already parked out
+    /// of the way.
+    ///
+    /// The batch on that edge is a two-slot swap plus a move whose ends
+    /// overlap, which the solver drops. Staging the swap needs a register,
+    /// and taking one evicts the other bank's too, so by the time the
+    /// dropped move is looked at its register has already been lent out.
+    /// A register in that state has its contents in a slot with a reload owed
+    /// after the whole batch, which is precisely what the dropped move asks
+    /// for, so it must not be counted a second time: a register cannot carry
+    /// two brackets at once.
+    pub fn with_a_dropped_move_on_a_lent_out_register() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let wide = RegClass::try_new(TestMachine::WIDE_ALIAS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for (reg_class, block, i) in [
+            (TestMachine::NARROW_ALIAS_CLASS, block(0), 0),
+            (TestMachine::WIDE_ALIAS_CLASS, block(0), 1),
+            (TestMachine::NARROW_ALIAS_CLASS, block(1), 0),
+            (TestMachine::NARROW_ALIAS_CLASS, block(1), 1),
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class,
+                        def: ValDef::BlockParam { block, i },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0, the entry: hand its narrow parameter to both of the
+            // loop header's parameters, so one value arrives in two places.
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: block(1),
+                        args: vec![val(0), val(0)],
+                    },
+                    BlockCall {
+                        target: block(2),
+                        args: vec![],
+                    },
+                ],
+            },
+            // block1, the loop header: the only read that pins anything to
+            // the wide register, which is what keeps the two banks fighting
+            // over the units they share.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(wide),
+                    Some(val(1)),
+                )],
+                side_effects: false,
+            },
+            // Round the loop with the two narrow parameters swapped, and back
+            // to the entry with the wide one still live.
+            InstData::Branch {
+                operands: vec![],
+                targets: vec![
+                    BlockCall {
+                        target: block(1),
+                        args: vec![val(3), val(2)],
+                    },
+                    BlockCall {
+                        target: block(0),
+                        args: vec![val(3), val(1)],
+                    },
+                ],
+            },
+            // block2, the exit: a late read of the entry parameter, happy to
+            // take it from anywhere.
+            InstData::Branch {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(val(0)),
+                )],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![val(0), val(1)],
+                insts: vec![inst(0)],
+                frequency: 37,
+            },
+            BlockData {
+                params: vec![val(2), val(3)],
+                insts: vec![inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(3)],
+                frequency: 44,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_aliasing_banks(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// Build the [`Input`] that this describes and hand it to `f`.
     ///
     /// The `Machine` has to be built to be borrowed, hence the callback.
@@ -7521,6 +8170,18 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_two_reuses_of_a_dying_value(),
         TestInput::with_block_arg_constraints(OperandConstraint::Any, OperandConstraint::Stack),
         TestInput::with_stack_param_and_arg(),
+        // The same edge with the machine's one register held by something
+        // else, so the move has nowhere to go but through a borrowed one.
+        TestInput::with_a_stack_to_stack_move_and_no_free_register(),
+        // A cycle of those, which can only be broken by parking a value in
+        // an emergency slot.
+        TestInput::with_a_cycle_of_stack_moves_and_no_free_register(),
+        // A cycle running through the whole bank, leaving nothing to break
+        // it with but the stack.
+        TestInput::with_a_cycle_through_every_register(),
+        // A move the solver drops, naming a register the batch beside it has
+        // already evicted.
+        TestInput::with_a_dropped_move_on_a_lent_out_register(),
         TestInput::with_a_rematerialized_block_arg(),
         TestInput::with_two_uses_of_different_values(),
         TestInput::with_a_critical_edge(),

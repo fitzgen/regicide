@@ -21,7 +21,7 @@ use crate::{
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
-use assignments::{Assignments, QuerySpan};
+use assignments::{Assignments, Occupant, QuerySpan};
 use core::{fmt, marker::PhantomData, ops::Range};
 use splitting::{Cut, SplitUse, WithinSpanCut};
 
@@ -191,6 +191,58 @@ where
         )
     }
 
+    /// The value sitting in `reg` over `span`, when exactly one bundle has it
+    /// there and nothing has reserved it.
+    ///
+    /// Errs towards `None`, since naming the wrong value would write it into a
+    /// home that is not its own. Treat an answer as a preference, not a fact.
+    pub(crate) fn sole_reg_occupant(
+        &self,
+        machine: &Machine,
+        live_ranges: &LiveRanges<E>,
+        reg: Reg<E>,
+        span: Range<LivePoint<E>>,
+    ) -> Option<Val<E>> {
+        let bundle = self.assignments.sole_conflicting_bundle(
+            core::iter::once(reg.units(machine)),
+            core::iter::once(QuerySpan::sees_all_reservations(span.clone())),
+        )?;
+
+        let mut vals = bundle
+            .spans(live_ranges)
+            // Moves run ahead of the instruction they sit in front of, so
+            // only a value already live coming into the point is certainly in
+            // the register now.
+            .filter(|s| s.start(live_ranges) < span.start && span.end <= s.end(live_ranges))
+            .map(|s| s.val(live_ranges));
+
+        let val = vals.next()?;
+        vals.all(|other| other == val).then_some(val)
+    }
+
+    /// Call `f` once for everything occupying any of the units `reg` covers.
+    pub(crate) fn for_each_reg_occupant(
+        &self,
+        machine: &Machine,
+        live_ranges: &LiveRanges<E>,
+        reg: Reg<E>,
+        span: Range<LivePoint<E>>,
+        mut f: impl FnMut(RegAllocation<E>),
+    ) {
+        self.assignments.for_each_occupant(
+            core::iter::once(reg.units(machine)),
+            core::iter::once(QuerySpan::sees_all_reservations(span)),
+            |occupant| {
+                f(match occupant {
+                    // A bundle the matrix still holds an assignment for has
+                    // an allocation.
+                    Occupant::Bundle(bundle) => bundle.reg_allocation(live_ranges).unwrap(),
+                    Occupant::Reserved(held) => held,
+                })
+            },
+        );
+    }
+
     fn allocate_region(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -212,6 +264,7 @@ where
                 self.region_assignments.insert_reservation(
                     reservation.reg(live_ranges).units(input.machine),
                     reservation.start(live_ranges)..reservation.end(live_ranges),
+                    reservation.reg(live_ranges),
                     // Porous to its own value: see `ReservationData`.
                     Some(reservation.val(live_ranges)),
                 );

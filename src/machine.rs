@@ -282,6 +282,12 @@ where
     pub fn is_non_allocatable(self, machine: &Machine) -> bool {
         !self.is_allocatable(machine)
     }
+
+    /// Does this register have its units to itself?
+    #[inline]
+    pub(crate) fn stands_alone(self, machine: &Machine) -> bool {
+        machine.stand_alone.contains(self.with_repr32())
+    }
 }
 
 impl RegGroup {
@@ -538,7 +544,10 @@ where
     }
 }
 
-impl Interfere for Reg {
+impl<E> Interfere for Reg<E>
+where
+    E: EntityRepr,
+{
     #[inline]
     fn interfere(machine: &Machine, lhs: Self, rhs: Self) -> bool {
         return if lhs == rhs {
@@ -547,9 +556,12 @@ impl Interfere for Reg {
             slow(machine, lhs, rhs)
         };
 
-        fn slow(machine: &Machine, lhs: Reg, rhs: Reg) -> bool {
-            let lhs = &machine.registers[lhs];
-            let rhs = &machine.registers[rhs];
+        fn slow<E>(machine: &Machine, lhs: Reg<E>, rhs: Reg<E>) -> bool
+        where
+            E: EntityRepr,
+        {
+            let lhs = &machine.registers[lhs.with_repr32()];
+            let rhs = &machine.registers[rhs.with_repr32()];
             if lhs.bank == rhs.bank {
                 // Registers in the same bank are disjoint.
                 debug_assert!(!Interfere::interfere(machine, &lhs.units, &rhs.units));
@@ -620,6 +632,9 @@ pub struct Machine {
     /// appended after them so that the [`RegClass`]es handed out while building
     /// keep their indices.
     num_user_classes: usize,
+
+    /// The registers that have their units to themselves.
+    stand_alone: RegSet,
 }
 
 impl Machine {
@@ -634,6 +649,23 @@ impl Machine {
     #[inline]
     pub(crate) fn num_user_classes(&self) -> usize {
         self.num_user_classes
+    }
+
+    /// Tabulate which registers have their units to themselves.
+    ///
+    /// Asked once per displaced register per candidate while move generation
+    /// looks for a scratch, which is often enough to be worth a bit test.
+    fn derive_stand_alone(&self) -> RegSet {
+        let mut set = RegSet::new();
+        for reg in self.regs() {
+            let alone = !self
+                .regs()
+                .any(|other| other != reg && Interfere::interfere(self, reg, other));
+            if alone {
+                set.insert(reg);
+            }
+        }
+        set
     }
 
     /// Every register.
@@ -1153,14 +1185,19 @@ impl MachineBuilder {
             classes,
             banks,
         } = self;
-        Ok(Machine {
+        // `stand_alone` is a question about the finished machine, so it is
+        // asked of one, and the placeholder never escapes.
+        let mut machine = Machine {
             registers,
             groups,
             classes,
             banks,
             class_intersections,
             num_user_classes,
-        })
+            stand_alone: RegSet::new(),
+        };
+        machine.stand_alone = machine.derive_stand_alone();
+        Ok(machine)
     }
 
     /// Derive the register classes that name the intersections of the classes

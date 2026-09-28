@@ -675,8 +675,8 @@
       "kind": "MoveEmitted",
       "move": {
         "reload": {
-          "from": 0,
-          "to": 1
+          "from": 1,
+          "to": 4
         }
       },
       "pos": {
@@ -691,8 +691,8 @@
       "kind": "MoveEmitted",
       "move": {
         "reload": {
-          "from": 1,
-          "to": 4
+          "from": 0,
+          "to": 1
         }
       },
       "pos": {
@@ -904,8 +904,8 @@
             "edit": {
               "move": {
                 "reload": {
-                  "from": 0,
-                  "to": 1
+                  "from": 1,
+                  "to": 4
                 }
               }
             }
@@ -918,8 +918,8 @@
             "edit": {
               "move": {
                 "reload": {
-                  "from": 1,
-                  "to": 4
+                  "from": 0,
+                  "to": 1
                 }
               }
             }
@@ -1834,7 +1834,7 @@
             51,
             53,
             56,
-            60
+            61
           ],
           [],
           [],
@@ -1846,7 +1846,7 @@
             52,
             54,
             58,
-            61
+            60
           ]
         ]
       },
@@ -1917,7 +1917,7 @@
             51,
             53,
             56,
-            60
+            61
           ],
           [
             38,
@@ -1928,7 +1928,7 @@
             52,
             54,
             58,
-            61
+            60
           ]
         ]
       },
@@ -2474,6 +2474,15 @@
         },
         "val": "Val"
       },
+      "ScratchRegBorrowed": {
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        },
+        "reg": "Reg",
+        "slot": "SpillSlot"
+      },
       "ScratchRegChosen": {
         "mv": {
           "dst": {
@@ -2483,7 +2492,8 @@
           "src": {
             "reg": "Reg",
             "slot": "SpillSlot"
-          }
+          },
+          "val": "Val"
         },
         "pos": {
           "criticalEdge": {
@@ -2493,23 +2503,6 @@
         "scratch": {
           "reg": "Reg",
           "slot": "SpillSlot"
-        }
-      },
-      "ScratchRegUnavailable": {
-        "mv": {
-          "dst": {
-            "reg": "Reg",
-            "slot": "SpillSlot"
-          },
-          "src": {
-            "reg": "Reg",
-            "slot": "SpillSlot"
-          }
-        },
-        "pos": {
-          "criticalEdge": {
-            "pred": "Block"
-          }
         }
       },
       "SpanConstructed": {

@@ -20,7 +20,7 @@ serde = {
     "derive",
   ]
 }
-serde_json = { version = "1.0.145", optional = true }
+serde_json = { version = "1.0.145", optional = true, features = ["float_roundtrip"] }
 mutatis = { version = "0.5.4", features = ["check", "derive"], optional = true }
 
 [dev-dependencies]

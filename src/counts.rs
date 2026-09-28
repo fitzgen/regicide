@@ -92,7 +92,10 @@ pub struct Counts {
     pub remats_emitted: Count,
     pub critical_edge_edits: Count,
     pub move_cycles_broken: Count,
+    pub cycles_parked_on_the_stack: Count,
     pub stack_to_stack_moves: Count,
+    pub borrowed_scratch_regs: Count,
+    pub scratch_reg_homes_reused: Count,
     pub emergency_spill_slots: Count,
 }
 
@@ -130,7 +133,10 @@ impl Counts {
             remats_emitted: Count::new(),
             critical_edge_edits: Count::new(),
             move_cycles_broken: Count::new(),
+            cycles_parked_on_the_stack: Count::new(),
             stack_to_stack_moves: Count::new(),
+            borrowed_scratch_regs: Count::new(),
+            scratch_reg_homes_reused: Count::new(),
             emergency_spill_slots: Count::new(),
         }
     }
@@ -172,7 +178,10 @@ impl Counts {
             remats_emitted,
             critical_edge_edits: critical_edge_moves,
             move_cycles_broken,
+            cycles_parked_on_the_stack,
             stack_to_stack_moves,
+            borrowed_scratch_regs,
+            scratch_reg_homes_reused,
             emergency_spill_slots,
         } = self;
         sccs.is_reset()
@@ -206,7 +215,10 @@ impl Counts {
             && remats_emitted.is_reset()
             && critical_edge_moves.is_reset()
             && move_cycles_broken.is_reset()
+            && cycles_parked_on_the_stack.is_reset()
             && stack_to_stack_moves.is_reset()
+            && borrowed_scratch_regs.is_reset()
+            && scratch_reg_homes_reused.is_reset()
             && emergency_spill_slots.is_reset()
     }
 }
