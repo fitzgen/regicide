@@ -460,57 +460,60 @@ where
 {
     let _timing = Timing::new("coalesce");
 
-    let ContextInner {
-        counts,
-        events,
-        region_tree,
-        live_ranges,
-        coalescing,
-        output,
-        ..
-    } = context;
-
-    debug_assert!(coalescing.is_reset());
+    debug_assert!(context.coalescing.is_reset());
 
     // Merge spans into sets within each region.
-    for region in region_tree.pre_order_iter() {
-        coalescing.coalesce_region(region_tree, live_ranges, input, events, output, region)?;
+    for region in context.region_tree.pre_order_iter() {
+        context.coalescing.coalesce_region(
+            &context.region_tree,
+            &context.live_ranges,
+            input,
+            &mut context.events,
+            &mut context.output,
+            region,
+        )?;
     }
 
     // Then build our bundles from the merged span sets.
     build_bundles(
-        coalescing,
-        region_tree,
-        live_ranges,
-        counts,
-        events,
+        &mut context.coalescing,
+        &context.region_tree,
+        &mut context.live_ranges,
+        &mut context.counts,
+        &mut context.events,
         input,
-        output,
+        &mut context.output,
     )?;
 
     // Then propagate hints across regions.
-    hint_across_regions(coalescing, region_tree, live_ranges, events, input.machine);
+    hint_across_regions(
+        &context.coalescing,
+        &context.region_tree,
+        &mut context.live_ranges,
+        &mut context.events,
+        input.machine,
+    );
 
     // And finally bias each reserved value's bundle towards its register.
-    for region in region_tree.pre_order_iter() {
-        for block in region.blocks(region_tree) {
-            let reservations = block.reservations(live_ranges);
+    for region in context.region_tree.pre_order_iter() {
+        for block in region.blocks(&context.region_tree) {
+            let reservations = block.reservations(&context.live_ranges);
             if reservations.is_empty() {
                 continue;
             }
             hint_reserved_registers(
                 input,
-                live_ranges,
-                events,
-                &mut coalescing.hint_scratch,
+                &mut context.live_ranges,
+                &mut context.events,
+                &mut context.coalescing.hint_scratch,
                 block,
                 reservations,
             );
         }
     }
 
-    coalescing.cross_region_affinities.clear();
-    coalescing.region_blocks.clear();
+    context.coalescing.cross_region_affinities.clear();
+    context.coalescing.region_blocks.clear();
     Ok(())
 }
 
@@ -1172,22 +1175,26 @@ mod tests {
 
     /// Run every analysis that coalescing depends on.
     fn analyze(context: &mut ContextInner<u32>, input: &Input<'_, TestFunction>) -> IResult<()> {
-        let ContextInner {
-            counts,
-            events,
-            rpo,
-            region_tree,
-            liveness,
-            live_ranges,
-            dfs,
-            output,
-            ..
-        } = context;
         let func = input.func;
-        rpo.construct(func, dfs, output)?;
-        region_tree.construct(func, counts, dfs, output)?;
-        liveness.construct(func, counts, rpo, output)?;
-        live_ranges.construct(input, counts, events, liveness, output)
+        context
+            .rpo
+            .construct(func, &mut context.dfs, &mut context.output)?;
+        context.region_tree.construct(
+            func,
+            &mut context.counts,
+            &mut context.dfs,
+            &mut context.output,
+        )?;
+        context
+            .liveness
+            .construct(func, &mut context.counts, &context.rpo, &mut context.output)?;
+        context.live_ranges.construct(
+            input,
+            &mut context.counts,
+            &mut context.events,
+            &mut context.liveness,
+            &mut context.output,
+        )
     }
 
     /// Run every analysis up through coalescing.

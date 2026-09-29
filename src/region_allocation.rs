@@ -34,31 +34,21 @@ where
 {
     let _timing = Timing::new("region allocate");
 
-    let ContextInner {
-        counts,
-        events,
-        region_tree,
-        live_ranges,
-        region_allocation,
-        output,
-        ..
-    } = context;
-
     // Reverse the pre-order so we visit children before parents.
-    for region in region_tree.pre_order_iter().rev() {
-        region_allocation.allocate_region(
+    for region in context.region_tree.pre_order_iter().rev() {
+        context.region_allocation.allocate_region(
             input,
-            region_tree,
-            live_ranges,
-            counts,
-            events,
-            output,
+            &context.region_tree,
+            &mut context.live_ranges,
+            &mut context.counts,
+            &mut context.events,
+            &mut context.output,
             region,
         )?;
     }
 
-    counts.final_live_spans += live_ranges.len_spans();
-    counts.final_bundles += live_ranges.len_bundles();
+    context.counts.final_live_spans += context.live_ranges.len_spans();
+    context.counts.final_bundles += context.live_ranges.len_bundles();
 
     Ok(())
 }
@@ -734,55 +724,44 @@ where
             OperandConstraint::Reuse(_) => unreachable!("already resolved"),
         };
 
-        let best = {
-            let RegionAllocation {
-                region_assignments,
-                split_spans,
-                split_span_vals,
-                split_uses,
-                interference_scratch,
-                ..
-            } = self;
+        let best = match rc.members(input.machine) {
+            RegClassMembers::Regs(regs) => splitting::best_split_between_spans(
+                &self.split_spans,
+                &self.split_uses,
+                pref.iter()
+                    .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                |reg, half| {
+                    self.region_assignments.interference_weight(
+                        core::iter::once(reg.units(input.machine)),
+                        half.iter_indexed()
+                            .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
+                        &mut self.interference_scratch,
+                        |victim| victim.spill_weight(live_ranges),
+                    )
+                },
+            )
+            .map(|best| (best.cut, Some(best.candidate))),
 
-            match rc.members(input.machine) {
-                RegClassMembers::Regs(regs) => splitting::best_split_between_spans(
-                    split_spans,
-                    split_uses,
-                    pref.iter()
-                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                    |reg, half| {
-                        region_assignments.interference_weight(
-                            core::iter::once(reg.units(input.machine)),
+            RegClassMembers::Groups(groups) => {
+                debug_assert!(pref.is_empty());
+                splitting::best_split_between_spans(
+                    &self.split_spans,
+                    &self.split_uses,
+                    groups.iter().copied(),
+                    |group, half| {
+                        self.region_assignments.interference_weight(
+                            group
+                                .members(input.machine)
+                                .iter()
+                                .map(|r| r.units(input.machine)),
                             half.iter_indexed()
-                                .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
-                            interference_scratch,
+                                .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
+                            &mut self.interference_scratch,
                             |victim| victim.spill_weight(live_ranges),
                         )
                     },
                 )
-                .map(|best| (best.cut, Some(best.candidate))),
-
-                RegClassMembers::Groups(groups) => {
-                    debug_assert!(pref.is_empty());
-                    splitting::best_split_between_spans(
-                        split_spans,
-                        split_uses,
-                        groups.iter().copied(),
-                        |group, half| {
-                            region_assignments.interference_weight(
-                                group
-                                    .members(input.machine)
-                                    .iter()
-                                    .map(|r| r.units(input.machine)),
-                                half.iter_indexed()
-                                    .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
-                                interference_scratch,
-                                |victim| victim.spill_weight(live_ranges),
-                            )
-                        },
-                    )
-                    .map(|best| (best.cut, None))
-                }
+                .map(|best| (best.cut, None))
             }
         };
 
@@ -884,58 +863,47 @@ where
             OperandConstraint::Reuse(_) => unreachable!("already resolved"),
         };
 
-        let (cut, winner) = {
-            let RegionAllocation {
-                region_assignments,
-                split_spans,
-                split_span_vals,
-                split_uses,
-                interference_scratch,
-                ..
-            } = self;
-
-            match rc.members(input.machine) {
-                RegClassMembers::Regs(regs) => {
-                    let best = splitting::best_split_within_span(
-                        split_spans,
-                        split_uses,
-                        pref.iter()
-                            .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                        |reg, half| {
-                            region_assignments.interference_weight(
-                                core::iter::once(reg.units(input.machine)),
-                                half.iter_indexed()
-                                    .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
-                                interference_scratch,
-                                |victim| victim.spill_weight(live_ranges),
-                            )
-                        },
-                    )
-                    .expect("already rejected unsplittable bundles");
-                    (best.cut, Some(best.candidate))
-                }
-                RegClassMembers::Groups(groups) => {
-                    debug_assert!(pref.is_empty());
-                    let best = splitting::best_split_within_span(
-                        split_spans,
-                        split_uses,
-                        groups.iter().copied(),
-                        |group, half| {
-                            region_assignments.interference_weight(
-                                group
-                                    .members(input.machine)
-                                    .iter()
-                                    .map(|r| r.units(input.machine)),
-                                half.iter_indexed()
-                                    .map(|(i, r)| QuerySpan::porous_to(split_span_vals[i], r)),
-                                interference_scratch,
-                                |victim| victim.spill_weight(live_ranges),
-                            )
-                        },
-                    )
-                    .expect("already rejected unsplittable bundles");
-                    (best.cut, None)
-                }
+        let (cut, winner) = match rc.members(input.machine) {
+            RegClassMembers::Regs(regs) => {
+                let best = splitting::best_split_within_span(
+                    &self.split_spans,
+                    &self.split_uses,
+                    pref.iter()
+                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                    |reg, half| {
+                        self.region_assignments.interference_weight(
+                            core::iter::once(reg.units(input.machine)),
+                            half.iter_indexed()
+                                .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
+                            &mut self.interference_scratch,
+                            |victim| victim.spill_weight(live_ranges),
+                        )
+                    },
+                )
+                .expect("already rejected unsplittable bundles");
+                (best.cut, Some(best.candidate))
+            }
+            RegClassMembers::Groups(groups) => {
+                debug_assert!(pref.is_empty());
+                let best = splitting::best_split_within_span(
+                    &self.split_spans,
+                    &self.split_uses,
+                    groups.iter().copied(),
+                    |group, half| {
+                        self.region_assignments.interference_weight(
+                            group
+                                .members(input.machine)
+                                .iter()
+                                .map(|r| r.units(input.machine)),
+                            half.iter_indexed()
+                                .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
+                            &mut self.interference_scratch,
+                            |victim| victim.spill_weight(live_ranges),
+                        )
+                    },
+                )
+                .expect("already rejected unsplittable bundles");
+                (best.cut, None)
             }
         };
 
@@ -1648,22 +1616,26 @@ mod tests {
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let inner = &mut context.context32;
-            let ContextInner {
-                counts,
-                events,
-                rpo,
-                region_tree,
-                liveness,
-                live_ranges,
-                dfs,
-                output,
-                ..
-            } = inner;
             let func = input.func;
-            rpo.construct(func, dfs, output)?;
-            region_tree.construct(func, counts, dfs, output)?;
-            liveness.construct(func, counts, rpo, output)?;
-            live_ranges.construct(input, counts, events, liveness, output)?;
+            inner
+                .rpo
+                .construct(func, &mut inner.dfs, &mut inner.output)?;
+            inner.region_tree.construct(
+                func,
+                &mut inner.counts,
+                &mut inner.dfs,
+                &mut inner.output,
+            )?;
+            inner
+                .liveness
+                .construct(func, &mut inner.counts, &inner.rpo, &mut inner.output)?;
+            inner.live_ranges.construct(
+                input,
+                &mut inner.counts,
+                &mut inner.events,
+                &mut inner.liveness,
+                &mut inner.output,
+            )?;
             crate::coalescing::coalesce(inner, input)?;
             region_allocate(inner, input)
         });

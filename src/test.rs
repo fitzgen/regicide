@@ -835,20 +835,14 @@ impl TestFunction {
             self.predecessors[Block::try_new(i).unwrap()].clear();
         }
 
-        let Self {
-            blocks,
-            insts,
-            predecessors,
-            ..
-        } = self;
-        for (block, block_data) in blocks.iter() {
+        for (block, block_data) in self.blocks.iter() {
             let terminator = *block_data.insts.last().unwrap();
             // These are the same block calls that `successors` reads, so the
             // two cannot disagree about what the edges are. One entry per edge,
             // so a block that branches to the same target twice appears twice
             // in that target's predecessors.
-            for call in insts[terminator].block_calls() {
-                predecessors[call.target].push(block);
+            for call in self.insts[terminator].block_calls() {
+                self.predecessors[call.target].push(block);
             }
         }
     }
@@ -958,24 +952,21 @@ impl TestFunction {
                 .unwrap()
         };
 
-        let Self {
-            values,
-            blocks,
-            insts,
-            ..
-        } = self;
-
-        for (block, block_data) in blocks.iter_mut() {
+        for (block, block_data) in self.blocks.iter_mut() {
             for (i, param) in block_data.params.iter_mut().enumerate() {
-                *param = fresh_val(values, *param, ValDef::BlockParam { block, i });
+                *param = fresh_val(&mut self.values, *param, ValDef::BlockParam { block, i });
             }
 
             for inst in &block_data.insts {
                 let inst = *inst;
                 let mut i = 0;
-                for op in insts[inst].operands_mut() {
+                for op in self.insts[inst].operands_mut() {
                     if let (DefUse::Def, Some(val)) = (op.kind(), op.val()) {
-                        op.set_val(Some(fresh_val(values, val, ValDef::InstResult { inst, i })));
+                        op.set_val(Some(fresh_val(
+                            &mut self.values,
+                            val,
+                            ValDef::InstResult { inst, i },
+                        )));
                         i += 1;
                     }
                 }
@@ -986,11 +977,10 @@ impl TestFunction {
     /// Make every block call pass exactly as many arguments as its target block
     /// has parameters.
     fn ensure_block_call_arity(&mut self) {
-        let Self { blocks, insts, .. } = self;
-        for (_block, block_data) in blocks.iter() {
+        for (_block, block_data) in self.blocks.iter() {
             for inst in &block_data.insts {
-                for call in insts[*inst].block_calls_mut() {
-                    let arity = blocks[call.target].params.len();
+                for call in self.insts[*inst].block_calls_mut() {
+                    let arity = self.blocks[call.target].params.len();
                     call.args.resize(arity, Val::default());
                 }
             }
@@ -1003,10 +993,9 @@ impl TestFunction {
     /// A definition carrying one moves to [`Position::Late`]; a use carrying
     /// one loses it, since making it a definition would give its value two.
     fn ensure_operand_constraints(&mut self) {
-        let Self { insts, .. } = self;
         let mut reusable = Vec::new();
 
-        for (_inst, inst_data) in insts.iter_mut() {
+        for (_inst, inst_data) in self.insts.iter_mut() {
             let operands = inst_data.operands_mut();
 
             reusable.clear();
@@ -1053,22 +1042,15 @@ impl TestFunction {
     /// Make the values that this function pins to a single location agree about
     /// which register class they belong to.
     fn ensure_reg_classes_agree(&mut self) {
-        let Self {
-            values,
-            blocks,
-            insts,
-            ..
-        } = self;
-
         let mut sets = UnionFind::<Val>::new();
 
-        for (_block, block_data) in blocks.iter() {
+        for (_block, block_data) in self.blocks.iter() {
             for inst in &block_data.insts {
-                let inst_data = &insts[*inst];
+                let inst_data = &self.insts[*inst];
 
                 // Block-call arguments and block params must agree.
                 for call in inst_data.block_calls() {
-                    for (arg, param) in call.args.iter().zip(&blocks[call.target].params) {
+                    for (arg, param) in call.args.iter().zip(&self.blocks[call.target].params) {
                         sets.union(*arg, *param);
                     }
                 }
@@ -1088,12 +1070,12 @@ impl TestFunction {
         }
 
         let max_reg_classes = u8::try_from(MAX_REG_CLASSES).unwrap();
-        for i in 0..values.len() {
+        for i in 0..self.values.len() {
             let val = Val::try_new(i).unwrap();
             let root = sets.find(val);
-            debug_assert!(root.index() < values.len());
-            let reg_class = values[root].reg_class % max_reg_classes;
-            values[val].reg_class = reg_class;
+            debug_assert!(root.index() < self.values.len());
+            let reg_class = self.values[root].reg_class % max_reg_classes;
+            self.values[val].reg_class = reg_class;
         }
     }
 
@@ -1101,13 +1083,6 @@ impl TestFunction {
     /// dominates it.
     fn ensure_uses_dominated_by_defs(&mut self) {
         let entry = self.entry_block();
-        let Self {
-            blocks,
-            insts,
-            dominators,
-            ..
-        } = self;
-
         let mut scope = Vec::<Val>::new();
         let mut stack = vec![ScopeFrame::Enter(entry)];
 
@@ -1121,18 +1096,18 @@ impl TestFunction {
             };
 
             stack.push(ScopeFrame::Restore(scope.len()));
-            scope.extend_from_slice(&blocks[block].params);
+            scope.extend_from_slice(&self.blocks[block].params);
 
-            for inst in &blocks[block].insts {
+            for inst in &self.blocks[block].insts {
                 let inst = *inst;
 
-                for op in insts[inst].operands_mut() {
+                for op in self.insts[inst].operands_mut() {
                     if let (DefUse::Use, Some(val)) = (op.kind(), op.val()) {
                         op.set_val(Some(in_scope(&scope, val)));
                     }
                 }
 
-                for op in insts[inst].operands() {
+                for op in self.insts[inst].operands() {
                     if let (DefUse::Def, Some(val)) = (op.kind(), op.val()) {
                         scope.push(val);
                     }
@@ -1140,7 +1115,7 @@ impl TestFunction {
 
                 // Outgoing arguments are read as control leaves the block,
                 // so they see the terminator's own definitions.
-                for call in insts[inst].block_calls_mut() {
+                for call in self.insts[inst].block_calls_mut() {
                     for arg in &mut call.args {
                         *arg = in_scope(&scope, *arg);
                     }
@@ -1148,7 +1123,7 @@ impl TestFunction {
             }
 
             // Every block is reachable, so this walk reaches every block.
-            stack.extend(block.dom_children(dominators).map(ScopeFrame::Enter));
+            stack.extend(block.dom_children(&self.dominators).map(ScopeFrame::Enter));
         }
     }
 }

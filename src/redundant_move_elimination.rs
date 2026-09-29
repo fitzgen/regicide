@@ -76,43 +76,37 @@ where
 
     let _timing = Timing::new("eliminate redundant moves");
 
-    let ContextInner {
-        counts,
-        events,
-        rpo,
-        liveness,
-        spill_slots,
-        move_generation,
-        redundant_move_elimination,
-        output,
-        ..
-    } = context;
-
     {
         let mut eliminator = Eliminator {
             input,
-            output,
-            move_generation,
-            spill_slots,
-            rpo,
-            liveness,
-            counts,
-            events,
-            me: redundant_move_elimination,
+            output: &context.output,
+            move_generation: &context.move_generation,
+            spill_slots: &context.spill_slots,
+            rpo: &context.rpo,
+            liveness: &context.liveness,
+            counts: &mut context.counts,
+            events: &mut context.events,
+            me: &mut context.redundant_move_elimination,
         };
         eliminator.run(level);
     }
 
-    redundant_move_elimination.eliminated.sort_unstable();
+    context
+        .redundant_move_elimination
+        .eliminated
+        .sort_unstable();
     debug_assert!(
-        redundant_move_elimination
+        context
+            .redundant_move_elimination
             .eliminated
             .windows(2)
             .all(|w| w[0] != w[1]),
         "must have no duplicates",
     );
 
-    move_generation.remove_edits(&redundant_move_elimination.eliminated);
+    context
+        .move_generation
+        .remove_edits(&context.redundant_move_elimination.eliminated);
     Ok(())
 }
 

@@ -158,27 +158,15 @@ where
 {
     let _timing = Timing::new("allocate spill slots");
 
-    let ContextInner {
-        counts,
-        events,
-        rpo,
-        liveness,
-        live_ranges,
-        region_allocation,
-        spill_slots,
-        output,
-        ..
-    } = context;
-
-    spill_slots.allocate(
+    context.spill_slots.allocate(
         input,
-        counts,
-        events,
-        rpo,
-        liveness,
-        live_ranges,
-        region_allocation,
-        output,
+        &mut context.counts,
+        &mut context.events,
+        &context.rpo,
+        &context.liveness,
+        &context.live_ranges,
+        &context.region_allocation,
+        &mut context.output,
     )
 }
 
@@ -954,24 +942,36 @@ mod tests {
         context: &mut ContextInner<u32>,
         input: &Input<'_, crate::test::TestFunction>,
     ) -> Result<(), String> {
-        let ContextInner {
-            counts,
-            events,
-            rpo,
-            region_tree,
-            liveness,
-            live_ranges,
-            dfs,
-            output,
-            ..
-        } = context;
         let func = input.func;
-        let result = rpo
-            .construct(func, dfs, output)
-            .and_then(|()| region_tree.construct(func, counts, dfs, output))
-            .and_then(|()| liveness.construct(func, counts, rpo, output))
-            .and_then(|()| live_ranges.construct(input, counts, events, liveness, output));
-        result.map_err(|()| format!("analysis failed: {:?}", output.take_error()))
+        let result = context
+            .rpo
+            .construct(func, &mut context.dfs, &mut context.output)
+            .and_then(|()| {
+                context.region_tree.construct(
+                    func,
+                    &mut context.counts,
+                    &mut context.dfs,
+                    &mut context.output,
+                )
+            })
+            .and_then(|()| {
+                context.liveness.construct(
+                    func,
+                    &mut context.counts,
+                    &context.rpo,
+                    &mut context.output,
+                )
+            })
+            .and_then(|()| {
+                context.live_ranges.construct(
+                    input,
+                    &mut context.counts,
+                    &mut context.events,
+                    &mut context.liveness,
+                    &mut context.output,
+                )
+            });
+        result.map_err(|()| format!("analysis failed: {:?}", context.output.take_error()))
     }
 
     /// Where each spilled value's slot has to be reserved, as one range per
@@ -1074,20 +1074,17 @@ mod tests {
                 .map(|(_, val)| val)
                 .collect();
 
-            {
-                let ContextInner {
-                    counts,
-                    events,
-                    rpo,
-                    liveness,
-                    spill_slots,
-                    output,
-                    ..
-                } = &mut *context;
-                spill_slots
-                    .color(input, counts, events, rpo, liveness, output)
-                    .map_err(|()| format!("coloring failed: {:?}", output.take_error()))?;
-            }
+            context
+                .spill_slots
+                .color(
+                    input,
+                    &mut context.counts,
+                    &mut context.events,
+                    &context.rpo,
+                    &context.liveness,
+                    &mut context.output,
+                )
+                .map_err(|()| format!("coloring failed: {:?}", context.output.take_error()))?;
 
             let spill_slots = &context.spill_slots;
 

@@ -180,28 +180,32 @@ where
          ======================================="
     );
 
-    {
-        let ContextInner {
-            counts,
-            events,
-            rpo,
-            region_tree,
-            liveness,
-            live_ranges,
-            dfs,
-            output,
-            ..
-        } = &mut *context;
-
-        if input.options.validate_input {
-            validation::validate(input, output)?;
-        }
-
-        rpo.construct(input.func, dfs, output)?;
-        region_tree.construct(input.func, counts, dfs, output)?;
-        liveness.construct(input.func, counts, rpo, output)?;
-        live_ranges.construct(input, counts, events, liveness, output)?;
+    if input.options.validate_input {
+        validation::validate(input, &mut context.output)?;
     }
+
+    context
+        .rpo
+        .construct(input.func, &mut context.dfs, &mut context.output)?;
+    context.region_tree.construct(
+        input.func,
+        &mut context.counts,
+        &mut context.dfs,
+        &mut context.output,
+    )?;
+    context.liveness.construct(
+        input.func,
+        &mut context.counts,
+        &context.rpo,
+        &mut context.output,
+    )?;
+    context.live_ranges.construct(
+        input,
+        &mut context.counts,
+        &mut context.events,
+        &mut context.liveness,
+        &mut context.output,
+    )?;
 
     coalescing::coalesce(context, input)?;
     region_allocation::region_allocate(context, input)?;
@@ -209,16 +213,13 @@ where
     spill_placement::place_spills(context, input)?;
     move_generation::generate_moves(context, input)?;
 
-    {
-        let ContextInner {
-            rpo,
-            live_ranges,
-            spill_slots,
-            output,
-            ..
-        } = &mut *context;
-        output.construct(input.func, input.machine, rpo, live_ranges, spill_slots)?;
-    }
+    context.output.construct(
+        input.func,
+        input.machine,
+        &context.rpo,
+        &context.live_ranges,
+        &context.spill_slots,
+    )?;
 
     redundant_move_elimination::eliminate_redundant_moves(context, input)?;
 

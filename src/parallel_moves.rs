@@ -668,15 +668,10 @@ where
     fn note_emitted(&mut self, mv: ParallelMove<E>, source: &impl ScratchSource<E>) {
         match mv.src {
             ScalarAllocation::Reg(_) => {
-                let Self {
-                    available,
-                    available_set,
-                    ..
-                } = self;
-                available.retain(|&reg| {
+                self.available.retain(|&reg| {
                     let remove = source.overlaps(reg.into(), mv.src);
                     if remove {
-                        available_set.remove(reg.with_repr32());
+                        self.available_set.remove(reg.with_repr32());
                     }
                     !remove
                 });
@@ -1004,14 +999,10 @@ where
     where
         S: ScratchSource<E>,
     {
-        let Emit {
-            out, base, pool, ..
-        } = emit;
-
         // A move we have yet to emit executes before this point in the batch,
         // so it already delivered its value into `loc` by this execution point,
         // and overwriting `loc` now would throw that value away.
-        if pool.is_filled_later(loc) {
+        if emit.pool.is_filled_later(loc) {
             return false;
         }
 
@@ -1019,7 +1010,7 @@ where
         // the program from the point we are at. A write of `loc` shields
         // everything past it, so we can stop there; a read we reach before
         // any such write is a value we would be destroying.
-        for mv in out[*base..].iter().rev() {
+        for mv in emit.out[emit.base..].iter().rev() {
             // Identity, not overlap, because this method asks whether this
             // `loc` itself is still in use or not.
             if mv.src == loc {
@@ -1030,7 +1021,7 @@ where
             }
         }
 
-        !pool.is_held(loc)
+        !emit.pool.is_held(loc)
     }
 
     /// Collect the registers the batch is finished with, for
@@ -1192,10 +1183,9 @@ where
             emit.pool.evicting,
         );
 
-        let slot = {
-            let Emit { pool, source, .. } = &mut *emit;
-            source.emergency_slot(mv, reason, &pool.unavailable)?
-        };
+        let slot = emit
+            .source
+            .emergency_slot(mv, reason, &emit.pool.unavailable)?;
         emit.pool.note_temporary_slot(slot);
 
         Ok(ScalarAllocation::Stack(slot))
@@ -1207,16 +1197,9 @@ where
     where
         S: ScratchSource<E>,
     {
-        let Emit { pool, source, .. } = &mut *emit;
-        let ScratchPool {
-            unavailable,
-            evicting,
-            ..
-        } = &mut **pool;
-
         let mut num_tight = 0;
-        for i in 0..evicting.len() {
-            let loc = ScalarAllocation::Reg(evicting[i].0);
+        for i in 0..emit.pool.evicting.len() {
+            let loc = ScalarAllocation::Reg(emit.pool.evicting[i].0);
 
             // A location that is a source or destination (or overlaps a
             // destination) in this batch must be tight-bracketed, or else we
@@ -1224,21 +1207,21 @@ where
             let is_in_batch = self
                 .moves
                 .values()
-                .any(|&mv| mv.src == loc || mv.dst == loc || source.overlaps(loc, mv.dst));
+                .any(|&mv| mv.src == loc || mv.dst == loc || emit.source.overlaps(loc, mv.dst));
 
             // Same for rewritten move-cycle destinations.
             let is_rewritten = self
                 .rewritten_destinations
                 .iter()
-                .any(|&dst| source.overlaps(loc, dst));
+                .any(|&dst| emit.source.overlaps(loc, dst));
 
             // An unavailable location is currently holding a value for this
             // batch, so we must tight-bracket its eviction, so that the rest of
             // the batch still sees its value.
-            let is_unavailable = unavailable.contains(&loc);
+            let is_unavailable = emit.pool.unavailable.contains(&loc);
 
             if is_in_batch || is_rewritten || is_unavailable {
-                evicting.swap(num_tight, i);
+                emit.pool.evicting.swap(num_tight, i);
                 num_tight += 1;
             }
         }
@@ -1450,32 +1433,25 @@ where
              {reg:?} came back for a cycle break",
         );
 
-        let Emit { pool, source, .. } = &mut *emit;
-        let ScratchPool {
-            evicting,
-            wide_evictions,
-            unavailable,
-            ..
-        } = &**pool;
-        let tight_evictions = &evicting[..num_tight];
+        let tight_evictions = &emit.pool.evicting[..num_tight];
 
-        self.debug_assert_evictions_are_disjoint(tight_evictions, &**source);
+        self.debug_assert_evictions_are_disjoint(tight_evictions, &*emit.source);
 
         for &(_, slot) in tight_evictions.iter() {
             let slot = ScalarAllocation::Stack(slot);
 
             for &mv in self.moves.values() {
                 debug_assert!(
-                    !source.overlaps(slot, mv.src) && !source.overlaps(slot, mv.dst),
+                    !emit.source.overlaps(slot, mv.src) && !emit.source.overlaps(slot, mv.dst),
                     "the slot an evicted register sits in must not be one the batch names, \
                      but {slot:?} overlaps {mv:?}",
                 );
             }
 
-            for &(_, other) in wide_evictions {
+            for &(_, other) in emit.pool.wide_evictions.iter() {
                 let other = ScalarAllocation::Stack(other);
                 debug_assert!(
-                    !source.overlaps(slot, other),
+                    !emit.source.overlaps(slot, other),
                     "each outstanding eviction needs a slot of its own, but {slot:?} \
                      overlaps {other:?}",
                 );
@@ -1486,9 +1462,9 @@ where
             // until after it closes, so however short this stay is, it is a
             // stay inside the park's, and saving here writes over what the
             // park is keeping for a move still to come.
-            for &other in unavailable.iter() {
+            for &other in emit.pool.unavailable.iter() {
                 debug_assert!(
-                    !source.overlaps(slot, other),
+                    !emit.source.overlaps(slot, other),
                     "the slot an evicted register sits in must not be one a broken cycle \
                      is parked in, but {slot:?} overlaps {other:?}",
                 );
@@ -1570,16 +1546,9 @@ where
             return;
         }
 
-        let Emit { pool, source, .. } = &mut *emit;
-        let ScratchPool {
-            evicting,
-            wide_evictions,
-            tight_or_parked_slots,
-            ..
-        } = &**pool;
-        let wide = &evicting[num_tight..];
+        let wide = &emit.pool.evicting[num_tight..];
 
-        self.debug_assert_evictions_are_disjoint(wide, &**source);
+        self.debug_assert_evictions_are_disjoint(wide, &*emit.source);
 
         for &(reg, _) in wide.iter() {
             let scratch = ScalarAllocation::Reg(reg);
@@ -1591,16 +1560,16 @@ where
                      the batch names, but {mv:?} names {scratch:?}",
                 );
                 debug_assert!(
-                    !source.overlaps(scratch, mv.dst),
+                    !emit.source.overlaps(scratch, mv.dst),
                     "a register evicted for the length of the batch must not share a \
                      unit with anything the batch writes, but {scratch:?} overlaps the \
                      destination of {mv:?}",
                 );
             }
 
-            for &(other, _) in wide_evictions {
+            for &(other, _) in emit.pool.wide_evictions.iter() {
                 debug_assert!(
-                    !source.overlaps(scratch, other.into()),
+                    !emit.source.overlaps(scratch, other.into()),
                     "two evicted scratch registers must not overlap, but {scratch:?} \
                      overlaps {other:?}",
                 );
@@ -1608,7 +1577,7 @@ where
 
             for &dst in &self.rewritten_destinations {
                 debug_assert!(
-                    !source.overlaps(scratch, dst),
+                    !emit.source.overlaps(scratch, dst),
                     "a register evicted for the length of the batch must not share a \
                      unit with where a broken cycle has already put its value, but \
                      {scratch:?} overlaps {dst:?}",
@@ -1623,16 +1592,16 @@ where
 
             for &mv in self.moves.values() {
                 debug_assert!(
-                    !source.overlaps(slot, mv.src) && !source.overlaps(slot, mv.dst),
+                    !emit.source.overlaps(slot, mv.src) && !emit.source.overlaps(slot, mv.dst),
                     "the slot an evicted register sits in must not be one the batch names, \
                      but {slot:?} overlaps {mv:?}",
                 );
             }
 
-            for &(_, other) in wide_evictions {
+            for &(_, other) in emit.pool.wide_evictions.iter() {
                 let other = ScalarAllocation::Stack(other);
                 debug_assert!(
-                    !source.overlaps(slot, other),
+                    !emit.source.overlaps(slot, other),
                     "each outstanding eviction needs a slot of its own, but {slot:?} \
                      overlaps {other:?}",
                 );
@@ -1642,10 +1611,10 @@ where
             // the batch writes, and this bracket is open across the whole
             // batch: that write lands on top of what we put here, and the
             // reload at the end takes it back out in its place.
-            for &other in tight_or_parked_slots {
+            for &other in emit.pool.tight_or_parked_slots.iter() {
                 let other = ScalarAllocation::Stack(other);
                 debug_assert!(
-                    !source.overlaps(slot, other),
+                    !emit.source.overlaps(slot, other),
                     "a slot evicted for the length of the batch must be one nothing \
                      else in the batch puts anything in, but {slot:?} overlaps {other:?}, \
                      which a bracket closing inside the batch or a parked cycle has \
@@ -1799,9 +1768,8 @@ where
             return;
         }
 
-        let Emit { pool, source, .. } = &mut *emit;
-        for (i, &(other, _)) in pool.evicting.iter().enumerate() {
-            if let Some(predicted) = source.predicted_tight(other, &pool.unavailable) {
+        for (i, &(other, _)) in emit.pool.evicting.iter().enumerate() {
+            if let Some(predicted) = emit.source.predicted_tight(other, &emit.pool.unavailable) {
                 debug_assert_eq!(
                     i < num_tight,
                     predicted,
@@ -1828,21 +1796,21 @@ where
     {
         assert!(cfg!(debug_assertions));
 
-        let Emit { pool, source, .. } = &mut *emit;
-        let ScratchPool {
-            unavailable,
-            wide_evictions,
-            ..
-        } = &**pool;
         let reg = ScalarAllocation::Reg(reg);
 
         self.moves
             .values()
-            .any(|&mv| source.overlaps(reg, mv.src) || source.overlaps(reg, mv.dst))
-            || unavailable.iter().any(|&s| source.overlaps(reg, s))
-            || wide_evictions
+            .any(|&mv| emit.source.overlaps(reg, mv.src) || emit.source.overlaps(reg, mv.dst))
+            || emit
+                .pool
+                .unavailable
                 .iter()
-                .any(|&(other, _)| source.overlaps(reg, other.into()))
+                .any(|&s| emit.source.overlaps(reg, s))
+            || emit
+                .pool
+                .wide_evictions
+                .iter()
+                .any(|&(other, _)| emit.source.overlaps(reg, other.into()))
     }
 }
 

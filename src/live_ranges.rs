@@ -915,21 +915,6 @@ where
     ) -> IResult<()> {
         let _timing = Timing::new("live ranges");
 
-        // Borrow the two maps separately so that `Liveness::block_spans` can
-        // append to `uses` while we push into `spans`.
-        let Self {
-            uses,
-            spans,
-            block_spans,
-            live_in_spans,
-            live_out_spans,
-            block_uses,
-            reservations,
-            block_reservations,
-            use_span,
-            ..
-        } = self;
-
         // Construct a span for each value live in or across this block.
         for (block, input_block) in input.func.blocks() {
             let first_inst = output.with_repr(block_first_inst(&input_block))?;
@@ -938,28 +923,36 @@ where
             let block_end = LivePoint::new(last_inst, Position::Late).next_point();
 
             let block = output.with_repr(block)?;
-            let spans_start = spans.next_key(output)?;
-            let uses_start = uses.next_key(output)?;
+            let spans_start = self.spans.next_key(output)?;
+            let uses_start = self.uses.next_key(output)?;
 
             // Collected before the spans, so that nothing below has to thread
             // reservations through the per-value walk.
-            let reservations_start = reservations.next_key(output)?;
-            collect_block_reservations(input, reservations, &input_block, output)?;
-            block_reservations[block] = EntityRange {
+            let reservations_start = self.reservations.next_key(output)?;
+            collect_block_reservations(input, &mut self.reservations, &input_block, output)?;
+            self.block_reservations[block] = EntityRange {
                 start: reservations_start,
-                end: reservations.next_key(output)?,
+                end: self.reservations.next_key(output)?,
             };
 
             #[cfg(feature = "visualizer")]
             let events_start = events.len();
 
-            for span in liveness.block_spans(input.func, block, uses, output)? {
+            for span in liveness.block_spans(input.func, block, &mut self.uses, output)? {
                 push_span_and_split_conflicts(
-                    input, uses, spans, counts, events, span, block, block_end, output,
+                    input,
+                    &self.uses,
+                    &mut self.spans,
+                    counts,
+                    events,
+                    span,
+                    block,
+                    block_end,
+                    output,
                 )?;
             }
-            let uses_end = uses.next_key(output)?;
-            let spans_end = spans.next_key(output)?;
+            let uses_end = self.uses.next_key(output)?;
+            let spans_end = self.spans.next_key(output)?;
 
             // Sort this block's spans into buckets so that live-in and live-out
             // spans are both in a contiguous run.
@@ -985,12 +978,12 @@ where
             // invalidate, so remember the order they were pushed in.
             #[cfg(feature = "visualizer")]
             let keys_before = alloc::vec::Vec::from_iter(
-                spans.as_slice()[block_span_range.clone()]
+                self.spans.as_slice()[block_span_range.clone()]
                     .iter()
                     .map(sort_key),
             );
 
-            spans.as_mut_slice()[block_span_range.clone()].sort_unstable_by_key(sort_key);
+            self.spans.as_mut_slice()[block_span_range.clone()].sort_unstable_by_key(sort_key);
 
             #[cfg(feature = "visualizer")]
             remap_block_span_events(
@@ -999,7 +992,7 @@ where
                 spans_start,
                 &keys_before,
                 &alloc::vec::Vec::from_iter(
-                    spans.as_slice()[block_span_range].iter().map(sort_key),
+                    self.spans.as_slice()[block_span_range].iter().map(sort_key),
                 ),
             );
 
@@ -1013,55 +1006,55 @@ where
                 start: spans_start,
                 end: spans_end,
             }) {
-                let val = spans[span].val;
-                for u in spans[span].uses {
-                    use_span[u] = span;
-                    uses[u].weight = use_spill_weight(input, uses, frequency, val, u);
+                let val = self.spans[span].val;
+                for u in self.spans[span].uses {
+                    self.use_span[u] = span;
+                    self.uses[u].weight = use_spill_weight(input, &self.uses, frequency, val, u);
                 }
 
                 let next = LiveSpan::try_new(span.index() + 1).unwrap();
-                if spans[span].start == block_start {
+                if self.spans[span].start == block_start {
                     live_in_end = next;
                 }
-                if spans[span].end == block_end {
+                if self.spans[span].end == block_end {
                     live_out_start.get_or_insert(span);
                     live_out_end = next;
                 }
             }
 
-            block_spans[block] = EntityRange {
+            self.block_spans[block] = EntityRange {
                 start: spans_start,
                 end: spans_end,
             };
 
-            block_uses[block] = EntityRange {
+            self.block_uses[block] = EntityRange {
                 start: uses_start,
                 end: uses_end,
             };
             debug_assert!(
-                block_uses[block]
+                self.block_uses[block]
                     .into_iter()
-                    .all(|u| use_span[u] != LiveSpan::default())
+                    .all(|u| self.use_span[u] != LiveSpan::default())
             );
 
-            live_in_spans[block] = EntityRange {
+            self.live_in_spans[block] = EntityRange {
                 start: spans_start,
                 end: live_in_end,
             };
             debug_assert!(
-                live_in_spans[block]
+                self.live_in_spans[block]
                     .into_iter()
-                    .all(|s| spans[s].start == block_start)
+                    .all(|s| self.spans[s].start == block_start)
             );
             debug_assert_eq!(
-                live_in_spans[block].into_iter().count(),
-                block_spans[block]
+                self.live_in_spans[block].into_iter().count(),
+                self.block_spans[block]
                     .into_iter()
-                    .filter(|&s| spans[s].start == block_start)
+                    .filter(|&s| self.spans[s].start == block_start)
                     .count(),
             );
 
-            live_out_spans[block] = match live_out_start {
+            self.live_out_spans[block] = match live_out_start {
                 Some(start) => EntityRange {
                     start,
                     end: live_out_end,
@@ -1069,21 +1062,21 @@ where
                 None => EntityRange::empty(),
             };
             debug_assert!(
-                live_out_spans[block]
+                self.live_out_spans[block]
                     .into_iter()
-                    .all(|s| spans[s].end == block_end)
+                    .all(|s| self.spans[s].end == block_end)
             );
             debug_assert_eq!(
-                live_out_spans[block].into_iter().count(),
-                block_spans[block]
+                self.live_out_spans[block].into_iter().count(),
+                self.block_spans[block]
                     .into_iter()
-                    .filter(|&s| spans[s].end == block_end)
+                    .filter(|&s| self.spans[s].end == block_end)
                     .count(),
             );
         }
 
-        counts.live_spans += spans.len();
-        counts.uses += uses.len();
+        counts.live_spans += self.spans.len();
+        counts.uses += self.uses.len();
         Ok(())
     }
 }

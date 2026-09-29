@@ -81,29 +81,16 @@ where
 {
     let _timing = Timing::new("place spills");
 
-    let ContextInner {
-        counts,
-        events,
-        rpo,
-        region_tree,
-        live_ranges,
-        region_allocation,
-        spill_slots,
-        spill_placement,
-        output,
-        ..
-    } = context;
-
-    spill_placement.place(
+    context.spill_placement.place(
         input,
-        counts,
-        events,
-        rpo,
-        region_tree,
-        live_ranges,
-        region_allocation,
-        spill_slots,
-        output,
+        &mut context.counts,
+        &mut context.events,
+        &context.rpo,
+        &context.region_tree,
+        &context.live_ranges,
+        &context.region_allocation,
+        &context.spill_slots,
+        &mut context.output,
     )
 }
 
@@ -818,24 +805,29 @@ mod tests {
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let context = &mut context.context32;
-            {
-                let ContextInner {
-                    counts,
-                    events,
-                    rpo,
-                    region_tree,
-                    liveness,
-                    live_ranges,
-                    dfs,
-                    output,
-                    ..
-                } = &mut *context;
-                let func = input.func;
-                rpo.construct(func, dfs, output)?;
-                region_tree.construct(func, counts, dfs, output)?;
-                liveness.construct(func, counts, rpo, output)?;
-                live_ranges.construct(input, counts, events, liveness, output)?;
-            }
+            let func = input.func;
+            context
+                .rpo
+                .construct(func, &mut context.dfs, &mut context.output)?;
+            context.region_tree.construct(
+                func,
+                &mut context.counts,
+                &mut context.dfs,
+                &mut context.output,
+            )?;
+            context.liveness.construct(
+                func,
+                &mut context.counts,
+                &context.rpo,
+                &mut context.output,
+            )?;
+            context.live_ranges.construct(
+                input,
+                &mut context.counts,
+                &mut context.events,
+                &mut context.liveness,
+                &mut context.output,
+            )?;
             crate::coalescing::coalesce(context, input)?;
             crate::region_allocation::region_allocate(context, input)?;
             crate::spill_slot_allocation::allocate_spill_slots(context, input)?;

@@ -87,31 +87,17 @@ where
 {
     let _timing = Timing::new("generate moves");
 
-    let ContextInner {
-        counts,
-        events,
-        rpo,
-        liveness,
-        live_ranges,
-        region_allocation,
-        spill_slots,
-        spill_placement,
-        move_generation,
-        output,
-        ..
-    } = context;
-
-    move_generation.generate(
+    context.move_generation.generate(
         input,
-        counts,
-        events,
-        rpo,
-        liveness,
-        live_ranges,
-        region_allocation,
-        spill_slots,
-        spill_placement,
-        output,
+        &mut context.counts,
+        &mut context.events,
+        &context.rpo,
+        &context.liveness,
+        &context.live_ranges,
+        &context.region_allocation,
+        &mut context.spill_slots,
+        &context.spill_placement,
+        &mut context.output,
     )
 }
 
@@ -1543,11 +1529,6 @@ where
                     .reservation_in_outs
                     .binary_search_by_key(&key, |p| (p.inst, p.val))
                     .expect("`reservation_in_outs` has an entry for every reservation");
-                let ReservationInOut {
-                    read_from,
-                    written_into,
-                    ..
-                } = self.reservation_in_outs[entry];
 
                 if reservation.uses(live_ranges) {
                     // At the top of a block the move sits on the incoming
@@ -1558,18 +1539,21 @@ where
 
                     // A span filled in this very gap cannot be read out of
                     // here.
-                    let arrives_here = read_from.is_some_and(|span| {
-                        span.start(live_ranges) >= reservation.start(live_ranges)
-                            && self.arrives_in_the_gap(
-                                input,
-                                live_ranges,
-                                spill_slots,
-                                span,
-                                pos,
-                                key_val,
-                                held,
-                            )
-                    });
+                    let arrives_here =
+                        self.reservation_in_outs[entry]
+                            .read_from
+                            .is_some_and(|span| {
+                                span.start(live_ranges) >= reservation.start(live_ranges)
+                                    && self.arrives_in_the_gap(
+                                        input,
+                                        live_ranges,
+                                        spill_slots,
+                                        span,
+                                        pos,
+                                        key_val,
+                                        held,
+                                    )
+                            });
 
                     self.emit_reservation_arrival(
                         counts,
@@ -1579,7 +1563,7 @@ where
                         pos,
                         key_val,
                         held,
-                        read_from,
+                        self.reservation_in_outs[entry].read_from,
                         arrives_here,
                     );
                 }
@@ -1597,7 +1581,7 @@ where
                         reservation,
                         val,
                         held,
-                        written_into,
+                        self.reservation_in_outs[entry].written_into,
                     )?;
                 }
             }
@@ -2408,22 +2392,12 @@ where
         unavailable: &[ScalarAllocation<E>],
         taken: &[(Reg<E>, SpillSlot<E>)],
     ) -> Result<SpillSlot<E>, SolveError> {
-        let Self {
-            spill_slots,
-            output,
-            counts,
-            events,
-            expanded,
-            wide_evicted_slots,
-            tight_evicted_slots,
-            ..
-        } = self;
-        spill_slots
-            .emergency_slot(counts, events, output, size, |slot| {
+        self.spill_slots
+            .emergency_slot(self.counts, self.events, self.output, size, |slot| {
                 slot_is_taken(
-                    expanded,
-                    wide_evicted_slots,
-                    tight_evicted_slots,
+                    self.expanded,
+                    self.wide_evicted_slots,
+                    self.tight_evicted_slots,
                     bracket,
                     unavailable,
                     slot,
@@ -2769,12 +2743,8 @@ where
         // Find each evicted value somewhere to sit. The slot has to fit that
         // register, which need not be one of the move's own bank: the
         // neighbours we put out can belong to any bank sharing units with it.
-        for Occupant {
-            reg: other,
-            bracket,
-            ..
-        } in eviction_regs.iter()
-        {
+        for occupant in eviction_regs.iter() {
+            let other = occupant.reg;
             let slot = match self.stack_home(other, unavailable, evicting) {
                 Some(slot) => {
                     self.counts.scratch_reg_homes_reused.inc();
@@ -2782,7 +2752,7 @@ where
                 }
                 None => {
                     let size = other.bank(self.machine).size(self.machine);
-                    self.emergency_slot(size, bracket, unavailable, evicting)?
+                    self.emergency_slot(size, occupant.bracket, unavailable, evicting)?
                 }
             };
             self.counts.borrowed_scratch_regs.inc();
@@ -3253,24 +3223,19 @@ mod tests {
 
         let result = test_input.with_input(|input| -> IResult<()> {
             let ctx = &mut context.context32;
-            {
-                let ContextInner {
-                    counts,
-                    events,
-                    rpo,
-                    region_tree,
-                    liveness,
-                    live_ranges,
-                    dfs,
-                    output,
-                    ..
-                } = &mut *ctx;
-                let func = input.func;
-                rpo.construct(func, dfs, output)?;
-                region_tree.construct(func, counts, dfs, output)?;
-                liveness.construct(func, counts, rpo, output)?;
-                live_ranges.construct(input, counts, events, liveness, output)?;
-            }
+            let func = input.func;
+            ctx.rpo.construct(func, &mut ctx.dfs, &mut ctx.output)?;
+            ctx.region_tree
+                .construct(func, &mut ctx.counts, &mut ctx.dfs, &mut ctx.output)?;
+            ctx.liveness
+                .construct(func, &mut ctx.counts, &ctx.rpo, &mut ctx.output)?;
+            ctx.live_ranges.construct(
+                input,
+                &mut ctx.counts,
+                &mut ctx.events,
+                &mut ctx.liveness,
+                &mut ctx.output,
+            )?;
             crate::coalescing::coalesce(ctx, input)?;
             crate::region_allocation::region_allocate(ctx, input)?;
             crate::spill_slot_allocation::allocate_spill_slots(ctx, input)?;
