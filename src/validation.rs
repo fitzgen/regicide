@@ -972,10 +972,14 @@ where
             return output.error(e);
         }
 
+        // A block argument is read as control leaves the block, not at the
+        // terminator, so a terminator may pass a value it defines itself along
+        // its own out-edge. That is, e.g., Cranelift's `try_call`'s shape.
+        //
         // `validate_insts` has already checked that every block has at least
         // one instruction.
         let (terminator, num_insts) = terminator(&func.block(block)).unwrap();
-        let use_ = ProgramPoint::inst(block, num_insts - 1);
+        let use_ = ProgramPoint::block_exit(block, num_insts);
         for i in 0..func.block(block).len_successors() {
             for arg in func.block(block).successor_block_args(i) {
                 if !defs[arg].unwrap().dominates(use_, dominators) {
@@ -1037,6 +1041,18 @@ impl ProgramPoint {
         Self {
             block,
             position: i + 1,
+        }
+    }
+
+    /// The point at which control leaves a block of `num_insts` instructions,
+    /// after every one of them has run.
+    ///
+    /// This is where the block's outgoing arguments are read, so a value the
+    /// terminator itself defines is in scope here.
+    fn block_exit(block: Block, num_insts: usize) -> Self {
+        Self {
+            block,
+            position: num_insts + 1,
         }
     }
 

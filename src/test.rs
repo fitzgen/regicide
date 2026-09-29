@@ -882,21 +882,13 @@ impl TestFunction {
             for inst in &self.blocks[block].insts {
                 let inst_data = &self.insts[*inst];
 
-                // The block calls' arguments count as uses, because
-                // `ensure_block_call_arity` is about to give each of them one
-                // argument per parameter of its target block.
                 // An operand naming no value reads nothing that has to be
                 // in scope, so it is not a use for this purpose.
                 let uses = inst_data
                     .operands()
                     .iter()
                     .filter(|op| op.kind() == DefUse::Use && op.val().is_some())
-                    .count()
-                    + inst_data
-                        .block_calls()
-                        .iter()
-                        .map(|call| self.blocks[call.target].params.len())
-                        .sum::<usize>();
+                    .count();
                 if scope_len == 0 && uses > 0 {
                     needs_param = true;
                     break 'walk;
@@ -907,6 +899,21 @@ impl TestFunction {
                     .iter()
                     .filter(|op| op.kind() == DefUse::Def && op.val().is_some())
                     .count();
+
+                // Block call arguments count as uses too, since
+                // `ensure_block_call_arity` is about to give each one an
+                // argument per target parameter. Counted after this
+                // instruction's own definitions, because arguments are read
+                // as control leaves the block.
+                let call_args = inst_data
+                    .block_calls()
+                    .iter()
+                    .map(|call| self.blocks[call.target].params.len())
+                    .sum::<usize>();
+                if scope_len == 0 && call_args > 0 {
+                    needs_param = true;
+                    break 'walk;
+                }
             }
 
             stack.extend(block.dom_children(&self.dominators).map(ScopeFrame::Enter));
@@ -1124,15 +1131,18 @@ impl TestFunction {
                         op.set_val(Some(in_scope(&scope, val)));
                     }
                 }
-                for call in insts[inst].block_calls_mut() {
-                    for arg in &mut call.args {
-                        *arg = in_scope(&scope, *arg);
-                    }
-                }
 
                 for op in insts[inst].operands() {
                     if let (DefUse::Def, Some(val)) = (op.kind(), op.val()) {
                         scope.push(val);
+                    }
+                }
+
+                // Outgoing arguments are read as control leaves the block,
+                // so they see the terminator's own definitions.
+                for call in insts[inst].block_calls_mut() {
+                    for arg in &mut call.args {
+                        *arg = in_scope(&scope, *arg);
                     }
                 }
             }
@@ -4313,6 +4323,100 @@ impl TestInput {
             },
             BlockData {
                 params: vec![],
+                insts: vec![inst(1), inst(2)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A terminator that passes a value it defines itself along one of its own
+    /// out-edges, which is Cranelift's `try_call`'s shape.
+    pub fn with_a_terminator_passing_its_own_result() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let defined = Val::try_new(0).unwrap();
+        let param = Val::try_new(1).unwrap();
+        let target = Block::try_new(1).unwrap();
+
+        func.values = PrimaryMap::new();
+        // The terminator's result, and the parameter it feeds.
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: target,
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // The terminator, defining the value and passing it onwards.
+            InstData::Branch {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(defined),
+                )],
+                targets: vec![BlockCall {
+                    target,
+                    args: vec![defined],
+                }],
+            },
+            // A read of the parameter, plus a terminator so that
+            // `ensure_terminators` does not take the read away.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(param),
+                )],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param],
                 insts: vec![inst(1), inst(2)],
                 frequency: 0,
             },
@@ -8563,6 +8667,7 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_clobber_beside_a_live_through_value(),
         TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Any),
         TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Stack),
+        TestInput::with_a_terminator_passing_its_own_result(),
         TestInput::with_a_fixed_def_spilled_beside_a_fixed_read(),
         TestInput::with_a_reload_under_a_reversed_group_reservation(),
         TestInput::with_a_recomputed_value_pinned_at_a_block_start(),

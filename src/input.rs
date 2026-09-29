@@ -831,6 +831,10 @@ pub trait InputBlock<'a> {
         Self: 'b;
 
     /// Get the block arguments passed to this block's `i`th successor.
+    ///
+    /// An argument is read as control leaves this block, after the terminator
+    /// has run, and therefore the terminator may pass along one of its own
+    /// out-edges a value that it defines itself.
     fn successor_block_args(&self, successor: usize) -> Self::SuccessorBlockArgsIter<'_>;
 }
 
