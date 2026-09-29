@@ -104,6 +104,7 @@
     "insts": [
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -124,6 +125,7 @@
       },
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -136,6 +138,7 @@
       },
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": []
       }
@@ -1298,6 +1301,9 @@
       },
       "insts": {
         "block": "Block",
+        "clobbers": [
+          "Reg"
+        ],
         "edits": [
           {
             "edit": {

@@ -21,8 +21,8 @@ use crate::{
         DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, Operand,
         OperandConstraint, Position,
     },
-    live_ranges::{FixedOperand, MAX_INST_INDEX, MAX_OPERANDS_PER_INST, fixed_operand_of},
-    machine::{Machine, RegUnit},
+    live_ranges::{MAX_INST_INDEX, MAX_OPERANDS_PER_INST, fixed_operand_of},
+    machine::{Machine, Reg, RegUnit},
     output::{OutputInner, RegAllocation},
     timing::Timing,
 };
@@ -44,7 +44,12 @@ where
     // has a terminator to look at, so this goes first.
     validate_insts(func, output)?;
 
-    validate_entity_references(func, input.machine.num_user_classes(), output)?;
+    validate_entity_references(
+        func,
+        input.machine.num_user_classes(),
+        input.machine.num_registers(),
+        output,
+    )?;
 
     // Every check below this point indexes by entity, and computing the
     // dominator tree does too, so the bounds check has to come first. The
@@ -76,6 +81,7 @@ where
 fn validate_entity_references<E>(
     func: &impl InputFunction,
     num_classes: usize,
+    num_registers: usize,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
@@ -133,6 +139,7 @@ where
             num_blocks,
             num_values,
             num_classes,
+            num_registers,
         );
         if let Err(e) = result {
             return output.error(e);
@@ -148,6 +155,7 @@ fn check_block_references<'a>(
     num_blocks: usize,
     num_values: usize,
     num_classes: usize,
+    num_registers: usize,
 ) -> Result<()> {
     let mut num_params = 0;
     for param in input_block.params() {
@@ -191,6 +199,13 @@ fn check_block_references<'a>(
                 method: "operands_len",
                 block: Some(block),
             });
+        }
+
+        // The checks below index tables by a clobbered register.
+        for reg in input_inst.clobbers().iter() {
+            if reg.index() >= num_registers {
+                return Err(Error::RegOutOfBounds { inst, reg });
+            }
         }
 
         for (i, operand) in input_inst.operands().enumerate() {
@@ -615,8 +630,8 @@ fn check_block_reg_classes<'a>(
     Ok(())
 }
 
-/// Check that no two of an instruction's fixed operands want the same register
-/// at the same time.
+/// Check that no two of an instruction's fixed operands, and no fixed operand
+/// and clobber of it, want the same register at the same time.
 pub(crate) fn check_inst_fixed_operands(
     func: &impl InputFunction,
     machine: &Machine,
@@ -630,10 +645,10 @@ pub(crate) fn check_inst_fixed_operands(
 
     // One hold per (claim, register, half). Two claims want the same register
     // at the same time exactly when two holds overlap.
-    for operand in 0..num_operands {
-        let Some(claim) = FixedClaim::of(func, machine, inst, operand) else {
-            continue;
-        };
+    let push_claim = |claims: &mut Vec<(Option<usize>, FixedClaim)>,
+                      holds: &mut Vec<Hold>,
+                      operand: Option<usize>,
+                      claim: FixedClaim| {
         let index = claims.len();
         for units in claim.reg().units(machine) {
             // A non-allocatable register covers no units, and so holds
@@ -652,6 +667,18 @@ pub(crate) fn check_inst_fixed_operands(
             }
         }
         claims.push((operand, claim));
+    };
+
+    for operand in 0..num_operands {
+        let Some(claim) = FixedClaim::of(func, machine, inst, operand) else {
+            continue;
+        };
+        push_claim(claims, holds, Some(operand), claim);
+    }
+
+    // And one claim per clobbered register, on the late half.
+    for reg in func.inst(inst).clobbers().iter() {
+        push_claim(claims, holds, None, FixedClaim::of_clobber(reg));
     }
 
     // Sorted, so that the scan below is linear: overlapping holds are adjacent
@@ -672,11 +699,35 @@ pub(crate) fn check_inst_fixed_operands(
                 let (i, this) = claims[hold.claim];
                 let (j, other) = claims[claim];
                 if this.conflicts_with(machine, &other) {
-                    let (operand, conflicts_with) = (i.max(j), i.min(j));
-                    return Err(Error::ConflictingFixedOperands {
-                        inst,
-                        operand,
-                        conflicts_with,
+                    return Err(match (i, j) {
+                        (Some(i), Some(j)) => Error::ConflictingFixedOperands {
+                            inst,
+                            operand: i.max(j),
+                            conflicts_with: i.min(j),
+                        },
+                        // A clobber has no operand index of its own, so name
+                        // the operand it collides with.
+                        (Some(operand), None) => Error::ConflictingClobber {
+                            inst,
+                            operand,
+                            reg: clobbered_reg(other),
+                        },
+                        (None, Some(operand)) => Error::ConflictingClobber {
+                            inst,
+                            operand,
+                            reg: clobbered_reg(this),
+                        },
+                        // Two clobbers of one register agree, but two that
+                        // merely share a unit each want a reservation over
+                        // that unit's late half, and those may not overlap.
+                        (None, None) => {
+                            let (a, b) = (clobbered_reg(this), clobbered_reg(other));
+                            Error::ConflictingClobbers {
+                                inst,
+                                reg: a.max(b),
+                                conflicts_with: a.min(b),
+                            }
+                        }
                     });
                 }
             }
@@ -690,12 +741,23 @@ pub(crate) fn check_inst_fixed_operands(
     Ok(())
 }
 
+/// The register a clobber claim names, for the error naming it.
+///
+/// Every clobber claim comes from `FixedClaim::of_clobber`, which names a
+/// single register; only a fixed operand can name a group.
+fn clobbered_reg(clobber: FixedClaim) -> Reg {
+    match clobber.reg() {
+        RegAllocation::Reg(reg) => reg,
+        RegAllocation::RegGroup(_) => unreachable!("a clobber names a single register"),
+    }
+}
+
 /// Scratch for `check_inst_fixed_operands`, reused across instructions.
 #[derive(Default)]
 pub(crate) struct FixedOperandScratch {
-    /// The instruction's fixed operands, each with the index of the operand it
-    /// came from, in operand order.
-    claims: Vec<(usize, FixedClaim)>,
+    /// The instruction's claims: its fixed operands in operand order, each
+    /// with its index, then its clobbers, which have no index.
+    claims: Vec<(Option<usize>, FixedClaim)>,
 
     /// One entry per claim, register of that claim, and half the claim covers.
     holds: Vec<Hold>,
@@ -714,11 +776,14 @@ struct Hold {
     claim: usize,
 }
 
-/// One fixed operand's claim on the register it names.
+/// One claim on a register: either a fixed operand's, or a clobber's.
 #[derive(Clone, Copy)]
 struct FixedClaim {
-    /// What the operand names.
-    fixed: FixedOperand,
+    /// The register, or register group, claimed.
+    reg: RegAllocation,
+
+    /// The value read out of, or written into, it. `None` for a clobber.
+    val: Option<Val>,
 
     /// Whether the claim covers the instruction's early half.
     early: bool,
@@ -740,10 +805,22 @@ impl FixedClaim {
         // Asked of `FixedOperand`, so the halves checked here are exactly the
         // ones `collect_block_reservations` would hold.
         Some(FixedClaim {
-            fixed,
+            reg: fixed.reg,
+            val: Some(fixed.val),
             early: fixed.holds(inst, Position::Early),
             late: fixed.holds(inst, Position::Late),
         })
+    }
+
+    /// The claim a clobber of `reg` makes, matching the hold
+    /// `collect_block_reservations` gives it.
+    fn of_clobber(reg: Reg) -> Self {
+        FixedClaim {
+            reg: RegAllocation::Reg(reg),
+            val: None,
+            early: false,
+            late: true,
+        }
     }
 
     /// Does this claim cover `half` of the instruction?
@@ -756,12 +833,13 @@ impl FixedClaim {
 
     /// The register, or register group, this claim names.
     fn reg(&self) -> RegAllocation {
-        self.fixed.reg
+        self.reg
     }
 
-    /// The value it reads out of, or writes into, that register.
-    fn val(&self) -> Val {
-        self.fixed.val
+    /// The value it reads out of, or writes into, that register. `None` for a
+    /// clobber.
+    fn val(&self) -> Option<Val> {
+        self.val
     }
 
     /// Do these two claims want the same register at the same time?
@@ -773,7 +851,9 @@ impl FixedClaim {
         }
 
         // Two claims on one register for one value agree rather than compete;
-        // `collect_block_reservations` folds them into one hold.
+        // `collect_block_reservations` folds them into one hold. So do two
+        // clobbers of one register, the `None == None` case: destroying it
+        // twice asks no more than destroying it once.
         if self.reg() == other.reg() && self.val() == other.val() {
             return false;
         }

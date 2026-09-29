@@ -1,7 +1,7 @@
 use core::{cell::RefCell, fmt, marker::PhantomData};
 
 use crate::{
-    Machine, RegClass,
+    Machine, RegClass, RegSet,
     context::ContextInner,
     entity::{Block, Entity as _, EntityRepr, Inst, Val},
     error::IResult,
@@ -902,6 +902,20 @@ pub trait InputInst<'a> {
 
     /// Get the block that this instruction lies within.
     fn block(&self) -> Block;
+
+    /// The registers that executing this instruction clobbers.
+    ///
+    /// Defaults to an empty set.
+    ///
+    /// The registers are clobbered in the instructions [`Position::Late`] half,
+    /// so these registers may still be accessed by operands naming
+    /// [`Position::Early`] uses, but not by [`Position::Late`] accesses.
+    ///
+    /// Every register in the set must be defined in the [`Machine`].
+    #[inline]
+    fn clobbers(&self) -> RegSet {
+        RegSet::new()
+    }
 }
 
 /// The cost of rematerializing a value, rather than shuffling it between
@@ -1105,6 +1119,15 @@ where
                     OperandConstraint::Reuse(i) => {
                         context.output.result(write!(f, "reusing operand {i}"))?
                     }
+                }
+                context.output.result(writeln!(f))?;
+            }
+            let clobbered = input_inst.clobbers();
+            let mut clobbers = clobbered.iter().peekable();
+            if clobbers.peek().is_some() {
+                context.output.result(write!(f, "      clobbers"))?;
+                for reg in clobbers {
+                    context.output.result(write!(f, " {reg:?}"))?;
                 }
                 context.output.result(writeln!(f))?;
             }

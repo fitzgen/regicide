@@ -581,6 +581,7 @@
     "insts": [
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -593,6 +594,7 @@
       },
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -605,11 +607,13 @@
       },
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": []
       },
       {
         "block": 1,
+        "clobbers": [],
         "edits": [
           {
             "at": {
@@ -637,6 +641,7 @@
       },
       {
         "block": 1,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -651,11 +656,13 @@
       },
       {
         "block": 1,
+        "clobbers": [],
         "edits": [],
         "operands": []
       },
       {
         "block": 2,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -670,6 +677,7 @@
       },
       {
         "block": 2,
+        "clobbers": [],
         "edits": [],
         "operands": []
       }
@@ -2213,6 +2221,9 @@
       },
       "insts": {
         "block": "Block",
+        "clobbers": [
+          "Reg"
+        ],
         "edits": [
           {
             "edit": {

@@ -255,8 +255,9 @@ where
                     reservation.reg(live_ranges).units(input.machine),
                     reservation.start(live_ranges)..reservation.end(live_ranges),
                     reservation.reg(live_ranges),
-                    // Porous to its own value: see `ReservationData`.
-                    Some(reservation.val(live_ranges)),
+                    // Porous to its own value, or to nothing when it is a
+                    // clobber. See `ReservationData`.
+                    reservation.val(live_ranges),
                 );
             }
         }

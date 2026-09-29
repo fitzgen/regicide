@@ -31,8 +31,8 @@
 use crate::{
     Block, BlockFrequency, ENCODING_FORMAT_VERSION, Entity, Error, Input, InputBlock,
     InputFunction, InputInst, InputOptions, InputValue, Inst, Machine, MachineBuilder, Operand,
-    OperandConstraint, Reg, RegBank, RegClass, RegGroup, RegUnit, RematCost, Result, SpillSlotSize,
-    Val,
+    OperandConstraint, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit, RematCost, Result,
+    SpillSlotSize, Val,
     dominators::DominatorTree,
     entity::{PrimaryMap, PrimaryMapKeys},
 };
@@ -190,6 +190,10 @@ struct WireValue {
 struct WireInst {
     block: Block,
     operands: Vec<Operand>,
+
+    /// The clobbered registers, as the ascending index list `RegSet`'s
+    /// `Serialize` emits.
+    clobbers: Vec<Reg>,
 }
 
 #[derive(Deserialize)]
@@ -242,6 +246,7 @@ impl WireFunction {
             insts.push_unwrap(InstData {
                 block: inst.block,
                 operands: inst.operands,
+                clobbers: inst.clobbers,
             });
         }
 
@@ -305,6 +310,7 @@ struct ValueData {
 struct InstData {
     block: Block,
     operands: Vec<Operand>,
+    clobbers: Vec<Reg>,
 }
 
 #[derive(Clone)]
@@ -355,6 +361,8 @@ impl DeserializedFunction {
                     check_val(val)?;
                 }
             }
+            // Clobbers need the machine, which this pass does not have;
+            // `impl Deserialize for DeserializedInput` bounds them.
         }
 
         for (_b, block) in self.blocks.iter() {
@@ -633,6 +641,14 @@ impl<'a> InputInst<'a> for DeserializedInst<'a> {
     fn operand(&self, i: usize) -> Operand {
         self.func.insts[self.inst].operands[i]
     }
+
+    fn clobbers(&self) -> RegSet {
+        let mut set = RegSet::new();
+        for &reg in &self.func.insts[self.inst].clobbers {
+            set.insert(reg);
+        }
+        set
+    }
 }
 
 impl<'a> InputBlock<'a> for DeserializedBlock<'a> {
@@ -758,8 +774,7 @@ impl<'de> Deserialize<'de> for DeserializedInput {
             func,
         } = WireInput::deserialize(deserializer)?;
 
-        // The one reference a function cannot check on its own, since it does
-        // not know the machine. Operand constraints name classes too, and
+        // The references a function cannot check without the machine, and
         // `options.validate_input` may be `false` in the file.
         let num_classes = machine.reg_classes().len();
         let check = |class: RegClass| -> Result<(), D::Error> {
@@ -777,6 +792,22 @@ impl<'de> Deserialize<'de> for DeserializedInput {
             for operand in func.inst(Inst::try_new(i).unwrap()).operands() {
                 if let OperandConstraint::Reg(class) = operand.constraint() {
                     check(class)?;
+                }
+            }
+        }
+
+        // Read out of the wire `Vec`, not through `InputInst::clobbers`:
+        // building that `RegSet` is itself the unsafe step, since
+        // `FixedEntitySet::insert` panics above its capacity.
+        let num_registers = machine.num_registers();
+        for inst in func.insts.values() {
+            for reg in &inst.clobbers {
+                if reg.index() >= num_registers {
+                    return Err(de::Error::custom(format_args!(
+                        "clobbered register {} is out of range; the machine has \
+                         {num_registers}",
+                        reg.index(),
+                    )));
                 }
             }
         }
@@ -904,6 +935,18 @@ mod tests {
                 TestInput::with_an_entry_param_read_two_ways(),
             ),
             ("stack_param_and_arg", TestInput::with_stack_param_and_arg()),
+            (
+                "an_early_read_beside_a_clobber_of_every_register",
+                TestInput::with_an_early_read_beside_a_clobber_of_every_register(),
+            ),
+            (
+                "a_clobbering_terminator_before_a_merge",
+                TestInput::with_a_clobbering_terminator_before_a_merge(),
+            ),
+            (
+                "a_reload_clobbered_before_its_next_read",
+                TestInput::with_a_reload_clobbered_before_its_next_read(),
+            ),
         ]
     }
 
@@ -951,7 +994,7 @@ mod tests {
         (v.val(), v.reg_class(), v.remat_cost())
     }
 
-    type InstFacts = (Inst, Block, usize, Vec<Operand>, Vec<Operand>);
+    type InstFacts = (Inst, Block, usize, Vec<Operand>, Vec<Operand>, RegSet);
 
     fn describe_inst<'x>(i: &impl InputInst<'x>) -> InstFacts {
         (
@@ -960,6 +1003,7 @@ mod tests {
             i.operands_len(),
             i.operands().collect(),
             (0..i.operands_len()).map(|j| i.operand(j)).collect(),
+            i.clobbers(),
         )
     }
 
@@ -1308,7 +1352,7 @@ mod corrupt_tests {
     /// Serialize a fixture, let `corrupt` edit the JSON, and return the error
     /// that reading it back produces.
     fn error_from(corrupt: impl FnOnce(&mut Value)) -> String {
-        let input = TestInput::with_use_constraints(&[OperandConstraint::Any]);
+        let input = TestInput::with_use_constraints(&[crate::OperandConstraint::Any]);
         let mut json =
             input.with_input(|input| serde_json::to_value(SerializeInput::new(input)).unwrap());
         corrupt(&mut json);
@@ -1324,12 +1368,12 @@ mod corrupt_tests {
         let cases: Vec<(&str, fn(&mut Value), &str)> = vec![
             (
                 "machine version",
-                |j| j["machine"]["version"] = json!(3),
+                |j| j["machine"]["version"] = json!(99),
                 "version",
             ),
             (
                 "function version",
-                |j| j["func"]["version"] = json!(3),
+                |j| j["func"]["version"] = json!(99),
                 "version",
             ),
             (
@@ -1433,6 +1477,24 @@ mod corrupt_tests {
                 "1 registers in it",
             ),
             (
+                // Unrepresentable, so `Reg`'s own `Deserialize` refuses it.
+                "unrepresentable clobber",
+                |j| j["func"]["insts"][0]["clobbers"] = json!([u64::MAX]),
+                "out of range",
+            ),
+            (
+                // Representable, but not a register this machine defines.
+                "out-of-range clobber",
+                |j| j["func"]["insts"][0]["clobbers"] = json!([9]),
+                "clobbered register 9 is out of range",
+            ),
+            (
+                // Above `RegSet`'s capacity, where building the set panics.
+                "clobber beyond the register set's capacity",
+                |j| j["func"]["insts"][0]["clobbers"] = json!([1000]),
+                "clobbered register 1000 is out of range",
+            ),
+            (
                 "unknown field",
                 |j| j["func"]["bogus"] = json!(1),
                 "unknown field",
@@ -1452,7 +1514,7 @@ mod corrupt_tests {
     /// gigantic allocation from a length prefix that outruns the data.
     #[test]
     fn rejects_truncated_postcard() {
-        let input = TestInput::with_use_constraints(&[OperandConstraint::Any]);
+        let input = TestInput::with_use_constraints(&[crate::OperandConstraint::Any]);
         let bytes =
             input.with_input(|input| postcard::to_allocvec(&SerializeInput::new(input)).unwrap());
 

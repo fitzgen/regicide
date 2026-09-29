@@ -153,9 +153,10 @@ struct WireValue {
 
 #[derive(Serialize)]
 #[serde(rename = "Inst")]
-struct WireInst<O> {
+struct WireInst<O, C> {
     block: Block,
     operands: O,
+    clobbers: C,
 }
 
 #[derive(Serialize)]
@@ -319,6 +320,7 @@ struct Values<'a, F: ?Sized>(&'a F);
 struct Insts<'a, F: ?Sized>(&'a F);
 struct Blocks<'a, F: ?Sized>(&'a F);
 struct InstOperands<'a, F: ?Sized>(&'a F, Inst);
+struct InstClobbers<'a, F: ?Sized>(&'a F, Inst);
 struct BlockParams<'a, F: ?Sized>(&'a F, Block);
 struct BlockInsts<'a, F: ?Sized>(&'a F, Block);
 struct BlockSuccessors<'a, F: ?Sized>(&'a F, Block);
@@ -364,6 +366,7 @@ where
                 WireInst {
                     block: func.inst(inst).block(),
                     operands: InstOperands(func, inst),
+                    clobbers: InstClobbers(func, inst),
                 }
             }),
         )
@@ -385,6 +388,22 @@ where
             "operands_len",
             inst.operands(),
         )
+    }
+}
+
+impl<F> Serialize for InstClobbers<'_, F>
+where
+    F: InputFunction + ?Sized,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // The set iterates in ascending index order, exactly the `Vec<Reg>`
+        // the other end reads. Its own `Serialize` collects an iterator of
+        // unknown length, which postcard refuses.
+        let clobbers = self.0.inst(self.1).clobbers();
+        serialize_seq(serializer, clobbers.len(), "clobbers", clobbers.iter())
     }
 }
 
@@ -582,7 +601,7 @@ mod tests {
     "move_elimination_level": "global"
   },
   "machine": {
-    "version": 2,
+    "version": 3,
     "banks": [
       {
         "size": 8
@@ -637,7 +656,7 @@ mod tests {
     ]
   },
   "func": {
-    "version": 2,
+    "version": 3,
     "entry_block": 0,
     "values": [
       {
@@ -655,7 +674,8 @@ mod tests {
             "constraint": "any",
             "val": 0
           }
-        ]
+        ],
+        "clobbers": []
       },
       {
         "block": 0,
@@ -666,11 +686,13 @@ mod tests {
             "constraint": "any",
             "val": 0
           }
-        ]
+        ],
+        "clobbers": []
       },
       {
         "block": 0,
-        "operands": []
+        "operands": [],
+        "clobbers": []
       }
     ],
     "blocks": [

@@ -474,6 +474,44 @@ pub enum Error {
         conflicts_with: usize,
     },
 
+    /// An instruction clobbers a register a fixed operand of the same
+    /// instruction also wants at the same time.
+    ///
+    /// A clobber holds its register over the instruction's late half, so a
+    /// fixed early read may name it but a fixed definition or late read may
+    /// not.
+    ConflictingClobber {
+        /// The instruction with the offending clobber.
+        inst: Inst,
+
+        /// The index of the fixed operand it conflicts with.
+        operand: usize,
+
+        /// The register both want.
+        reg: Reg,
+    },
+
+    /// An instruction clobbers two registers that share a register unit.
+    ConflictingClobbers {
+        /// The instruction with the offending clobbers.
+        inst: Inst,
+
+        /// The later of the two registers, in register order.
+        reg: Reg,
+
+        /// The earlier register it shares a unit with.
+        conflicts_with: Reg,
+    },
+
+    /// An instruction clobbers a register this machine does not define.
+    RegOutOfBounds {
+        /// The instruction with the offending clobber.
+        inst: Inst,
+
+        /// The first out-of-range [`Reg`] in its clobber set.
+        reg: Reg,
+    },
+
     /// The function has an instruction index above the largest one supported.
     TooManyInsts {
         /// The first [`Inst`] found whose index is out of range.
@@ -701,6 +739,24 @@ impl fmt::Debug for Error {
                 f,
                 "operands {conflicts_with} and {operand} of {inst:?} both name the same \
                  register at the same time"
+            ),
+            Self::ConflictingClobber { inst, operand, reg } => write!(
+                f,
+                "{inst:?} clobbers {reg:?}, which operand {operand} of the same instruction \
+                 also names at that time"
+            ),
+            Self::ConflictingClobbers {
+                inst,
+                reg,
+                conflicts_with,
+            } => write!(
+                f,
+                "{inst:?} clobbers both {conflicts_with:?} and {reg:?}, which share a \
+                 register unit"
+            ),
+            Self::RegOutOfBounds { inst, reg } => write!(
+                f,
+                "{inst:?} clobbers {reg:?}, which this machine does not define"
             ),
             Self::TooManyInsts { inst } => {
                 write!(

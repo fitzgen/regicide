@@ -1043,12 +1043,13 @@ fn hint_reserved_registers<E>(
 ) where
     E: EntityRepr,
 {
-    // The join key, once, so the index and its lookups agree.
-    fn key<E>(live_ranges: &LiveRanges<E>, r: Reservation<E>) -> (LivePoint<E>, Val<E>)
+    // The join key, once, so the index and its lookups agree. A clobber has
+    // no value to bias any bundle towards it.
+    fn key<E>(live_ranges: &LiveRanges<E>, r: Reservation<E>) -> Option<(LivePoint<E>, Val<E>)>
     where
         E: EntityRepr,
     {
-        (r.start(live_ranges), r.val(live_ranges))
+        Some((r.start(live_ranges), r.val(live_ranges)?))
     }
 
     debug_assert!(scratch.is_empty());
@@ -1059,7 +1060,7 @@ fn hint_reserved_registers<E>(
         let RegAllocation::Reg(_) = r.reg(live_ranges) else {
             return None;
         };
-        let (point, val) = key(live_ranges, r);
+        let (point, val) = key(live_ranges, r)?;
         Some((point, val, r))
     }));
     scratch.sort_unstable_by_key(|&(point, val, _)| (point, val));
@@ -1690,7 +1691,7 @@ mod tests {
                                 live_ranges.reservations().any(|r| {
                                     matches!(r.reg(live_ranges), RegAllocation::Reg(_))
                                         && r.start(live_ranges) == point
-                                        && r.val(live_ranges) == val
+                                        && r.val(live_ranges) == Some(val)
                                 })
                             })
                         });

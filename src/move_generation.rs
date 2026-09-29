@@ -1376,11 +1376,14 @@ fn find_reservation_in_outs<E>(
 {
     debug_assert!(in_outs.is_empty());
 
-    in_outs.extend(reservations.into_iter().map(|r| ReservationInOut {
-        inst: r.start(live_ranges).inst(),
-        val: r.val(live_ranges),
-        read_from: None,
-        written_into: None,
+    // A clobber has no value to deliver or carry out, so it needs no entry.
+    in_outs.extend(reservations.into_iter().filter_map(|r| {
+        Some(ReservationInOut {
+            inst: r.start(live_ranges).inst(),
+            val: r.val(live_ranges)?,
+            read_from: None,
+            written_into: None,
+        })
     }));
     in_outs.sort_unstable_by_key(|p| (p.inst, p.val));
     in_outs.dedup_by_key(|p| (p.inst, p.val));
@@ -1521,7 +1524,15 @@ where
             );
 
             for reservation in reservations {
-                let val = reservation.val(live_ranges);
+                // A clobber has no half-moves to emit, and so no
+                // `reservation_in_outs` entry to look up.
+                let Some(val) = reservation.val(live_ranges) else {
+                    debug_assert!(
+                        !reservation.uses(live_ranges) && !reservation.defs(live_ranges),
+                        "a reservation with no value has no operand to move for",
+                    );
+                    continue;
+                };
                 let held = Allocation::Reg(reservation.reg(live_ranges));
 
                 let key = (reservation.start(live_ranges).inst(), val);
@@ -3067,13 +3078,12 @@ where
 
     // Can we place the move just before the predecessor's terminator? The
     // predecessor must have a single successor (or else we might clobber other
-    // edges' values) and its terminator must not read or write a register (or
-    // else the terminator could clobber our move or we could clobber one of its
-    // operands).
+    // edges' values) and its terminator must leave the gap alone.
     let pred_block = input.func.block(edge.pred.with_repr32());
     if pred_block.len_successors() == 1 {
         let last = block_last_inst(&pred_block);
-        if input.func.inst(last).operands_len() == 0 {
+        let last_inst = input.func.inst(last);
+        if crate::liveness::terminator_leaves_the_gap_free(&last_inst) {
             let last = last
                 .with_repr::<E>()
                 .expect("every instruction index already fit in `E` in the earlier passes");
@@ -3460,20 +3470,24 @@ mod tests {
                 .collect::<Vec<_>>();
 
             // The registers held for fixed operands, which no span covers and
-            // which nothing else describes.
+            // which nothing else describes. A val-less one holds no value to
+            // track through the gaps.
             let reservations = func
                 .blocks()
                 .flat_map(|(block, _)| {
-                    block.reservations(live_ranges).into_iter().map(move |r| {
-                        (
-                            r.val(live_ranges),
-                            r.start(live_ranges),
-                            r.end(live_ranges),
-                            Allocation::Reg(r.reg(live_ranges)),
-                            r.uses(live_ranges),
-                            block,
-                        )
-                    })
+                    block
+                        .reservations(live_ranges)
+                        .into_iter()
+                        .filter_map(move |r| {
+                            Some((
+                                r.val(live_ranges)?,
+                                r.start(live_ranges),
+                                r.end(live_ranges),
+                                Allocation::Reg(r.reg(live_ranges)),
+                                r.uses(live_ranges),
+                                block,
+                            ))
+                        })
                 })
                 .collect::<Vec<_>>();
 
@@ -3803,14 +3817,16 @@ mod tests {
                     // really is critical: neither block will take the move.
                     // The successor will not when another edge reaches it, and
                     // the entry block never will, since the function's own
-                    // entry reaches it too.
+                    // entry reaches it too. The predecessor will not when it
+                    // has another successor or a gap-free terminator.
                     let on_edge = batch(edge_pos);
                     if !on_edge.is_empty() {
                         let succ_takes_it =
                             input_succ.len_predecessors() == 1 && succ != func.entry_block();
+                        let terminator = func.inst(last);
                         let critical = !succ_takes_it
                             && (input_pred.len_successors() > 1
-                                || func.inst(last).operands_len() > 0);
+                                || !crate::liveness::terminator_leaves_the_gap_free(&terminator));
                         if !critical {
                             return Err(format!(
                                 "the edge {pred:?} -[{index}]-> {succ:?} is not critical, so its \

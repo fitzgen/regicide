@@ -8,7 +8,7 @@ pub use parallel_moves::*;
 
 use crate::{
     Block, InputBlock, InputFunction, InputInst, InputValue, Machine, MachineBuilder, Operand, Reg,
-    RegClass, RegGroup, RegUnit, Val,
+    RegClass, RegGroup, RegSet, RegUnit, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
     entity::{Entity, EntityRepr, Inst, PrimaryMap, Region, SecondaryMap},
@@ -265,10 +265,12 @@ pub struct BlockCall {
 pub enum InstData {
     Op {
         operands: Vec<Operand>,
+        clobbers: Vec<Reg>,
         side_effects: bool,
     },
     Branch {
         operands: Vec<Operand>,
+        clobbers: Vec<Reg>,
         targets: Vec<BlockCall>,
     },
 }
@@ -277,6 +279,7 @@ impl Default for InstData {
     fn default() -> Self {
         Self::Op {
             operands: vec![],
+            clobbers: vec![],
             side_effects: false,
         }
     }
@@ -294,6 +297,24 @@ impl InstData {
     fn operands_mut(&mut self) -> &mut [Operand] {
         match self {
             InstData::Op { operands, .. } | InstData::Branch { operands, .. } => operands,
+        }
+    }
+
+    /// The registers this instruction destroys the contents of.
+    ///
+    /// A `Vec` rather than a `RegSet`, so that `Mutate` and `Deserialize` come
+    /// free. `TestInput::fixup` keeps it canonical, so that the round trip
+    /// through a set and back is the identity.
+    fn clobbers(&self) -> &[Reg] {
+        match self {
+            InstData::Op { clobbers, .. } | InstData::Branch { clobbers, .. } => clobbers,
+        }
+    }
+
+    /// Get mutable access to this instruction's clobbers.
+    fn clobbers_mut(&mut self) -> &mut Vec<Reg> {
+        match self {
+            InstData::Op { clobbers, .. } | InstData::Branch { clobbers, .. } => clobbers,
         }
     }
 
@@ -668,6 +689,7 @@ impl TestFunction {
                             OperandConstraint::Any,
                             Some(Val::try_new(0).unwrap()),
                         )],
+                        clobbers: vec![],
                         side_effects: true,
                     },
                 )
@@ -755,27 +777,35 @@ impl TestFunction {
             for inst in rest {
                 if let InstData::Branch {
                     operands,
+                    clobbers,
                     targets: _,
                 } = &mut self.insts[*inst]
                 {
                     let operands = mem::take(operands);
+                    let clobbers = mem::take(clobbers);
                     self.insts[*inst] = InstData::Op {
                         operands,
+                        clobbers,
                         side_effects: false,
                     };
                 }
             }
 
             match &mut self.insts[terminator] {
-                InstData::Op { operands, .. } => {
+                InstData::Op {
+                    operands, clobbers, ..
+                } => {
                     let operands = mem::take(operands);
+                    let clobbers = mem::take(clobbers);
                     self.insts[terminator] = InstData::Branch {
                         operands,
+                        clobbers,
                         targets: vec![],
                     };
                 }
                 InstData::Branch {
                     operands: _,
+                    clobbers: _,
                     targets,
                 } => {
                     for target in targets {
@@ -812,6 +842,7 @@ impl TestFunction {
                 InstData::Op { .. } => unreachable!(),
                 InstData::Branch {
                     operands: _,
+                    clobbers: _,
                     targets,
                 } => {
                     targets.push(BlockCall {
@@ -1437,6 +1468,7 @@ impl<'a> TestBlock<'a> {
             InstData::Op { .. } => panic!("invalid function; should have called `fixup`"),
             InstData::Branch {
                 operands: _,
+                clobbers: _,
                 targets,
             } => targets,
         }
@@ -1486,6 +1518,14 @@ impl<'a> InputInst<'a> for TestInst<'a> {
     fn block(&self) -> Block {
         self.func.inst_blocks[self.inst]
             .expect("should have been inserted by `ensure_unique_insts_in_layout`")
+    }
+
+    fn clobbers(&self) -> RegSet {
+        let mut set = RegSet::new();
+        for &reg in self.func.insts[self.inst].clobbers() {
+            set.insert(reg);
+        }
+        set
     }
 }
 
@@ -2551,8 +2591,25 @@ impl TestInput {
             }
         }
 
+        // A clobber names a register directly, so the class remaps above do
+        // not reach it. Canonical order matters because `TestInst::clobbers`
+        // turns the list into a set, and `write_fuzz_corpus` asserts the round
+        // trip is byte-identical.
+        let num_registers = machine.num_registers();
+        for (_inst, inst_data) in self.func.insts.iter_mut() {
+            let clobbers = inst_data.clobbers_mut();
+            for reg in clobbers.iter_mut() {
+                *reg = Reg::try_new(reg.index() % num_registers).unwrap();
+            }
+            clobbers.retain(|reg| reg.is_allocatable(&machine));
+            clobbers.sort_unstable();
+            clobbers.dedup();
+        }
+
         // Two fixed operands of one instruction may not name one register at
-        // one time, since each holds its register outright.
+        // one time, since each holds its register outright. Nor may a clobber
+        // and a fixed operand that wants the clobbered register in the late
+        // half.
         //
         // Relax the last operand that could be *making* something fixed rather
         // than the one the check names: `reuse_aware_constraint` can resolve an
@@ -2582,7 +2639,18 @@ impl TestInput {
                             OperandConstraint::Any | OperandConstraint::Stack => false,
                         }
                 });
-                let i = relax.expect("a conflict needs an operand that fixes something");
+                let Some(i) = relax else {
+                    // Nothing left to relax, so the clobbers are party to the
+                    // conflict. Dropping them settles it and creates no new
+                    // one.
+                    let clobbers = self.func.insts[inst].clobbers_mut();
+                    assert!(
+                        !clobbers.is_empty(),
+                        "a conflict with no clobbers needs an operand that fixes something",
+                    );
+                    clobbers.clear();
+                    continue;
+                };
                 let operand = operands[i];
                 operands[i] = Operand::new(
                     operand.pos(),
@@ -2682,6 +2750,7 @@ impl TestInput {
                         def_constraint,
                         Some(val),
                     )],
+                    clobbers: vec![],
                     side_effects: true,
                 },
             )
@@ -2697,6 +2766,7 @@ impl TestInput {
                             constraint,
                             Some(val),
                         )],
+                        clobbers: vec![],
                         side_effects: true,
                     },
                 )
@@ -2710,6 +2780,7 @@ impl TestInput {
                 &mut output,
                 InstData::Op {
                     operands: vec![],
+                    clobbers: vec![],
                     side_effects: true,
                 },
             )
@@ -2777,6 +2848,7 @@ impl TestInput {
                 OperandConstraint::Any,
                 Some(val),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -2799,12 +2871,14 @@ impl TestInput {
                         Some(second),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -2872,6 +2946,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(first),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -2895,6 +2970,7 @@ impl TestInput {
                         Some(second),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -2904,12 +2980,14 @@ impl TestInput {
                     OperandConstraint::Reg(r1),
                     Some(second),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -2967,6 +3045,7 @@ impl TestInput {
                         Some(val),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -2976,12 +3055,14 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(val),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -3066,6 +3147,7 @@ impl TestInput {
                 OperandConstraint::Reg(class),
                 Some(val),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
         let reads = |constraint: fn(RegClass) -> OperandConstraint| InstData::Op {
@@ -3083,6 +3165,7 @@ impl TestInput {
                     Some(narrow),
                 ),
             ],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -3096,6 +3179,7 @@ impl TestInput {
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -3155,10 +3239,12 @@ impl TestInput {
 
         let op = |pos, kind, constraint| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[Block]| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&target| BlockCall {
@@ -3185,6 +3271,7 @@ impl TestInput {
             // alone.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -3259,6 +3346,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -3271,12 +3359,14 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the tied instruction.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -3341,6 +3431,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -3358,6 +3449,7 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The read that makes the tied use's value a survivor.
@@ -3368,12 +3460,14 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the later read.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -3457,6 +3551,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -3476,6 +3571,7 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The read that makes the tied use's value a survivor.
@@ -3486,12 +3582,14 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the later read.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -3534,6 +3632,22 @@ impl TestInput {
         num_values: usize,
         operands: Vec<Vec<Operand>>,
     ) -> Self {
+        let clobbers = vec![Vec::new(); operands.len()];
+        Self::defining_values_in_order_with_clobbers(
+            machine, reg_class, num_values, operands, clobbers,
+        )
+    }
+
+    /// As [`Self::defining_values_in_order`], but each instruction also
+    /// clobbers the registers of the entry of `clobbers` with its index.
+    fn defining_values_in_order_with_clobbers(
+        machine: TestMachine,
+        reg_class: u8,
+        num_values: usize,
+        operands: Vec<Vec<Operand>>,
+        clobbers: Vec<Vec<Reg>>,
+    ) -> Self {
+        assert_eq!(operands.len(), clobbers.len());
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
 
@@ -3555,13 +3669,19 @@ impl TestInput {
         }
 
         let written = operands.clone();
+        let written_clobbers = clobbers.clone();
         func.insts = PrimaryMap::new();
-        for operands in operands.into_iter().chain(core::iter::once(Vec::new())) {
+        let bodies = operands
+            .into_iter()
+            .zip(clobbers)
+            .chain(core::iter::once((Vec::new(), Vec::new())));
+        for (operands, clobbers) in bodies {
             func.insts
                 .push(
                     &mut output,
                     InstData::Op {
                         operands,
+                        clobbers,
                         side_effects: true,
                     },
                 )
@@ -3572,11 +3692,14 @@ impl TestInput {
 
         // `fixup` relaxes an instruction whose fixed operands conflict, and
         // several of these fixtures exist to *be* that conflict, so put the
-        // operands back exactly as written.
-        for (i, operands) in written.into_iter().enumerate() {
-            let written = input.func.insts[Inst::try_new(i).unwrap()].operands_mut();
+        // operands back exactly as written. Same for the clobbers, which
+        // `fixup` drops wholesale when nothing else can give.
+        for (i, (operands, clobbers)) in written.into_iter().zip(written_clobbers).enumerate() {
+            let inst = Inst::try_new(i).unwrap();
+            let written = input.func.insts[inst].operands_mut();
             assert_eq!(written.len(), operands.len());
             written.clone_from_slice(&operands);
+            *input.func.insts[inst].clobbers_mut() = clobbers;
         }
         input
     }
@@ -4279,6 +4402,219 @@ impl TestInput {
         )
     }
 
+    /// An instruction that clobbers every allocatable register, beside a
+    /// value whose only operand on it is an *early* read.
+    ///
+    /// The read holds the early half and the clobbers the late one, so the
+    /// input is allocatable.
+    ///
+    /// The read *dies* here, which is what makes this a test of the clobbers.
+    pub fn with_an_early_read_beside_a_clobber_of_every_register() -> Self {
+        let read = Val::try_new(0).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+        let regs = [Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap()];
+
+        Self::defining_values_in_order_with_clobbers(
+            TestMachine::two_registers(),
+            TestMachine::BOTH_REGS_CLASS,
+            1,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(read),
+                )],
+                // In a register, or the allocator sidesteps the clobbers by
+                // leaving the value on the stack.
+                vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(both),
+                    Some(read),
+                )],
+            ],
+            vec![Vec::new(), Vec::from(regs)],
+        )
+    }
+
+    /// A value reloaded into a register, clobbered out of it, and read in a
+    /// register again.
+    ///
+    /// The second reload is only redundant if the clobber did not happen, so
+    /// `redundant_move_elimination` has to account for clobbers to keep it.
+    pub fn with_a_reload_clobbered_before_its_next_read() -> Self {
+        let read = Val::try_new(0).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+        let regs = vec![Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap()];
+
+        let in_a_reg =
+            |pos, kind| Operand::new(pos, kind, OperandConstraint::Reg(both), Some(read));
+
+        Self::defining_values_in_order_with_clobbers(
+            TestMachine::two_registers(),
+            TestMachine::BOTH_REGS_CLASS,
+            1,
+            vec![
+                vec![in_a_reg(Position::Late, DefUse::Def)],
+                // Forces the spill the reloads below undo.
+                vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Stack,
+                    Some(read),
+                )],
+                vec![in_a_reg(Position::Early, DefUse::Use)],
+                // Destroys whatever register that read landed in.
+                vec![],
+                vec![in_a_reg(Position::Early, DefUse::Use)],
+            ],
+            vec![Vec::new(), Vec::new(), Vec::new(), regs, Vec::new()],
+        )
+    }
+
+    /// A block whose only instruction is a terminator that carries no operands
+    /// but *does* clobber, branching to a merge block that takes a parameter.
+    ///
+    /// Exercises `terminator_leaves_the_gap_free`, where the operand count
+    /// alone says the departure gap is usable and the clobbers say it is not.
+    /// `move_generation::edge_position` and
+    /// `checker::departs_from_its_first_gap` both consult it and must agree.
+    ///
+    /// The merge has two predecessors so that the checker pins the parameter
+    /// against an arrival state rather than skipping the check.
+    pub fn with_a_clobbering_terminator_before_a_merge() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let first = Val::try_new(0).unwrap();
+        let second = Val::try_new(1).unwrap();
+        let param = Val::try_new(2).unwrap();
+        let merge = Block::try_new(3).unwrap();
+        let both = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let r0 = Reg::try_new(0).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: Inst::try_new(0).unwrap(),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: Inst::try_new(3).unwrap(),
+                i: 0,
+            },
+            ValDef::BlockParam { block: merge, i: 0 },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let call = |target, args: &[Val]| BlockCall {
+            target,
+            args: args.to_vec(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // `block0`: branch two ways, giving the merge two predecessors.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, first),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(both),
+                first,
+            ),
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: vec![
+                    call(Block::try_new(1).unwrap(), &[]),
+                    call(Block::try_new(2).unwrap(), &[]),
+                ],
+            },
+            // `block1`: the merge's other predecessor.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, second),
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: vec![call(merge, &[second])],
+            },
+            // `block2`: the block under test, one clobbering terminator.
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![r0],
+                targets: vec![call(merge, &[first])],
+            },
+            // `block3`: read the parameter from a register.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(both),
+                param,
+            ),
+            InstData::Op {
+                operands: vec![],
+                clobbers: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for block in [
+            BlockData {
+                params: vec![],
+                insts: vec![inst(0), inst(1), inst(2)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(3), inst(4)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![],
+                insts: vec![inst(5)],
+                frequency: 0,
+            },
+            BlockData {
+                params: vec![param],
+                insts: vec![inst(6), inst(7)],
+                frequency: 0,
+            },
+        ] {
+            func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+
+        // `fixup` drops clobbers to resolve a conflict, and the clobber is
+        // the point here.
+        *input.func.insts[inst(5)].clobbers_mut() = vec![r0];
+        input
+    }
+
     /// A value defined into `r0` by a block's *terminator*, and read under
     /// `read` in the block it branches to.
     pub fn with_a_fixed_def_on_a_terminator(read: OperandConstraint) -> Self {
@@ -4315,6 +4651,7 @@ impl TestInput {
                     OperandConstraint::Reg(first_reg),
                     Some(defined),
                 )],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target,
                     args: vec![],
@@ -4329,10 +4666,12 @@ impl TestInput {
                     read,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -4409,6 +4748,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target,
                     args: vec![defined],
@@ -4423,10 +4763,12 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(param),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -4491,6 +4833,7 @@ impl TestInput {
         let block = |b: usize| Block::try_new(b).unwrap();
         let branch = |target: usize| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: vec![BlockCall {
                 target: block(target),
                 args: vec![],
@@ -4498,6 +4841,7 @@ impl TestInput {
         };
         let op = |operands: Vec<Operand>| InstData::Op {
             operands,
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -4641,10 +4985,12 @@ impl TestInput {
             |kind, constraint, v| Operand::new(Position::Early, kind, constraint, Some(v));
         let def = |v| InstData::Op {
             operands: vec![operand(DefUse::Def, reg, v)],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[usize]| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -4667,6 +5013,7 @@ impl TestInput {
                     operand(DefUse::Use, reg, val(1)),
                     operand(DefUse::Use, reg, val(2)),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(&[3]),
@@ -4680,6 +5027,7 @@ impl TestInput {
                     operand(DefUse::Use, second_reg, val(0)),
                     operand(DefUse::Use, reg, val(0)),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(&[]),
@@ -4769,6 +5117,7 @@ impl TestInput {
                     &mut output,
                     InstData::Op {
                         operands,
+                        clobbers: vec![],
                         side_effects: true,
                     },
                 )
@@ -4824,6 +5173,7 @@ impl TestInput {
                 OperandConstraint::Any,
                 Some(val),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
         let read = |class, val| {
@@ -4842,10 +5192,12 @@ impl TestInput {
             def(scalar),
             InstData::Op {
                 operands: operands.clone(),
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -4918,6 +5270,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The pinned read, on an instruction of its own so that it is not
@@ -4929,6 +5282,7 @@ impl TestInput {
                     OperandConstraint::Reg(first_reg),
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -4962,6 +5316,7 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The read that makes the tied use's value a survivor.
@@ -4972,12 +5327,14 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the later read.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -5045,6 +5402,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The pinned read, on an instruction of its own so that it is not
@@ -5057,6 +5415,7 @@ impl TestInput {
                     OperandConstraint::Reg(first_reg),
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -5083,12 +5442,14 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -5157,6 +5518,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The read that pins the piece to `r1`, on an instruction of its
@@ -5168,6 +5530,7 @@ impl TestInput {
                     OperandConstraint::Reg(second_reg),
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -5187,6 +5550,7 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The tied definition wants `r0`, which the pinned read's `r1`
@@ -5198,12 +5562,14 @@ impl TestInput {
                     OperandConstraint::Reg(first_reg),
                     Some(tied),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -5270,10 +5636,12 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: Block::try_new(1).unwrap(),
                     args: vec![],
@@ -5296,6 +5664,7 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // A read to make the tied value a survivor, and one of the
@@ -5315,12 +5684,14 @@ impl TestInput {
                         Some(tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -5420,6 +5791,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(defined),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -5449,6 +5821,7 @@ impl TestInput {
                         Some(second_tied),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The read that makes the tied value a survivor, if it has one.
@@ -5463,12 +5836,14 @@ impl TestInput {
                 } else {
                     vec![]
                 },
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the read.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -5584,6 +5959,7 @@ impl TestInput {
 
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -5595,6 +5971,7 @@ impl TestInput {
             op(Position::Early, DefUse::Use, arg, arg_val),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target,
                     args: vec![arg_val],
@@ -5605,6 +5982,7 @@ impl TestInput {
             op(Position::Early, DefUse::Use, param, param_val),
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -5698,10 +6076,12 @@ impl TestInput {
 
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let nothing = || InstData::Op {
             operands: vec![],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -5729,6 +6109,7 @@ impl TestInput {
                         Some(spilled),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             op(
@@ -5818,6 +6199,7 @@ impl TestInput {
 
         let def = |v| InstData::Op {
             operands: vec![Operand::new(Position::Late, DefUse::Def, any, Some(val(v)))],
+            clobbers: vec![],
             side_effects: true,
         };
         let read = |v| InstData::Op {
@@ -5827,6 +6209,7 @@ impl TestInput {
                 any,
                 Some(val(v)),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
         // A read that has to be in a register, so the value it reads holds one
@@ -5840,6 +6223,7 @@ impl TestInput {
                 ),
                 Some(val(v)),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
         // A definition that reads an operand, so its value gets no remat cost.
@@ -5848,10 +6232,12 @@ impl TestInput {
                 Operand::new(Position::Early, DefUse::Use, any, Some(val(read))),
                 Operand::new(Position::Late, DefUse::Def, any, Some(val(defined))),
             ],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |target| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: vec![BlockCall {
                 target: block(target),
                 args: vec![],
@@ -5871,6 +6257,7 @@ impl TestInput {
             read_in_a_register(2),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![],
             },
         ] {
@@ -5958,6 +6345,7 @@ impl TestInput {
 
         let def = |v| InstData::Op {
             operands: vec![Operand::new(Position::Late, DefUse::Def, any, Some(val(v)))],
+            clobbers: vec![],
             side_effects: true,
         };
         let read = |v, constraint| InstData::Op {
@@ -5967,6 +6355,7 @@ impl TestInput {
                 constraint,
                 Some(val(v)),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -5978,6 +6367,7 @@ impl TestInput {
             read(2, reg),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: block(1),
                     args: vec![],
@@ -5987,6 +6377,7 @@ impl TestInput {
             read(1, any),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![],
             },
         ] {
@@ -6063,6 +6454,7 @@ impl TestInput {
         let block = |i| Block::try_new(i).unwrap();
         let branch = |target| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: vec![BlockCall {
                 target: block(target),
                 args: vec![],
@@ -6075,10 +6467,12 @@ impl TestInput {
                 OperandConstraint::Any,
                 Some(val),
             )],
+            clobbers: vec![],
             side_effects: true,
         };
         let nothing = || InstData::Op {
             operands: vec![],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -6092,6 +6486,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(val),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(1),
@@ -6106,6 +6501,7 @@ impl TestInput {
             read(),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![],
             },
         ] {
@@ -6195,14 +6591,17 @@ impl TestInput {
             |kind, constraint, v| Operand::new(Position::Early, kind, constraint, Some(v));
         let def = |v| InstData::Op {
             operands: vec![operand(DefUse::Def, reg, v)],
+            clobbers: vec![],
             side_effects: true,
         };
         let read = |constraint, v| InstData::Op {
             operands: vec![operand(DefUse::Use, constraint, v)],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[usize]| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -6225,6 +6624,7 @@ impl TestInput {
                     operand(DefUse::Use, reg, val(1)),
                     operand(DefUse::Use, reg, val(2)),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(&[3]),
@@ -6321,6 +6721,7 @@ impl TestInput {
         let operand = |pos, kind, constraint, v| Operand::new(pos, kind, constraint, Some(v));
         let branch = |operands: Vec<Operand>, targets: &[usize]| InstData::Branch {
             operands,
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -6340,6 +6741,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     val(0),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(
@@ -6359,6 +6761,7 @@ impl TestInput {
                     OperandConstraint::Reg(one_reg),
                     val(0),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(
@@ -6476,14 +6879,17 @@ impl TestInput {
             |kind, constraint, v| Operand::new(Position::Early, kind, constraint, Some(v));
         let def = |v| InstData::Op {
             operands: vec![operand(DefUse::Def, reg, v)],
+            clobbers: vec![],
             side_effects: true,
         };
         let read = |v| InstData::Op {
             operands: vec![operand(DefUse::Use, reg, v)],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[usize], args: Vec<Val<u32>>| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -6518,6 +6924,7 @@ impl TestInput {
                     operand(DefUse::Use, reg, val(1)),
                     operand(DefUse::Use, reg, val(2)),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             branch(&[3], args),
@@ -6613,6 +7020,7 @@ impl TestInput {
 
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let call = |target, args: &[Val]| BlockCall {
@@ -6633,6 +7041,7 @@ impl TestInput {
             ),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![call(Block::try_new(1).unwrap(), &[]), call(merge, &[first])],
             },
             // `block1`: pass a value of its own in a register instead, giving
@@ -6646,6 +7055,7 @@ impl TestInput {
             ),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![call(merge, &[second])],
             },
             // `block2`: read the parameter from a register, where `block1`'s
@@ -6658,6 +7068,7 @@ impl TestInput {
             ),
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -6732,10 +7143,12 @@ impl TestInput {
         );
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |target, args| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: vec![BlockCall { target, args }],
         };
 
@@ -6745,6 +7158,7 @@ impl TestInput {
             op(Position::Late, DefUse::Def, OperandConstraint::Any, arg_val),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: block(1),
@@ -6771,6 +7185,7 @@ impl TestInput {
             ),
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -6860,6 +7275,7 @@ impl TestInput {
 
         let branch = |target, arg| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: vec![BlockCall {
                 target,
                 args: vec![arg],
@@ -6881,6 +7297,7 @@ impl TestInput {
                         OperandConstraint::Reg(class),
                         Some(val(0)),
                     )],
+                    clobbers: vec![],
                     side_effects: true,
                 },
             )
@@ -6898,10 +7315,12 @@ impl TestInput {
                     OperandConstraint::Reg(class),
                     Some(val(links)),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7008,6 +7427,7 @@ impl TestInput {
                     OperandConstraint::Reg(first),
                     Some(val(0)),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // The tie, and the sibling read that contradicts it.
@@ -7032,12 +7452,14 @@ impl TestInput {
                         Some(val(1)),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // A terminator of its own, so `ensure_terminators` leaves the tied
             // instruction alone.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7118,10 +7540,12 @@ impl TestInput {
 
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |target, args| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: vec![BlockCall { target, args }],
         };
 
@@ -7137,6 +7561,7 @@ impl TestInput {
             op(Position::Late, DefUse::Def, OperandConstraint::Any, second),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: block(1),
@@ -7169,6 +7594,7 @@ impl TestInput {
             ),
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7262,10 +7688,12 @@ impl TestInput {
                         Some(next),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: entry,
@@ -7286,10 +7714,12 @@ impl TestInput {
                     OperandConstraint::Stack,
                     Some(param),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7381,6 +7811,7 @@ impl TestInput {
                         Some(clobber),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             // And read it there again afterwards, so it comes back.
@@ -7391,10 +7822,12 @@ impl TestInput {
                     OperandConstraint::Reg(pinned),
                     Some(param),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: entry,
                     args: vec![param],
@@ -7455,10 +7888,12 @@ impl TestInput {
 
         let op = |pos, kind, constraint| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[usize]| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -7488,6 +7923,7 @@ impl TestInput {
             // block's return.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7791,10 +8227,12 @@ impl TestInput {
                         Some(second),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7870,12 +8308,14 @@ impl TestInput {
                         )
                     })
                     .collect(),
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -7954,6 +8394,7 @@ impl TestInput {
                         Some(param),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -7963,12 +8404,14 @@ impl TestInput {
                     OperandConstraint::Stack,
                     Some(param),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             // Give the block a terminator of its own, so that
             // `ensure_terminators` does not rewrite the reads.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -8040,6 +8483,7 @@ impl TestInput {
 
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -8056,6 +8500,7 @@ impl TestInput {
             ),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target,
                     args: vec![arg_val],
@@ -8078,6 +8523,7 @@ impl TestInput {
             ),
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -8151,6 +8597,7 @@ impl TestInput {
         let operand = |pos, kind, constraint, val| Operand::new(pos, kind, constraint, Some(val));
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![operand(pos, kind, constraint, val)],
+            clobbers: vec![],
             side_effects: true,
         };
 
@@ -8180,6 +8627,7 @@ impl TestInput {
                     OperandConstraint::Reg(both),
                     resident_val,
                 )],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target,
                     args: vec![arg_val],
@@ -8204,6 +8652,7 @@ impl TestInput {
                         resident_val,
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             op(
@@ -8216,6 +8665,7 @@ impl TestInput {
             // does not take the reads away.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -8303,6 +8753,7 @@ impl TestInput {
         let operand = |pos, kind, constraint, val| Operand::new(pos, kind, constraint, Some(val));
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![operand(pos, kind, constraint, val)],
+            clobbers: vec![],
             side_effects: true,
         };
         let stack_use = |val| operand(Position::Early, DefUse::Use, OperandConstraint::Stack, val);
@@ -8341,10 +8792,12 @@ impl TestInput {
             ),
             InstData::Op {
                 operands: vec![stack_use(first_val), stack_use(second_val)],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![reg_use(resident_val)],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: header,
                     args: vec![first_val, second_val],
@@ -8359,10 +8812,12 @@ impl TestInput {
                     stack_use(second_param),
                     reg_use(resident_val),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: Block::try_new(2).unwrap(),
@@ -8379,6 +8834,7 @@ impl TestInput {
             // register is taken over the edge that carries the swap.
             InstData::Branch {
                 operands: vec![reg_use(resident_val)],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: header,
                     args: vec![second_param, first_param],
@@ -8387,6 +8843,7 @@ impl TestInput {
             // block3, the exit.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -8481,6 +8938,7 @@ impl TestInput {
         let operand = |pos, kind, constraint, val| Operand::new(pos, kind, constraint, Some(val));
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![operand(pos, kind, constraint, val)],
+            clobbers: vec![],
             side_effects: true,
         };
         let reg_use = |val| {
@@ -8509,6 +8967,7 @@ impl TestInput {
             ),
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: header,
                     args: vec![first_val, second_val],
@@ -8519,10 +8978,12 @@ impl TestInput {
             // again.
             InstData::Op {
                 operands: vec![reg_use(first_param), reg_use(second_param)],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: Block::try_new(2).unwrap(),
@@ -8540,10 +9001,12 @@ impl TestInput {
             // register the machine has.
             InstData::Op {
                 operands: vec![reg_use(first_param), reg_use(second_param)],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![BlockCall {
                     target: header,
                     args: vec![second_param, first_param],
@@ -8552,6 +9015,7 @@ impl TestInput {
             // block3, the exit.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -8639,6 +9103,7 @@ impl TestInput {
             // loop header's parameters, so one value arrives in two places.
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: block(1),
@@ -8660,12 +9125,14 @@ impl TestInput {
                     OperandConstraint::Reg(wide),
                     Some(val(1)),
                 )],
+                clobbers: vec![],
                 side_effects: false,
             },
             // Round the loop with the two narrow parameters swapped, and back
             // to the entry with the wide one still live.
             InstData::Branch {
                 operands: vec![],
+                clobbers: vec![],
                 targets: vec![
                     BlockCall {
                         target: block(1),
@@ -8686,6 +9153,7 @@ impl TestInput {
                     OperandConstraint::Any,
                     Some(val(0)),
                 )],
+                clobbers: vec![],
                 targets: vec![],
             },
         ] {
@@ -8922,6 +9390,9 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_fixed_def_before_a_reuse_of_its_pinned_read(),
         TestInput::with_one_value_read_from_two_registers(),
         TestInput::with_a_clobber_beside_a_live_through_value(),
+        TestInput::with_an_early_read_beside_a_clobber_of_every_register(),
+        TestInput::with_a_clobbering_terminator_before_a_merge(),
+        TestInput::with_a_reload_clobbered_before_its_next_read(),
         TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Any),
         TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Stack),
         TestInput::with_a_terminator_passing_its_own_result(),
@@ -9983,6 +10454,7 @@ mod tests {
                     OperandConstraint::Any,
                     Some(val(0)),
                 )],
+                clobbers: vec![],
                 side_effects: true,
             },
             InstData::Op {
@@ -10000,6 +10472,7 @@ mod tests {
                         Some(val(1)),
                     ),
                 ],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {

@@ -347,12 +347,28 @@ function buildOutline(func) {
     push(depth, "inst", [entity("Inst", index), text(" early:"), ...early]);
     // Right-aligned under `early:`, which is what makes a column of operands
     // readable. Both halves are always drawn, even an empty one.
-    push(depth, "inst", [text(" ".repeat(label.length + 2) + "late:"), ...late]);
+    push(depth, "inst", [
+      text(" ".repeat(label.length + 2) + "late:"),
+      ...late,
+      ...clobberParts(inst),
+    ]);
     instRows.set(index, { first: from, last: lines.length - 1 });
 
     for (const edit of inst.edits) {
       if (edit.at.pos === "late") push(depth, "edit", editParts(edit.edit));
     }
+  }
+
+  // ` clobbers { r0, r1 }` on the late row, where the registers are held, or
+  // nothing at all when the instruction clobbers none.
+  function clobberParts(inst) {
+    const clobbers = inst.clobbers || [];
+    if (clobbers.length === 0) return [];
+    return [
+      text(" clobbers { "),
+      ...joinParts(clobbers.map((reg) => [entity("Reg", reg)])),
+      text(" }"),
+    ];
   }
 
   function operandParts(index, inst, pos) {
@@ -800,10 +816,14 @@ function buildDetails(json, entityEvents) {
             ...constraintParts(operand.constraint),
           ];
         });
+        const clobbers = inst.clobbers || [];
         return [
           list("Live spans", live.map(spanParts), live.length),
           { label: "Block", value: [entity("Block", inst.block)] },
           list("Operands", operands, operands.length),
+          // After the operands, because a clobber is what the instruction
+          // destroys over and above what they already say.
+          listField("Clobbers", "Reg", clobbers),
           list("Edits", inst.edits.map((edit) => editParts(edit.edit)), inst.edits.length),
         ];
       }

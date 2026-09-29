@@ -305,6 +305,19 @@ pub enum CheckerError {
         loc: ScalarAllocation,
     },
 
+    /// A clobber destroys a location an operand of the same instruction is
+    /// reading.
+    ClobberDestroysUse {
+        /// The [`Inst`] whose clobber and operand collide.
+        inst: Inst,
+        /// The clobbered register.
+        reg: Reg,
+        /// The index of the reading operand it destroys.
+        operand: usize,
+        /// The location the read is in.
+        loc: ScalarAllocation,
+    },
+
     /// A value the input does not say may be rematerialized was
     /// rematerialized anyway.
     NotRematerializable {
@@ -674,6 +687,16 @@ impl fmt::Debug for CheckerError {
                 "operand {operand} of {inst:?} defines {loc:?}, which operand {other} reads at \
                  the same point"
             ),
+            Self::ClobberDestroysUse {
+                inst,
+                reg,
+                operand,
+                loc,
+            } => write!(
+                f,
+                "{inst:?} clobbers {reg:?}, destroying {loc:?}, which operand {operand} reads \
+                 at the same point"
+            ),
             Self::NotRematerializable { block, val } => write!(
                 f,
                 "{block:?} rematerializes {val:?}, which the input does not give a \
@@ -987,6 +1010,7 @@ struct Stats {
     surviving_reuse_targets: usize,
     stack_constraints: usize,
     fixed_operands: usize,
+    clobbers: usize,
     shared_locations: usize,
     shrunk_entry_states: usize,
     entry_block_edges: usize,
@@ -1308,7 +1332,9 @@ where
         if first != terminator || input_block.len_successors() != 1 {
             return false;
         }
-        if func.inst(terminator).operands_len() != 0 {
+        // `edge_position` decides whether the gap is usable at all; ask the
+        // predicate it asks, so the two cannot disagree.
+        if !crate::liveness::terminator_leaves_the_gap_free(&func.inst(terminator)) {
             return false;
         }
         let Some(succ) = input_block.successors().next() else {
@@ -1811,6 +1837,37 @@ where
         for (i, &op) in operands.iter().enumerate() {
             if op.pos().is_late() && op.kind() == DefUse::Def {
                 self.write_operand(state, inst, i, op, &scalars[i], mode);
+            }
+        }
+
+        // Clobbers last: they destroy these registers over the late half,
+        // whatever else the instruction did with them.
+        let machine = self.input.machine;
+        for reg in func.inst(inst).clobbers().iter() {
+            let loc = ScalarAllocation::Reg(reg);
+
+            // `use_locs` still holds the late reads, so catch a clobber
+            // landing on one here rather than as a distant `WrongValue`.
+            let destroyed = self
+                .use_locs
+                .iter()
+                .find(|&&(_, read)| Interfere::interfere(machine, read, loc))
+                .map(|&(operand, _)| operand);
+            if let Some(operand) = destroyed {
+                self.error(
+                    mode,
+                    CheckerError::ClobberDestroysUse {
+                        inst,
+                        reg,
+                        operand,
+                        loc,
+                    },
+                );
+            }
+
+            state.clobber(machine, loc);
+            if mode == Mode::Report {
+                self.stats.clobbers += 1;
             }
         }
     }
@@ -2383,6 +2440,7 @@ mod tests {
                 "a reuse whose reused value is still live in another location",
             STACK_CONSTRAINTS: stack_constraints = "an operand constrained to the stack",
             FIXED_OPERANDS: fixed_operands = "an operand pinned to one register",
+            CLOBBERS: clobbers = "a register an instruction destroys the contents of",
             SHARED_LOCATIONS: shared_locations = "a location holding more than one value",
             SHRUNK_ENTRY_STATES: shrunk_entry_states = "a block whose entry state shrank",
             ENTRY_BLOCK_EDGES: entry_block_edges = "an edge arriving at the entry block",
@@ -2492,6 +2550,9 @@ mod tests {
             TestInput::with_a_val_less_read_of_a_non_allocatable_reg(),
             TestInput::with_one_value_read_from_two_registers(),
             TestInput::with_a_clobber_beside_a_live_through_value(),
+            // A clobber of every register, beside an early read wanting one
+            // of them in the other half.
+            TestInput::with_an_early_read_beside_a_clobber_of_every_register(),
             TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Any),
             TestInput::with_a_fixed_def_on_a_terminator(OperandConstraint::Stack),
             // A pinned definition whose own piece loses the register it is

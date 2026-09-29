@@ -194,6 +194,7 @@ where
 {
     block: Block<E>,
     operands: Vec<OperandInfo<E>>,
+    clobbers: RegSet,
     edits: Vec<PointEditInfo<E>>,
 }
 
@@ -379,6 +380,7 @@ where
                     pos: operand.pos(),
                     constraint: operand.constraint(),
                 })),
+                clobbers: input_inst.clobbers(),
                 edits: Vec::from_iter(
                     context
                         .move_generation
@@ -605,6 +607,7 @@ pub(crate) const FUNCTION_SCHEMA: Table = &[
         &[
             ("block", Some(Descriptor::Entity("Block"))),
             ("operands", Some(Descriptor::List(&OPERAND))),
+            ("clobbers", Some(schema::REG_SET)),
             ("edits", Some(Descriptor::List(&POINT_EDIT_INFO))),
         ],
     ),

@@ -695,15 +695,19 @@ mod tests {
                 TestInput::with_a_value_reloaded_past_a_diamond,
             ),
             ("critical-edge", TestInput::with_a_critical_edge),
-            // The one operand shape no allocation produces: a read of a
-            // register the allocator does not own, naming no value.
+            // A read of a register the allocator does not own, naming no value.
             (
                 "val-less-read",
                 TestInput::with_a_val_less_read_of_a_non_allocatable_reg,
             ),
             ("spilled-merge-param", TestInput::with_spilled_merge_param),
-            // The one prefix the other fixtures cannot show: a real allocation
-            // over blocks the embedder called cold, hot, and merely unusual.
+            // A non-empty clobber set.
+            (
+                "clobbers",
+                TestInput::with_an_early_read_beside_a_clobber_of_every_register,
+            ),
+            // A real allocation over blocks the embedder called cold, hot, and
+            // otherwise.
             ("block-kinds", || {
                 let mut test = TestInput::with_spilled_merge_param();
                 use crate::entity::{Block, Entity};

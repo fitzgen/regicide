@@ -262,6 +262,49 @@ test("an operand naming no value renders as the class it is pinned to", () => {
   assert.equal(modelOf(blob).details({ kind: "Val", index: 1 }), null);
 });
 
+test("a clobbering instruction shows its clobbers on the late row", () => {
+  // The late half is the one the registers are held across, so that is the row
+  // they belong on -- and each is a clickable register, not a rendered label.
+  const blob = fixture("clobbers");
+  const outline = outlineOf(blob);
+  const line = outline.lines.find((l) => text(l).includes("clobbers"));
+  assert.ok(line !== undefined, "no clobbers in the outline:\n" + render(outline));
+  assert.equal(text(line), "       late: clobbers { r0, r1 }");
+
+  const regs = line.parts.filter((part) => part.entity && part.entity.kind === "Reg");
+  assert.deepEqual(regs.map((part) => part.entity.index), blob.function.insts[1].clobbers);
+  for (const part of regs) assertReads(part, "an outline clobber");
+
+  // And only that row: the early half of the same instruction says nothing
+  // about them, nor does any instruction that clobbers nothing.
+  const clobbering = outline.lines.filter((l) => text(l).includes("clobbers"));
+  assert.equal(clobbering.length, 1, "more rows mention clobbers than clobber");
+});
+
+test("an instruction that clobbers nothing says nothing about clobbers", () => {
+  // Nearly every instruction is this one, and an empty pair of braces on each
+  // would bury the ones that do clobber.
+  const outline = outlineOf(fixture("spills-and-reloads"));
+  assert.ok(!render(outline).includes("clobbers"));
+});
+
+test("an instruction's pane lists its clobbers after its operands", () => {
+  const blob = fixture("clobbers");
+  const details = modelOf(blob).details({ kind: "Inst", index: 1 });
+  assert.equal(shown(details)["Clobbers"], "r0, r1");
+  // A clobber is what the instruction destroys over and above what the
+  // operands say, so it reads after them.
+  assert.deepEqual(labels(details).slice(2, 4), ["Operands", "Clobbers"]);
+
+  // The count is the list's, which is what lets the view cap a long one.
+  const field = details.fields.find((f) => f.label === "Clobbers");
+  assert.equal(field.count, 2);
+  for (const part of field.value.filter((p) => p.entity)) assertReads(part, "a pane clobber");
+
+  // An instruction with none reads `none`, like every other empty field.
+  assert.equal(shown(modelOf(blob).details({ kind: "Inst", index: 0 }))["Clobbers"], "none");
+});
+
 test("an instruction's operands link their `def` and `use` to the use", () => {
   // The same link in the pane, and the line reads exactly as it did before.
   const blob = fixture("spills-and-reloads");
@@ -437,7 +480,7 @@ const FIELDS = {
     "Live-in spans",
     "Live-out spans",
   ],
-  Inst: ["Live spans", "Block", "Operands", "Edits"],
+  Inst: ["Live spans", "Block", "Operands", "Clobbers", "Edits"],
   Use: ["Constraint", "Operand", "Instruction", "Spill weight"],
   LiveSpan: [
     "Value",

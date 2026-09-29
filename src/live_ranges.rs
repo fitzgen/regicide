@@ -603,8 +603,8 @@ where
     }
 }
 
-/// A register held for the fixed operands of one instruction that name it for
-/// one value.
+/// A register held across part of one instruction, either for the fixed
+/// operands that name it for one value or because the instruction clobbers it.
 ///
 /// A fixed operand, one whose resolved constraint names a class holding a
 /// single register or register group, is not choosing among registers but
@@ -619,6 +619,9 @@ where
 /// half-instruction from the value's live range; regicide has no point to
 /// excise to, so the value's own span covers its own reservation and a hard
 /// wall would forbid the very assignment the hint asks for.
+///
+/// A clobber has no `val`, which makes it porous to nothing and so a hard wall
+/// to every bundle. It also needs no move and biases no preference.
 pub(crate) struct ReservationData<E>
 where
     E: EntityRepr,
@@ -632,8 +635,9 @@ where
     /// Where it ends, exclusive.
     end: LivePoint<E>,
 
-    /// The value delivered into, or produced out of, `reg`.
-    val: Val<E>,
+    /// The value delivered into, or produced out of, `reg`. `None` for a
+    /// clobber.
+    val: Option<Val<E>>,
 
     /// Whether some operand reads `val` out of `reg`, and so needs the move
     /// delivering it there.
@@ -663,8 +667,9 @@ where
         live_ranges.reservations[self].end
     }
 
-    /// The value delivered into, or produced out of, the reserved register.
-    pub(crate) fn val(self, live_ranges: &LiveRanges<E>) -> Val<E> {
+    /// The value delivered into, or produced out of, the reserved register, or
+    /// `None` for a clobber.
+    pub(crate) fn val(self, live_ranges: &LiveRanges<E>) -> Option<Val<E>> {
         live_ranges.reservations[self].val
     }
 
@@ -2225,29 +2230,38 @@ pub(crate) struct FixedOperand {
     pub pos: Position,
 }
 
+/// The program points a reservation holds its register over, for an operand of
+/// `kind` in the `pos` half of `inst`.
+///
+/// A read reaches back over the gap before the instruction, where the move
+/// delivering it lives; a definition reaches forward over the gap after. So an
+/// early read and a late definition of one register want disjoint halves of
+/// it, the shape report 000 could not allocate. A clobber is a definition of
+/// nothing, and takes the definition's range.
+pub(crate) fn held_range<E>(
+    kind: DefUse,
+    pos: Position,
+    inst: Inst<E>,
+) -> core::ops::Range<LivePoint<E>>
+where
+    E: EntityRepr,
+{
+    let point = LivePoint::new(inst, pos);
+    if kind.is_use() {
+        point.inst_boundary_at_or_before()..point.next_point()
+    } else {
+        point..point.inst_boundary_after()
+    }
+}
+
 impl FixedOperand {
     /// The program points a reservation for this operand holds its register
-    /// over.
-    ///
-    /// A read is delivered by a move in the gap before the instruction, which
-    /// borrows the early half (`MovePosition::range`), so the register is held
-    /// from there through the half the read happens in, late reads included.
-    ///
-    /// A definition writes the register itself, so it holds it from its own
-    /// half through the gap after, where the move carrying the value out
-    /// lives. It deliberately does not reach back, so that an early read and a
-    /// late definition of one register want disjoint halves of it, the shape
-    /// report 000 could not allocate.
+    /// over. See the free `held_range`.
     pub(crate) fn held_range<E>(&self, inst: Inst<E>) -> core::ops::Range<LivePoint<E>>
     where
         E: EntityRepr,
     {
-        let point = LivePoint::new(inst, self.pos);
-        if self.kind.is_use() {
-            point.inst_boundary_at_or_before()..point.next_point()
-        } else {
-            point..point.inst_boundary_after()
-        }
+        held_range(self.kind, self.pos, inst)
     }
 
     /// Does the hold cover `pos` of `inst`, the operand's own instruction?
@@ -2349,7 +2363,7 @@ where
             // already rejected.
             if let Some(held) = reservations.as_mut_slice()[inst_start..]
                 .iter_mut()
-                .find(|r| r.reg == reg && r.val == val)
+                .find(|r| r.reg == reg && r.val == Some(val))
             {
                 held.start = held.start.min(start);
                 held.end = held.end.max(end);
@@ -2364,9 +2378,55 @@ where
                     reg,
                     start,
                     end,
-                    val,
+                    val: Some(val),
                     uses: fixed.kind.is_use(),
                     defs: fixed.kind.is_def(),
+                },
+            )?;
+        }
+
+        // A val-less reservation for each register the instruction destroys,
+        // over the late half a definition of it would have held. Running after
+        // the operand pass still leaves the whole run sorted by start point:
+        // `inst:Late` is at or after anything this instruction's operands
+        // produced, and before anything the next instruction produces.
+        let core::ops::Range { start, end } = held_range(DefUse::Def, Position::Late, inst);
+        for reg in input_inst.clobbers().iter() {
+            // `is_non_allocatable` indexes the machine's registers, and
+            // `validation`, which reports this properly, is off by default in
+            // release.
+            debug_assert!(
+                reg.index() < input.machine.num_registers(),
+                "`InputInst::clobbers` named a register this machine does not define",
+            );
+
+            // A register the allocator does not own holds nothing to destroy.
+            if reg.is_non_allocatable(input.machine) {
+                continue;
+            }
+
+            let reg = RegAllocation::Reg(output.with_repr(reg)?);
+
+            // Reservations on a register may not overlap, and two clobbers of
+            // one register agree, so fold them together. A fixed operand is
+            // left alone: only an early read can name this register, and it
+            // holds the other half.
+            if reservations.as_mut_slice()[inst_start..]
+                .iter()
+                .any(|r| r.reg == reg && r.val.is_none())
+            {
+                continue;
+            }
+
+            reservations.push(
+                output,
+                ReservationData {
+                    reg,
+                    start,
+                    end,
+                    val: None,
+                    uses: false,
+                    defs: false,
                 },
             )?;
         }
@@ -4299,6 +4359,49 @@ mod tests {
         let held = reservations(&live_ranges);
         assert_eq!(held.len(), 1, "{held:#?}");
         assert_eq!(held[0], (held[0].0, tie, overwritten, true, false));
+    }
+
+    /// A clobbered register is reserved over the instruction's late half, and
+    /// that reservation delivers and carries out nothing.
+    #[test]
+    fn a_clobber_reserves_its_register_over_the_late_half() {
+        let test_input = TestInput::with_an_early_read_beside_a_clobber_of_every_register();
+        let (_liveness, live_ranges) = analyze_spans(&test_input).unwrap();
+
+        // The read names the two-register class, not a singleton, so it is
+        // not a fixed operand: every reservation below is a clobber's.
+        test_input.with_input(|input| {
+            let inst1 = input.func.inst(inst(1));
+            assert_eq!(inst1.operand(0).pos(), Position::Early);
+            assert_eq!(inst1.operand(0).kind(), DefUse::Use);
+            assert_eq!(
+                inst1.clobbers().iter().collect::<Vec<_>>(),
+                vec![Reg::try_new(0).unwrap(), Reg::try_new(1).unwrap()],
+            );
+        });
+
+        let late = LivePoint::new(inst(1), Position::Late);
+        let held = reservations(&live_ranges);
+        assert_eq!(held.len(), 2, "one per clobbered register: {held:#?}");
+        for (i, entry) in held.iter().enumerate() {
+            assert_eq!(
+                *entry,
+                (
+                    RegAllocation::Reg(Reg::try_new(i).unwrap()),
+                    late,
+                    late.inst_boundary_after(),
+                    // No move on either side of a clobber.
+                    false,
+                    false,
+                ),
+                "{held:#?}",
+            );
+        }
+
+        // Val-less, which is what makes it a wall rather than porous.
+        for r in live_ranges.reservations() {
+            assert_eq!(r.val(&live_ranges), None, "a clobber names no value");
+        }
     }
 
     /// A read pinned elsewhere, at an *earlier* point, does not keep the run at

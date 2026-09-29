@@ -64,7 +64,7 @@ use crate::{
         Block, Entity as _, EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap, Val,
     },
     error::IResult,
-    input::{DefUse, InputBlock, InputFunction, InputInst as _, Position},
+    input::{DefUse, InputBlock, InputFunction, InputInst, Position},
     live_ranges::{LivePoint, Use, UseData},
     output::OutputInner,
     rpo::Rpo,
@@ -631,6 +631,15 @@ where
 
 pub(crate) fn block_inst_bounds<'a>(input_block: &impl InputBlock<'a>) -> (Inst, Inst) {
     (block_first_inst(input_block), block_last_inst(input_block))
+}
+
+/// Can an edge leaving this block put its moves in the gap before the block's
+/// terminator?
+///
+/// Only when the terminator would leave them alone: an operand or a clobber
+/// could trample a move, or be trampled by one.
+pub(crate) fn terminator_leaves_the_gap_free<'a>(terminator: &impl InputInst<'a>) -> bool {
+    terminator.operands_len() == 0 && terminator.clobbers().is_empty()
 }
 
 /// Get the first instruction in a block.

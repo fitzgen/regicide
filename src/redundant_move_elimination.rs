@@ -986,8 +986,9 @@ where
         self.me.eliminated.push(index);
     }
 
-    /// Run one instruction's definitions against `state`. Reads change nothing,
-    /// and input validation makes an operand naming no value always a read.
+    /// Run one instruction's definitions and clobbers against `state`. Reads
+    /// change nothing, and input validation makes an operand naming no value
+    /// always a read.
     fn apply_inst(&mut self, state: &mut State<E>, inst: Inst<E>) {
         let func = self.input.func;
         let machine = self.input.machine;
@@ -1033,6 +1034,13 @@ where
                     );
                 }
             }
+        }
+
+        // A clobber destroys its register just as a definition does, only
+        // without leaving a value behind to record.
+        for reg in input_inst.clobbers().iter() {
+            let reg = Reg::<E>::try_new(reg.index()).unwrap();
+            state.clobber(machine, ScalarAllocation::Reg(reg));
         }
 
         self.me.scalars = scalars;
@@ -1503,6 +1511,29 @@ mod tests {
         assert_eq!(count(&local.edits, is_reload), 0);
         assert_eq!(count(&local.edits, is_spill), 2);
         assert_eq!(local.stats.eliminated_reloads, 2);
+
+        // Nothing here needs the fixpoint.
+        assert_eq!(global.edits, local.edits);
+    }
+
+    /// Two reloads into the register a value never left, with a clobber of that
+    /// register between them. Only the first is redundant: the clobber destroys
+    /// what the second refills, so eliminating it would miscompile.
+    #[test]
+    fn a_clobber_keeps_the_reload_that_follows_it() {
+        let test_input = TestInput::with_a_reload_clobbered_before_its_next_read();
+        let none = allocated(&test_input, MoveEliminationLevel::None);
+        let local = allocated(&test_input, MoveEliminationLevel::Local);
+        let global = allocated(&test_input, MoveEliminationLevel::Global);
+
+        assert_eq!(count(&none.edits, is_spill), 1);
+        assert_eq!(count(&none.edits, is_reload), 2);
+
+        assert_eq!(count(&local.edits, is_reload), 1);
+        assert_eq!(local.stats.eliminated_reloads, 1);
+        // The survivor is the one the clobber made necessary, so it is the
+        // later of the two.
+        assert_eq!(deleted(&local.edits, &none.edits).unwrap(), [1]);
 
         // Nothing here needs the fixpoint.
         assert_eq!(global.edits, local.edits);
