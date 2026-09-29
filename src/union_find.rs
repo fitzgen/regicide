@@ -50,6 +50,7 @@ where
         map.is_reset() && stack.is_empty()
     }
 
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn find_without_path_compression(&self, entry: E) -> E {
         let mut entry = entry;
         while let Some(e) = self.map[entry]

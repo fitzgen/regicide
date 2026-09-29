@@ -3,44 +3,83 @@
 //! A region is a set of basic blocks whose contained live ranges are allocated
 //! together. We never allocate across regions.
 //!
-//! To make this effective, we create regions for each loop in the control-flow
+//! To make this effective, we create regions for each cycle in the control-flow
 //! graph, and for the function's top level.
 //!
-//! A block's region is identified by the first strongly-connected component
-//! at-or-above that block in the dominator tree that either contains more than
-//! one block (i.e. is a loop) or is the entry block's component. Note that this
-//! means a block that runs *after* a loop exits is still a member of that
-//! loop's region when the loop dominates it.
+//! The cycles we find are natural loops (single-entry) when control flow is
+//! reducible and a traversal-dependent but valid nesting when it is not. A
+//! block's region is the innermost cycle containing it; blocks in no cycle,
+//! unreachable ones included, belong to the top-level region.
+//!
+//! Cycle membership is *not* the same as (transitive) domination: a block after
+//! a loop exits belongs to the enclosing region even though the loop dominates
+//! it.
 
 use crate::counts::Counts;
-use crate::dfs::Dfs;
+use crate::dfs::{Dfs, DfsEvent};
 use crate::entity::{
     EntityRange, EntityRepr, PrimaryMap, Region, RegionBlocksStorageIndex,
-    RegionChildrenStorageIndex, Scc, SecondaryMap,
+    RegionChildrenStorageIndex, SecondaryMap,
 };
 use crate::error::IResult;
 use crate::input::InputFunction;
 use crate::output::OutputInner;
-use crate::sccs::StronglyConnectedComponents;
 use crate::timing::Timing;
 use crate::union_find::UnionFind;
 use crate::{Block, Entity, InputBlock};
 use alloc::vec::Vec;
+
+/// Where a block sits in the depth-first traversal of the control-flow graph.
+///
+/// `start` is the one-based pre-order number, so zero means "never reached".
+///
+/// `end` is the largest pre-order number in the block's subtree.
+///
+/// A subtree's numbers are contiguous, so `start..=end` is exactly the
+/// associated block's subtree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DfsInfo {
+    start: u32,
+    end: u32,
+}
+
+impl DfsInfo {
+    /// Did the depth-first traversal reach this block at all?
+    fn is_reached(&self) -> bool {
+        self.start != 0
+    }
+
+    /// Is this block an ancestor of `other` in the depth-first tree?
+    fn is_ancestor_of(&self, other: &DfsInfo) -> bool {
+        self.start <= other.start && other.end <= self.end
+    }
+}
 
 /// The region tree for a function.
 pub struct RegionTree<E>
 where
     E: EntityRepr,
 {
-    /// The strongly-connected components of the control-flow graph, which are
-    /// what define the regions.
-    sccs: StronglyConnectedComponents<E>,
-
     /// The root of the region tree: the function entry block's region.
     root: Option<Region<E>>,
 
-    /// Map from an SCC to the region's SCC representative.
-    regions: UnionFind<Scc<E>>,
+    /// Map from a block to the innermost region containing it.
+    ///
+    /// `None` until `construct_block_regions` fills in the blocks in no cycle.
+    block_region: SecondaryMap<Block<E>, Option<Region<E>>>,
+
+    /// Map from a block to its position in the depth-first traversal.
+    dfs_info: SecondaryMap<Block<E>, DfsInfo>,
+
+    /// Map from a region to the enclosing region in the cycle nest, or `None`
+    /// for the top-level region.
+    region_parent: SecondaryMap<Region<E>, Option<Region<E>>>,
+
+    /// Map from a region to the outermost region currently containing it.
+    ///
+    /// A new cycle absorbing a block an inner cycle already claimed must
+    /// reparent that inner cycle's whole nest at once; this finds its top.
+    top_level: UnionFind<Region<E>>,
 
     /// Map from a region to the indices within `region_blocks_storage` that
     /// contain this region's blocks.
@@ -48,10 +87,6 @@ where
 
     /// The contiguous storage for the blocks that belong to each region.
     region_blocks_storage: PrimaryMap<RegionBlocksStorageIndex<E>, Block<E>>,
-
-    /// Map from a region to its parent region, or `None` for the top-level
-    /// region.
-    region_parent: SecondaryMap<Region<E>, Option<Region<E>>>,
 
     /// Map from a region to the indices within `region_children_storage` that
     /// contain this region's immediate children.
@@ -64,30 +99,31 @@ where
     /// once, and always before any of its descendants.
     pre_order: Vec<Region<E>>,
 
-    /// Scratch space: the depth-first stack used to build `pre_order`.
+    /// Scratch space: the blocks in depth-first pre-order.
+    dfs_pre_order: Vec<Block<E>>,
+
+    /// Scratch space: each cycle's entry blocks, paired with the cycle.
     ///
-    /// Always empty outside of `construct`; a field only so that we reuse its
-    /// allocation across resets.
+    /// An entry is a block with a predecessor outside the cycle, i.e. one
+    /// control can enter at. Only an irreducible cycle has more than one.
+    cycle_entries: Vec<(Region<E>, Block<E>)>,
+
+    /// Scratch space: the backward worklist used to grow a cycle from its
+    /// header.
+    worklist: Vec<Block<E>>,
+
+    /// Scratch space: the depth-first stack used to build `pre_order`.
     pre_order_stack: Vec<Region<E>>,
 
     /// Scratch space: each block paired with its region, sorted by region so that
     /// we can lay each region's blocks out contiguously.
-    ///
-    /// Always empty outside of `construct`; a field only so that we reuse its
-    /// allocation across resets.
     blocks_by_region: Vec<(Region<E>, Block<E>)>,
 
     /// Scratch space: the distinct regions, in increasing index order.
-    ///
-    /// Always empty outside of `construct`; a field only so that we reuse its
-    /// allocation across resets.
     distinct_regions: Vec<Region<E>>,
 
     /// Scratch space: each non-top-level region paired with its parent, sorted by
     /// parent so that we can lay each region's children out contiguously.
-    ///
-    /// Always empty outside of `construct`; a field only so that we reuse its
-    /// allocation across resets.
     children_by_parent: Vec<(Region<E>, Region<E>)>,
 }
 
@@ -97,15 +133,19 @@ where
 {
     pub const fn new() -> Self {
         RegionTree {
-            sccs: StronglyConnectedComponents::new(),
             root: None,
-            regions: UnionFind::new(),
+            block_region: SecondaryMap::new(None),
+            dfs_info: SecondaryMap::new(DfsInfo { start: 0, end: 0 }),
+            region_parent: SecondaryMap::new(None),
+            top_level: UnionFind::new(),
             region_blocks: SecondaryMap::new(EntityRange::empty()),
             region_blocks_storage: PrimaryMap::new(),
-            region_parent: SecondaryMap::new(None),
             region_children: SecondaryMap::new(EntityRange::empty()),
             region_children_storage: PrimaryMap::new(),
             pre_order: Vec::new(),
+            dfs_pre_order: Vec::new(),
+            cycle_entries: Vec::new(),
+            worklist: Vec::new(),
             pre_order_stack: Vec::new(),
             blocks_by_region: Vec::new(),
             distinct_regions: Vec::new(),
@@ -115,29 +155,37 @@ where
 
     pub fn reset(&mut self) {
         let Self {
-            sccs,
             root,
-            regions,
+            block_region,
+            dfs_info,
+            region_parent,
+            top_level,
             region_blocks,
             region_blocks_storage,
-            region_parent,
             region_children,
             region_children_storage,
             pre_order,
+            dfs_pre_order,
+            cycle_entries,
+            worklist,
             pre_order_stack,
             blocks_by_region,
             distinct_regions,
             children_by_parent,
         } = self;
-        sccs.reset();
         *root = None;
-        regions.reset();
+        block_region.reset();
+        dfs_info.reset();
+        region_parent.reset();
+        top_level.reset();
         region_blocks.reset();
         region_blocks_storage.reset();
-        region_parent.reset();
         region_children.reset();
         region_children_storage.reset();
         pre_order.clear();
+        debug_assert!(dfs_pre_order.is_empty());
+        debug_assert!(cycle_entries.is_empty());
+        debug_assert!(worklist.is_empty());
         debug_assert!(pre_order_stack.is_empty());
         debug_assert!(blocks_by_region.is_empty());
         debug_assert!(distinct_regions.is_empty());
@@ -146,29 +194,37 @@ where
 
     pub fn is_reset(&self) -> bool {
         let Self {
-            sccs,
             root,
-            regions,
+            block_region,
+            dfs_info,
+            region_parent,
+            top_level,
             region_blocks,
             region_blocks_storage,
-            region_parent,
             region_children,
             region_children_storage,
             pre_order,
+            dfs_pre_order,
+            cycle_entries,
+            worklist,
             pre_order_stack,
             blocks_by_region,
             distinct_regions,
             children_by_parent,
         } = self;
-        sccs.is_reset()
-            && root.is_none()
-            && regions.is_reset()
+        root.is_none()
+            && block_region.is_reset()
+            && dfs_info.is_reset()
+            && region_parent.is_reset()
+            && top_level.is_reset()
             && region_blocks.is_reset()
             && region_blocks_storage.is_reset()
-            && region_parent.is_reset()
             && region_children.is_reset()
             && region_children_storage.is_reset()
             && pre_order.is_empty()
+            && dfs_pre_order.is_empty()
+            && cycle_entries.is_empty()
+            && worklist.is_empty()
             && pre_order_stack.is_empty()
             && blocks_by_region.is_empty()
             && distinct_regions.is_empty()
@@ -185,15 +241,19 @@ where
         let _timing = Timing::new("region tree");
 
         debug_assert!(self.pre_order.is_empty());
+        debug_assert!(self.dfs_pre_order.is_empty());
+        debug_assert!(self.cycle_entries.is_empty());
+        debug_assert!(self.worklist.is_empty());
         debug_assert!(self.pre_order_stack.is_empty());
         debug_assert!(self.blocks_by_region.is_empty());
         debug_assert!(self.distinct_regions.is_empty());
         debug_assert!(self.children_by_parent.is_empty());
 
-        self.sccs.construct(func, counts, dfs, output)?;
-        self.construct_regions(func, output)?;
+        self.construct_dfs_info(func, dfs, output)?;
+        self.construct_cycles(func, output)?;
+        self.construct_block_regions(func, output)?;
         self.construct_region_blocks(func, output)?;
-        self.construct_region_tree(func, output)?;
+        self.construct_region_tree(output)?;
         self.construct_pre_order();
 
         counts.regions += self.distinct_regions.len();
@@ -201,45 +261,190 @@ where
         Ok(())
     }
 
-    fn construct_regions(
+    /// Run a depth-first traversal of the control-flow graph, recording each
+    /// block's `DfsInfo` and filling `dfs_pre_order`.
+    fn construct_dfs_info(
         &mut self,
         func: &impl InputFunction,
+        dfs: &mut Dfs<E>,
         output: &mut OutputInner<E>,
-    ) -> Result<(), ()> {
-        let entry = output.with_repr(func.entry_block())?;
-        let entry_scc = entry.scc(&self.sccs);
-        self.root = Some(Region::try_new(entry_scc.index()).unwrap());
+    ) -> IResult<()> {
+        self.dfs_pre_order.reserve(func.len_blocks());
 
-        for (block, _) in func.blocks() {
-            let block = output.with_repr(block)?;
-            let mut dom: Block<E> = block;
-            let mut dom_scc = block.scc(&self.sccs);
-            while dom_scc != entry_scc && dom_scc.blocks(&self.sccs).len() == 1 {
-                dom = output.with_repr(
-                    func.block(dom.with_repr32())
-                        .immediate_dominator()
-                        .expect("handled root already above"),
-                )?;
-                let next_dom_scc = dom.scc(&self.sccs);
-
-                // `dom_scc` is a single-block component, so `dom`'s immediate
-                // dominator is necessarily in some other component, and the walk
-                // strictly ascends the dominator tree.
-                debug_assert_ne!(dom_scc, next_dom_scc);
-
-                // Union so that the *outer* component becomes the representative.
-                //
-                // Either argument order would merge the same components, and so
-                // would give the same partition of blocks into regions, but
-                // `Scc::region` turns the representative into the `Region`, so
-                // making the outer component the representative matches the
-                // spirit of the region tree.
-                self.regions.union(next_dom_scc, dom_scc);
-
-                dom_scc = next_dom_scc;
+        let mut counter: u32 = 0;
+        dfs.construct(func, output)?;
+        while let Some(event) = dfs.next(func, output, |block| self.dfs_info[block].is_reached())? {
+            match event {
+                DfsEvent::Pre(block) => {
+                    debug_assert!(!self.dfs_info[block].is_reached());
+                    debug_assert_eq!(counter, u32::try_from(self.dfs_pre_order.len()).unwrap());
+                    counter += 1;
+                    self.dfs_info[block].start = counter;
+                    self.dfs_pre_order.push(block);
+                }
+                DfsEvent::AfterEdge(..) => {}
+                DfsEvent::Post(block) => {
+                    debug_assert!(self.dfs_info[block].is_reached());
+                    self.dfs_info[block].end = counter;
+                }
             }
         }
 
+        dfs.reset();
+        Ok(())
+    }
+
+    /// Discover the control-flow graph's cycles, filling in `block_region` and
+    /// `region_parent`.
+    ///
+    /// Reverse pre-order finds every cycle before any cycle containing it, so
+    /// an outer cycle adopts any inner cycles it runs into.
+    fn construct_cycles(
+        &mut self,
+        func: &impl InputFunction,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        for i in (0..self.dfs_pre_order.len()).rev() {
+            let header = self.dfs_pre_order[i];
+            let header_info = self.dfs_info[header];
+
+            // A block heads a cycle exactly when a predecessor lies within its
+            // own depth-first subtree, i.e. when an edge back to it closes a
+            // loop.
+            debug_assert!(self.worklist.is_empty());
+            for pred in func.block(header.with_repr32()).predecessors() {
+                let pred = output.with_repr(pred)?;
+                if header_info.is_ancestor_of(&self.dfs_info[pred]) {
+                    self.worklist.push(pred);
+                }
+            }
+            if self.worklist.is_empty() {
+                continue;
+            }
+
+            // Name the cycle by its header.
+            let cycle = output.entity::<Region<E>>(header.index())?;
+            debug_assert!(self.block_region[header].is_none());
+            self.block_region[header] = Some(cycle);
+            self.cycle_entries.push((cycle, header));
+
+            // Absorb everything that reaches the header without leaving its
+            // depth-first subtree.
+            while let Some(block) = self.worklist.pop() {
+                if block == header {
+                    continue;
+                }
+
+                match self.block_region[block] {
+                    // Already claimed, so the outermost cycle containing it
+                    // becomes our child, and its entries are where we continue
+                    // looking for our own predecessors.
+                    Some(inner) => {
+                        let inner_top = self.top_level.find(inner);
+                        if inner_top == cycle {
+                            continue;
+                        }
+
+                        self.region_parent[inner_top] = Some(cycle);
+                        let rep = self.top_level.union(cycle, inner_top);
+                        debug_assert_eq!(rep, cycle);
+
+                        // `process_predecessors` appends only entries of
+                        // `cycle`, which never match `inner_top`, so skipping
+                        // any newly pushed entries (when `len` becomes stale)
+                        // loses nothing.
+                        let len = self.cycle_entries.len();
+                        for j in 0..len {
+                            let (region, entry) = self.cycle_entries[j];
+                            if region == inner_top {
+                                self.process_predecessors(func, output, header, cycle, entry)?;
+                            }
+                        }
+                    }
+
+                    None => {
+                        self.block_region[block] = Some(cycle);
+                        self.process_predecessors(func, output, header, cycle, block)?;
+                    }
+                }
+            }
+        }
+
+        self.dfs_pre_order.clear();
+        self.cycle_entries.clear();
+
+        Ok(())
+    }
+
+    /// Follow `block`'s predecessors while growing the cycle headed by
+    /// `header`.
+    ///
+    /// A predecessor within the header's subtree joins the worklist; one
+    /// outside it makes `block` an entry. An unreachable predecessor is
+    /// ignored, since control never arrives along that edge.
+    fn process_predecessors(
+        &mut self,
+        func: &impl InputFunction,
+        output: &mut OutputInner<E>,
+        header: Block<E>,
+        cycle: Region<E>,
+        block: Block<E>,
+    ) -> IResult<()> {
+        let header_info = self.dfs_info[header];
+
+        let mut is_entry = false;
+        for pred in func.block(block.with_repr32()).predecessors() {
+            let pred = output.with_repr(pred)?;
+            let pred_info = self.dfs_info[pred];
+            if header_info.is_ancestor_of(&pred_info) {
+                self.worklist.push(pred);
+            } else if pred_info.is_reached() {
+                is_entry = true;
+            }
+        }
+
+        if is_entry {
+            debug_assert!(!self.cycle_entries.contains(&(cycle, block)));
+            self.cycle_entries.push((cycle, block));
+        }
+
+        Ok(())
+    }
+
+    /// Assign every block that cycle-discovery left unclaimed the top-level
+    /// region, so that regions partition all of the function's blocks.
+    ///
+    /// Unreachable blocks land here too: we have nothing better to say about
+    /// them, and giving them a region keeps every later pass total.
+    fn construct_block_regions(
+        &mut self,
+        func: &impl InputFunction,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        let entry = output.with_repr(func.entry_block())?;
+
+        let root = output.entity::<Region<E>>(entry.index())?;
+        debug_assert!(self.block_region[entry].is_none_or(|r| r == root));
+        self.root = Some(root);
+        self.block_region[entry] = Some(root);
+
+        for (block, _) in func.blocks() {
+            let block = output.with_repr(block)?;
+            if self.block_region[block].is_none() {
+                self.block_region[block] = Some(root);
+            }
+        }
+
+        // A cycle nothing adopted sits directly inside the top level.
+        for (block, _) in func.blocks() {
+            let block = output.with_repr(block)?;
+            let region = self.block_region[block].unwrap();
+            if region != root && self.region_parent[region].is_none() {
+                self.region_parent[region] = Some(root);
+            }
+        }
+
+        debug_assert!(self.region_parent[root].is_none());
         Ok(())
     }
 
@@ -284,19 +489,13 @@ where
         Ok(())
     }
 
-    /// Compute each region's parent, and lay each region's children out
-    /// contiguously within `region_children_storage`.
-    fn construct_region_tree(
-        &mut self,
-        func: &impl InputFunction,
-        output: &mut OutputInner<E>,
-    ) -> IResult<()> {
+    /// Lay each region's children out contiguously within
+    /// `region_children_storage`.
+    fn construct_region_tree(&mut self, output: &mut OutputInner<E>) -> IResult<()> {
         self.children_by_parent.reserve(self.distinct_regions.len());
         for i in 0..self.distinct_regions.len() {
             let region = self.distinct_regions[i];
-            let parent = self.compute_parent(func, region, output)?;
-            self.region_parent[region] = parent;
-            if let Some(parent) = parent {
+            if let Some(parent) = self.region_parent[region] {
                 self.children_by_parent.push((parent, region));
             }
         }
@@ -326,51 +525,6 @@ where
 
         self.children_by_parent.clear();
         Ok(())
-    }
-
-    /// Compute the given region's parent region.
-    ///
-    /// This is the region of the nearest common dominator of the region's
-    /// blocks, stepping out to that block's immediate dominator when it is
-    /// itself a member of this region.
-    ///
-    /// Note that we deliberately do not use "the immediate dominator of the
-    /// region's header". With irreducible control flow a region's component can
-    /// be entered at more than one block, and so has no unique header; worse,
-    /// the candidate headers' immediate dominators can lie in different regions
-    /// that aren't ancestors of one another. The nearest common dominator is
-    /// always well defined and always yields a proper tree: it dominates all of
-    /// the region's blocks, so stepping outside the region always lands on a
-    /// block strictly closer to the dominator tree's root.
-    fn compute_parent(
-        &self,
-        func: &impl InputFunction,
-        region: Region<E>,
-        output: &mut OutputInner<E>,
-    ) -> IResult<Option<Region<E>>> {
-        let mut blocks = region.blocks(self);
-        let mut ncd = blocks
-            .next()
-            .expect("every region contains at least one block");
-        for block in blocks {
-            ncd = nearest_common_dominator(func, output, ncd, block)?;
-        }
-
-        // If the nearest common dominator is a member of this region, then it is
-        // this region's single entry point, and our parent is the region of *its*
-        // immediate dominator. Only the top-level region contains the function's
-        // entry block, and only the entry block has no immediate dominator, so
-        // only the top-level region ends up without a parent.
-        let outside = if ncd.region(self) == region {
-            match func.block(ncd.with_repr32()).immediate_dominator() {
-                Some(idom) => output.with_repr(idom)?,
-                None => return Ok(None),
-            }
-        } else {
-            ncd
-        };
-
-        Ok(Some(outside.region(self)))
     }
 
     /// Fill `pre_order` with a pre-order traversal of the region tree.
@@ -420,18 +574,7 @@ where
 {
     /// Get the region containing this block.
     pub(crate) fn region(self, region_tree: &RegionTree<E>) -> Region<E> {
-        self.scc(&region_tree.sccs).region(region_tree)
-    }
-}
-
-impl<E> Scc<E>
-where
-    E: EntityRepr,
-{
-    /// Get the region containing this SCC.
-    pub(crate) fn region(self, region_tree: &RegionTree<E>) -> Region<E> {
-        let region_scc = region_tree.regions.find_without_path_compression(self);
-        Region::try_new(region_scc.index()).unwrap()
+        region_tree.block_region[self].expect("every block has a region after construction")
     }
 }
 
@@ -469,32 +612,6 @@ where
     }
 }
 
-/// Compute the nearest common dominator of two blocks.
-///
-/// Both blocks must be reachable from the function's entry block.
-fn nearest_common_dominator<E>(
-    func: &impl InputFunction,
-    output: &mut OutputInner<E>,
-    a: Block<E>,
-    b: Block<E>,
-) -> IResult<Block<E>>
-where
-    E: EntityRepr,
-{
-    // Walk `a` up the dominator tree until it dominates `b`. Because `dominates`
-    // is reflexive this stops immediately when `a` already dominates `b`, and it
-    // always terminates because the entry block dominates every reachable block.
-    let mut a = a;
-    while !func.block(a.with_repr32()).dominates(b.with_repr32()) {
-        a = output.with_repr(
-            func.block(a.with_repr32())
-                .immediate_dominator()
-                .expect("the entry block dominates every reachable block"),
-        )?;
-    }
-    Ok(a)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,12 +623,11 @@ mod tests {
         string::{String, ToString},
     };
 
-    /// A region, as identified by the set of blocks in the strongly-connected
-    /// component that defines it.
+    /// A region, identified by the blocks of the cycle that defines it plus
+    /// those of every cycle nested inside it.
     ///
-    /// The tests identify regions this way, rather than by `Region`, so that
-    /// they never depend on how `StronglyConnectedComponents` happens to number
-    /// things.
+    /// Identifying regions this way keeps the tests independent of how the
+    /// region tree numbers things.
     type RegionId = BTreeSet<Block>;
 
     /// Construct the region tree for `func`.
@@ -645,25 +761,173 @@ mod tests {
             .collect()
     }
 
-    /// For each block, compute the region it belongs to: the first component
-    /// at-or-above it in the dominator tree that either holds more than one
-    /// block or is the entry block's component.
+    /// Is this control-flow graph reducible?
+    ///
+    /// Hecht and Ullman's characterization: every strongly-connected component
+    /// has exactly one entry, and the component minus that header is itself
+    /// reducible. The recursion is needed because a single-entry cycle can
+    /// still hold an irreducible one.
+    ///
+    /// Phrased in edges and reachability alone, with no depth-first traversal,
+    /// which is what makes it usable against a traversal-dependent
+    /// decomposition.
+    fn is_reducible(func: &TestFunction) -> bool {
+        let entry = func.entry_block();
+        let all: BTreeSet<Block> = reachable_avoiding(func, None);
+
+        // Reachability within `nodes`, by plain worklist so that it depends on
+        // nothing under test.
+        fn reachable_within(
+            func: &TestFunction,
+            nodes: &BTreeSet<Block>,
+            from: Block,
+        ) -> BTreeSet<Block> {
+            let mut seen = BTreeSet::from([from]);
+            let mut worklist = alloc::vec![from];
+            while let Some(b) = worklist.pop() {
+                for succ in func.block(b).successors() {
+                    if nodes.contains(&succ) && seen.insert(succ) {
+                        worklist.push(succ);
+                    }
+                }
+            }
+            seen
+        }
+
+        // Is the subgraph induced by `nodes` reducible?
+        fn check(func: &TestFunction, entry: Block, nodes: &BTreeSet<Block>) -> bool {
+            // Two blocks share a component when each reaches the other without
+            // leaving `nodes`.
+            let forward: BTreeMap<Block, BTreeSet<Block>> = nodes
+                .iter()
+                .map(|&b| (b, reachable_within(func, nodes, b)))
+                .collect();
+
+            let mut remaining: BTreeSet<Block> = nodes.clone();
+            while let Some(&a) = remaining.iter().next() {
+                let component: BTreeSet<Block> = nodes
+                    .iter()
+                    .copied()
+                    .filter(|b| forward[&a].contains(b) && forward[b].contains(&a))
+                    .collect();
+                for b in &component {
+                    remaining.remove(b);
+                }
+
+                // A single block with no edge to itself is not a cycle.
+                let has_self_edge = func.block(a).successors().any(|s| s == a);
+                if component.len() == 1 && !has_self_edge {
+                    continue;
+                }
+
+                // Control enters at the function's entry block and at any
+                // member with a predecessor outside the component.
+                let entries: BTreeSet<Block> = component
+                    .iter()
+                    .copied()
+                    .filter(|&b| {
+                        b == entry
+                            || func
+                                .block(b)
+                                .predecessors()
+                                .any(|p| !component.contains(&p))
+                    })
+                    .collect();
+                if entries.len() != 1 {
+                    return false;
+                }
+
+                // Dropping the header exposes an inner cycle that is
+                // irreducible even when this one is not.
+                let header = *entries.iter().next().unwrap();
+                let rest: BTreeSet<Block> =
+                    component.iter().copied().filter(|&b| b != header).collect();
+                if !rest.is_empty() && !check(func, entry, &rest) {
+                    return false;
+                }
+            }
+
+            true
+        }
+
+        check(func, entry, &all)
+    }
+
+    /// For each block that heads a natural loop, compute that loop's blocks.
+    ///
+    /// A back edge `u -> h` is one whose target dominates its source, and its
+    /// loop body is `h` plus every block reaching such a `u` without passing
+    /// through `h`.
+    ///
+    /// Only meaningful for a reducible CFG, whose cycles are all induced by
+    /// back edges.
+    fn natural_loops_oracle(
+        func: &TestFunction,
+        dominators: &HashMap<Block, BTreeSet<Block>>,
+    ) -> BTreeMap<Block, BTreeSet<Block>> {
+        // Computed from `successors` alone, so it depends on nothing under
+        // test.
+        let can_reach_avoiding = |from: Block, to: Block, avoid: Block| -> bool {
+            if from == avoid {
+                return false;
+            }
+            let mut visited = BTreeSet::from([from]);
+            let mut worklist = alloc::vec![from];
+            while let Some(b) = worklist.pop() {
+                if b == to {
+                    return true;
+                }
+                for succ in func.block(b).successors() {
+                    if succ != avoid && visited.insert(succ) {
+                        worklist.push(succ);
+                    }
+                }
+            }
+            from == to
+        };
+
+        let mut loops: BTreeMap<Block, BTreeSet<Block>> = BTreeMap::new();
+        for (u, data) in func.blocks() {
+            for h in data.successors() {
+                // Only a back edge induces a loop.
+                if !dominators[&u].contains(&h) {
+                    continue;
+                }
+                let body = loops.entry(h).or_insert_with(|| BTreeSet::from([h]));
+                for (b, _) in func.blocks() {
+                    if b != h && can_reach_avoiding(b, u, h) {
+                        body.insert(b);
+                    }
+                }
+            }
+        }
+        loops
+    }
+
+    /// For each block, compute the region containing it: the innermost natural
+    /// loop that contains it, or the top level when none does.
+    ///
+    /// A loop headed by the entry block *is* the top-level region, since both
+    /// are named by that block, so blocks after such a loop stay in it.
+    ///
+    /// Only meaningful for a reducible CFG; see `natural_loops_oracle`.
     fn regions_oracle(
         func: &TestFunction,
-        sccs: &HashMap<Block, BTreeSet<Block>>,
-        idoms: &HashMap<Block, Option<Block>>,
+        loops: &BTreeMap<Block, BTreeSet<Block>>,
     ) -> HashMap<Block, RegionId> {
-        let entry_scc = &sccs[&func.entry_block()];
+        let entry = func.entry_block();
+        let all: BTreeSet<Block> = func.blocks().map(|(b, _)| b).collect();
 
         func.blocks()
             .map(|(b, _)| {
-                let mut dom = b;
-                loop {
-                    let scc = &sccs[&dom];
-                    if scc == entry_scc || scc.len() > 1 {
-                        return (b, scc.clone());
-                    }
-                    dom = idoms[&dom].expect("the entry block's component stops the walk");
+                // Loops are well nested, so innermost is smallest.
+                let innermost = loops
+                    .iter()
+                    .filter(|(_, body)| body.contains(&b))
+                    .min_by_key(|(_, body)| body.len());
+                match innermost {
+                    Some((header, body)) if *header != entry => (b, body.clone()),
+                    _ => (b, all.clone()),
                 }
             })
             .collect()
@@ -862,13 +1126,34 @@ mod tests {
                 let dominators = dominators_oracle(func);
                 let idoms = idoms_oracle(&dominators);
                 let oracle_sccs = sccs_oracle(func);
-                let oracle_regions = regions_oracle(func, &oracle_sccs, &idoms);
 
-                // Property 1: the regions partition the blocks, and two blocks
-                // share a region exactly when the oracle says they should.
+                // An irreducible graph's decomposition depends on the
+                // depth-first traversal's choices, so there is no oracle for
+                // it. A reducible one has canonical natural loops.
+                let reducible = is_reducible(func);
+                let oracle_loops = natural_loops_oracle(func, &dominators);
+                let oracle_regions = regions_oracle(func, &oracle_loops);
+
+                // A region's blocks plus those of every region nested inside
+                // it. This, not `Region::blocks`, is what corresponds to a
+                // cycle: `blocks` reports only the blocks whose *innermost*
+                // region this is.
+                let closure = |tree: &RegionTree<u32>, region: Region| -> BTreeSet<Block> {
+                    let mut blocks = BTreeSet::new();
+                    let mut stack = alloc::vec![region];
+                    while let Some(r) = stack.pop() {
+                        blocks.extend(r.blocks(tree));
+                        stack.extend(r.children(tree));
+                    }
+                    blocks
+                };
+
+                // Property 1: the regions partition the blocks, and, when
+                // there is a canonical answer to compare against, group them
+                // exactly as the oracle does.
                 //
-                // `blocks()` covering every block exactly once and agreeing with
-                // `Block::region` gives the partition; comparing the two groupings
+                // `blocks()` covering every block once and agreeing with
+                // `Block::region` gives the partition; comparing the groupings
                 // gives the agreement.
                 let mut actual_groups: BTreeMap<Region, BTreeSet<Block>> = BTreeMap::new();
                 for b in &blocks {
@@ -877,20 +1162,24 @@ mod tests {
                         .or_default()
                         .insert(*b);
                 }
-                let mut expected_groups: BTreeMap<RegionId, BTreeSet<Block>> = BTreeMap::new();
-                for b in &blocks {
-                    expected_groups
-                        .entry(oracle_regions[b].clone())
-                        .or_default()
-                        .insert(*b);
-                }
-                let actual_partition: BTreeSet<&BTreeSet<Block>> = actual_groups.values().collect();
-                let expected_partition: BTreeSet<&BTreeSet<Block>> = expected_groups.values().collect();
-                if actual_partition != expected_partition {
-                    return Err(format!(
-                        "the regions group the blocks as {actual_partition:?} but should group them \
-                         as {expected_partition:?}"
-                    ));
+                if reducible {
+                    let mut expected_groups: BTreeMap<RegionId, BTreeSet<Block>> = BTreeMap::new();
+                    for b in &blocks {
+                        expected_groups
+                            .entry(oracle_regions[b].clone())
+                            .or_default()
+                            .insert(*b);
+                    }
+                    let actual_partition: BTreeSet<&BTreeSet<Block>> =
+                        actual_groups.values().collect();
+                    let expected_partition: BTreeSet<&BTreeSet<Block>> =
+                        expected_groups.values().collect();
+                    if actual_partition != expected_partition {
+                        return Err(format!(
+                            "the regions group the blocks as {actual_partition:?} but should group \
+                             them as {expected_partition:?}"
+                        ));
+                    }
                 }
 
                 let regions: Vec<Region> = actual_groups.keys().copied().collect();
@@ -911,34 +1200,69 @@ mod tests {
                     }
                 }
 
-                // Property 2: a region is identified by the component that defines
-                // it, i.e. a region's index is the index of the first component
-                // at-or-above its blocks that is a loop or the entry's component.
-                for b in &blocks {
-                    let defining = *oracle_regions[b]
-                        .first()
-                        .expect("a region is defined by a non-empty component");
-                    let expected = Region::try_new(defining.scc(&tree.sccs).index()).unwrap();
-                    if b.region(&tree) != expected {
+                // Property 2: a region is named by its header block, which is
+                // the entry block for the top-level region.
+                let entry_region = Region::<u32>::try_new(entry.index()).unwrap();
+                if tree.root() != entry_region {
+                    return Err(format!(
+                        "the root region is {:?} but {entry:?} is the entry block, so it should \
+                         be {entry_region:?}",
+                        tree.root(),
+                    ));
+                }
+                for region in &regions {
+                    let header = Block::try_new(region.index()).unwrap();
+                    if !closure(&tree, *region).contains(&header) {
                         return Err(format!(
-                            "{b:?}'s region is {:?}, but its region is defined by the component \
-                             {:?}, so it should be {expected:?}",
-                            b.region(&tree),
-                            oracle_regions[b],
+                            "{region:?} should be named by a block it contains, but its blocks \
+                             are {:?}, which does not include {header:?}",
+                            closure(&tree, *region),
+                        ));
+                    }
+                    if header.region(&tree) != *region {
+                        return Err(format!(
+                            "{region:?} is named by {header:?}, but that block's own region is \
+                             {:?}; a region's header always belongs to it directly, never to one \
+                             of its children",
+                            header.region(&tree),
                         ));
                     }
                 }
 
-                // Property 3: a loop is never split across regions.
-                for b in &blocks {
-                    let region = b.region(&tree);
-                    for &other in &oracle_sccs[b] {
-                        if other.region(&tree) != region {
+                // Property 3: a natural loop is never split across regions.
+                // A strongly-connected component holding a loop nest is split,
+                // deliberately; an individual loop is not.
+                for (header, body) in &oracle_loops {
+                    let region = header.region(&tree);
+                    let region_blocks = closure(&tree, region);
+                    for b in body {
+                        if !region_blocks.contains(b) {
                             return Err(format!(
-                                "{b:?} and {other:?} are in the same strongly-connected component \
-                                 {:?}, but {b:?} is in {region:?} and {other:?} is in {:?}",
-                                oracle_sccs[b],
-                                other.region(&tree),
+                                "{b:?} is in the natural loop headed by {header:?}, whose body is \
+                                 {body:?}, but that loop's region {region:?} holds only \
+                                 {region_blocks:?}"
+                            ));
+                        }
+                    }
+                }
+
+                // Property 3b: a region never spans two strongly-connected
+                // components, so it splits one only along that component's own
+                // structure. Unlike the oracle comparison, this holds for
+                // irreducible control flow too.
+                for region in &regions {
+                    if *region == tree.root() {
+                        continue;
+                    }
+                    let region_blocks = closure(&tree, *region);
+                    let header = Block::try_new(region.index()).unwrap();
+                    for b in &region_blocks {
+                        if !oracle_sccs[&header].contains(b) {
+                            return Err(format!(
+                                "{region:?} holds {region_blocks:?}, but {b:?} is not in the \
+                                 strongly-connected component {:?} of its header {header:?}, so \
+                                 the region is not strongly connected",
+                                oracle_sccs[&header],
                             ));
                         }
                     }
@@ -1060,11 +1384,42 @@ mod tests {
                     ));
                 }
 
-                // Property 7: a region's parent is the region of the nearest common
-                // dominator of its blocks, stepping out when that block is itself
-                // in the region. This is the tie-break that makes `parent` well
-                // defined for irreducible control flow, where a region's component
-                // can have several entry points.
+                // Property 7: the region tree is the cycle nest, so a region's
+                // parent is the innermost region whose block set strictly
+                // contains its own. Stated over `closure`, since a child's
+                // `blocks` is disjoint from its parent's, not a subset.
+                for region in &regions {
+                    let own = closure(&tree, *region);
+
+                    let strict_supersets: Vec<Region> = regions
+                        .iter()
+                        .copied()
+                        .filter(|other| {
+                            *other != *region && closure(&tree, *other).is_superset(&own)
+                        })
+                        .collect();
+
+                    // Cycles nest, so the innermost is the smallest.
+                    let expected = strict_supersets
+                        .iter()
+                        .copied()
+                        .min_by_key(|other| closure(&tree, *other).len());
+
+                    if region.parent(&tree) != expected {
+                        return Err(format!(
+                            "`parent({region:?})` is {:?}, but {region:?} holds {own:?} and the \
+                             innermost region strictly containing that is {expected:?}",
+                            region.parent(&tree),
+                        ));
+                    }
+                }
+
+                // Property 8: an ancestor region's nearest common dominator
+                // dominates every block of a descendant region.
+                //
+                // Reducible graphs only: an irreducible cycle can be entered at
+                // more than one block, and then no block of it dominates the
+                // rest.
                 let ncd = |a: Block, b: Block| -> Block {
                     let mut a = a;
                     while !dominators[&b].contains(&a) {
@@ -1072,51 +1427,29 @@ mod tests {
                     }
                     a
                 };
-                for region in &regions {
-                    let mut region_blocks = region.blocks(&tree);
-                    let mut d = region_blocks.next().expect("regions are never empty");
-                    for b in region_blocks {
-                        d = ncd(d, b);
-                    }
-
-                    let expected = if d.region(&tree) == *region {
-                        idoms[&d].map(|idom| idom.region(&tree))
-                    } else {
-                        Some(d.region(&tree))
-                    };
-
-                    if region.parent(&tree) != expected {
-                        return Err(format!(
-                            "`parent({region:?})` is {:?} but the nearest common dominator of its \
-                             blocks is {d:?}, which makes the parent {expected:?}",
-                            region.parent(&tree),
-                        ));
-                    }
-                }
-
-                // Property 8: nesting is consistent with dominance. If one region
-                // is a descendant of another, the ancestor's nearest common
-                // dominator dominates every one of the descendant's blocks.
-                for region in &regions {
-                    let mut curr = region.parent(&tree);
-                    while let Some(ancestor) = curr {
-                        let mut ancestor_blocks = ancestor.blocks(&tree);
-                        let mut ancestor_ncd = ancestor_blocks.next().expect("regions are never empty");
-                        for b in ancestor_blocks {
-                            ancestor_ncd = ncd(ancestor_ncd, b);
-                        }
-
-                        for b in region.blocks(&tree) {
-                            if !dominators[&b].contains(&ancestor_ncd) {
-                                return Err(format!(
-                                    "{region:?} is a descendant of {ancestor:?}, whose nearest \
-                                     common dominator {ancestor_ncd:?} does not dominate \
-                                     {region:?}'s block {b:?}"
-                                ));
+                if reducible {
+                    for region in &regions {
+                        let mut curr = region.parent(&tree);
+                        while let Some(ancestor) = curr {
+                            let mut ancestor_blocks = ancestor.blocks(&tree);
+                            let mut ancestor_ncd =
+                                ancestor_blocks.next().expect("regions are never empty");
+                            for b in ancestor_blocks {
+                                ancestor_ncd = ncd(ancestor_ncd, b);
                             }
-                        }
 
-                        curr = ancestor.parent(&tree);
+                            for b in region.blocks(&tree) {
+                                if !dominators[&b].contains(&ancestor_ncd) {
+                                    return Err(format!(
+                                        "{region:?} is a descendant of {ancestor:?}, whose nearest \
+                                         common dominator {ancestor_ncd:?} does not dominate \
+                                         {region:?}'s block {b:?}"
+                                    ));
+                                }
+                            }
+
+                            curr = ancestor.parent(&tree);
+                        }
                     }
                 }
 

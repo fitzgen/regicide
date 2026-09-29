@@ -138,7 +138,7 @@
       "kind": "BundleConstructed",
       "num_spans": 4,
       "num_vals": 2,
-      "region": 3
+      "region": 0
     },
     {
       "bundle": 1,
@@ -146,41 +146,41 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 3
+      "region": 0
     },
     {
       "bundle": 0,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 4,
-      "region": 3
+      "region": 0
     },
     {
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 3
+      "region": 0
     },
     {
       "bundle": 1,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 3
+      "region": 0
     },
     {
       "bundle": 1,
       "forced": true,
       "kind": "BundleSpilledToStack",
-      "region": 3
+      "region": 0
     },
     {
       "bundle": 0,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 4,
-      "region": 3
+      "region": 0
     },
     {
       "alloc": {
@@ -660,7 +660,7 @@
         "isMinimal": false,
         "parent": null,
         "preference": [],
-        "region": 3,
+        "region": 0,
         "spans": [
           0,
           1,
@@ -675,7 +675,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 3,
+        "region": 0,
         "spans": [
           4
         ],
@@ -758,9 +758,6 @@
       }
     ],
     "regions": [
-      null,
-      null,
-      null,
       {
         "blocks": [
           0,
@@ -775,7 +772,10 @@
         "children": [],
         "depth": 0,
         "parent": null
-      }
+      },
+      null,
+      null,
+      null
     ],
     "spans": [
       {
@@ -1680,9 +1680,6 @@
       "Region": {
         "default": [],
         "values": [
-          [],
-          [],
-          [],
           [
             9,
             10,

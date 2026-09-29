@@ -80,7 +80,7 @@ test("the outline renders the shape the spec describes", () => {
       "function {",
       "    stack0: 8 bytes",
       "",
-      "    region2 {",
+      "    region0 {",
       "        entry block0:",
       "            inst0 early:",
       "                   late: def v0[stack0]",
@@ -506,7 +506,7 @@ test("a block's predecessors carry their arguments and its successors their para
   // successor -- so each list has to be read from the other block.
   const model = modelOf(fixture("critical-edge"));
   assert.deepEqual(shown(model.details({ kind: "Block", index: 2 })), {
-    Region: "region2",
+    Region: "region0",
     Frequency: "1",
     Instructions: "inst6, inst7",
     Predecessors: "block0(v0), block1(v0)",
@@ -523,11 +523,12 @@ test("a block names the region that owns it", () => {
   const field = modelOf(blob)
     .details({ kind: "Block", index: 1 })
     .fields.find((f) => f.label === "Region");
-  assert.deepEqual(field.value, [{ text: "region2", entity: { kind: "Region", index: 2 }, cls: "kind-Region" }]);
+  assert.deepEqual(field.value, [{ text: "region0", entity: { kind: "Region", index: 0 }, cls: "kind-Region" }]);
 
   // Region allocation can stop before it reaches every block, and a block no
-  // region claims has to say so rather than point at region0.
-  blob.function.regions[2].blocks = [0, 2];
+  // region claims has to say so rather than point at whichever region happens
+  // to come first.
+  blob.function.regions[0].blocks = [0, 2];
   assert.equal(shown(modelOf(blob).details({ kind: "Block", index: 1 })).Region, "none");
 });
 
@@ -565,12 +566,12 @@ test("a region's edges are the ones that leave or enter it", () => {
   // An edge is incoming when its predecessor is outside, which is only
   // testable once some block is.
   const blob = fixture("critical-edge");
-  blob.function.regions[2] = { ...blob.function.regions[2], blocks: [0, 1], children: [3] };
-  blob.function.regions[3] = { blocks: [2], bundles: [], children: [], depth: 1, parent: 2 };
+  blob.function.regions[0] = { ...blob.function.regions[0], blocks: [0, 1], children: [2] };
+  blob.function.regions[2] = { blocks: [2], bundles: [], children: [], depth: 1, parent: 0 };
   const model = modelOf(blob);
 
-  assert.deepEqual(shown(model.details({ kind: "Region", index: 3 })), {
-    Parent: "region2",
+  assert.deepEqual(shown(model.details({ kind: "Region", index: 2 })), {
+    Parent: "region0",
     Children: "none",
     Blocks: "block2",
     // block0 and block1 both jump here, and both are outside now.
@@ -580,8 +581,8 @@ test("a region's edges are the ones that leave or enter it", () => {
     Depth: "1",
   });
 
-  const parent = shown(model.details({ kind: "Region", index: 2 }));
-  assert.equal(parent.Children, "region3");
+  const parent = shown(model.details({ kind: "Region", index: 0 }));
+  assert.equal(parent.Children, "region2");
   // block0 -> block1 stays inside, so it is neither.
   assert.equal(parent["Incoming edges"], "none");
   assert.equal(parent["Outgoing edges"], "block0 -> block2, block1 -> block2");

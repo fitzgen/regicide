@@ -41,7 +41,6 @@ mod redundant_move_elimination;
 mod region_allocation;
 mod region_tree;
 mod rpo;
-mod sccs;
 mod spill_placement;
 mod spill_slot_allocation;
 mod timing;

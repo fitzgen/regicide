@@ -431,14 +431,6 @@ define_entities! {
 
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Scc = "scc";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct SccBlockIndex = "scc_block_index";
-
-    /// TODO FITZGEN
-    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct Region = "region";
 
     /// TODO FITZGEN

@@ -506,8 +506,8 @@ mod tests {
             let json = viz_blob_json(context, input).expect("the blob serializes");
             let json: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
             let function = &json["function"];
-            // `regions` is indexed by a strongly-connected component's
-            // representative block, so it is as long as the block array.
+            // `regions` is indexed by a region's header block, so it is as
+            // long as the block array.
             let expected = [
                 ("blocks", input.func.len_blocks()),
                 ("insts", input.func.len_insts()),

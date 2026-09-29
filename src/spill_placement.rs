@@ -1375,6 +1375,87 @@ mod tests {
         });
     }
 
+    /// A loop nest gives its two loops separate regions, so an outer-loop
+    /// value's spill lands in the outer loop rather than once per inner
+    /// iteration.
+    #[test]
+    fn a_spill_is_hoisted_out_of_an_inner_loop() {
+        let test_input = TestInput::with_a_nested_loop();
+        let context = place(&test_input).unwrap().unwrap();
+
+        test_input.with_input(|input| {
+            let ctx = &context.context32;
+            let func = input.func;
+            let live_ranges = &ctx.live_ranges;
+            let region_tree = &ctx.region_tree;
+
+            let outside = Val::<u32>::try_new(0).unwrap();
+            let outer = Val::<u32>::try_new(1).unwrap();
+            let entry = Block::<u32>::try_new(0).unwrap();
+            let outer_header = Block::<u32>::try_new(1).unwrap();
+            let inner_header = Block::<u32>::try_new(2).unwrap();
+            let inner_body = Block::<u32>::try_new(3).unwrap();
+
+            // The premise: the two loops are separate, nested regions, even
+            // though they are one strongly-connected component.
+            let inner_region = inner_header.region(region_tree);
+            let outer_region = outer_header.region(region_tree);
+            assert_eq!(
+                inner_body.region(region_tree),
+                inner_region,
+                "the inner loop's body is in the inner loop's region",
+            );
+            assert_ne!(
+                inner_region, outer_region,
+                "the inner and outer loops have to be separate regions",
+            );
+            assert_eq!(
+                inner_region.parent(region_tree),
+                Some(outer_region),
+                "and the inner region is nested inside the outer one",
+            );
+            assert_ne!(
+                outer_region,
+                entry.region(region_tree),
+                "the outer loop is its own region too",
+            );
+
+            // Both values are read off the stack in the inner loop.
+            for val in [outside, outer] {
+                assert!(
+                    ctx.spill_slots.spilled().contains(val),
+                    "{val:?} is read off the stack, so it has to have a slot",
+                );
+            }
+
+            // Each spill sits in the region its value is defined in, which is
+            // never the inner loop.
+            for (val, def_block) in [(outside, entry), (outer, outer_header)] {
+                let sites: Vec<_> = ctx
+                    .spill_placement
+                    .spills()
+                    .iter()
+                    .copied()
+                    .filter(|site| site.val(live_ranges) == val)
+                    .collect();
+                assert!(!sites.is_empty(), "expected a spill for {val:?}");
+                for site in sites {
+                    let block = site.block(func, live_ranges);
+                    assert_ne!(
+                        block.region(region_tree),
+                        inner_region,
+                        "the spill {site:?} for {val:?} is inside the inner loop",
+                    );
+                    assert_eq!(
+                        block.region(region_tree),
+                        def_block.region(region_tree),
+                        "the spill {site:?} for {val:?} belongs in the region it is defined in",
+                    );
+                }
+            }
+        });
+    }
+
     /// A block whose span of the value holds it nowhere at all is not a place
     /// we can spill it from: a stack-constrained use gives the value a slot,
     /// while the crossing piece is at its block's entry and not on the stack --

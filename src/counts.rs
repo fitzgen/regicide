@@ -61,7 +61,6 @@ impl Count {
 
 #[derive(Debug)]
 pub struct Counts {
-    pub sccs: Count,
     pub regions: Count,
     pub liveness_iterations: Count,
     pub live_spans: Count,
@@ -105,7 +104,6 @@ pub struct Counts {
 impl Counts {
     pub const fn new() -> Self {
         Self {
-            sccs: Count::new(),
             regions: Count::new(),
             liveness_iterations: Count::new(),
             live_spans: Count::new(),
@@ -153,7 +151,6 @@ impl Counts {
 
     pub fn is_reset(&self) -> bool {
         let Self {
-            sccs,
             regions,
             liveness_iterations,
             live_spans,
@@ -193,8 +190,7 @@ impl Counts {
             scratch_reg_homes_reused,
             emergency_spill_slots,
         } = self;
-        sccs.is_reset()
-            && regions.is_reset()
+        regions.is_reset()
             && liveness_iterations.is_reset()
             && live_spans.is_reset()
             && uses.is_reset()

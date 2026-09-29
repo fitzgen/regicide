@@ -453,10 +453,10 @@ where
 
 /// Check that every block is reachable from the entry block.
 ///
-/// Unreachable blocks are not in the dominator tree, they are never assigned to
-/// a strongly-connected component, and their values have no meaningful live
-/// ranges. Reject them up front so that we don't have to constantly
-/// special-case unreachable blocks.
+/// Unreachable blocks are not in the dominator tree, the region tree has
+/// nothing meaningful to say about where they belong, and their values have no
+/// meaningful live ranges. Reject them up front so that we don't have to
+/// constantly special-case unreachable blocks.
 fn validate_reachability<E>(
     func: &impl InputFunction,
     dominators: &DominatorTree,

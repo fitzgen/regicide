@@ -11,7 +11,7 @@ use crate::{
     RegClass, RegGroup, RegUnit, Val,
     dfs::{Dfs, DfsEvent},
     dominators::DominatorTree,
-    entity::{Entity, EntityRepr, Inst, PrimaryMap, Region, Scc, SccBlockIndex, SecondaryMap},
+    entity::{Entity, EntityRepr, Inst, PrimaryMap, Region, SecondaryMap},
     input::{
         BlockFrequency, DefUse, Input, InputOptions, MoveEliminationLevel, OperandConstraint,
         Position, RematCost,
@@ -95,8 +95,6 @@ entity_default_mutate! {
     Val
     Inst
     Block
-    Scc
-    SccBlockIndex
     Region
     Reg
     SpillSlot
@@ -7525,6 +7523,232 @@ impl TestInput {
         input
     }
 
+    /// A loop nest: `block0` defines a value outside both loops, `block1`
+    /// heads the outer loop and defines a second value, and `block2 <-> block3`
+    /// is the inner loop, which reads both values off the stack.
+    ///
+    /// The two loops are a single strongly-connected component but must be
+    /// separate regions, so that the inner loop holds neither value's spill.
+    pub fn with_a_nested_loop() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let outside = Val::try_new(0).unwrap();
+        let outer = Val::try_new(1).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        for inst in [0, 2] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(inst).unwrap(),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |pos, kind, constraint, val| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0 defines the value that lives outside both loops. The
+            // second successor stops the single-successor hoist.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, outside),
+            branch(&[1, 5]),
+            // block1, the outer loop header, defines a value that lives in the
+            // outer loop.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any, outer),
+            branch(&[2, 5]),
+            // Reading the outer value in a register here keeps the outer loop
+            // header from being its only legal spill placement.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(class),
+                outside,
+            ),
+            branch(&[3, 4]),
+            // Reading both values off the stack is what spills them. Those
+            // spills must land outside the inner loop: in `block1` for the
+            // outer value, `block0` for the outside one.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                outer,
+            ),
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Stack,
+                outside,
+            ),
+            branch(&[2]),
+            // block4 takes the outer loop's back edge; reading the outer value
+            // in a register keeps it live around that edge.
+            op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(class),
+                outer,
+            ),
+            branch(&[1]),
+            // block5, the outer loop's exit.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3)],
+            vec![inst(4), inst(5)],
+            vec![inst(6), inst(7), inst(8)],
+            vec![inst(9), inst(10)],
+            vec![inst(11)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// An irreducible loop: `block0` branches into either half of the cycle
+    /// `block1 <-> block2`, so the cycle has two entries and neither dominates
+    /// the other.
+    ///
+    /// No natural loop describes such a cycle, but it still has to end up in
+    /// one region: allocating half of a cycle independently of the other half
+    /// would be wrong.
+    pub fn with_an_irreducible_loop() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // Branching into either half of the cycle is what makes it
+            // irreducible.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any),
+            branch(&[1, 2]),
+            // block1, one of the two entries.
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            branch(&[2, 3]),
+            // block2, the other entry, closes the cycle back to `block1`.
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+            branch(&[1, 3]),
+            // block3, the cycle's exit.
+            InstData::Op {
+                operands: vec![],
+                side_effects: true,
+            },
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3)],
+            vec![inst(4), inst(5)],
+            vec![inst(6)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input whose entry block takes two parameters, each read
     /// once. One place for both would be a contract no caller could meet, and
     /// no other fixture has a block with two parameters to say so with.
@@ -8671,6 +8895,11 @@ pub fn corpus() -> Vec<TestInput> {
         // the stack inside it, which is where a spill has a region to be
         // hoisted out of.
         TestInput::with_a_value_spilled_inside_a_loop(),
+        // A loop nest, whose two loops must be separate regions so that an
+        // outer-loop value's spill stays out of the inner loop.
+        TestInput::with_a_nested_loop(),
+        // A cycle entered at two different blocks, so no natural loop.
+        TestInput::with_an_irreducible_loop(),
         TestInput::with_a_def_only_value_under_pressure(),
         TestInput::with_a_stack_constrained_value_under_pressure(),
         TestInput::with_three_values_needing_two_register_groups(),

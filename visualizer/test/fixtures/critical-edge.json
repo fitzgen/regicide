@@ -111,7 +111,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 1,
@@ -121,7 +121,7 @@
       "kind": "BundleConstructed",
       "num_spans": 2,
       "num_vals": 2,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 2,
@@ -129,35 +129,35 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 0,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 1,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 2,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 2,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 2,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 2
+      "region": 0
     },
     {
       "alloc": {
@@ -172,7 +172,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 2,
-      "region": 2
+      "region": 0
     },
     {
       "alloc": {
@@ -187,13 +187,13 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 1,
-      "region": 2
+      "region": 0
     },
     {
       "bundle": 0,
       "forced": true,
       "kind": "BundleSpilledToStack",
-      "region": 2
+      "region": 0
     },
     {
       "kind": "ValueSpilled",
@@ -540,7 +540,7 @@
         "isMinimal": false,
         "parent": null,
         "preference": [],
-        "region": 2,
+        "region": 0,
         "spans": [
           0
         ],
@@ -556,7 +556,7 @@
         "isMinimal": false,
         "parent": null,
         "preference": [],
-        "region": 2,
+        "region": 0,
         "spans": [
           1,
           3
@@ -571,7 +571,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 2,
+        "region": 0,
         "spans": [
           2
         ],
@@ -675,8 +675,6 @@
       }
     ],
     "regions": [
-      null,
-      null,
       {
         "blocks": [
           0,
@@ -691,7 +689,9 @@
         "children": [],
         "depth": 0,
         "parent": null
-      }
+      },
+      null,
+      null
     ],
     "spans": [
       {
@@ -1564,8 +1564,6 @@
       "Region": {
         "default": [],
         "values": [
-          [],
-          [],
           [
             7,
             8,
