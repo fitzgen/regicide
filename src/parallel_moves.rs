@@ -13,7 +13,7 @@
 //! semantics.
 
 use crate::entity::{Entity as _, EntityRepr, EntitySet, PrimaryMap, SecondaryMap, Val};
-use crate::machine::Reg;
+use crate::machine::{Reg, RegSet};
 use crate::output::ScalarAllocation;
 use crate::spill_slot_allocation::SpillSlot;
 use alloc::vec::Vec;
@@ -500,6 +500,11 @@ where
     /// scratch without consulting the caller.
     available: Vec<Reg<E>>,
 
+    /// The same registers as `available`, as a set, so we can test membership
+    /// with a bit instead of a scan. `available` keeps the order, which decides
+    /// what `allocate` hands out.
+    available_set: RegSet,
+
     /// The registers we evicted under a wide bracket, and where we put what
     /// they were holding.
     ///
@@ -537,6 +542,7 @@ where
         ScratchPool {
             unavailable: Vec::new(),
             available: Vec::new(),
+            available_set: RegSet::new(),
             wide_evictions: Vec::new(),
             tight_or_parked_slots: Vec::new(),
             evicting: Vec::new(),
@@ -549,6 +555,7 @@ where
         let Self {
             unavailable,
             available,
+            available_set,
             wide_evictions,
             tight_or_parked_slots,
             evicting,
@@ -557,6 +564,7 @@ where
         } = self;
         unavailable.clear();
         available.clear();
+        available_set.reset();
         wide_evictions.clear();
         tight_or_parked_slots.clear();
         evicting.clear();
@@ -568,6 +576,7 @@ where
         let Self {
             unavailable,
             available,
+            available_set,
             wide_evictions,
             tight_or_parked_slots,
             evicting,
@@ -576,6 +585,7 @@ where
         } = self;
         unavailable.is_empty()
             && available.is_empty()
+            && available_set.is_empty()
             && wide_evictions.is_empty()
             && tight_or_parked_slots.is_empty()
             && evicting.is_empty()
@@ -656,10 +666,33 @@ where
     /// than a leak: coming back takes a move that writes it, emitted later and
     /// so running earlier, and that write shields every use past it.
     fn note_emitted(&mut self, mv: ParallelMove<E>, source: &impl ScratchSource<E>) {
-        self.available
-            .retain(|&reg| !source.overlaps(reg.into(), mv.src));
+        match mv.src {
+            ScalarAllocation::Reg(_) => {
+                let Self {
+                    available,
+                    available_set,
+                    ..
+                } = self;
+                available.retain(|&reg| {
+                    let remove = source.overlaps(reg.into(), mv.src);
+                    if remove {
+                        available_set.remove(reg.with_repr32());
+                    }
+                    !remove
+                });
+            }
+
+            ScalarAllocation::Stack(_) => debug_assert!(
+                self.available
+                    .iter()
+                    .all(|&reg| !source.overlaps(reg.into(), mv.src)),
+                "a register overlaps a stack slot, so skipping the scan for a \
+                 stack source leaves a register pooled that should have left",
+            ),
+        }
+
         if let ScalarAllocation::Reg(reg) = mv.dst {
-            if !self.available.contains(&reg) {
+            if self.available_set.insert(reg.with_repr32()) {
                 self.available.push(reg);
             }
         }
@@ -710,6 +743,7 @@ where
     fn end_walk(&mut self) {
         self.unavailable.clear();
         self.available.clear();
+        self.available_set.reset();
         self.evicting.clear();
     }
 

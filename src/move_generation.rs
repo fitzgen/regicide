@@ -2154,6 +2154,8 @@ enum Bracket {
     Wide,
 }
 
+const PARK_BRACKET: Bracket = Bracket::Wide;
+
 /// One register that writing a candidate scratch would clobber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Occupant<E>
@@ -2924,7 +2926,13 @@ where
         unavailable: &[ScalarAllocation<E>],
     ) -> Result<SpillSlot<E>, SolveError> {
         let size = self.bank(mv).size(self.machine);
-        let slot = self.emergency_slot(size, Bracket::Tight, unavailable, &[])?;
+
+        // A park holds its value until the move that reads it back, so every
+        // tight stay in the batch runs inside it. Asking wide keeps it off any
+        // slot a tight bracket has touched, which a later tight save would
+        // otherwise write over.
+        let slot = self.emergency_slot(size, PARK_BRACKET, unavailable, &[])?;
+
         self.wide_evicted_slots.push(slot);
         self.counts.cycles_parked_on_the_stack.inc();
         trace!("move generation: breaking a move-cycle with {slot:?}");
@@ -4472,6 +4480,49 @@ mod tests {
                 "but only that slot ({bracket:?})",
             );
         }
+    }
+
+    /// A park does not take a slot a tight bracket has already used, even
+    /// though that bracket is finished with it.
+    #[test]
+    fn a_park_may_not_share_a_slot_with_a_tight_bracket() {
+        let slot = |i| SpillSlot::<u32>::try_new(i).unwrap();
+
+        let used = slot(0);
+        let tight_evicted_slots = &[used][..];
+
+        assert!(
+            slot_is_taken::<u32>(&[], &[], tight_evicted_slots, PARK_BRACKET, &[], used, &[]),
+            "a park outlives every tight stay in the batch, so a slot one of \
+             them has used is not free for it to take",
+        );
+        assert!(
+            !slot_is_taken::<u32>(
+                &[],
+                &[],
+                tight_evicted_slots,
+                Bracket::Tight,
+                &[],
+                used,
+                &[]
+            ),
+            "which is exactly what a tight request would allow, so the park \
+             must not be making one",
+        );
+
+        // The rule is about used slots, not about parks finding nowhere.
+        assert!(
+            !slot_is_taken::<u32>(
+                &[],
+                &[],
+                tight_evicted_slots,
+                PARK_BRACKET,
+                &[],
+                slot(1),
+                &[]
+            ),
+            "a slot no bracket has used is free for a park like anything else",
+        );
     }
 
     /// The moves put every value where the allocation says it belongs, at
