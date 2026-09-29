@@ -28,6 +28,11 @@ fuzz_target!(|bytes: &[u8]| {
 fuzz_mutator!(|data: &mut [u8], size: usize, max_size: usize, seed: u32| {
     let mut session = Session::new().seed(seed.into()).shrink(max_size < size);
 
+    // With low probability, use libfuzzer's default mutator.
+    if session.generate::<u8>().is_ok_and(|x| x == 0) {
+        return fuzzer_mutate(data, size, max_size);
+    }
+
     let moves = match decode(&data[..size]) {
         Some(mut moves) => match session.mutate(&mut moves) {
             Ok(()) => moves,
