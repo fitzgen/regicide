@@ -1829,6 +1829,10 @@
           "Reg"
         ]
       },
+      "BundleNarrowedToEarlyHalf": {
+        "bundle": "LiveBundle",
+        "reload": "LiveBundle"
+      },
       "BundleQueuePopped": {
         "bundle": "LiveBundle",
         "region": "Region"

@@ -1778,6 +1778,111 @@ where
         Ok(new)
     }
 
+    /// Move this bundle's early reads onto their own half-instruction bundle,
+    /// leaving it a use-less carrier for the caller to spill.
+    ///
+    /// ```text
+    ///                    inst:Early       inst:Late      (inst+1):Early
+    ///                        |                |                |
+    /// reload (returned):     [reads===========)
+    /// carrier (self):        [=================================)
+    /// ```
+    ///
+    /// It is the whole-instruction footprint that cannot be satisfied, not the
+    /// half the reads are in, so the carry goes to the stack and the reads keep
+    /// a register.
+    pub(crate) fn narrow_to_early_half(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        input: &Input<'_, impl InputFunction>,
+        events: &mut EventsLog<E>,
+        output: &mut OutputInner<E>,
+    ) -> IResult<LiveBundle<E>> {
+        debug_assert!(live_ranges.bundles[self].reg_allocation.is_none());
+
+        let span = {
+            let mut spans = self.spans(live_ranges);
+            let span = spans
+                .next()
+                .expect("a bundle always holds at least one span");
+            debug_assert_eq!(spans.next(), None, "only a single-span bundle narrows");
+            span
+        };
+
+        let LiveSpanData {
+            start,
+            end,
+            uses,
+            val,
+        } = live_ranges.spans[span];
+
+        debug_assert_eq!(start.pos(), Position::Early);
+        debug_assert_eq!(span.len_insts(live_ranges), 1);
+        debug_assert!(!uses.is_empty());
+        debug_assert!(
+            uses.into_iter().all(|u| u.point(live_ranges) == start
+                && input
+                    .func
+                    .inst(start.inst().with_repr32())
+                    .operand(u.operand(live_ranges))
+                    .kind()
+                    == DefUse::Use),
+            "every operand must be a read at {start:?}",
+        );
+
+        // The mid-instruction point, not `inst_boundary_after`: that wider
+        // footprint is what is being shed.
+        let reload_end = start.next_point();
+        debug_assert_eq!(reload_end.pos(), Position::Late);
+        debug_assert!(reload_end < end, "the span must be wider than to narrow to");
+
+        let block = span.block(input.func, live_ranges);
+        let constraint = span.constraint(live_ranges, input);
+
+        let reload = push_span(
+            &mut live_ranges.spans,
+            output,
+            events,
+            val,
+            (start, reload_end),
+            (uses.start, uses.end),
+            constraint,
+            block,
+        )?;
+        live_ranges.spans[span].uses = EntityRange {
+            start: uses.start,
+            end: uses.start,
+        };
+        for u in uses {
+            live_ranges.use_span[u] = reload;
+        }
+
+        // Now use-less, so its constraint drops to `Any`, which is what lets
+        // the caller spill it.
+        self.recompute_weight_and_flags(live_ranges, input);
+        self.recompute_constraint(live_ranges, input);
+        debug_assert_eq!(self.constraint(live_ranges), OperandConstraint::Any);
+
+        let reload = live_ranges.push_bundle(
+            input,
+            output,
+            self.region(live_ranges),
+            constraint,
+            core::iter::once(reload),
+        )?;
+
+        event!(
+            events,
+            BundleNarrowedToEarlyHalf {
+                bundle: self,
+                reload,
+                at: reload_end,
+            }
+        );
+
+        Ok(reload)
+    }
+
     /// The region that this bundle is within.
     ///
     /// Bundles never span across regions.

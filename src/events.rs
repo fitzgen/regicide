@@ -272,6 +272,18 @@ where
         num_pieces: usize,
     },
 
+    /// A bundle's reads moved to a new half-instruction bundle, leaving it
+    /// carrying its value with no uses of its own. The `BundleSpilledToStack`
+    /// that follows covers that carrier.
+    BundleNarrowedToEarlyHalf {
+        /// The bundle, which keeps the use-less carrier span.
+        bundle: LiveBundle<E>,
+        /// The new bundle holding the reads.
+        reload: LiveBundle<E>,
+        /// The mid-instruction point the reload ends at.
+        at: LivePoint<E>,
+    },
+
     /// A bundle will live in memory rather than in a register.
     BundleSpilledToStack {
         /// The bundle.
@@ -612,6 +624,7 @@ mod viz_enabled {
                 Self::BundleSplitWithinSpan { .. } => "BundleSplitWithinSpan",
                 Self::BundleSplitFailed { .. } => "BundleSplitFailed",
                 Self::BundleSplitIntoMinimal { .. } => "BundleSplitIntoMinimal",
+                Self::BundleNarrowedToEarlyHalf { .. } => "BundleNarrowedToEarlyHalf",
                 Self::BundleSpilledToStack { .. } => "BundleSpilledToStack",
                 Self::BundleRematerialized { .. } => "BundleRematerialized",
                 Self::BundleHint { .. } => "BundleHint",
@@ -809,6 +822,12 @@ mod viz_enabled {
                     num_pieces: _,
                 } => {
                     f(EntityRef::Bundle(*bundle));
+                }
+
+                Self::BundleNarrowedToEarlyHalf { bundle, reload, at } => {
+                    f(EntityRef::Bundle(*bundle));
+                    f(EntityRef::Bundle(*reload));
+                    visit_point(*at, f);
                 }
 
                 Self::BundleSpilledToStack {
@@ -1156,6 +1175,11 @@ mod viz_enabled {
         BundleSplitIntoMinimal {
             bundle: LiveBundle,
             num_pieces: _,
+        }
+        BundleNarrowedToEarlyHalf {
+            bundle: LiveBundle,
+            reload: LiveBundle,
+            at: _,
         }
         BundleSpilledToStack {
             bundle: LiveBundle,

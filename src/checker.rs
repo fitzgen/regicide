@@ -2504,6 +2504,8 @@ mod tests {
             // A pinned read of a value nothing delivers, which only the
             // recomputation after the gap's moves can fill.
             TestInput::with_a_recomputed_value_pinned_at_a_block_start(),
+            // Fits only by narrowing the read off of the carry.
+            TestInput::with_an_early_read_under_a_full_late_half(),
         ]
         .into_iter()
         .enumerate()

@@ -13,7 +13,7 @@ use crate::{
     entity::{EntityRepr, Region, SecondaryMap},
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
-    input::InputValue,
+    input::{DefUse, InputInst, InputValue},
     live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
     machine::{Machine, Reg, RegClassMembers},
     output::{OutputInner, RegAllocation},
@@ -953,6 +953,63 @@ where
         Ok(true)
     }
 
+    /// Is `LiveBundle::narrow_to_early_half` both possible and worth doing
+    /// for `bundle`?
+    fn can_narrow_to_early_half(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+        bundle: LiveBundle<E>,
+    ) -> bool {
+        debug_assert!(matches!(
+            bundle.constraint(live_ranges),
+            OperandConstraint::Reg(_)
+        ));
+
+        // Several spans would each need narrowing, with the carrier
+        // re-formed around them.
+        let mut spans = bundle.spans(live_ranges);
+        let span = spans
+            .next()
+            .expect("a bundle always holds at least one span");
+        if spans.next().is_some() {
+            return false;
+        }
+
+        // The narrowing only means anything against one instruction's halves.
+        if span.len_insts(live_ranges) != 1 {
+            return false;
+        }
+
+        let start = span.start(live_ranges);
+
+        // A span already ending at `inst:Late` has nothing to shed, so its
+        // error is a real one.
+        if span.end(live_ranges) <= start.next_point() {
+            return false;
+        }
+
+        let uses = span.uses(live_ranges);
+        if uses.is_empty() {
+            return false;
+        }
+
+        // A `Late` operand genuinely needs the late half, and a def must start
+        // its value's range at its own point.
+        uses.into_iter().all(|u| {
+            let point = u.point(live_ranges);
+            if point != start {
+                return false;
+            }
+            let kind = input
+                .func
+                .inst(point.inst().with_repr32())
+                .operand(u.operand(live_ranges))
+                .kind();
+            kind == DefUse::Use
+        })
+    }
+
     /// The final phase for allocating a bundle: if it isn't already minimal,
     /// then split it into minimal pieces and push those back on the queue;
     /// otherwise, spill the bundle.
@@ -1003,17 +1060,43 @@ where
                             );
                             return Ok(());
                         }
+
+                        // Fall through to the spill code below...
                     }
 
-                    // It wants a register, we could not find one for it, and
-                    // there is nothing left to try.
-                    OperandConstraint::Reg(_) => return output.error(Error::TooManyLiveRegs),
+                    // It wants a register and there was none for it. One thing
+                    // is left to try: split off a early-half-instruction span
+                    // fo its early reads that need to be in a register, and
+                    // then let the old span spill to the stack. See
+                    // `LiveBundle::narrow_to_early_half`.
+                    OperandConstraint::Reg(_) => {
+                        if !self.can_narrow_to_early_half(input, live_ranges, bundle) {
+                            return output.error(Error::TooManyLiveRegs);
+                        }
+
+                        let pref = bundle.preference(live_ranges).clone();
+                        let reload =
+                            bundle.narrow_to_early_half(live_ranges, input, events, output)?;
+                        reload.add_hint(live_ranges, events, &pref, None);
+                        self.push_bundle(
+                            input,
+                            live_ranges,
+                            events,
+                            reload,
+                            Phase::SplitIntoMinimalOrSpill,
+                        );
+                        counts.early_half_reloads.inc();
+
+                        // And fall through to spill the carrier bundle below...
+                    }
 
                     OperandConstraint::Reuse(_) => unreachable!("already resolved"),
                     OperandConstraint::Stack => unreachable!("already handled"),
                 }
-                counts.spilled_bundles.inc();
+
                 self.stack_bundles.push(bundle);
+
+                counts.spilled_bundles.inc();
                 event!(
                     events,
                     BundleSpilledToStack {
@@ -1022,6 +1105,7 @@ where
                         forced: false,
                     }
                 );
+
                 return Ok(());
             }
 
@@ -1687,6 +1771,11 @@ mod tests {
                             Event::BundleSplit { child, .. } => {
                                 *bundle_parents.entry(child).or_default() += 1;
                             }
+                            // The reload is split out of the bundle it
+                            // narrows.
+                            Event::BundleNarrowedToEarlyHalf { reload, .. } => {
+                                *bundle_parents.entry(reload).or_default() += 1;
+                            }
                             Event::SpanConstructed { span, .. } => {
                                 constructed_spans.insert(span);
                             }
@@ -1735,6 +1824,74 @@ mod tests {
                     Ok(())
                 },
             )
+    }
+
+    /// An early read whose class is full over the late half allocates by
+    /// narrowing: the carrier goes to the stack and the read gets its own
+    /// early-half bundle.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn an_early_read_narrows_to_its_own_half_instruction_bundle() {
+        let test_input = TestInput::with_an_early_read_under_a_full_late_half();
+        let context = allocate(&test_input)
+            .expect("the fixture allocates")
+            .expect("the fixture does not run out of registers");
+        let inner = &context.context32;
+        let live_ranges = &inner.live_ranges;
+
+        let mut narrowings = inner.events.iter().filter_map(|(_, event)| match *event {
+            Event::BundleNarrowedToEarlyHalf { bundle, reload, at } => Some((bundle, reload, at)),
+            _ => None,
+        });
+        let (carrier, reload, at) = narrowings
+            .next()
+            .expect("the read narrows to the early half");
+        assert_eq!(narrowings.next(), None, "it narrows only the once");
+
+        // Spilling the carrier is what frees the late half for the two
+        // pinned definitions.
+        assert!(
+            inner.region_allocation.stack_bundles().contains(&carrier),
+            "{carrier:?} should have been spilled, but the stack bundles are {:?}",
+            inner.region_allocation.stack_bundles(),
+        );
+
+        let reload_spans = reload.spans(live_ranges).collect::<Vec<_>>();
+        assert_eq!(reload_spans.len(), 1, "the reload holds a single span");
+        let reload_span = reload_spans[0];
+        assert_eq!(reload_span.start(live_ranges).pos(), Position::Early);
+        assert_eq!(reload_span.end(live_ranges), at);
+        assert_eq!(
+            reload_span.end(live_ranges).pos(),
+            Position::Late,
+            "the reload ends at the late half, not at the next instruction",
+        );
+
+        // The carrier keeps its full extent, so the value stays covered
+        // across the instruction it is only read in the early half of.
+        let carrier_spans = carrier.spans(live_ranges).collect::<Vec<_>>();
+        assert_eq!(carrier_spans.len(), 1, "the carrier holds a single span");
+        assert!(
+            carrier_spans[0].end(live_ranges) > reload_span.end(live_ranges),
+            "the carrier should still reach past the reload",
+        );
+        assert!(
+            carrier_spans[0].uses(live_ranges).is_empty(),
+            "the carrier handed all of its uses to the reload",
+        );
+
+        // This is what puts the reload's register in `operand_allocs`
+        // instead of the carrier's stack slot.
+        let reload_uses = reload_span.uses(live_ranges);
+        assert!(!reload_uses.is_empty(), "the reload carries the read");
+        for u in reload_uses {
+            assert_eq!(
+                u.span(live_ranges),
+                reload_span,
+                "every use the reload holds should point back at it",
+            );
+            assert_eq!(u.point(live_ranges), reload_span.start(live_ranges));
+        }
     }
 
     /// The queue events tell the whole story of the queue: nothing is popped

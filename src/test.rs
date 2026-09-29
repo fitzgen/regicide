@@ -4228,6 +4228,59 @@ impl TestInput {
         )
     }
 
+    /// A value read in the early half of an instruction whose *late* half is
+    /// full, and which survives the instruction.
+    pub fn with_an_early_read_under_a_full_late_half() -> Self {
+        let carried = Val::try_new(0).unwrap();
+        let both_regs = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let second_reg = RegClass::try_new(TestMachine::SECOND_REG_CLASS.into()).unwrap();
+
+        Self::around_an_overwritten_read(
+            3,
+            vec![
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(carried),
+                )],
+                vec![
+                    // Constrained to the whole class rather than to one
+                    // register, so that it constrains its bundle instead of
+                    // becoming a reservation.
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Reg(both_regs),
+                        Some(carried),
+                    ),
+                    // These two take both registers over the late half.
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(Val::try_new(1).unwrap()),
+                    ),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(second_reg),
+                        Some(Val::try_new(2).unwrap()),
+                    ),
+                ],
+                // Makes the value a survivor, so its span reaches past the
+                // half it is read in.
+                vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(carried),
+                )],
+            ],
+        )
+    }
+
     /// A value defined into `r0` by a block's *terminator*, and read under
     /// `read` in the block it branches to.
     pub fn with_a_fixed_def_on_a_terminator(read: OperandConstraint) -> Self {
@@ -8696,6 +8749,8 @@ pub fn corpus() -> Vec<TestInput> {
             input.set_remat_costs(Some(RematCost::CheaperThanReload));
             input
         },
+        // Drives the early-half reload in `split_into_minimal_or_spill`.
+        TestInput::with_an_early_read_under_a_full_late_half(),
     ]
 }
 

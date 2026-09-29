@@ -202,6 +202,11 @@ where
                 Event::BundleSplit { parent, child, .. } => {
                     bundle_parents[*child] = Some(*parent);
                 }
+                // A narrowing is a split too: the reload carries the uses
+                // the bundle it names held.
+                Event::BundleNarrowedToEarlyHalf { bundle, reload, .. } => {
+                    bundle_parents[*reload] = Some(*bundle);
+                }
                 _ => {}
             }
         }
@@ -971,6 +976,11 @@ mod tests {
                             Event::BundleSplit { child, .. } => {
                                 if index.indices.bundle_parents[*child].is_none() {
                                     return Err(format!("{child:?} lost its parent"));
+                                }
+                            }
+                            Event::BundleNarrowedToEarlyHalf { reload, .. } => {
+                                if index.indices.bundle_parents[*reload].is_none() {
+                                    return Err(format!("{reload:?} lost its parent"));
                                 }
                             }
                             _ => {}
