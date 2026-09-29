@@ -1141,7 +1141,7 @@ where
         let victim = emit.source.evict(
             mv,
             reason,
-            &mut emit.pool.unavailable,
+            &emit.pool.unavailable,
             &spent,
             &mut emit.pool.evicting,
         );
@@ -1768,6 +1768,7 @@ where
             return;
         }
 
+        #[cfg(debug_assertions)]
         for (i, &(other, _)) in emit.pool.evicting.iter().enumerate() {
             if let Some(predicted) = emit.source.predicted_tight(other, &emit.pool.unavailable) {
                 debug_assert_eq!(

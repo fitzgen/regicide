@@ -7993,10 +7993,12 @@ impl TestInput {
 
         let op = |pos, kind, constraint, val| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[usize]| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -8053,6 +8055,7 @@ impl TestInput {
             // block5, the outer loop's exit.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
@@ -8122,10 +8125,12 @@ impl TestInput {
 
         let op = |pos, kind, constraint| InstData::Op {
             operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
             side_effects: true,
         };
         let branch = |targets: &[usize]| InstData::Branch {
             operands: vec![],
+            clobbers: vec![],
             targets: targets
                 .iter()
                 .map(|&t| BlockCall {
@@ -8150,6 +8155,7 @@ impl TestInput {
             // block3, the cycle's exit.
             InstData::Op {
                 operands: vec![],
+                clobbers: vec![],
                 side_effects: true,
             },
         ] {
