@@ -2164,6 +2164,14 @@ impl TestMachine {
 
     /// Repair this description so that [`TestMachine::build`] cannot fail.
     pub fn fixup(&mut self) {
+        // Clamped here rather than trusted from the field, because
+        // `set_regs_per_bank` is not the only writer: a deserialized
+        // `TestMachine` carries whatever count it was encoded with, and the
+        // register counts below feed `u8` conversions.
+        self.regs_per_bank = self
+            .regs_per_bank
+            .map(|n| n.clamp(1, Self::MAX_REGS_PER_BANK_TARGET));
+
         self.banks.truncate(Self::MAX_BANKS);
         if self.banks.is_empty() {
             self.banks.push(TestBank::default());
@@ -11049,6 +11057,37 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// A `regs_per_bank` out of range reaches `fixup` from `Deserialize`,
+    /// which does not go through `set_regs_per_bank`.
+    #[test]
+    fn fixup_clamps_regs_per_bank() {
+        for (asked, want) in [
+            (0, 1),
+            (1, 1),
+            (64, 64),
+            (65, TestMachine::MAX_REGS_PER_BANK_TARGET),
+            (350, TestMachine::MAX_REGS_PER_BANK_TARGET),
+            (usize::MAX, TestMachine::MAX_REGS_PER_BANK_TARGET),
+        ] {
+            let mut machine = TestMachine::two_registers();
+            machine.regs_per_bank = Some(asked);
+            machine.fixup();
+
+            assert_eq!(machine.regs_per_bank, Some(want), "asked for {asked}");
+            for bank in &machine.banks {
+                assert_eq!(bank.regs.len(), want, "asked for {asked}");
+            }
+
+            // Idempotent, so that a clamped machine survives the next
+            // mutation unchanged.
+            let mut again = machine.clone();
+            again.fixup();
+            assert_eq!(again.regs_per_bank, machine.regs_per_bank);
+
+            machine.build();
         }
     }
 
