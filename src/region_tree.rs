@@ -183,13 +183,13 @@ where
         region_children.reset();
         region_children_storage.reset();
         pre_order.clear();
-        debug_assert!(dfs_pre_order.is_empty());
-        debug_assert!(cycle_entries.is_empty());
-        debug_assert!(worklist.is_empty());
-        debug_assert!(pre_order_stack.is_empty());
-        debug_assert!(blocks_by_region.is_empty());
-        debug_assert!(distinct_regions.is_empty());
-        debug_assert!(children_by_parent.is_empty());
+        dfs_pre_order.clear();
+        cycle_entries.clear();
+        worklist.clear();
+        pre_order_stack.clear();
+        blocks_by_region.clear();
+        distinct_regions.clear();
+        children_by_parent.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -231,6 +231,17 @@ where
             && children_by_parent.is_empty()
     }
 
+    /// Is every field that only holds state mid-construction empty?
+    fn scratch_is_empty(&self) -> bool {
+        self.dfs_pre_order.is_empty()
+            && self.cycle_entries.is_empty()
+            && self.worklist.is_empty()
+            && self.pre_order_stack.is_empty()
+            && self.blocks_by_region.is_empty()
+            && self.distinct_regions.is_empty()
+            && self.children_by_parent.is_empty()
+    }
+
     pub fn construct(
         &mut self,
         func: &impl InputFunction,
@@ -241,13 +252,7 @@ where
         let _timing = Timing::new("region tree");
 
         debug_assert!(self.pre_order.is_empty());
-        debug_assert!(self.dfs_pre_order.is_empty());
-        debug_assert!(self.cycle_entries.is_empty());
-        debug_assert!(self.worklist.is_empty());
-        debug_assert!(self.pre_order_stack.is_empty());
-        debug_assert!(self.blocks_by_region.is_empty());
-        debug_assert!(self.distinct_regions.is_empty());
-        debug_assert!(self.children_by_parent.is_empty());
+        debug_assert!(self.scratch_is_empty());
 
         self.construct_dfs_info(func, dfs, output)?;
         self.construct_cycles(func, output)?;
@@ -258,6 +263,10 @@ where
 
         counts.regions += self.distinct_regions.len();
         self.distinct_regions.clear();
+        debug_assert!(
+            self.scratch_is_empty(),
+            "a completed construction leaves no scratch behind",
+        );
         Ok(())
     }
 
@@ -622,6 +631,24 @@ mod tests {
         format,
         string::{String, ToString},
     };
+
+    /// A construction that bailed with `EntityReprTooSmall` never reached the cleanup
+    /// at the end of its walk, and `Context::reset` resets that abandoned
+    /// context too, so `reset` has to clear the scratch rather than assume it.
+    #[test]
+    fn reset_clears_scratch_from_an_abandoned_construction() {
+        let mut region_tree = RegionTree::<u8>::new();
+
+        region_tree.dfs_pre_order.push(Block::try_new(0).unwrap());
+        region_tree.worklist.push(Block::try_new(1).unwrap());
+        region_tree
+            .distinct_regions
+            .push(Region::try_new(0).unwrap());
+        assert!(!region_tree.is_reset());
+
+        region_tree.reset();
+        assert!(region_tree.is_reset());
+    }
 
     /// A region, identified by the blocks of the cycle that defines it plus
     /// those of every cycle nested inside it.

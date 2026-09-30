@@ -281,11 +281,13 @@ where
         val_home.reset();
         spilled.reset();
         *max_live = [0; RegBank::NUM_SIZES];
-        debug_assert!(live_count.iter().all(|&n| n == 0));
-        debug_assert!(in_use.is_empty());
-        debug_assert!(free_slots.iter().all(|free| free.is_empty()));
-        debug_assert!(events.is_empty());
-        debug_assert!(live.is_empty());
+        *live_count = [0; RegBank::NUM_SIZES];
+        in_use.reset();
+        for free in free_slots {
+            free.clear();
+        }
+        events.clear();
+        live.reset();
         for slots in emergency {
             slots.clear();
         }
@@ -318,6 +320,15 @@ where
             && events.is_empty()
             && live.is_empty()
             && emergency.iter().all(|slots| slots.is_empty())
+    }
+
+    /// Is every field that only holds state mid-walk empty?
+    fn scratch_is_empty(&self) -> bool {
+        self.live_count.iter().all(|&n| n == 0)
+            && self.in_use.is_empty()
+            && self.free_slots.iter().all(|free| free.is_empty())
+            && self.events.is_empty()
+            && self.live.is_empty()
     }
 
     /// How many stack slots did we create?
@@ -406,7 +417,12 @@ where
     ) -> IResult<()> {
         debug_assert!(self.is_reset());
         self.collect_spilled_values(counts, events, live_ranges, region_allocation);
-        self.color(input, counts, events, rpo, liveness, output)
+        self.color(input, counts, events, rpo, liveness, output)?;
+        debug_assert!(
+            self.scratch_is_empty(),
+            "a completed walk leaves no scratch behind",
+        );
+        Ok(())
     }
 
     /// Gather the values that need a stack slot: everything covered by a bundle
@@ -494,11 +510,7 @@ where
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         trace!("spill slots: coloring {block:?}");
-        debug_assert!(self.in_use.is_empty());
-        debug_assert!(self.free_slots.iter().all(|free| free.is_empty()));
-        debug_assert!(self.live_count.iter().all(|&n| n == 0));
-        debug_assert!(self.events.is_empty());
-        debug_assert!(self.live.is_empty());
+        debug_assert!(self.scratch_is_empty());
 
         self.enter_block(input, counts, events, liveness, block, output)?;
         self.collect_events(input, liveness, block, output)?;
@@ -906,6 +918,23 @@ mod tests {
 
     #[cfg(feature = "visualizer")]
     use crate::events::Event as LoggedEvent;
+
+    /// A pass that bailed with `EntityReprTooSmall` never reached the cleanup
+    /// at the end of its walk, and `Context::reset` resets that abandoned
+    /// context too, so `reset` has to clear the scratch rather than assume it.
+    #[test]
+    fn reset_clears_scratch_from_an_abandoned_walk() {
+        let mut spill_slots = SpillSlots::<u8>::new();
+
+        spill_slots.live_count[0] = 1;
+        spill_slots.in_use.insert(SpillSlot::try_new(0).unwrap());
+        spill_slots.free_slots[0].push(SpillSlot::try_new(1).unwrap());
+        spill_slots.live.insert(Val::try_new(0).unwrap());
+        assert!(!spill_slots.is_reset());
+
+        spill_slots.reset();
+        assert!(spill_slots.is_reset());
+    }
 
     /// Run every phase up through spill slot allocation.
     ///

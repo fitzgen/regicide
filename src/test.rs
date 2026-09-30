@@ -2808,6 +2808,110 @@ impl TestInput {
         input
     }
 
+    /// An input that needs more spill-slot group members than a `u8` entity
+    /// representation can index, so that spill slot allocation bails with
+    /// `EntityReprTooSmall` and `run_dispatch` retries under a wider one.
+    pub fn with_more_spill_slot_groups_than_a_u8_can_index() -> Self {
+        /// Enough live-at-once values to push `group_members` past 254.
+        const NUM_VALS: usize = 128;
+
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        // One value per definition, each pinned to the register group.
+        func.values = PrimaryMap::new();
+        for i in 0..NUM_VALS {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::GROUP_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(i / 2).unwrap(),
+                            i: i % 2,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        // Two values per instruction, so that `NUM_VALS` values fit in half as
+        // many instructions and the function stays inside what a `u8` can
+        // index even though its spill slot groups do not.
+        func.insts = PrimaryMap::new();
+        for pair in (0..NUM_VALS).step_by(2) {
+            func.insts
+                .push(
+                    &mut output,
+                    InstData::Op {
+                        operands: (pair..pair + 2)
+                            .map(|i| {
+                                Operand::new(
+                                    Position::Late,
+                                    DefUse::Def,
+                                    OperandConstraint::Any,
+                                    Some(Val::try_new(i).unwrap()),
+                                )
+                            })
+                            .collect(),
+                        clobbers: vec![],
+                        side_effects: true,
+                    },
+                )
+                .unwrap();
+        }
+
+        // A self-loop, so that the values defined in the body are live across
+        // the back edge and the loop body is walked with all of them needing
+        // slots at once.
+        let body = Block::try_new(1).unwrap();
+        func.insts
+            .push(
+                &mut output,
+                InstData::Branch {
+                    operands: vec![],
+                    clobbers: vec![],
+                    targets: vec![BlockCall {
+                        target: body,
+                        args: vec![],
+                    }],
+                },
+            )
+            .unwrap();
+        let entry_term = func.insts.len() - 1;
+
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: vec![Inst::try_new(entry_term).unwrap()],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..entry_term).map(|i| Inst::try_new(i).unwrap()).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::one_register_group(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input whose third instruction reads two different
     /// values, one pinned to each of [`TestMachine::two_registers`]' two
     /// registers.
@@ -9312,6 +9416,7 @@ pub fn corpus() -> Vec<TestInput> {
     let group_class = RegClass::try_new(usize::from(TestMachine::GROUP_CLASS)).unwrap();
     vec![
         TestInput::default(),
+        TestInput::with_more_spill_slot_groups_than_a_u8_can_index(),
         TestInput::with_spilled_merge_param(),
         TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
         TestInput::with_use_constraints(&[OperandConstraint::Stack]),
@@ -9506,6 +9611,28 @@ mod tests {
         mutators as m,
     };
     use std::{format, string::String};
+
+    /// A `Context` is reusable across allocations even when an allocation made
+    /// it take the `EntityReprTooSmall` retry path.
+    ///
+    /// The narrow context that bailed never finished its passes, so it holds
+    /// partial state that only `reset` will clear. `run` asserts a reset
+    /// context, and that assert is a plain `assert!`, so a `reset` that left
+    /// the abandoned context dirty would fail the *second* `run` here even in
+    /// a release build.
+    #[test]
+    fn a_context_is_reusable_after_the_entity_repr_retry() {
+        let input = TestInput::with_more_spill_slot_groups_than_a_u8_can_index();
+        let mut context = crate::Context::new();
+
+        for _ in 0..2 {
+            input
+                .with_input(|input| crate::run(&mut context, input).map(|_| ()))
+                .expect("the wider representation fits this input");
+            context.reset();
+            assert!(context.is_reset());
+        }
+    }
 
     /// Check that `func` is a well-formed function in valid SSA form, as
     /// `TestFunction::fixup` is supposed to guarantee.

@@ -192,9 +192,9 @@ where
         set_constraint.reset();
         val_exit_span.reset();
         val_entry_span.reset();
-        debug_assert!(region_blocks.is_empty());
-        debug_assert!(cross_region_affinities.is_empty());
-        debug_assert!(hint_scratch.is_empty());
+        region_blocks.clear();
+        cross_region_affinities.clear();
+        hint_scratch.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -513,7 +513,10 @@ where
     }
 
     context.coalescing.cross_region_affinities.clear();
-    context.coalescing.region_blocks.clear();
+    debug_assert!(
+        context.coalescing.region_blocks.is_empty() && context.coalescing.hint_scratch.is_empty(),
+        "a completed coalescing leaves no scratch behind",
+    );
     Ok(())
 }
 
@@ -1173,6 +1176,28 @@ mod tests {
         string::{String, ToString},
         vec::Vec,
     };
+
+    /// A run that bailed with `EntityReprTooSmall` never reached the cleanup
+    /// at the end of its walk, and `Context::reset` resets that abandoned
+    /// context too, so `reset` has to clear the scratch rather than assume it.
+    #[test]
+    fn reset_clears_scratch_from_an_abandoned_run() {
+        let mut coalescing = Coalescing::<u8>::new();
+
+        coalescing.region_blocks.push(Block::try_new(0).unwrap());
+        coalescing
+            .cross_region_affinities
+            .push((LiveSpan::try_new(0).unwrap(), LiveSpan::try_new(1).unwrap()));
+        coalescing.hint_scratch.push((
+            LivePoint::new(Inst::try_new(0).unwrap(), Position::Early),
+            Val::try_new(0).unwrap(),
+            Reservation::try_new(0).unwrap(),
+        ));
+        assert!(!coalescing.is_reset());
+
+        coalescing.reset();
+        assert!(coalescing.is_reset());
+    }
 
     /// Run every analysis that coalescing depends on.
     fn analyze(context: &mut ContextInner<u32>, input: &Input<'_, TestFunction>) -> IResult<()> {

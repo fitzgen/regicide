@@ -42,7 +42,7 @@ where
     pub fn reset(&mut self) {
         let Self { map, stack } = self;
         map.reset();
-        debug_assert!(stack.is_empty());
+        stack.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -100,6 +100,18 @@ mod tests {
 
     fn v(v: u8) -> V {
         V::try_new(v as usize).unwrap()
+    }
+
+    /// `reset` leaves nothing behind even when the path-compression scratch
+    /// was not drained, so that a reused context starts clean.
+    #[test]
+    fn reset_clears_scratch() {
+        let mut uf = UnionFind::<V>::new();
+        uf.stack.push(v(0));
+        assert!(!uf.is_reset());
+
+        uf.reset();
+        assert!(uf.is_reset());
     }
 
     #[test]

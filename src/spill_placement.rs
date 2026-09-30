@@ -300,10 +300,10 @@ where
         defs.reset();
         legal.reset();
         union_find.reset();
-        debug_assert!(spans.is_empty());
-        debug_assert!(is_spill_site.is_empty());
-        debug_assert!(spill_site_blocks.is_empty());
-        debug_assert!(arrives_from_nowhere.is_empty());
+        spans.clear();
+        is_spill_site.reset();
+        spill_site_blocks.clear();
+        arrives_from_nowhere.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -375,6 +375,12 @@ where
         self.spans = spans;
         self.spans.clear();
 
+        debug_assert!(
+            self.is_spill_site.is_empty()
+                && self.spill_site_blocks.is_empty()
+                && self.arrives_from_nowhere.is_empty(),
+            "a completed placement leaves no scratch behind",
+        );
         Ok(())
     }
 
@@ -793,6 +799,28 @@ mod tests {
 
     #[cfg(feature = "visualizer")]
     use crate::events::Event as LoggedEvent;
+
+    /// A run that bailed with `EntityReprTooSmall` never reached the cleanup
+    /// at the end of its walk, and `Context::reset` resets that abandoned
+    /// context too, so `reset` has to clear the scratch rather than assume it.
+    #[test]
+    fn reset_clears_scratch_from_an_abandoned_run() {
+        let mut spill_placement = SpillPlacement::<u8>::new();
+
+        spill_placement
+            .spill_site_blocks
+            .push(Block::try_new(0).unwrap());
+        spill_placement
+            .is_spill_site
+            .insert(Block::try_new(1).unwrap());
+        spill_placement
+            .arrives_from_nowhere
+            .insert(Block::try_new(2).unwrap());
+        assert!(!spill_placement.is_reset());
+
+        spill_placement.reset();
+        assert!(spill_placement.is_reset());
+    }
 
     /// Run every phase up through spill placement.
     ///
