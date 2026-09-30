@@ -598,7 +598,9 @@ mod tests {
             r#"{
   "options": {
     "validate_input": true,
-    "move_elimination_level": "global"
+    "redundant_move_elimination_level": "global",
+    "dead_move_elimination_level": "global",
+    "eliminate_dead_register_moves": true
   },
   "machine": {
     "version": 3,

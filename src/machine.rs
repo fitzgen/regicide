@@ -264,6 +264,14 @@ where
         machine.registers[self.with_repr32()].units.clone()
     }
 
+    /// The units that this register covers, one at a time.
+    #[inline]
+    pub(crate) fn iter_units(self, machine: &Machine) -> impl Iterator<Item = RegUnit> {
+        let units = self.units(machine);
+        debug_assert!(units.start <= units.end);
+        (units.start.to_bits()..units.end.to_bits()).map(RegUnit::from_bits)
+    }
+
     /// This register's associated register bank.
     #[inline]
     pub fn bank(self, machine: &Machine) -> RegBank {
@@ -458,6 +466,12 @@ impl RegBank {
 
 /// A set of `Reg`s.
 pub type RegSet = FixedEntitySet<Reg, { words_for(Reg::MAX) }>;
+
+/// A set of `RegUnit`s.
+///
+/// `RegUnit::MAX` is 512, so this is eight words whatever the machine, and
+/// `MachineBuilder::define_reg` rejects any unit past that maximum.
+pub type RegUnitSet = FixedEntitySet<RegUnit, { words_for(RegUnit::MAX) }>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RegDef {

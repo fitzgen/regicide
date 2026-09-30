@@ -94,6 +94,26 @@ impl<K, const WORDS: usize> FixedEntitySet<K, WORDS> {
         self.combine(rhs, |l, r| l | r)
     }
 
+    /// Add every entity of `rhs` to `self`, returning whether that added
+    /// anything `self` did not already have.
+    #[inline]
+    pub fn union_with(&mut self, rhs: &Self) -> bool {
+        let mut grew = false;
+        for i in 0..WORDS {
+            let before = self.words[i];
+            let after = before | rhs.words[i];
+            grew |= after != before;
+            self.words[i] = after;
+        }
+        grew
+    }
+
+    /// Replace this set's contents with `other`'s.
+    #[inline]
+    pub fn copy_from(&mut self, other: &Self) {
+        self.words.copy_from_slice(&other.words);
+    }
+
     /// Create the set of entities that are in both `self` and `rhs`.
     #[inline]
     pub fn intersection(&self, rhs: &Self) -> Self {
@@ -566,6 +586,60 @@ mod tests {
                     Ok(())
                 },
             )
+    }
+
+    /// Build a set and a `BTreeSet` holding the entities at `indices`.
+    fn set_of(indices: &[u32]) -> (TestSet, BTreeSet<Val>) {
+        let mut set = TestSet::new();
+        let mut oracle = BTreeSet::<Val>::new();
+        for &index in indices {
+            let val = Val::try_new((index % CAPACITY) as usize).unwrap();
+            set.insert(val);
+            oracle.insert(val);
+        }
+        (set, oracle)
+    }
+
+    #[test]
+    fn union_with_and_copy_from_properties() -> CheckResult<(Vec<u32>, Vec<u32>)> {
+        Check::new()
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
+            .run(|(lhs, rhs): &(Vec<u32>, Vec<u32>)| -> Result<(), String> {
+                let (mut set, mut oracle) = set_of(lhs);
+                let (other, other_oracle) = set_of(rhs);
+
+                // The dataflow fixpoints key their worklists on this.
+                let expected_grew = !other_oracle.is_subset(&oracle);
+                let grew = set.union_with(&other);
+                if grew != expected_grew {
+                    return Err(format!(
+                        "`union_with` returned {grew} but should have returned \
+                             {expected_grew}",
+                    ));
+                }
+                oracle.extend(other_oracle.iter().copied());
+                check_agree(&set, &oracle)?;
+
+                // It agrees with the by-value `union`.
+                let (fresh, _) = set_of(lhs);
+                if set.iter().collect::<Vec<_>>() != fresh.union(&other).iter().collect::<Vec<_>>()
+                {
+                    return Err("`union_with` and `union` disagree".to_string());
+                }
+
+                // Unioning the same thing in again cannot grow it.
+                if set.union_with(&other) {
+                    return Err("a repeated `union_with` reported growth".to_string());
+                }
+                check_agree(&set, &oracle)?;
+
+                // `copy_from` clears whatever the union added.
+                set.copy_from(&other);
+                check_agree(&set, &other_oracle)?;
+
+                Ok(())
+            })
     }
 
     #[test]

@@ -143,13 +143,40 @@ fn gen_operand_constraint(ctx: &mut mutatis::Context) -> mutatis::Result<Operand
     })
 }
 
-/// Generate a level of redundant-move elimination.
+/// Generate a level of move elimination.
 fn gen_move_elimination_level(ctx: &mut mutatis::Context) -> mutatis::Result<MoveEliminationLevel> {
     Ok(match ctx.rng().gen_index(3).unwrap() {
         0 => MoveEliminationLevel::None,
         1 => MoveEliminationLevel::Local,
         _ => MoveEliminationLevel::Global,
     })
+}
+
+/// Mutate one move-elimination level in place.
+///
+/// Doing less move elimination is the simpler test case, so shrinking walks
+/// down towards `None`; a level that is already `None` has nowhere left to
+/// shrink to.
+fn mutate_move_elimination_level(
+    ctx: &mut mutatis::Context,
+    level: &mut MoveEliminationLevel,
+) -> mutatis::Result<()> {
+    *level = if ctx.shrink() {
+        match *level {
+            MoveEliminationLevel::None => return Err(mutatis::error::Error::exhausted()),
+            MoveEliminationLevel::Local => MoveEliminationLevel::None,
+            MoveEliminationLevel::Global => {
+                if ctx.rng().gen_bool() {
+                    MoveEliminationLevel::None
+                } else {
+                    MoveEliminationLevel::Local
+                }
+            }
+        }
+    } else {
+        gen_move_elimination_level(ctx)?
+    };
+    Ok(())
 }
 
 impl<E> Mutate<Operand<E>> for OperandMutator<E>
@@ -6002,6 +6029,16 @@ impl TestInput {
         self.func.blocks[block].frequency = u8::try_from(index).unwrap();
     }
 
+    /// Turn off every move-elimination pass.
+    ///
+    /// For a test that needs a particular edit to survive into the output,
+    /// typically so it can perturb it and watch the checker object. Elimination
+    /// is generally *right* to drop such an edit.
+    pub fn disable_move_elimination(&mut self) {
+        self.options.redundant_move_elimination_level = MoveEliminationLevel::None;
+        self.options.dead_move_elimination_level = MoveEliminationLevel::None;
+    }
+
     /// Report `remat` for every value in this function that may legally carry
     /// it; the rest keep no cost at all.
     ///
@@ -7199,6 +7236,139 @@ impl TestInput {
             },
         ] {
             func.blocks.push(&mut output, block).unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A loop carrying an entry parameter read only after the loop, on a path
+    /// where it has been spilled: the register half of its arrival is written
+    /// and never read.
+    pub fn with_a_looping_value_read_only_after_the_loop() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i: usize| Val::try_new(i).unwrap();
+        let inst = |i: usize| Inst::try_new(i).unwrap();
+        let block = |i: usize| Block::try_new(i).unwrap();
+
+        // `v0` is the entry parameter; the rest keep the registers busy.
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::BlockParam {
+                block: block(0),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(0),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(0),
+                i: 1,
+            },
+            ValDef::InstResult {
+                inst: inst(1),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(2),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(2),
+                i: 1,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let def = |pos, val| Operand::new(pos, DefUse::Def, OperandConstraint::Any, Some(val));
+        let call = |target, args: &[Val]| BlockCall {
+            target: block(target),
+            args: args.to_vec(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`: define two values, then fork into and past the loop.
+            InstData::Branch {
+                operands: vec![def(Position::Late, val(1)), def(Position::Late, val(2))],
+                clobbers: vec![],
+                targets: vec![call(1, &[]), call(2, &[]), call(3, &[])],
+            },
+            // `block1`: another definition, then the loop's second block.
+            InstData::Branch {
+                operands: vec![def(Position::Late, val(3))],
+                clobbers: vec![],
+                targets: vec![call(2, &[])],
+            },
+            // `block2`: two more definitions, at both halves of the
+            // instruction, and the back edge.
+            InstData::Op {
+                operands: vec![def(Position::Late, val(4)), def(Position::Early, val(5))],
+                clobbers: vec![],
+                side_effects: false,
+            },
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: vec![call(0, &[val(2)])],
+            },
+            // `block3`: the one read of `v0`, past the loop.
+            InstData::Op {
+                operands: vec![],
+                clobbers: vec![],
+                side_effects: false,
+            },
+            InstData::Branch {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(val(0)),
+                )],
+                clobbers: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (params, insts, frequency) in [
+            // Cold tips the allocator into leaving the carried value in a
+            // register *and* a slot, so there is a second copy to be dead.
+            (vec![val(0)], vec![inst(0)], 1),
+            (vec![], vec![inst(1)], 0),
+            (vec![], vec![inst(2), inst(3)], 0),
+            (vec![], vec![inst(4), inst(5)], 0),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency,
+                    },
+                )
+                .unwrap();
         }
 
         let mut input = TestInput {
@@ -9316,7 +9486,7 @@ impl TestInput {
 
 /// A mutator for `InputOptions`.
 ///
-/// Only the move-elimination level is mutated: `TestInput::fixup` guarantees
+/// Only the move-elimination options are mutated: `TestInput::fixup` guarantees
 /// that the input is valid, so turning `validate_input` off would only lose
 /// coverage of the validator.
 #[derive(Default)]
@@ -9329,24 +9499,22 @@ impl Mutate<InputOptions> for InputOptionsMutator {
         options: &mut InputOptions,
     ) -> mutatis::Result<()> {
         mutations.mutation(|ctx| {
-            options.move_elimination_level = if ctx.shrink() {
-                // Doing less move elimination is the simpler test case, so
-                // shrink towards `None`.
-                match options.move_elimination_level {
-                    MoveEliminationLevel::None => {
-                        return Err(mutatis::error::Error::exhausted());
-                    }
-                    MoveEliminationLevel::Local => MoveEliminationLevel::None,
-                    MoveEliminationLevel::Global => {
-                        if ctx.rng().gen_bool() {
-                            MoveEliminationLevel::None
-                        } else {
-                            MoveEliminationLevel::Local
-                        }
-                    }
+            mutate_move_elimination_level(ctx, &mut options.redundant_move_elimination_level)
+        })?;
+
+        mutations.mutation(|ctx| {
+            mutate_move_elimination_level(ctx, &mut options.dead_move_elimination_level)
+        })?;
+
+        mutations.mutation(|ctx| {
+            // Tracking fewer locations is simpler, so shrink towards `false`.
+            options.eliminate_dead_register_moves = if ctx.shrink() {
+                if !options.eliminate_dead_register_moves {
+                    return Err(mutatis::error::Error::exhausted());
                 }
+                false
             } else {
-                gen_move_elimination_level(ctx)?
+                ctx.rng().gen_bool()
             };
             Ok(())
         })
@@ -9356,7 +9524,9 @@ impl Mutate<InputOptions> for InputOptionsMutator {
 impl Generate<InputOptions> for InputOptionsMutator {
     fn generate(&mut self, ctx: &mut mutatis::Context) -> mutatis::Result<InputOptions> {
         Ok(InputOptions {
-            move_elimination_level: gen_move_elimination_level(ctx)?,
+            redundant_move_elimination_level: gen_move_elimination_level(ctx)?,
+            dead_move_elimination_level: gen_move_elimination_level(ctx)?,
+            eliminate_dead_register_moves: ctx.rng().gen_bool(),
             ..InputOptions::default()
         })
     }
@@ -9469,6 +9639,9 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_rematerialized_block_arg(),
         TestInput::with_two_uses_of_different_values(),
         TestInput::with_a_critical_edge(),
+        // A value carried around a loop and read only past it, left in both a
+        // register and a slot: the corpus's one dead register-to-register move.
+        TestInput::with_a_looping_value_read_only_after_the_loop(),
         TestInput::with_values_in_two_banks_spilled_and_reloaded(),
         // A value defined outside a loop that spends part of its live range on
         // the stack inside it, which is where a spill has a region to be
@@ -9731,39 +9904,70 @@ mod tests {
             })
     }
 
-    /// A `TestInput` asks for a level of move elimination, and `with_input`
-    /// hands whichever one it holds down to the allocator.
+    /// `with_input` hands the move-elimination options it holds down to the
+    /// allocator.
     #[test]
-    fn with_input_reports_the_move_elimination_level() {
+    fn with_input_reports_the_move_elimination_options() {
         let mut input = TestInput::default();
         assert_eq!(
-            input.options.move_elimination_level,
-            InputOptions::default().move_elimination_level,
+            input.options.redundant_move_elimination_level,
+            InputOptions::default().redundant_move_elimination_level,
+        );
+        assert_eq!(
+            input.options.dead_move_elimination_level,
+            InputOptions::default().dead_move_elimination_level,
         );
 
-        for level in [
+        for redundant in [
             MoveEliminationLevel::None,
             MoveEliminationLevel::Local,
             MoveEliminationLevel::Global,
         ] {
-            input.options.move_elimination_level = level;
-            input.with_input(|input| assert_eq!(input.options.move_elimination_level, level));
+            for dead in [
+                MoveEliminationLevel::None,
+                MoveEliminationLevel::Local,
+                MoveEliminationLevel::Global,
+            ] {
+                for regs in [false, true] {
+                    input.options.redundant_move_elimination_level = redundant;
+                    input.options.dead_move_elimination_level = dead;
+                    input.options.eliminate_dead_register_moves = regs;
+                    input.with_input(|input| {
+                        assert_eq!(input.options.redundant_move_elimination_level, redundant);
+                        assert_eq!(input.options.dead_move_elimination_level, dead);
+                        assert_eq!(input.options.eliminate_dead_register_moves, regs);
+                    });
+                }
+            }
         }
     }
 
-    /// `InputOptionsMutator` really does vary the move-elimination level, so
-    /// that the checks which generate `TestInput`s exercise all of them.
+    /// `InputOptionsMutator` varies every move-elimination option, so the
+    /// checks generating `TestInput`s exercise all of them.
+    ///
+    /// Both levels are checked separately: a mutator varying one and leaving the
+    /// other at its default would leave a whole pass untested.
     #[test]
-    fn generates_every_move_elimination_level() {
+    fn generates_every_move_elimination_option() {
         let mut session = mutatis::Session::new().seed(0);
-        let mut seen = Vec::new();
+        let mut redundant = Vec::new();
+        let mut dead = Vec::new();
+        let mut regs = Vec::new();
         for _ in 0..100 {
             let options: InputOptions = session.generate().unwrap();
-            if !seen.contains(&options.move_elimination_level) {
-                seen.push(options.move_elimination_level);
+            if !redundant.contains(&options.redundant_move_elimination_level) {
+                redundant.push(options.redundant_move_elimination_level);
+            }
+            if !dead.contains(&options.dead_move_elimination_level) {
+                dead.push(options.dead_move_elimination_level);
+            }
+            if !regs.contains(&options.eliminate_dead_register_moves) {
+                regs.push(options.eliminate_dead_register_moves);
             }
         }
-        assert_eq!(seen.len(), 3, "only generated {seen:?}");
+        assert_eq!(redundant.len(), 3, "only generated {redundant:?}");
+        assert_eq!(dead.len(), 3, "only generated {dead:?}");
+        assert_eq!(regs.len(), 2, "only generated {regs:?}");
     }
 
     /// Every machine that `TestMachine` can describe is one that

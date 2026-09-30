@@ -514,6 +514,20 @@ where
         index: usize,
     },
 
+    /// A move or rematerialization was dropped because nothing would ever read
+    /// its destination again.
+    DeadEditEliminated {
+        /// Where the edit was.
+        pos: PackedMovePosition<E>,
+
+        /// The edit that is not happening.
+        edit: EdgeEdit<E>,
+
+        /// Which edit it was, with the same numbering `Event::MoveEmitted`
+        /// uses.
+        index: usize,
+    },
+
     /// An edit was placed on a critical edge, which the client has to split.
     CriticalEdgeEdit {
         /// The predecessor the edge leaves.
@@ -645,6 +659,7 @@ mod viz_enabled {
                 Self::ParallelMoveBatchSolved { .. } => "ParallelMoveBatchSolved",
                 Self::MoveEmitted { .. } => "MoveEmitted",
                 Self::EditEliminated { .. } => "EditEliminated",
+                Self::DeadEditEliminated { .. } => "DeadEditEliminated",
                 Self::CriticalEdgeEdit { .. } => "CriticalEdgeEdit",
             }
         }
@@ -1003,6 +1018,15 @@ mod viz_enabled {
                     visit_edge_edit(*edit, f);
                 }
 
+                Self::DeadEditEliminated {
+                    pos,
+                    edit,
+                    index: _,
+                } => {
+                    visit_move_position(*pos, f);
+                    visit_edge_edit(*edit, f);
+                }
+
                 Self::CriticalEdgeEdit {
                     pred,
                     succ: _,
@@ -1281,6 +1305,11 @@ mod viz_enabled {
             index: _,
         }
         EditEliminated {
+            pos: (MOVE_POSITION),
+            edit: (EDGE_EDIT),
+            index: _,
+        }
+        DeadEditEliminated {
             pos: (MOVE_POSITION),
             edit: (EDGE_EDIT),
             index: _,

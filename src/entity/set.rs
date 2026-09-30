@@ -54,6 +54,35 @@ impl<K> EntitySet<K> {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    /// Add every entity of `rhs` to `self`, returning whether that added
+    /// anything `self` did not already have.
+    pub fn union_with(&mut self, rhs: &Self) -> bool {
+        // Only the words `rhs` has can contribute, and a trailing zero word
+        // means the same as no word.
+        if rhs.words.len() > self.words.len() {
+            self.words.resize(rhs.words.len(), 0);
+        }
+
+        let mut grew = false;
+        for (word, r) in self.words.iter_mut().zip(rhs.words.iter()) {
+            let before = *word;
+            let after = before | *r;
+            if after != before {
+                grew = true;
+                self.len += usize::try_from((after & !before).count_ones()).unwrap();
+                *word = after;
+            }
+        }
+        grew
+    }
+
+    /// Replace this set's contents with `other`'s, keeping `self`'s capacity.
+    pub fn copy_from(&mut self, other: &Self) {
+        self.words.clear();
+        self.words.extend_from_slice(&other.words);
+        self.len = other.len;
+    }
 }
 
 impl<K> EntitySet<K>
@@ -360,5 +389,64 @@ mod tests {
                     Ok(())
                 },
             )
+    }
+
+    /// Build a set and a `BTreeSet` holding the entities at `indices`.
+    fn set_of(indices: &[u32]) -> (EntitySet<Val>, BTreeSet<Val>) {
+        let mut set = EntitySet::<Val>::new();
+        let mut oracle = BTreeSet::<Val>::new();
+        for &index in indices {
+            let val = Val::try_new((index % MAX_INDEX) as usize).unwrap();
+            set.insert(val);
+            oracle.insert(val);
+        }
+        (set, oracle)
+    }
+
+    #[test]
+    fn union_with_and_copy_from_properties() -> CheckResult<(Vec<u32>, Vec<u32>)> {
+        Check::new()
+            .min_iters(1_000)
+            .min_duration(std::time::Duration::from_secs(1))
+            .run(|(lhs, rhs): &(Vec<u32>, Vec<u32>)| -> Result<(), String> {
+                let (mut set, mut oracle) = set_of(lhs);
+                let (other, other_oracle) = set_of(rhs);
+
+                // The dataflow fixpoints key their worklists on this.
+                let expected_grew = !other_oracle.is_subset(&oracle);
+                let grew = set.union_with(&other);
+                if grew != expected_grew {
+                    return Err(format!(
+                        "`union_with` returned {grew} but should have returned \
+                             {expected_grew}",
+                    ));
+                }
+                oracle.extend(other_oracle.iter().copied());
+                check_agree(&set, &oracle)?;
+
+                // Unioning the same thing in again cannot grow it.
+                if set.union_with(&other) {
+                    return Err("a repeated `union_with` reported growth".to_string());
+                }
+                check_agree(&set, &oracle)?;
+
+                // `copy_from` shrinks past whatever words the union grew into.
+                set.copy_from(&other);
+                check_agree(&set, &other_oracle)?;
+
+                // And leaves no stale bit past the end of the source's storage.
+                for index in 0..PROBE_LIMIT {
+                    let val = Val::try_new(index as usize).unwrap();
+                    if set.contains(val) != other_oracle.contains(&val) {
+                        return Err(format!(
+                            "after `copy_from`, `contains({val:?})` is {} but should be {}",
+                            set.contains(val),
+                            other_oracle.contains(&val),
+                        ));
+                    }
+                }
+
+                Ok(())
+            })
     }
 }

@@ -69,7 +69,7 @@ pub(crate) fn eliminate_redundant_moves<E>(
 where
     E: EntityRepr,
 {
-    let level = input.options.move_elimination_level;
+    let level = input.options.redundant_move_elimination_level;
     if level == MoveEliminationLevel::None {
         return Ok(());
     }
@@ -104,9 +104,8 @@ where
         "must have no duplicates",
     );
 
-    context
-        .move_generation
-        .remove_edits(&context.redundant_move_elimination.eliminated);
+    // The edits are removed by `crate::remove_eliminated_edits`, once dead-move
+    // elimination has run too.
     Ok(())
 }
 
@@ -370,9 +369,9 @@ where
     /// Scratch space for the single locations one allocation is made of.
     scalars: Vec<ScalarAllocation<E>>,
 
-    /// The edits to remove, by index into the edit list as move generation left
-    /// it.
-    eliminated: Vec<usize>,
+    /// The edits to remove, sorted, by index into the edit list as move
+    /// generation left it. See `crate::remove_eliminated_edits`.
+    pub(crate) eliminated: Vec<usize>,
 
     #[cfg(test)]
     test_stats: TestStats,
@@ -469,7 +468,7 @@ where
 }
 
 /// Expand an `Allocation` into `scalars`.
-fn scalars_of<E>(
+pub(crate) fn scalars_of<E>(
     machine: &Machine,
     spill_slots: &SpillSlots<E>,
     alloc: Allocation,
@@ -1165,7 +1164,12 @@ mod tests {
     /// `crate::test::check_allocation` also draws.
     fn run_at(test_input: &TestInput, level: MoveEliminationLevel) -> Result<Option<Run>, String> {
         let mut test_input = test_input.clone();
-        test_input.options.move_elimination_level = level;
+        test_input.options.redundant_move_elimination_level = level;
+
+        // These tests measure *this* pass; at its default level the other one
+        // would delete edits of its own, and every assertion below would read
+        // the sum of the two.
+        test_input.options.dead_move_elimination_level = MoveEliminationLevel::None;
 
         let mut context = Context::new();
         let result = test_input.with_input(|input| -> Result<Option<Run>, String> {
@@ -1758,6 +1762,11 @@ mod tests {
             m::default::<TestInput>(),
             crate::test::corpus(),
             |test_input: &TestInput| -> Result<(), String> {
+                // `removed` reads `EditEliminated` alone, so this has to be the
+                // only pass dropping edits.
+                let mut test_input = test_input.clone();
+                test_input.options.dead_move_elimination_level = MoveEliminationLevel::None;
+
                 let mut context = Context::new();
                 let result = test_input.with_input(|input| -> Result<(), String> {
                     match crate::run_dispatch(&mut context, input) {

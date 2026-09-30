@@ -45,7 +45,9 @@ where
 ///
 /// let options = InputOptions {
 ///     validate_input: true,
-///     move_elimination_level: MoveEliminationLevel::Global,
+///     redundant_move_elimination_level: MoveEliminationLevel::Global,
+///     dead_move_elimination_level: MoveEliminationLevel::Global,
+///     eliminate_dead_register_moves: true,
 /// };
 ///
 /// // Use whatever serialization format you like; here, we're using JSON.
@@ -75,7 +77,30 @@ pub struct InputOptions {
 
     /// How much effort should the register allocator put into identifying and
     /// eliminating redundant moves?
-    pub move_elimination_level: MoveEliminationLevel,
+    ///
+    /// A move is redundant when its destination already holds the value being
+    /// moved there.
+    pub redundant_move_elimination_level: MoveEliminationLevel,
+
+    /// How much effort should the register allocator put into identifying and
+    /// eliminating dead moves?
+    ///
+    /// A move is dead when nothing reads its destination before that
+    /// destination is overwritten again or the program terminates.
+    pub dead_move_elimination_level: MoveEliminationLevel,
+
+    /// Should dead-move elimination consider moves into registers, and not just
+    /// moves into spill slots?
+    ///
+    /// Tracking registers finds strictly more dead moves, at the cost of a
+    /// larger working set in the analysis. With this disabled, dead-move
+    /// elimination may still remove a dead spill, but never a reload, a
+    /// register-to-register move, or a rematerialization.
+    ///
+    /// This option is enabled by default, and has no effect when
+    /// [`InputOptions::dead_move_elimination_level`] is
+    /// [`MoveEliminationLevel::None`].
+    pub eliminate_dead_register_moves: bool,
 }
 
 impl Default for InputOptions {
@@ -89,12 +114,16 @@ impl InputOptions {
     pub const fn new() -> Self {
         Self {
             validate_input: cfg!(debug_assertions),
-            move_elimination_level: MoveEliminationLevel::Global,
+            redundant_move_elimination_level: MoveEliminationLevel::Global,
+            dead_move_elimination_level: MoveEliminationLevel::Global,
+            eliminate_dead_register_moves: true,
         }
     }
 }
 
-/// The level of redundant-move elimination to perform.
+/// The level of move elimination to perform.
+///
+/// [`InputOptions`] has one of these per move-elimination pass.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serialize", derive(serde::Serialize))]
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
@@ -103,14 +132,15 @@ impl InputOptions {
     serde(rename_all = "lowercase")
 )]
 pub enum MoveEliminationLevel {
-    /// Do not spend time identifying and eliminating redundant moves.
+    /// Do not spend time identifying and eliminating these moves at all.
     None,
 
-    /// Perform a single pass of redundant-move elimination, which can only
-    /// remove redundant moves locally within a basic block.
+    /// Perform a single pass, which can only remove the moves provably
+    /// removable from within one basic block.
     Local,
 
-    /// Remove redundant moves in a global fixed point loop.
+    /// Remove moves in a global fixed point loop, which also finds the ones
+    /// only an analysis spanning several blocks can prove removable.
     #[default]
     Global,
 }
@@ -1664,27 +1694,45 @@ mod tests {
         );
     }
 
-    /// `InputOptions` is two public scalars; round-trip it separately because it
-    /// is not `PartialEq`.
+    /// `InputOptions` is a handful of public scalars; round-trip it separately
+    /// because it is not `PartialEq`.
+    ///
+    /// The exact JSON is pinned on purpose: changing a field here changes the
+    /// encoding, and needs `crate::ENCODING_FORMAT_VERSION` bumped with it.
     #[cfg(all(feature = "serialize", feature = "deserialize"))]
     #[test]
     fn input_options_round_trips() {
         let options = InputOptions {
             validate_input: true,
-            move_elimination_level: MoveEliminationLevel::Local,
+            redundant_move_elimination_level: MoveEliminationLevel::Local,
+            dead_move_elimination_level: MoveEliminationLevel::Global,
+            eliminate_dead_register_moves: false,
         };
         let json = serde_json::to_string(&options).unwrap();
         assert_eq!(
             json,
-            r#"{"validate_input":true,"move_elimination_level":"local"}"#,
+            r#"{"validate_input":true,"redundant_move_elimination_level":"local","dead_move_elimination_level":"global","eliminate_dead_register_moves":false}"#,
         );
 
-        let back: InputOptions = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.validate_input, options.validate_input);
-        assert_eq!(back.move_elimination_level, options.move_elimination_level);
+        let check = |back: &InputOptions| {
+            assert_eq!(back.validate_input, options.validate_input);
+            assert_eq!(
+                back.redundant_move_elimination_level,
+                options.redundant_move_elimination_level,
+            );
+            assert_eq!(
+                back.dead_move_elimination_level,
+                options.dead_move_elimination_level,
+            );
+            assert_eq!(
+                back.eliminate_dead_register_moves,
+                options.eliminate_dead_register_moves,
+            );
+        };
+
+        check(&serde_json::from_str(&json).unwrap());
 
         let bytes = postcard::to_allocvec(&options).unwrap();
-        let back: InputOptions = postcard::from_bytes(&bytes).unwrap();
-        assert_eq!(back.move_elimination_level, options.move_elimination_level);
+        check(&postcard::from_bytes(&bytes).unwrap());
     }
 }

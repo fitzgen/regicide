@@ -684,7 +684,7 @@ mod tests {
             // reload in the blob and its rendering covered.
             ("spills-and-reloads", || {
                 let mut test = TestInput::with_values_in_two_banks_spilled_and_reloaded();
-                test.options.move_elimination_level = crate::input::MoveEliminationLevel::None;
+                test.disable_move_elimination();
                 test
             }),
             // The only fixture with an `EditEliminated` event: every other one
@@ -693,6 +693,13 @@ mod tests {
             (
                 "eliminated-edits",
                 TestInput::with_a_value_reloaded_past_a_diamond,
+            ),
+            // The same, for `DeadEditEliminated`: this input spends a loop with
+            // its carried value on the stack, so the register half of the
+            // value's arrival is written and never read.
+            (
+                "dead-edits",
+                TestInput::with_a_looping_value_read_only_after_the_loop,
             ),
             ("critical-edge", TestInput::with_a_critical_edge),
             // A read of a register the allocator does not own, naming no value.

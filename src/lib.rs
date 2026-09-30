@@ -26,6 +26,7 @@ mod btree;
 mod coalescing;
 mod context;
 mod counts;
+mod dead_move_elimination;
 mod dfs;
 mod dominators;
 mod error;
@@ -98,6 +99,18 @@ mod hash_map {
     pub type FxHashMap<K, V> = HashMap<K, V, FxBuildHasher>;
 }
 
+mod hash_set {
+    #[cfg(feature = "std")]
+    pub use std::collections::HashSet;
+
+    #[cfg(not(feature = "std"))]
+    pub use hashbrown::HashSet;
+
+    use rustc_hash::FxBuildHasher;
+
+    pub type FxHashSet<T> = HashSet<T, FxBuildHasher>;
+}
+
 #[cfg(any(feature = "serialize", feature = "deserialize"))]
 const ENCODING_FORMAT_VERSION: u32 = 3;
 
@@ -143,6 +156,37 @@ fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Res
             InternalError::Error(e) => Err(e),
         },
     }
+}
+
+/// Drop the edits that redundant- and dead-move elimination proved unnecessary.
+///
+/// Neither pass removes its own. Both number their indices against the edit list
+/// as move generation left it, as do the `index` fields of every event they log
+/// and of `Event::MoveEmitted`, so the removal happens once, here, after both
+/// have run.
+fn remove_eliminated_edits<E>(context: &mut ContextInner<E>)
+where
+    E: EntityRepr,
+{
+    let redundant = &context.redundant_move_elimination.eliminated;
+    let dead = &mut context.dead_move_elimination;
+
+    // Each list is sorted and duplicate free, and the two are disjoint because
+    // dead-move elimination skips every index the other pass took, so the merge
+    // is strictly increasing as `remove_edits` requires.
+    dead.to_remove.clear();
+    dead.to_remove
+        .reserve(redundant.len() + dead.eliminated.len());
+    dead.to_remove.extend(redundant.iter().copied());
+    dead.to_remove.extend(dead.eliminated.iter().copied());
+    dead.to_remove.sort_unstable();
+    debug_assert!(
+        dead.to_remove.windows(2).all(|w| w[0] < w[1]),
+        "the two passes' eliminated-edit lists must each be sorted and be \
+         disjoint from one another",
+    );
+
+    context.move_generation.remove_edits(&dead.to_remove);
 }
 
 /// Is `E` likely wide enough to describe this allocation problem?
@@ -221,6 +265,9 @@ where
     )?;
 
     redundant_move_elimination::eliminate_redundant_moves(context, input)?;
+    dead_move_elimination::eliminate_dead_moves(context, input)?;
+
+    remove_eliminated_edits(context);
 
     trace!(
         "====== register allocation output ======\n\

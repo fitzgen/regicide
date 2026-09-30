@@ -92,6 +92,9 @@ pub struct Counts {
     pub remats_emitted: Count,
     pub moves_eliminated: Count,
     pub remats_eliminated: Count,
+    pub dead_moves_eliminated: Count,
+    pub dead_remats_eliminated: Count,
+    pub dead_move_elimination_iterations: Count,
     pub critical_edge_edits: Count,
     pub move_cycles_broken: Count,
     pub cycles_parked_on_the_stack: Count,
@@ -135,6 +138,9 @@ impl Counts {
             remats_emitted: Count::new(),
             moves_eliminated: Count::new(),
             remats_eliminated: Count::new(),
+            dead_moves_eliminated: Count::new(),
+            dead_remats_eliminated: Count::new(),
+            dead_move_elimination_iterations: Count::new(),
             critical_edge_edits: Count::new(),
             move_cycles_broken: Count::new(),
             cycles_parked_on_the_stack: Count::new(),
@@ -182,6 +188,9 @@ impl Counts {
             remats_emitted,
             moves_eliminated,
             remats_eliminated,
+            dead_moves_eliminated,
+            dead_remats_eliminated,
+            dead_move_elimination_iterations,
             critical_edge_edits: critical_edge_moves,
             move_cycles_broken,
             cycles_parked_on_the_stack,
@@ -221,6 +230,9 @@ impl Counts {
             && remats_emitted.is_reset()
             && moves_eliminated.is_reset()
             && remats_eliminated.is_reset()
+            && dead_moves_eliminated.is_reset()
+            && dead_remats_eliminated.is_reset()
+            && dead_move_elimination_iterations.is_reset()
             && critical_edge_moves.is_reset()
             && move_cycles_broken.is_reset()
             && cycles_parked_on_the_stack.is_reset()

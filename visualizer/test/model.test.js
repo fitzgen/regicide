@@ -856,6 +856,29 @@ test("an eliminated edit summarizes the edit that is not happening", () => {
   );
 });
 
+test("a dead edit summarizes the move into a location nothing reads", () => {
+  // The sibling kind, from the pass that runs after. A different fixture,
+  // because the default level leaves nothing dead in the others.
+  const blob = fixture("dead-edits");
+  const model = modelOf(blob);
+  const found = model
+    .details({ kind: "Reg", index: 1 })
+    .events.filter((event) => event.kind === "DeadEditEliminated");
+  assert.equal(found.length, 1, "the fixture drops one move into r1");
+  assert.equal(
+    flat(found[0].summary),
+    "DeadEditEliminated edit=move regReg {from: r0, to: r1} index=1 pos=point inst1:early",
+  );
+  assert.deepEqual(
+    found[0].summary.filter((part) => part.entity).map((part) => part.entity),
+    [
+      { kind: "Reg", index: 0 },
+      { kind: "Reg", index: 1 },
+      { kind: "Inst", index: 1 },
+    ],
+  );
+});
+
 test("a list's count is the true total and its value is what survived the cap", () => {
   // The pane says "200 of 1204", so the two disagree exactly when a list was
   // truncated. Anything reading `value.length` as the total is wrong.

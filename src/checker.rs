@@ -2275,7 +2275,7 @@ mod tests {
         Entity as _,
         context::{Context, WhichContext},
         error::Error,
-        input::{MoveEliminationLevel, Position, RematCost},
+        input::{Position, RematCost},
         machine::{RegClassMembers, RegGroup},
         test::{TestInput, TestMachine},
     };
@@ -3052,7 +3052,7 @@ mod tests {
         test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
         // The value is still in the register the remat targets, so elimination
         // would drop the very edit this test perturbs.
-        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input.disable_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -3070,7 +3070,7 @@ mod tests {
     /// is right to drop it --- but the tests below need the remat there.
     fn rematerialized_block_arg_without_move_elimination() -> TestInput {
         let mut test_input = TestInput::with_a_rematerialized_block_arg();
-        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input.disable_move_elimination();
         test_input
     }
 
@@ -3103,7 +3103,7 @@ mod tests {
             &[OperandConstraint::Stack, OperandConstraint::Reg(wide)],
         );
         test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
-        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input.disable_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -3573,7 +3573,7 @@ mod tests {
             &[OperandConstraint::Stack, OperandConstraint::Reg(narrow)],
         );
         test_input.set_remat_costs(Some(RematCost::AlwaysRemat));
-        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input.disable_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(stats.remats > 0, "the fixture should rematerialize");
 
@@ -3859,7 +3859,7 @@ mod tests {
     /// a reload and watch the checker object.
     fn spilled_and_reloaded_without_move_elimination() -> TestInput {
         let mut test_input = TestInput::with_values_in_two_banks_spilled_and_reloaded();
-        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input.disable_move_elimination();
         test_input
     }
 
@@ -4072,7 +4072,7 @@ mod tests {
             OperandConstraint::Reg(group_class),
         ]);
         // Elimination would drop the very reloads this test perturbs.
-        test_input.options.move_elimination_level = MoveEliminationLevel::None;
+        test_input.disable_move_elimination();
         let stats = check_allocation(&test_input).unwrap();
         assert!(
             stats.reg_group_operands > 0,

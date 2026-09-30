@@ -1221,8 +1221,18 @@ mod round_trip_tests {
                         "{name}",
                     );
                     assert_eq!(
-                        deserialized.options().move_elimination_level,
-                        input.options.move_elimination_level,
+                        deserialized.options().redundant_move_elimination_level,
+                        input.options.redundant_move_elimination_level,
+                        "{name}",
+                    );
+                    assert_eq!(
+                        deserialized.options().dead_move_elimination_level,
+                        input.options.dead_move_elimination_level,
+                        "{name}",
+                    );
+                    assert_eq!(
+                        deserialized.options().eliminate_dead_register_moves,
+                        input.options.eliminate_dead_register_moves,
                         "{name}",
                     );
                     assert_eq!(
@@ -1368,12 +1378,12 @@ mod corrupt_tests {
         let cases: Vec<(&str, fn(&mut Value), &str)> = vec![
             (
                 "machine version",
-                |j| j["machine"]["version"] = json!(99),
+                |j| j["machine"]["version"] = json!(ENCODING_FORMAT_VERSION + 1),
                 "version",
             ),
             (
                 "function version",
-                |j| j["func"]["version"] = json!(99),
+                |j| j["func"]["version"] = json!(ENCODING_FORMAT_VERSION + 1),
                 "version",
             ),
             (
