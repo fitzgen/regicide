@@ -141,7 +141,7 @@ use crate::{
     spill_slot_allocation::SpillSlotSize,
 };
 use alloc::{boxed::Box, collections::BTreeMap, vec, vec::Vec};
-use core::ops::Range;
+use core::{fmt, ops::Range};
 
 define_fixed_size_entities! {
     /// The smallest accessible portion of a register.
@@ -500,7 +500,7 @@ pub(crate) struct RegGroupDef {
     pub bank: RegBank,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct RegClassDef {
     /// The cost of spilling this register class.
     pub spill_cost: f32,
@@ -518,6 +518,17 @@ pub(crate) struct RegClassDef {
 
     /// This register class's associated register bank.
     pub bank: RegBank,
+}
+
+impl fmt::Debug for RegClassDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RegClassDef")
+            .field("spill_cost", &self.spill_cost)
+            .field("members", &self.members)
+            .field("has_an_allocatable_member", &self.has_an_allocatable_member)
+            .field("bank", &self.bank)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -623,7 +634,7 @@ impl Interfere for Range<RegUnit> {
 /// let machine2: Machine = serde_json::from_str(&json)?;
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Machine {
     registers: PrimaryMap<Reg, RegDef>,
     groups: PrimaryMap<RegGroup, RegGroupDef>,
@@ -649,6 +660,19 @@ pub struct Machine {
 
     /// The registers that have their units to themselves.
     stand_alone: RegSet,
+}
+
+impl fmt::Debug for Machine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Machine")
+            .field("registers", &self.registers)
+            .field("groups", &self.groups)
+            .field("classes", &self.classes)
+            .field("banks", &self.banks)
+            .field("num_user_classes", &self.num_user_classes)
+            .field("stand_alone", &self.stand_alone)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Machine {
