@@ -1001,6 +1001,33 @@
         "a": "LiveSpan",
         "b": "LiveSpan"
       },
+      "DeadEditEliminated": {
+        "edit": {
+          "move": {
+            "regReg": {
+              "from": "Reg",
+              "to": "Reg"
+            },
+            "reload": {
+              "from": "SpillSlot",
+              "to": "Reg"
+            },
+            "spill": {
+              "from": "Reg",
+              "to": "SpillSlot"
+            }
+          },
+          "remat": {
+            "dest": "Reg",
+            "val": "Val"
+          }
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        }
+      },
       "EagerSplit": {
         "before": "LiveSpan",
         "conflicting": {

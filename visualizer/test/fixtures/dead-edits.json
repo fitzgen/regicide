@@ -173,7 +173,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 1,
@@ -181,7 +181,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 2,
@@ -189,7 +189,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 3,
@@ -197,7 +197,7 @@
       "kind": "BundleConstructed",
       "num_spans": 2,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 4,
@@ -205,7 +205,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 5,
@@ -213,7 +213,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 6,
@@ -221,7 +221,7 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 7,
@@ -229,70 +229,70 @@
       "kind": "BundleConstructed",
       "num_spans": 1,
       "num_vals": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 0,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 2,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 3,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 2,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 4,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 5,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 6,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 7,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 1,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 6,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -307,7 +307,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -322,7 +322,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -337,7 +337,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -352,7 +352,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -367,7 +367,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 0,
@@ -383,20 +383,20 @@
       "bundle": 0,
       "forced": false,
       "kind": "BundleSpilledToStack",
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 3,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 2,
-      "region": 1
+      "region": 0
     },
     {
       "child": 8,
       "kind": "BundleSplit",
       "parent": 3,
-      "region": 1
+      "region": 0
     },
     {
       "at": {
@@ -429,21 +429,21 @@
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 8,
       "kind": "BundleQueued",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 8,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 8,
@@ -459,14 +459,14 @@
       "bundle": 8,
       "forced": false,
       "kind": "BundleSpilledToStack",
-      "region": 1
+      "region": 0
     },
     {
       "bundle": 3,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 536870913,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -483,7 +483,7 @@
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
       "priority": 1,
-      "region": 1
+      "region": 0
     },
     {
       "alloc": {
@@ -1153,7 +1153,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           0
         ],
@@ -1167,7 +1167,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           1
         ],
@@ -1181,7 +1181,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           2
         ],
@@ -1197,7 +1197,7 @@
         "preference": [
           0
         ],
-        "region": 1,
+        "region": 0,
         "spans": [
           3
         ],
@@ -1211,7 +1211,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           4
         ],
@@ -1225,7 +1225,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           5
         ],
@@ -1239,7 +1239,7 @@
         "isMinimal": true,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           7
         ],
@@ -1253,7 +1253,7 @@
         "isMinimal": false,
         "parent": null,
         "preference": [],
-        "region": 1,
+        "region": 0,
         "spans": [
           8
         ],
@@ -1267,7 +1267,7 @@
         "preference": [
           0
         ],
-        "region": 1,
+        "region": 0,
         "spans": [
           6
         ],
@@ -1277,6 +1277,7 @@
     "insts": [
       {
         "block": 0,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -1295,6 +1296,7 @@
       },
       {
         "block": 1,
+        "clobbers": [],
         "edits": [
           {
             "at": {
@@ -1322,6 +1324,7 @@
       },
       {
         "block": 2,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -1340,6 +1343,7 @@
       },
       {
         "block": 2,
+        "clobbers": [],
         "edits": [
           {
             "at": {
@@ -1374,6 +1378,7 @@
       },
       {
         "block": 3,
+        "clobbers": [],
         "edits": [
           {
             "at": {
@@ -1394,6 +1399,7 @@
       },
       {
         "block": 3,
+        "clobbers": [],
         "edits": [],
         "operands": [
           {
@@ -1406,7 +1412,6 @@
       }
     ],
     "regions": [
-      null,
       {
         "blocks": [
           0,
@@ -1429,6 +1434,7 @@
         "depth": 0,
         "parent": null
       },
+      null,
       null,
       null
     ],
@@ -2541,7 +2547,6 @@
       "Region": {
         "default": [],
         "values": [
-          [],
           [
             10,
             11,
@@ -2939,6 +2944,10 @@
         "hint": [
           "Reg"
         ]
+      },
+      "BundleNarrowedToEarlyHalf": {
+        "bundle": "LiveBundle",
+        "reload": "LiveBundle"
       },
       "BundleQueuePopped": {
         "bundle": "LiveBundle",
@@ -3349,6 +3358,9 @@
       },
       "insts": {
         "block": "Block",
+        "clobbers": [
+          "Reg"
+        ],
         "edits": [
           {
             "edit": {
