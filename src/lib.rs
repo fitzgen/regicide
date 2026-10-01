@@ -65,9 +65,9 @@ pub use context::Context;
 pub use entity::{Block, Entity, EntityRepr, Inst, Val};
 pub use error::{Error, Result};
 pub use input::{
-    BlockFrequency, DefUse, DisplayInputBlock, DisplayInputFunction, Input, InputBlock,
-    InputFunction, InputInst, InputOptions, InputValue, MoveEliminationLevel, Operand,
-    OperandConstraint, Position, RematCost,
+    BlockFrequency, DefUse, DisplayFuncWithContext, DisplayInputBlock, DisplayInputFunction,
+    DisplayWithContext, Input, InputBlock, InputFunction, InputInst, InputOptions, InputValue,
+    MoveEliminationLevel, Operand, OperandConstraint, Position, RematCost,
 };
 pub use live_ranges::MAX_OPERANDS_PER_INST;
 pub use machine::{Machine, MachineBuilder, Reg, RegBank, RegClass, RegGroup, RegSet, RegUnit};
@@ -79,7 +79,6 @@ pub use spill_slot_allocation::{SpillSlot, SpillSlotGroup, SpillSlotSize};
 
 use context::{ContextInner, WhichContext};
 use error::{IResult, InternalError};
-use input::DisplayWithContext;
 
 mod hash_map {
     #[cfg(feature = "std")]

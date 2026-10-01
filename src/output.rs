@@ -798,8 +798,19 @@ pub(crate) fn block_iter<'a, E>(
 where
     E: EntityRepr,
 {
-    let input_block = func.block(block);
-    let (first, last) = block_inst_bounds(&input_block);
+    block_iter_of(move_generation, &func.block(block), block)
+}
+
+/// Like `block_iter`, for a caller that already has the block in hand.
+pub(crate) fn block_iter_of<'a, 'b, E>(
+    move_generation: &'a MoveGeneration<E>,
+    input_block: &impl InputBlock<'b>,
+    block: Block,
+) -> BlockInstsAndEdits<'a, E>
+where
+    E: EntityRepr,
+{
+    let (first, last) = block_inst_bounds(input_block);
 
     let insts = first.index()..last.index() + 1;
 

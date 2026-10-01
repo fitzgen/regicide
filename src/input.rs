@@ -1,8 +1,8 @@
 use core::{cell::RefCell, fmt, marker::PhantomData};
 
 use crate::{
-    Machine, RegClass, RegSet,
-    context::ContextInner,
+    Context, Edit, Machine, RegClass, RegSet,
+    context::{ContextInner, WhichContext},
     entity::{Block, Entity as _, EntityRepr, Inst, Val},
     error::IResult,
     live_ranges::MAX_OPERANDS_PER_INST,
@@ -688,8 +688,31 @@ pub trait InputFunction {
     fn blocks(&self) -> Self::BlocksIter<'_>;
 
     /// Get a `Display` implementation that prints this `InputFunction`.
+    ///
+    /// Prints the program alone. To also report the allocations and edits from
+    /// a register allocation, use
+    /// [`display_with_context`][InputFunction::display_with_context].
     fn display(&self) -> DisplayInputFunction<'_, Self> {
         DisplayInputFunction(self)
+    }
+
+    /// Get a `Display` implementation that prints this `InputFunction` along
+    /// with what `context` says about it.
+    ///
+    /// After a [`run`][crate::run] the context holds that allocation, so each
+    /// operand is printed with where it was placed, each block parameter with
+    /// where it arrives, and each block with the edits to insert into it. A
+    /// context that has not allocated, or has been
+    /// [`reset`][crate::Context::reset], has nothing to add and this prints
+    /// what [`display`][InputFunction::display] does.
+    fn display_with_context<'a>(
+        &'a self,
+        context: &'a mut Context,
+    ) -> DisplayFuncWithContext<'a, Self>
+    where
+        Self: Sized,
+    {
+        DisplayFuncWithContext::new(self, context)
     }
 }
 
@@ -989,7 +1012,11 @@ where
 
 /// Adapt a `FmtWithContext` into a `Display` that formats with a particular
 /// context, rather than with an empty scratch context.
-pub(crate) struct DisplayWithContext<'a, T, E>
+///
+/// A context that has allocated registers carries the allocations and the
+/// edits, so formatting through it reports those alongside the program;
+/// formatting through a reset one prints the program alone.
+pub struct DisplayWithContext<'a, T, E>
 where
     E: EntityRepr,
 {
@@ -1105,12 +1132,94 @@ where
                 }
                 context.output.result(write!(f, "{block:?}"))?;
                 fmt_val_list(f, &mut context.output, input_block.params())?;
+
+                // Where the parameters arrive, once the allocator has said.
+                // Collected first because the writes need the context back.
+                let param_allocs = context.output.block_param_allocs(block).to_vec();
+                if !param_allocs.is_empty() {
+                    context.output.result(write!(f, " -> ("))?;
+                    for (i, alloc) in param_allocs.iter().enumerate() {
+                        if i > 0 {
+                            context.output.result(write!(f, ", "))?;
+                        }
+                        match alloc {
+                            Some(alloc) => context.output.result(write!(f, "{alloc:?}"))?,
+                            // A parameter that is not live anywhere has
+                            // nowhere to arrive.
+                            None => context.output.result(write!(f, "dead"))?,
+                        }
+                    }
+                    context.output.result(write!(f, ")"))?;
+                }
+
                 context.output.result(writeln!(f, ":"))?;
                 DisplayInputBlock(input_block).fmt_with_context(f, context)?;
                 context.output.result(writeln!(f))?;
             }
         }
         context.output.result(writeln!(f, "}}"))
+    }
+}
+
+/// What [`InputFunction::display_with_context`] returns.
+///
+/// A `Context` stores its results under whichever entity representation the
+/// allocation actually used, so this picks that one and formats through the
+/// matching [`DisplayWithContext`].
+pub struct DisplayFuncWithContext<'a, F>
+where
+    F: InputFunction,
+{
+    func: &'a F,
+    context: RefCell<&'a mut Context>,
+}
+
+impl<'a, F> DisplayFuncWithContext<'a, F>
+where
+    F: InputFunction,
+{
+    fn new(func: &'a F, context: &'a mut Context) -> Self {
+        Self {
+            func,
+            context: RefCell::new(context),
+        }
+    }
+}
+
+impl<F> fmt::Display for DisplayFuncWithContext<'_, F>
+where
+    F: InputFunction,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Display::fmt` only has `&self`, and formatting through a context
+        // needs `&mut ContextInner` to report its errors, so the mutable
+        // borrow lives in a `RefCell` that this takes for the call. A nested
+        // format of the same value would find it taken, which is why
+        // `borrow_mut` is not unwrapped: fall back to the program alone
+        // rather than panic inside a `Display`.
+        let Ok(mut context) = self.context.try_borrow_mut() else {
+            return fmt::Display::fmt(&self.func.display(), f);
+        };
+
+        // A context that has not allocated has no representation chosen, and
+        // nothing to add beyond the program itself.
+        match context.which {
+            None => fmt::Display::fmt(&self.func.display(), f),
+            #[cfg(feature = "entity-repr-8")]
+            Some(WhichContext::Context8) => fmt::Display::fmt(
+                &DisplayWithContext::new(self.func.display(), &mut context.context8),
+                f,
+            ),
+            #[cfg(feature = "entity-repr-16")]
+            Some(WhichContext::Context16) => fmt::Display::fmt(
+                &DisplayWithContext::new(self.func.display(), &mut context.context16),
+                f,
+            ),
+            Some(WhichContext::Context32) => fmt::Display::fmt(
+                &DisplayWithContext::new(self.func.display(), &mut context.context32),
+                f,
+            ),
+        }
     }
 }
 
@@ -1127,9 +1236,20 @@ where
         f: &mut fmt::Formatter<'_>,
         context: &mut ContextInner<E>,
     ) -> IResult<()> {
+        // The edits the allocator wants inserted in this block, collected up
+        // front because printing them needs the context back, and grouped by
+        // the instruction they sit before so they land where they belong.
+        let edits = collect_block_edits(context, &self.0);
+
         for (inst, input_inst) in self.0.insts() {
+            for edit in edits.iter().filter(|(at, _)| *at == Some(inst)) {
+                context
+                    .output
+                    .result(writeln!(f, "      edit: {:?}", edit.1))?;
+            }
+
             context.output.result(writeln!(f, "    {inst:?}"))?;
-            for arg in input_inst.operands() {
+            for (i, arg) in input_inst.operands().enumerate() {
                 context.output.result(write!(f, "      "))?;
                 match arg.pos() {
                     Position::Early => context.output.result(write!(f, "early "))?,
@@ -1149,6 +1269,13 @@ where
                     OperandConstraint::Reuse(i) => {
                         context.output.result(write!(f, "reusing operand {i}"))?
                     }
+                }
+                // Copied out rather than held: the writes below need the
+                // context back. Absent until the allocator has run, and then
+                // one per operand.
+                let alloc = context.output.inst_allocs(inst).get(i).copied();
+                if let Some(alloc) = alloc {
+                    context.output.result(write!(f, " -> {alloc:?}"))?;
                 }
                 context.output.result(writeln!(f))?;
             }
@@ -1173,6 +1300,40 @@ where
         }
         Ok(())
     }
+}
+
+/// The edits the allocator wants inserted in this block, each paired with the
+/// instruction it goes before, or `None` for one that belongs after them all.
+///
+/// Collected rather than streamed because printing writes through the same
+/// context this reads from. Empty before the allocator has run.
+fn collect_block_edits<'a, E, B>(
+    context: &ContextInner<E>,
+    input_block: &B,
+) -> alloc::vec::Vec<(Option<Inst<u32>>, Edit<u32>)>
+where
+    E: EntityRepr,
+    B: InputBlock<'a>,
+{
+    let block = input_block.block();
+    let mut edits = alloc::vec::Vec::new();
+    let mut pending = alloc::vec::Vec::new();
+
+    for item in crate::output::block_iter_of(&context.move_generation, input_block, block) {
+        match item {
+            // An edit is yielded before the instruction it precedes, so hold
+            // it until that instruction arrives.
+            crate::output::InstOrEdit::Edit(edit) => pending.push(edit),
+            crate::output::InstOrEdit::Inst(inst) => {
+                edits.extend(pending.drain(..).map(|edit| (Some(inst), edit)));
+            }
+        }
+    }
+
+    // Whatever is left has no instruction after it: a critical-edge edit, or
+    // the moves for an outgoing edge that the terminator could not host.
+    edits.extend(pending.into_iter().map(|edit| (None, edit)));
+    edits
 }
 
 /// Format a parenthesized, comma-separated list of values, or nothing at all
