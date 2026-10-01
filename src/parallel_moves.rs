@@ -1513,9 +1513,13 @@ where
 
         let scratch = ScalarAllocation::Reg(reg);
 
-        for &mv in self.moves.values() {
+        // A move already emitted runs later than our use of the scratch, which
+        // is over by the time it does, so only the unemitted ones can name it.
+        for (m, &mv) in self.moves.iter() {
             debug_assert!(
-                !emit.source.overlaps(scratch, mv.src) && !emit.source.overlaps(scratch, mv.dst),
+                self.state.get(m) == State::Done
+                    || (!emit.source.overlaps(scratch, mv.src)
+                        && !emit.source.overlaps(scratch, mv.dst)),
                 "an evicted scratch register must not be named by the batch, but \
                  {scratch:?} overlaps {mv:?}",
             );
@@ -1789,8 +1793,8 @@ where
         self.debug_assert_wide_eviction_is_sound(num_tight, emit);
     }
 
-    /// Is anything still looking at `reg`: the batch, a parked cycle, or an
-    /// eviction we have yet to close?
+    /// Is anything still looking at `reg`: a move we have yet to emit, a
+    /// parked cycle, or an eviction we have yet to close?
     fn debug_only_scratch_in_use<S>(&self, reg: Reg<E>, emit: &mut Emit<'_, E, S>) -> bool
     where
         S: ScratchSource<E>,
@@ -1799,14 +1803,17 @@ where
 
         let reg = ScalarAllocation::Reg(reg);
 
-        self.moves
-            .values()
-            .any(|&mv| emit.source.overlaps(reg, mv.src) || emit.source.overlaps(reg, mv.dst))
-            || emit
-                .pool
-                .unavailable
-                .iter()
-                .any(|&s| emit.source.overlaps(reg, s))
+        // Emission is in reverse program order, so an already-emitted move runs
+        // after our use of the scratch, and a later write cannot disturb a
+        // value we put there now and read back before it.
+        self.moves.iter().any(|(m, &mv)| {
+            self.state.get(m) != State::Done
+                && (emit.source.overlaps(reg, mv.src) || emit.source.overlaps(reg, mv.dst))
+        }) || emit
+            .pool
+            .unavailable
+            .iter()
+            .any(|&s| emit.source.overlaps(reg, s))
             || emit
                 .pool
                 .wide_evictions
