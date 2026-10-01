@@ -12,12 +12,10 @@ use regicide::{
     serialize::SerializeInput,
     test::{TestInput, TestMachine},
 };
-use std::{
-    env,
-    fs::File,
-    io::{BufReader, BufWriter},
-    process,
-};
+use std::{env, fs::File, io::BufWriter, path::Path, process};
+
+#[path = "support/encoding.rs"]
+mod encoding;
 
 const USAGE: &str = "\
 usage: visualize [-s SEED] [-i ITERS] [-r REGS] [-d FILE] <path.html>
@@ -33,7 +31,8 @@ usage: visualize [-s SEED] [-i ITERS] [-r REGS] [-d FILE] <path.html>
                      mutations produced, which is at most four per bank)
   -d, --dump FILE    write the input to FILE, as JSON, before allocating
       --input FILE   read the input from FILE instead of generating one,
-                     which rules out -s, -i and -r
+                     which rules out -s, -i and -r; the file may be JSON or
+                     postcard, whichever it turns out to be
   -h, --help         print this message";
 
 const DEFAULT_SEED: u64 = 21;
@@ -49,7 +48,7 @@ fn main() {
     };
 
     if let Some(path) = &args.input {
-        let input = load(path);
+        let input = load(Path::new(path));
         // No closure, unlike the generated path: a `DeserializedInput` owns
         // its machine, so `as_input` can borrow everything from it.
         emit(&input.as_input(), &args.path);
@@ -98,16 +97,12 @@ fn dump(input: &Input<'_, impl InputFunction>, path: &str) {
     println!("wrote {path}");
 }
 
-/// Read back what `dump` wrote.
-fn load(path: &str) -> DeserializedInput {
-    let read = || -> Result<DeserializedInput, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        serde_json::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
-    };
-    match read() {
+/// Read back what `dump` wrote, or what `regicide-dump` captured.
+fn load(path: &Path) -> DeserializedInput {
+    match encoding::load(path) {
         Ok(input) => input,
         Err(e) => {
-            eprintln!("could not read {path}: {e}");
+            eprintln!("could not read {}: {e}", path.display());
             process::exit(1);
         }
     }

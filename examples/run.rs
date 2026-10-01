@@ -9,29 +9,32 @@
 //! ```text
 //! cargo run --example run -- corpus/
 //! cargo run --example run -- --check -q corpus/
-//! cargo run --example run -- -r none -d none corpus/one-input.json
+//! cargo run --example run -- -r none -d none corpus/one-input.postcard
 //! ```
 //!
 //! Build a corpus with `scripts/make-corpus` in the `regalloc2` repository.
 
 use regicide::{
     Context, EdgeEdit, Edit, Error, Input, InputFunction, InputOptions, InstOrEdit, Move,
-    MoveEliminationLevel, Output, deserialize::DeserializedInput,
+    MoveEliminationLevel, Output,
 };
 use std::{
     env,
-    fs::File,
-    io::{BufReader, BufWriter, Write},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     process,
 };
+
+#[path = "support/encoding.rs"]
+mod encoding;
 
 const USAGE: &str = "\
 usage: run [OPTIONS] <path>...
 
 Run register allocation on each serialized input and print the result. A path
-is either a directory, in which case every `*.json` file directly in it is an
-input, or a single input file.
+is either a directory, in which case every `*.postcard` and `*.json` file
+directly in it is an input, or a single input file. Either encoding is read,
+whichever a file turns out to be in.
 
   -r, --redundant-moves LEVEL  redundant-move elimination: none, local or
                                global
@@ -68,7 +71,10 @@ fn main() {
         }
     };
     if inputs.is_empty() {
-        eprintln!("no `*.json` inputs among the given paths");
+        eprintln!(
+            "no `*.{}` inputs among the given paths",
+            encoding::EXTENSIONS.join("` or `*.")
+        );
         process::exit(1);
     }
 
@@ -91,7 +97,7 @@ fn main() {
             .unwrap_or(path.as_os_str())
             .to_string_lossy();
 
-        let input = match load(path) {
+        let input = match encoding::load(path) {
             Ok(input) => input,
             Err(message) => {
                 // Naming the file matters most for a corpus that predates an
@@ -178,8 +184,8 @@ fn main() {
 
 /// Expand the given paths into the input files to run.
 ///
-/// A directory contributes the `*.json` files directly in it, sorted so that
-/// two runs over one corpus print in the same order and can be diffed.
+/// A directory contributes the input files directly in it, sorted so that two
+/// runs over one corpus print in the same order and can be diffed.
 fn collect(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut inputs = vec![];
 
@@ -200,7 +206,7 @@ fn collect(paths: &[String]) -> Result<Vec<PathBuf>, String> {
         for entry in dir {
             let entry = entry.map_err(|e| format!("could not read {}: {e}", path.display()))?;
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "json") {
+            if encoding::is_input(&path) {
                 found.push(path);
             }
         }
@@ -211,11 +217,6 @@ fn collect(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     Ok(inputs)
 }
 
-/// Read one serialized input.
-fn load(path: &Path) -> Result<DeserializedInput, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    serde_json::from_reader(BufReader::new(file)).map_err(|e| e.to_string())
-}
 
 /// How many of each kind of edit an allocation introduced.
 ///
