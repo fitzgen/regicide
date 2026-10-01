@@ -196,19 +196,6 @@
       "val": 1
     },
     {
-      "emergency": false,
-      "kind": "SpillSlotCreated",
-      "size": 8,
-      "slot": 0
-    },
-    {
-      "kind": "SpillSlotAssigned",
-      "slot": {
-        "slot": 0
-      },
-      "val": 1
-    },
-    {
       "block": 3,
       "kind": "SpillBlockChosen",
       "num_candidates": 1,
@@ -221,10 +208,20 @@
       },
       "block": 3,
       "kind": "SpillPlaced",
+      "span": 3,
+      "val": 1
+    },
+    {
+      "emergency": false,
+      "kind": "SpillSlotCreated",
+      "size": 8,
+      "slot": 0
+    },
+    {
+      "kind": "SpillSlotAssigned",
       "slot": {
         "slot": 0
       },
-      "span": 3,
       "val": 1
     },
     {
@@ -1545,8 +1542,8 @@
           [
             3,
             5,
-            20,
-            21
+            18,
+            19
           ]
         ]
       },
@@ -1584,7 +1581,7 @@
           [
             2,
             3,
-            21,
+            19,
             31,
             32,
             37,
@@ -1637,7 +1634,7 @@
             4,
             6,
             7,
-            21
+            19
           ],
           [
             5
@@ -1702,8 +1699,7 @@
         "default": [],
         "values": [
           [
-            18,
-            19,
+            20,
             21,
             32,
             37,
@@ -1744,8 +1740,8 @@
             4,
             5,
             17,
+            18,
             19,
-            20,
             21,
             30,
             31,
@@ -1822,16 +1818,16 @@
         8
       ],
       "SpillBlockChosen": [
-        20
+        18
       ],
       "SpillPlaced": [
-        21
-      ],
-      "SpillSlotAssigned": [
         19
       ],
+      "SpillSlotAssigned": [
+        21
+      ],
       "SpillSlotCreated": [
-        18
+        20
       ],
       "ValueSpilled": [
         17
@@ -2250,10 +2246,6 @@
       },
       "SpillPlaced": {
         "block": "Block",
-        "slot": {
-          "slot": "SpillSlot",
-          "slotGroup": "SpillSlotGroup"
-        },
         "span": "LiveSpan",
         "val": "Val"
       },

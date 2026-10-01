@@ -378,8 +378,6 @@ where
         at: LivePoint<E>,
         /// The block it goes in.
         block: Block<E>,
-        /// Where it stores to.
-        slot: StackAllocation<E>,
     },
 
     /// A block where a value may legally be spilled.
@@ -910,13 +908,11 @@ mod viz_enabled {
                     span,
                     at,
                     block,
-                    slot,
                 } => {
                     f(EntityRef::Val(*val));
                     f(EntityRef::Span(*span));
                     visit_point(*at, f);
                     f(EntityRef::Block(*block));
-                    visit_stack_allocation(*slot, f);
                 }
 
                 Self::SpillBlockChosen {
@@ -1247,7 +1243,6 @@ mod viz_enabled {
             span: LiveSpan,
             at: _,
             block: Block,
-            slot: (STACK_ALLOCATION),
         }
         SpillBlockChosen {
             val: Val,

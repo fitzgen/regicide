@@ -41,6 +41,9 @@ whichever a file turns out to be in.
   -d, --dead-moves LEVEL       dead-move elimination: none, local or global
       --dead-reg-moves         let dead-move elimination consider registers
       --no-dead-reg-moves      restrict it to spill slots
+      --narrow-slots           reserve each spill slot only where its value is
+                               both live and spilled
+      --no-narrow-slots        reserve it across the whole live range
       --validate               validate each input before allocating
       --no-validate            do not validate
       --check                  check each allocation against the checker
@@ -306,11 +309,13 @@ fn describe_options(options: &InputOptions) -> String {
         MoveEliminationLevel::Global => "global",
     };
     format!(
-        "options: validate {}, redundant-moves {}, dead-moves {}, dead-reg-moves {}",
+        "options: validate {}, redundant-moves {}, dead-moves {}, dead-reg-moves {}, \
+         narrow-slots {}",
         options.validate_input,
         level(options.redundant_move_elimination_level),
         level(options.dead_move_elimination_level),
         options.eliminate_dead_register_moves,
+        options.narrow_spill_slot_live_ranges,
     )
 }
 
@@ -324,6 +329,7 @@ struct OptionOverrides {
     redundant_move_elimination_level: Option<MoveEliminationLevel>,
     dead_move_elimination_level: Option<MoveEliminationLevel>,
     eliminate_dead_register_moves: Option<bool>,
+    narrow_spill_slot_live_ranges: Option<bool>,
 }
 
 impl OptionOverrides {
@@ -339,6 +345,9 @@ impl OptionOverrides {
             eliminate_dead_register_moves: self
                 .eliminate_dead_register_moves
                 .unwrap_or(from_file.eliminate_dead_register_moves),
+            narrow_spill_slot_live_ranges: self
+                .narrow_spill_slot_live_ranges
+                .unwrap_or(from_file.narrow_spill_slot_live_ranges),
         }
     }
 }
@@ -389,6 +398,8 @@ impl Args {
                 }
                 "--dead-reg-moves" => options.eliminate_dead_register_moves = Some(true),
                 "--no-dead-reg-moves" => options.eliminate_dead_register_moves = Some(false),
+                "--narrow-slots" => options.narrow_spill_slot_live_ranges = Some(true),
+                "--no-narrow-slots" => options.narrow_spill_slot_live_ranges = Some(false),
                 "--validate" => options.validate_input = Some(true),
                 "--no-validate" => options.validate_input = Some(false),
                 "--check" => check = true,

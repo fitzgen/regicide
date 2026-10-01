@@ -590,7 +590,13 @@ mod tests {
     /// Changing this is a wire-format change; bump `ENCODING_FORMAT_VERSION`.
     #[test]
     fn json_snapshot() {
-        let input = TestInput::with_use_constraints(&[OperandConstraint::Any]);
+        let mut input = TestInput::with_use_constraints(&[OperandConstraint::Any]);
+
+        // Pin every serialized field, so the snapshot describes the format
+        // rather than the defaults: `validate_input` otherwise follows
+        // `debug_assertions` and flips between build profiles.
+        input.options.validate_input = true;
+
         let json = input
             .with_input(|input| serde_json::to_string_pretty(&SerializeInput::new(input)).unwrap());
         assert_eq!(
@@ -600,7 +606,8 @@ mod tests {
     "validate_input": true,
     "redundant_move_elimination_level": "global",
     "dead_move_elimination_level": "global",
-    "eliminate_dead_register_moves": true
+    "eliminate_dead_register_moves": true,
+    "narrow_spill_slot_live_ranges": false
   },
   "machine": {
     "version": 3,

@@ -71,6 +71,7 @@ use crate::{
     output::{Allocation, OutputInner, StackAllocation},
     region_allocation::RegionAllocation,
     rpo::Rpo,
+    spilled_live_ranges::{RangeEvent, SpilledLiveRanges},
     timing::Timing,
 };
 use alloc::vec::Vec;
@@ -156,6 +157,18 @@ pub(crate) fn allocate_spill_slots<E>(
 where
     E: EntityRepr,
 {
+    if input.options.narrow_spill_slot_live_ranges {
+        context.spilled_live_ranges.construct(
+            input,
+            &context.rpo,
+            &context.liveness,
+            &context.live_ranges,
+            &context.region_allocation,
+            &context.spill_placement,
+            &mut context.output,
+        )?;
+    }
+
     let _timing = Timing::new("allocate spill slots");
 
     context.spill_slots.allocate(
@@ -164,10 +177,55 @@ where
         &mut context.events,
         &context.rpo,
         &context.liveness,
-        &context.live_ranges,
         &context.region_allocation,
+        &context.spilled_live_ranges,
         &mut context.output,
     )
+}
+
+/// Where the ranges we color come from.
+///
+/// Both carry the same shape, so the coloring is written once and reads
+/// whichever it was handed. That is what makes any difference in the slots we
+/// create attributable to the ranges alone.
+#[derive(Clone, Copy)]
+enum Ranges<'a, E>
+where
+    E: EntityRepr,
+{
+    /// Reserve each value's slot across the whole of its liveness.
+    WholeLiveRange,
+
+    /// Reserve each value's slot only where it is both live and spilled.
+    Spilled(&'a SpilledLiveRanges<E>),
+}
+
+impl<E> Ranges<'_, E>
+where
+    E: EntityRepr,
+{
+    /// The values whose slot is reserved on entry to `block`.
+    fn live_in<'a>(
+        &'a self,
+        liveness: &'a Liveness<E>,
+        block: Block<E>,
+        spilled: &'a EntitySet<Val<E>>,
+    ) -> impl Iterator<Item = Val<E>> + 'a
+    where
+        E: 'a,
+    {
+        let (whole, narrowed) = match *self {
+            Ranges::WholeLiveRange => (
+                Some(block.live_in(liveness).filter(|&val| spilled.contains(val))),
+                None,
+            ),
+            Ranges::Spilled(ranges) => (None, Some(ranges.live_in(block))),
+        };
+        whole
+            .into_iter()
+            .flatten()
+            .chain(narrowed.into_iter().flatten())
+    }
 }
 
 /// What happens to a spilled value at a program point during a block's walk.
@@ -205,10 +263,6 @@ where
     /// Where each spilled value lives on the stack, or `None` for values that
     /// are never spilled.
     val_home: SecondaryMap<Val<E>, Option<StackAllocation<E>>>,
-
-    /// The values that need a slot, gathered from region allocation's stack
-    /// bundles.
-    spilled: EntitySet<Val<E>>,
 
     /// The largest number of spilled values of each size that are ever
     /// simultaneously live, indexed by the base-two logarithm of that size.
@@ -258,7 +312,6 @@ where
             groups: PrimaryMap::new(),
             group_members: PrimaryMap::new(),
             val_home: SecondaryMap::new(None),
-            spilled: EntitySet::new(),
             max_live: [0; RegBank::NUM_SIZES],
             live_count: [0; RegBank::NUM_SIZES],
             in_use: EntitySet::new(),
@@ -276,7 +329,6 @@ where
             groups,
             group_members,
             val_home,
-            spilled,
             max_live,
             live_count,
             in_use,
@@ -290,7 +342,6 @@ where
         groups.reset();
         group_members.reset();
         val_home.reset();
-        spilled.reset();
         *max_live = [0; RegBank::NUM_SIZES];
         *live_count = [0; RegBank::NUM_SIZES];
         in_use.reset();
@@ -311,7 +362,6 @@ where
             groups,
             group_members,
             val_home,
-            spilled,
             max_live,
             live_count,
             in_use,
@@ -325,7 +375,6 @@ where
             && groups.is_reset()
             && group_members.is_reset()
             && val_home.is_reset()
-            && spilled.is_reset()
             && max_live.iter().all(|&n| n == 0)
             && live_count.iter().all(|&n| n == 0)
             && in_use.is_empty()
@@ -371,12 +420,6 @@ where
     /// concrete iterator type.
     pub(crate) fn sizes(&self) -> &[SpillSlotSize] {
         self.slots.as_slice()
-    }
-
-    /// The values that region allocation left on the stack, and that therefore
-    /// have a slot.
-    pub(crate) fn spilled(&self) -> &EntitySet<Val<E>> {
-        &self.spilled
     }
 
     /// Get a spill slot for breaking a cycle of parallel moves when no register is free.
@@ -425,65 +468,26 @@ where
         events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
-        live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
+        spilled_live_ranges: &SpilledLiveRanges<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         debug_assert!(self.is_reset());
-        self.collect_spilled_values(counts, events, live_ranges, region_allocation);
-        self.color(input, counts, events, rpo, liveness, output)?;
+        let spilled = region_allocation.spilled();
+        trace!("spill slots: {} values need a stack slot", spilled.len());
+        let ranges = if input.options.narrow_spill_slot_live_ranges {
+            Ranges::Spilled(spilled_live_ranges)
+        } else {
+            Ranges::WholeLiveRange
+        };
+        self.color(
+            input, counts, events, rpo, liveness, spilled, ranges, output,
+        )?;
         debug_assert!(
             self.scratch_is_empty(),
             "a completed walk leaves no scratch behind",
         );
         Ok(())
-    }
-
-    /// Gather the values that need a stack slot: everything covered by a bundle
-    /// that region allocation could not keep in a register.
-    fn collect_spilled_values(
-        &mut self,
-        counts: &mut Counts,
-        events: &mut EventsLog<E>,
-        live_ranges: &LiveRanges<E>,
-        region_allocation: &RegionAllocation<E>,
-    ) {
-        // How many stack spans each value has. Only counted when we are
-        // logging, which is the only thing that reads it.
-        let logging = cfg!(any(
-            feature = "trace-log",
-            debug_assertions,
-            feature = "visualizer",
-        ));
-        let mut num_spans = SecondaryMap::<Val<E>, usize>::new(0);
-
-        for bundle in region_allocation.stack_bundles().iter().copied() {
-            for span in bundle.spans(live_ranges) {
-                let val = span.val(live_ranges);
-                if self.spilled.insert(val) {
-                    counts.spilled_values.inc();
-                }
-                if logging {
-                    num_spans[val] += 1;
-                }
-            }
-        }
-
-        if logging {
-            for val in self.spilled.iter() {
-                event!(
-                    events,
-                    ValueSpilled {
-                        val,
-                        num_spans: num_spans[val],
-                    }
-                );
-            }
-        }
-        trace!(
-            "spill slots: {} values need a stack slot",
-            self.spilled.len()
-        );
     }
 
     /// Color `self.spilled`: walk the blocks in reverse post-order, greedily
@@ -496,17 +500,21 @@ where
         events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
+        spilled: &EntitySet<Val<E>>,
+        ranges: Ranges<'_, E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
-        if self.spilled.is_empty() {
+        if spilled.is_empty() {
             return Ok(());
         }
 
         for block in rpo.iter() {
-            self.allocate_block(input, counts, events, liveness, block, output)?;
+            self.allocate_block(
+                input, counts, events, liveness, block, spilled, ranges, output,
+            )?;
         }
 
-        self.check_every_spilled_value_has_a_slot();
+        self.check_every_spilled_value_has_a_slot(spilled);
         self.check_optimality();
 
         counts.spill_slots += self.slots.len();
@@ -521,15 +529,36 @@ where
         events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         block: Block<E>,
+        spilled: &EntitySet<Val<E>>,
+        ranges: Ranges<'_, E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         trace!("spill slots: coloring {block:?}");
         debug_assert!(self.scratch_is_empty());
 
-        self.enter_block(input, counts, events, liveness, block, output)?;
-        self.collect_events(input, liveness, block, output)?;
-
-        self.events.sort_unstable();
+        self.enter_block(
+            input, counts, events, liveness, block, spilled, ranges, output,
+        )?;
+        match ranges {
+            Ranges::WholeLiveRange => {
+                self.collect_events(input, liveness, block, spilled, output)?;
+                self.events.sort_unstable();
+            }
+            // Already in program order, and already trimmed.
+            Ranges::Spilled(spilled_live_ranges) => {
+                self.events.extend(
+                    spilled_live_ranges
+                        .events(block)
+                        .map(|(point, event, val)| {
+                            let event = match event {
+                                RangeEvent::Kill => Event::Kill,
+                                RangeEvent::Def => Event::Def,
+                            };
+                            (point, event, val)
+                        }),
+                );
+            }
+        }
         let mut block_events = core::mem::take(&mut self.events);
         for (point, event, val) in block_events.drain(..) {
             match event {
@@ -553,14 +582,15 @@ where
         Ok(())
     }
 
-    /// Set up `in_use` for a walk of `block`, from the values live on entry to
-    /// it.
+    /// Set up `in_use` for a walk of `block`, from the values whose slot is
+    /// reserved on entry.
     ///
-    /// A live-in value whose definition is in some other block already has a
-    /// slot, because that block dominates this one and so came earlier in
-    /// reverse post-order; it just marks its slot occupied. A live-in value
-    /// with no slot yet can only be one of this block's own parameters, which
-    /// are defined on the incoming edges, so this is where we color them.
+    /// A value whose range began elsewhere already has a slot, since that block
+    /// came earlier in reverse post-order; it just marks the slot occupied. One
+    /// without a slot has a range beginning on the incoming edges, so it is
+    /// colored here. Over whole live ranges that is this block's parameters;
+    /// over spilled live ranges it is nobody, since a range opens with a `Def`
+    /// inside the block that holds its head.
     fn enter_block(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -568,12 +598,14 @@ where
         events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
         block: Block<E>,
+        spilled: &EntitySet<Val<E>>,
+        ranges: Ranges<'_, E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         // First color the live-in values that already have spill slot
         // assignments. We want to make sure they retain their same slot.
-        for val in block.live_in(liveness) {
-            if !self.spilled.contains(val) || self.val_home[val].is_none() {
+        for val in ranges.live_in(liveness, block, spilled) {
+            if self.val_home[val].is_none() {
                 continue;
             }
             self.occupy_val_slots(input, val);
@@ -590,20 +622,23 @@ where
             }
         }
 
-        // Color the live-in values that did not already have slots assigned,
-        // which therefore must be this block's live block parameters.
-        for val in block.live_in(liveness) {
-            if !self.spilled.contains(val) || self.val_home[val].is_some() {
+        for val in ranges.live_in(liveness, block, spilled) {
+            if self.val_home[val].is_some() {
                 continue;
             }
             debug_assert!(
-                input
-                    .func
-                    .block(block.with_repr32())
-                    .params()
-                    .any(|param| param.with_repr::<E>() == Some(val)),
-                "{val:?} is live on entry to {block:?} without a slot, so it must be one of \
-                 {block:?}'s parameters",
+                match ranges {
+                    Ranges::WholeLiveRange => input
+                        .func
+                        .block(block.with_repr32())
+                        .params()
+                        .any(|param| param.with_repr::<E>() == Some(val)),
+                    // A spilled live range begins inside the block holding its
+                    // head, never on an edge, so this value is already colored.
+                    Ranges::Spilled(_) => false,
+                },
+                "{val:?}'s slot is reserved on entry to {block:?} without having one, so its \
+                 range must begin on an edge into {block:?}",
             );
             // Sharing the argument's slot makes the edge's move a no-op;
             // otherwise it pays a stack-to-stack move, the most expensive kind.
@@ -671,18 +706,18 @@ where
         input: &Input<'_, impl InputFunction>,
         liveness: &Liveness<E>,
         block: Block<E>,
+        spilled: &EntitySet<Val<E>>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         // Everything live at the block's exit outlives the block, so it never
         // gets a kill here.
         for val in block.live_out(liveness) {
-            if self.spilled.contains(val) {
+            if spilled.contains(val) {
                 self.live.insert(val);
             }
         }
 
         let input_block = input.func.block(block.with_repr32());
-        let spilled = &self.spilled;
         let live = &mut self.live;
 
         let mut events = core::mem::take(&mut self.events);
@@ -750,7 +785,6 @@ where
         output: &mut OutputInner<E>,
         prefer: Option<SpillSlot<E>>,
     ) -> IResult<()> {
-        debug_assert!(self.spilled.contains(val));
         debug_assert!(
             self.val_home[val].is_none(),
             "{val:?} has a single definition in SSA, so we color it exactly once",
@@ -891,11 +925,11 @@ where
         }
     }
 
-    fn check_every_spilled_value_has_a_slot(&self) {
+    fn check_every_spilled_value_has_a_slot(&self, spilled: &EntitySet<Val<E>>) {
         if !cfg!(debug_assertions) {
             return;
         }
-        for val in self.spilled.iter() {
+        for val in spilled.iter() {
             debug_assert!(
                 self.val_home[val].is_some(),
                 "{val:?} needs a stack slot but never got one; is it defined in an unreachable \
@@ -1118,17 +1152,17 @@ mod tests {
     fn live_ranges_of(
         input: &Input<'_, impl InputFunction>,
         context: &ContextInner<u32>,
+        spilled: &EntitySet<Val<u32>>,
     ) -> BTreeMap<Val<u32>, Vec<(LivePoint<u32>, LivePoint<u32>)>> {
         let func = input.func;
         let live_ranges = &context.live_ranges;
         let liveness = &context.liveness;
-        let spill_slots = &context.spill_slots;
 
         let mut per_block: BTreeMap<(Val<u32>, Block<u32>), (LivePoint<u32>, LivePoint<u32>)> =
             BTreeMap::new();
         for span in live_ranges.spans() {
             let val = span.val(live_ranges);
-            if !spill_slots.spilled.contains(val) {
+            if !spilled.contains(val) {
                 continue;
             }
             let block = span.block(func, live_ranges);
@@ -1145,7 +1179,7 @@ mod tests {
         let mut ranges: BTreeMap<Val<u32>, Vec<_>> = BTreeMap::new();
         for (block, _) in func.blocks() {
             let (block_start, block_end) = (block.start_point(input), block.end_point(input));
-            for val in spill_slots.spilled.iter() {
+            for val in spilled.iter() {
                 let live_in = block.is_live_in(liveness, val);
                 let live_out = block.is_live_out(liveness, val);
                 let (start, end) = match per_block.get(&(val, block)) {
@@ -1200,9 +1234,10 @@ mod tests {
                 .collect();
             vals.sort_unstable();
             vals.dedup();
+            let mut spilled_set = EntitySet::<Val<u32>>::new();
             for (i, val) in vals.iter().copied().enumerate() {
                 if i % stride == 0 {
-                    context.spill_slots.spilled.insert(val);
+                    spilled_set.insert(val);
                 }
             }
             let spilled: BTreeSet<Val<u32>> = vals
@@ -1221,6 +1256,8 @@ mod tests {
                     &mut context.events,
                     &context.rpo,
                     &context.liveness,
+                    &spilled_set,
+                    Ranges::WholeLiveRange,
                     &mut context.output,
                 )
                 .map_err(|()| format!("coloring failed: {:?}", context.output.take_error()))?;
@@ -1241,7 +1278,7 @@ mod tests {
                 ));
             }
 
-            let ranges = live_ranges_of(input, context);
+            let ranges = live_ranges_of(input, context, &spilled_set);
             let size_of = |val: Val<u32>| val.reg_bank(input).size(input.machine);
 
             // A value in a register group has one slot per member, so compare
@@ -1506,7 +1543,8 @@ mod tests {
                         }
                     }
 
-                    let want_spilled: BTreeSet<Val<u32>> = spill_slots.spilled().iter().collect();
+                    let want_spilled: BTreeSet<Val<u32>> =
+                        inner.region_allocation.spilled().iter().collect();
                     if spilled != want_spilled {
                         return Err(format!(
                             "the log spilled {spilled:?}, but the pass spilled {want_spilled:?}"
@@ -1576,7 +1614,7 @@ mod tests {
         let spill_slots = &context.context32.spill_slots;
 
         assert_eq!(spill_slots.len_slots(), 0);
-        assert!(spill_slots.spilled.is_empty());
+        assert!(context.context32.region_allocation.spilled().is_empty());
         assert_eq!(
             Val::<u32>::try_new(0).unwrap().stack_home(spill_slots),
             None
@@ -1596,7 +1634,7 @@ mod tests {
         let spill_slots = &context.context32.spill_slots;
 
         assert_eq!(spill_slots.len_slots(), 0);
-        assert!(spill_slots.spilled.is_empty());
+        assert!(context.context32.region_allocation.spilled().is_empty());
         let carried = Val::<u32>::try_new(0).unwrap();
         assert_eq!(carried.stack_home(spill_slots), None);
     }
@@ -1613,5 +1651,29 @@ mod tests {
 
         let carried = Val::<u32>::try_new(0).unwrap();
         assert!(carried.stack_home(spill_slots).is_some());
+    }
+
+    /// Two values whose *slot* lifetimes do not overlap share one slot, even
+    /// though the values are live at the same time.
+    ///
+    /// The first is spilled, reloaded, then held in a register, so nothing can
+    /// read its slot again and the second can have it. Reserving across whole
+    /// liveness cannot see that and takes two slots.
+    #[test]
+    fn two_values_share_a_slot_when_only_their_live_ranges_overlap() {
+        let slots_with = |narrow: bool| {
+            let mut test_input = TestInput::with_two_staggered_spilled_values();
+            test_input.options.narrow_spill_slot_live_ranges = narrow;
+
+            // The whole pipeline, so that the checker sees a real allocation
+            // rather than this pass's output on its own.
+            crate::test::check_allocation(&test_input).expect("the allocation must be correct");
+
+            let context = allocate(&test_input).unwrap().unwrap();
+            context.context32.spill_slots.len_slots()
+        };
+
+        assert_eq!(slots_with(false), 2, "each value keeps its own slot");
+        assert_eq!(slots_with(true), 1, "the two values share one slot");
     }
 }

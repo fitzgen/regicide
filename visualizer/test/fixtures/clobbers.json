@@ -1217,10 +1217,6 @@
       },
       "SpillPlaced": {
         "block": "Block",
-        "slot": {
-          "slot": "SpillSlot",
-          "slotGroup": "SpillSlotGroup"
-        },
         "span": "LiveSpan",
         "val": "Val"
       },

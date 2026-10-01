@@ -504,6 +504,22 @@
       "val": 2
     },
     {
+      "block": 1,
+      "kind": "SpillBlockChosen",
+      "num_candidates": 1,
+      "val": 2
+    },
+    {
+      "at": {
+        "inst": 1,
+        "pos": "early"
+      },
+      "block": 0,
+      "kind": "SpillPlaced",
+      "span": 2,
+      "val": 2
+    },
+    {
       "emergency": false,
       "kind": "SpillSlotCreated",
       "size": 8,
@@ -527,25 +543,6 @@
       "slot": {
         "slot": 1
       },
-      "val": 2
-    },
-    {
-      "block": 1,
-      "kind": "SpillBlockChosen",
-      "num_candidates": 1,
-      "val": 2
-    },
-    {
-      "at": {
-        "inst": 1,
-        "pos": "early"
-      },
-      "block": 0,
-      "kind": "SpillPlaced",
-      "slot": {
-        "slot": 1
-      },
-      "span": 2,
       "val": 2
     },
     {
@@ -2303,7 +2300,7 @@
             0,
             1,
             2,
-            62,
+            58,
             65,
             69,
             75,
@@ -2315,7 +2312,7 @@
           [
             3,
             4,
-            61,
+            57,
             72
           ],
           [
@@ -2343,7 +2340,7 @@
             2,
             3,
             4,
-            62,
+            58,
             64,
             68,
             71,
@@ -2471,7 +2468,7 @@
           ],
           [
             0,
-            62
+            58
           ],
           [
             4,
@@ -2586,8 +2583,8 @@
         "default": [],
         "values": [
           [
-            57,
-            58,
+            59,
+            60,
             63,
             64,
             65,
@@ -2599,8 +2596,7 @@
             89
           ],
           [
-            59,
-            60,
+            61,
             62,
             73,
             74,
@@ -2631,7 +2627,7 @@
             2,
             8,
             55,
-            58,
+            60,
             64,
             65,
             66,
@@ -2646,8 +2642,8 @@
             4,
             7,
             56,
-            60,
-            61,
+            57,
+            58,
             62,
             63,
             68,
@@ -2802,18 +2798,18 @@
         9
       ],
       "SpillBlockChosen": [
-        61
+        57
       ],
       "SpillPlaced": [
-        62
+        58
       ],
       "SpillSlotAssigned": [
-        58,
-        60
+        60,
+        62
       ],
       "SpillSlotCreated": [
-        57,
-        59
+        59,
+        61
       ],
       "ValueSpilled": [
         55,
@@ -3233,10 +3229,6 @@
       },
       "SpillPlaced": {
         "block": "Block",
-        "slot": {
-          "slot": "SpillSlot",
-          "slotGroup": "SpillSlotGroup"
-        },
         "span": "LiveSpan",
         "val": "Val"
       },

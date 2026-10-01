@@ -104,6 +104,29 @@ jobs:
       - name: Test
         run: cargo test --locked ${{ matrix.flags }}
 
+  test-release:
+    name: Test (release)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustc --version
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: test-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-release-
+
+      - name: Test
+        run: cargo test --locked --release --all-features
+
   doc:
     name: cargo doc
     runs-on: ubuntu-latest
@@ -164,7 +187,7 @@ jobs:
     name: CI
     runs-on: ubuntu-latest
     if: always()
-    needs: [fmt, build, doc, js, fuzz]
+    needs: [fmt, build, test-release, doc, js, fuzz]
     steps:
       - name: Check that all jobs succeeded
         if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')

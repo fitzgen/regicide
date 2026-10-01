@@ -65,7 +65,6 @@ use crate::{
     region_allocation::RegionAllocation,
     region_tree::RegionTree,
     rpo::Rpo,
-    spill_slot_allocation::SpillSlots,
     timing::Timing,
     union_find::UnionFind,
 };
@@ -89,7 +88,6 @@ where
         &context.region_tree,
         &context.live_ranges,
         &context.region_allocation,
-        &context.spill_slots,
         &mut context.output,
     )
 }
@@ -345,7 +343,6 @@ where
         region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
-        spill_slots: &SpillSlots<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         debug_assert!(self.is_reset());
@@ -354,22 +351,14 @@ where
             self.stack_bundles.insert(bundle);
         }
 
-        let spilled = spill_slots.spilled();
+        let spilled = region_allocation.spilled();
         self.collect_block_param_defs(input, rpo, spilled, output)?;
         self.collect_spilled_value_spans(input, live_ranges, spilled);
 
         let spans = core::mem::take(&mut self.spans);
 
         for val_spans in spans.chunk_by(|a, b| a.val(live_ranges) == b.val(live_ranges)) {
-            self.place_spills_for_value(
-                input,
-                counts,
-                events,
-                region_tree,
-                live_ranges,
-                spill_slots,
-                val_spans,
-            );
+            self.place_spills_for_value(input, counts, events, region_tree, live_ranges, val_spans);
         }
 
         self.spans = spans;
@@ -460,7 +449,6 @@ where
         events: &mut EventsLog<E>,
         region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
-        spill_slots: &SpillSlots<E>,
         val_spans: &[LiveSpan<E>],
     ) {
         let val = val_spans[0].val(live_ranges);
@@ -530,9 +518,6 @@ where
                     span,
                     at: point,
                     block,
-                    slot: val
-                        .stack_home(spill_slots)
-                        .expect("a value we are spilling has a stack home"),
                 }
             );
         }
@@ -858,7 +843,6 @@ mod tests {
             )?;
             crate::coalescing::coalesce(context, input)?;
             crate::region_allocation::region_allocate(context, input)?;
-            crate::spill_slot_allocation::allocate_spill_slots(context, input)?;
             place_spills(context, input)
         });
 
@@ -894,7 +878,6 @@ mod tests {
                     test_input.with_input(|input| -> Result<(), String> {
                         let inner = &context.context32;
                         let live_ranges = &inner.live_ranges;
-                        let spill_slots = &inner.spill_slots;
 
                         let mut on_stack: BTreeSet<LiveBundle<u32>> = BTreeSet::new();
                         let mut spilled: BTreeSet<Val<u32>> = BTreeSet::new();
@@ -913,16 +896,9 @@ mod tests {
                                     span,
                                     at,
                                     block,
-                                    slot,
                                 } => {
                                     if span.val(live_ranges) != val {
                                         return Err(format!("{span:?} does not hold {val:?}"));
-                                    }
-                                    if Some(slot) != val.stack_home(spill_slots) {
-                                        return Err(format!(
-                                            "{val:?} was spilled to {slot:?}, but lives at {:?}",
-                                            val.stack_home(spill_slots),
-                                        ));
                                     }
                                     if block != span.block(input.func, live_ranges) {
                                         return Err(format!(
@@ -1077,7 +1053,7 @@ mod tests {
 
             // Property 1: we only ever spill a value that was spilled.
             for (val, sites) in &sites_of {
-                if !ctx.spill_slots.spilled().contains(*val) {
+                if !ctx.region_allocation.spilled().contains(*val) {
                     return Err(format!(
                         "{val:?} was never spilled, but we placed the spills {sites:?} for it"
                     ));
@@ -1085,7 +1061,7 @@ mod tests {
             }
 
             let no_sites = Vec::new();
-            for val in ctx.spill_slots.spilled().iter() {
+            for val in ctx.region_allocation.spilled().iter() {
                 let no_spans = Vec::new();
                 let spans = spans_of.get(&val).unwrap_or(&no_spans);
                 let sites = sites_of.get(&val).unwrap_or(&no_sites);
@@ -1314,7 +1290,7 @@ mod tests {
                 2,
                 "the point of this input is a parameter with more than one edge into it",
             );
-            assert!(ctx.spill_slots.spilled().contains(param));
+            assert!(ctx.region_allocation.spilled().contains(param));
 
             let sites = ctx.spill_placement.spills();
             assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
@@ -1351,7 +1327,7 @@ mod tests {
             let header = Block::<u32>::try_new(1).unwrap();
             let body = Block::<u32>::try_new(2).unwrap();
 
-            assert!(ctx.spill_slots.spilled().contains(val));
+            assert!(ctx.region_allocation.spilled().contains(val));
 
             // The premise of the test: the loop really is a region of its own,
             // and the definition is outside it.
@@ -1451,7 +1427,7 @@ mod tests {
             // Both values are read off the stack in the inner loop.
             for val in [outside, outer] {
                 assert!(
-                    ctx.spill_slots.spilled().contains(val),
+                    ctx.region_allocation.spilled().contains(val),
                     "{val:?} is read off the stack, so it has to have a slot",
                 );
             }
@@ -1502,7 +1478,7 @@ mod tests {
             let val = Val::<u32>::try_new(0).unwrap();
             let crowded = Block::<u32>::try_new(1).unwrap();
             assert!(
-                ctx.spill_slots.spilled().contains(val),
+                ctx.region_allocation.spilled().contains(val),
                 "the stack-constrained read has to give the value a slot, or there is no spill \
                  to place at all",
             );
@@ -1574,7 +1550,7 @@ mod tests {
             let def_block = Block::<u32>::try_new(0).unwrap();
             let arrival = Block::<u32>::try_new(1).unwrap();
             assert!(
-                ctx.spill_slots.spilled().contains(val),
+                ctx.region_allocation.spilled().contains(val),
                 "the stack-constrained read has to give the value a slot, or there is no spill \
                  to place at all",
             );
@@ -1660,7 +1636,7 @@ mod tests {
         let context = &context.context32;
 
         let val = Val::<u32>::try_new(0).unwrap();
-        assert!(context.spill_slots.spilled().contains(val));
+        assert!(context.region_allocation.spilled().contains(val));
         assert!(context.spill_placement.spills().is_empty());
     }
 }

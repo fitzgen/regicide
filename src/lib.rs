@@ -44,6 +44,7 @@ mod region_tree;
 mod rpo;
 mod spill_placement;
 mod spill_slot_allocation;
+mod spilled_live_ranges;
 mod timing;
 mod union_find;
 mod validation;
@@ -251,8 +252,8 @@ where
 
     coalescing::coalesce(context, input)?;
     region_allocation::region_allocate(context, input)?;
-    spill_slot_allocation::allocate_spill_slots(context, input)?;
     spill_placement::place_spills(context, input)?;
+    spill_slot_allocation::allocate_spill_slots(context, input)?;
     move_generation::generate_moves(context, input)?;
 
     context.output.construct(

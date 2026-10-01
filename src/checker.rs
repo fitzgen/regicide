@@ -2795,6 +2795,11 @@ mod tests {
         .into_iter()
         .enumerate()
         {
+            // These are validation errors, and validation is only on by
+            // default in a debug build.
+            let mut test_input = test_input;
+            test_input.options.validate_input = true;
+
             let error = test_input.with_input(|input| {
                 let mut context = crate::Context::new();
                 crate::run(&mut context, input).err()

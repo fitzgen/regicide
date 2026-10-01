@@ -1236,6 +1236,11 @@ mod round_trip_tests {
                         "{name}",
                     );
                     assert_eq!(
+                        deserialized.options().narrow_spill_slot_live_ranges,
+                        input.options.narrow_spill_slot_live_ranges,
+                        "{name}",
+                    );
+                    assert_eq!(
                         format!("{:?}", deserialized.machine()),
                         format!("{:?}", input.machine),
                         "{name}",

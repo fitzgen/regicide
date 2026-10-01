@@ -10,7 +10,7 @@ use crate::{
     Entity, Input, InputFunction, OperandConstraint, Position, RegSet, Val,
     context::ContextInner,
     counts::Counts,
-    entity::{EntityRepr, Region, SecondaryMap},
+    entity::{EntityRepr, EntitySet, Region, SecondaryMap},
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
     input::{DefUse, InputInst, InputValue},
@@ -60,6 +60,12 @@ where
     }
 
     context.coalescing.cross_region_affinities.clear();
+
+    context.region_allocation.collect_spilled_values(
+        &mut context.counts,
+        &mut context.events,
+        &context.live_ranges,
+    );
 
     context.counts.final_live_spans += context.live_ranges.len_spans();
     context.counts.final_bundles += context.live_ranges.len_bundles();
@@ -161,6 +167,10 @@ where
     /// in later passes.
     stack_bundles: Vec<LiveBundle<E>>,
 
+    /// The values needing a stack slot, derived from `stack_bundles` once this
+    /// pass is done so that downstream passes share one copy.
+    spilled: EntitySet<Val<E>>,
+
     /// Scratch space holding the spans of the bundle being split.
     split_spans: Vec<Range<LivePoint<E>>>,
 
@@ -190,6 +200,7 @@ where
             queue: BinaryHeap::new(),
             bundle_priority: SecondaryMap::new(Priority::ZERO),
             stack_bundles: Vec::new(),
+            spilled: EntitySet::new(),
             split_spans: Vec::new(),
             split_span_vals: Vec::new(),
             split_uses: Vec::new(),
@@ -205,6 +216,7 @@ where
             queue,
             bundle_priority,
             stack_bundles,
+            spilled,
             split_spans,
             split_span_vals,
             split_uses,
@@ -216,6 +228,7 @@ where
         queue.clear();
         bundle_priority.reset();
         stack_bundles.clear();
+        spilled.reset();
         split_spans.clear();
         split_span_vals.clear();
         split_uses.clear();
@@ -230,6 +243,7 @@ where
             queue,
             bundle_priority,
             stack_bundles,
+            spilled,
             split_spans,
             split_span_vals,
             split_uses,
@@ -241,6 +255,7 @@ where
             && queue.is_empty()
             && bundle_priority.is_reset()
             && stack_bundles.is_empty()
+            && spilled.is_reset()
             && split_spans.is_empty()
             && split_span_vals.is_empty()
             && split_uses.is_empty()
@@ -251,6 +266,60 @@ where
     /// The bundles that must live in memory, and so need a spill slot.
     pub(crate) fn stack_bundles(&self) -> &[LiveBundle<E>] {
         &self.stack_bundles
+    }
+
+    /// The values that we left on the stack, and that therefore need a slot.
+    pub(crate) fn spilled(&self) -> &EntitySet<Val<E>> {
+        &self.spilled
+    }
+
+    /// Gather the values needing a stack slot: everything covered by a bundle
+    /// we could not keep in a register.
+    ///
+    /// Built here, where the bundles are decided, because both spill placement
+    /// and spill slot allocation want it.
+    fn collect_spilled_values(
+        &mut self,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        live_ranges: &LiveRanges<E>,
+    ) {
+        // How many stack spans each value has. Only counted when we are
+        // logging, which is the only thing that reads it.
+        let logging = cfg!(any(
+            feature = "trace-log",
+            debug_assertions,
+            feature = "visualizer",
+        ));
+        let mut num_spans = SecondaryMap::<Val<E>, usize>::new(0);
+
+        for bundle in self.stack_bundles.iter().copied() {
+            for span in bundle.spans(live_ranges) {
+                let val = span.val(live_ranges);
+                if self.spilled.insert(val) {
+                    counts.spilled_values.inc();
+                }
+                if logging {
+                    num_spans[val] += 1;
+                }
+            }
+        }
+
+        if logging {
+            for val in self.spilled.iter() {
+                event!(
+                    events,
+                    ValueSpilled {
+                        val,
+                        num_spans: num_spans[val],
+                    }
+                );
+            }
+        }
+        trace!(
+            "region allocation: {} values need a stack slot",
+            self.spilled.len()
+        );
     }
 
     /// Did we leave `reg` unassigned over all of `span`?

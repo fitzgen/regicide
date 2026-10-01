@@ -4,7 +4,7 @@ use crate::{
     move_generation::MoveGeneration, output::OutputInner,
     redundant_move_elimination::RedundantMoveElimination, region_allocation::RegionAllocation,
     region_tree::RegionTree, rpo::Rpo, spill_placement::SpillPlacement,
-    spill_slot_allocation::SpillSlots,
+    spill_slot_allocation::SpillSlots, spilled_live_ranges::SpilledLiveRanges,
 };
 
 /// TODO FITZGEN
@@ -100,6 +100,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub region_allocation: RegionAllocation<E>,
     pub spill_slots: SpillSlots<E>,
     pub spill_placement: SpillPlacement<E>,
+    pub spilled_live_ranges: SpilledLiveRanges<E>,
     pub move_generation: MoveGeneration<E>,
     pub redundant_move_elimination: RedundantMoveElimination<E>,
     pub dead_move_elimination: DeadMoveElimination<E>,
@@ -120,6 +121,7 @@ impl<E: EntityRepr> ContextInner<E> {
             region_allocation: RegionAllocation::new(),
             spill_slots: SpillSlots::new(),
             spill_placement: SpillPlacement::new(),
+            spilled_live_ranges: SpilledLiveRanges::new(),
             move_generation: MoveGeneration::new(),
             redundant_move_elimination: RedundantMoveElimination::new(),
             dead_move_elimination: DeadMoveElimination::new(),
@@ -140,6 +142,7 @@ impl<E: EntityRepr> ContextInner<E> {
             region_allocation,
             spill_slots,
             spill_placement,
+            spilled_live_ranges,
             move_generation,
             redundant_move_elimination,
             dead_move_elimination,
@@ -156,6 +159,7 @@ impl<E: EntityRepr> ContextInner<E> {
         region_allocation.reset();
         spill_slots.reset();
         spill_placement.reset();
+        spilled_live_ranges.reset();
         move_generation.reset();
         redundant_move_elimination.reset();
         dead_move_elimination.reset();
@@ -175,6 +179,7 @@ impl<E: EntityRepr> ContextInner<E> {
             region_allocation,
             spill_slots,
             spill_placement,
+            spilled_live_ranges,
             move_generation,
             redundant_move_elimination,
             dead_move_elimination,
@@ -191,6 +196,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && region_allocation.is_reset()
             && spill_slots.is_reset()
             && spill_placement.is_reset()
+            && spilled_live_ranges.is_reset()
             && move_generation.is_reset()
             && redundant_move_elimination.is_reset()
             && dead_move_elimination.is_reset()

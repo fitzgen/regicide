@@ -1052,6 +1052,13 @@ mod tests {
 
     /// Which positions of `large` the greedy match of `small` into it skipped,
     /// or `None` if `small` is not a subsequence.
+    ///
+    /// When `large` holds equal edits, which of them this calls deleted is an
+    /// artifact of matching at the leftmost one: deleting either of two equal
+    /// edits with nothing surviving between them leaves the same list, and
+    /// there is no fact of the matter about which survived. Compare the lists
+    /// themselves, with `surviving`, to ask a question that does not depend on
+    /// the choice.
     fn deleted(small: &[PlacedEdit], large: &[PlacedEdit]) -> Option<Vec<usize>> {
         let mut skipped = Vec::new();
         let mut next = 0;
@@ -1063,6 +1070,69 @@ mod tests {
             }
         }
         (next == small.len()).then_some(skipped)
+    }
+
+    /// What is left of `edits` once the positions in `drop` are removed.
+    fn surviving(edits: &[PlacedEdit], drop: &BTreeSet<usize>) -> Vec<PlacedEdit> {
+        edits
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !drop.contains(i))
+            .map(|(_, &edit)| edit)
+            .collect()
+    }
+
+    /// Deleting either of two equal edits with nothing surviving between them
+    /// leaves the same list, so `deleted` cannot tell the two choices apart but
+    /// `surviving` reports them as the same answer.
+    ///
+    /// Equal edits are legitimate: two reloads of one slot into one register on
+    /// the same edge is what move generation emits for a value wanted along
+    /// more than one path.
+    #[test]
+    fn equal_edits_are_compared_by_what_survives() {
+        let block = Block::try_new(0).unwrap();
+        let edit = |i: usize, slot: usize| PlacedEdit {
+            block,
+            insts_before: i,
+            edit: Edit::Move(Move::Reload {
+                from: SpillSlot::try_new(slot).unwrap(),
+                to: Reg::try_new(0).unwrap(),
+            }),
+        };
+
+        // `[1]` and `[2]` are equal, and nothing survives between them.
+        let none = Vec::from([edit(0, 0), edit(1, 1), edit(1, 1), edit(2, 2)]);
+        let kept = Vec::from([edit(0, 0), edit(1, 1), edit(2, 2)]);
+
+        // Dropping either one leaves `kept`, so the lists agree ...
+        for drop in [1, 2] {
+            let drop = BTreeSet::from([drop]);
+            assert_eq!(surviving(&none, &drop), kept);
+        }
+
+        // ... while `deleted` can only name the rightmost of them.
+        assert_eq!(deleted(&kept, &none), Some(Vec::from([2])));
+
+        // With an edit surviving between them, the choice is visible in the
+        // list and both comparisons see it.
+        let none = Vec::from([edit(1, 1), edit(9, 9), edit(1, 1)]);
+        assert_eq!(
+            surviving(&none, &BTreeSet::from([0])),
+            Vec::from([edit(9, 9), edit(1, 1)]),
+        );
+        assert_eq!(
+            surviving(&none, &BTreeSet::from([2])),
+            Vec::from([edit(1, 1), edit(9, 9)]),
+        );
+        assert_eq!(
+            deleted(&[edit(9, 9), edit(1, 1)], &none),
+            Some(Vec::from([0]))
+        );
+        assert_eq!(
+            deleted(&[edit(1, 1), edit(9, 9)], &none),
+            Some(Vec::from([2]))
+        );
     }
 
     /// How many of `edits` are the kind `want` accepts, unwrapping a
@@ -1893,14 +1963,23 @@ mod tests {
                 context.reset();
                 let by_oracle = by_oracle?;
 
-                if by_pass != by_oracle {
+                // Compare the lists the two answers leave, not the index sets:
+                // with equal edits in the list, which index is called deleted
+                // is not well defined, but the surviving list is. See
+                // `deleted`.
+                let kept_by_oracle = surviving(&none.edits, &by_oracle);
+                if kept_by_oracle != global.edits {
                     return Err(format!(
                         "the pass and the oracle disagree:\n\
                          only the pass   = {:?}\n\
                          only the oracle = {:?}\n\
+                         the pass kept   = {:?}\n\
+                         the oracle kept = {:?}\n\
                          edits = {:?}",
                         by_pass.difference(&by_oracle).collect::<Vec<_>>(),
                         by_oracle.difference(&by_pass).collect::<Vec<_>>(),
+                        global.edits,
+                        kept_by_oracle,
                         none.edits,
                     ));
                 }

@@ -7122,6 +7122,92 @@ impl TestInput {
         input
     }
 
+    /// A single block holding two values whose *slot* lifetimes do not overlap,
+    /// although the values are live at the same time.
+    ///
+    /// `v0` goes to the stack, is read back, then lives in a register with
+    /// nothing able to read its slot again; `v1` takes the stack during that
+    /// tail, so one slot serves both. Both are read at the end, so their live
+    /// ranges genuinely overlap and only a slot-aware range sees the saving.
+    pub fn with_two_staggered_spilled_values() -> Self {
+        // Four registers, so the reloaded tail can stay in one. With two, the
+        // tail returns to the stack and the slot never comes free.
+        let reg_class = RegClass::try_new(usize::from(TestMachine::ALL_FOUR_REGS_CLASS)).unwrap();
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let reg = OperandConstraint::Reg(reg_class);
+        let stack = OperandConstraint::Stack;
+
+        func.values = PrimaryMap::new();
+        for i in [0, 3] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::ALL_FOUR_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: inst(i),
+                            i: 0,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand =
+            |kind, constraint, v| Operand::new(Position::Early, kind, constraint, Some(v));
+        let op = |operands: Vec<Operand>| InstData::Op {
+            operands,
+            clobbers: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            op(vec![operand(DefUse::Def, stack, val(0))]),
+            op(vec![operand(DefUse::Use, stack, val(0))]),
+            // `v0`'s last slot read, so the slot is free from here on.
+            op(vec![operand(DefUse::Use, reg, val(0))]),
+            // `v1` takes the slot `v0` has finished with.
+            op(vec![operand(DefUse::Def, stack, val(1))]),
+            op(vec![operand(DefUse::Use, stack, val(1))]),
+            // Both are still live here, so their live ranges overlap even
+            // though their slot lifetimes do not.
+            op(vec![operand(DefUse::Use, reg, val(0))]),
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: (0..7).map(inst).collect(),
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::four_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// An input with a critical edge that really needs an edit: `block0`
     /// branches to `block1` or `block2` and `block1` falls through to `block2`,
     /// so `block0`'s edge joins two successors to two predecessors. Its two
@@ -9494,9 +9580,9 @@ impl TestInput {
 
 /// A mutator for `InputOptions`.
 ///
-/// Only the move-elimination options are mutated: `TestInput::fixup` guarantees
-/// that the input is valid, so turning `validate_input` off would only lose
-/// coverage of the validator.
+/// `validate_input` is left alone: `TestInput::fixup` guarantees that the input
+/// is valid, so turning it off would only lose coverage of the validator. Every
+/// other option is mutated, so that the fuzzer explores their combinations.
 #[derive(Default)]
 pub struct InputOptionsMutator {}
 
@@ -9525,6 +9611,20 @@ impl Mutate<InputOptions> for InputOptionsMutator {
                 ctx.rng().gen_bool()
             };
             Ok(())
+        })?;
+
+        mutations.mutation(|ctx| {
+            // Not narrowing is the simpler test case: it reserves each slot
+            // across the whole live range, as the allocator always used to.
+            options.narrow_spill_slot_live_ranges = if ctx.shrink() {
+                if !options.narrow_spill_slot_live_ranges {
+                    return Err(mutatis::error::Error::exhausted());
+                }
+                false
+            } else {
+                ctx.rng().gen_bool()
+            };
+            Ok(())
         })
     }
 }
@@ -9535,6 +9635,7 @@ impl Generate<InputOptions> for InputOptionsMutator {
             redundant_move_elimination_level: gen_move_elimination_level(ctx)?,
             dead_move_elimination_level: gen_move_elimination_level(ctx)?,
             eliminate_dead_register_moves: ctx.rng().gen_bool(),
+            narrow_spill_slot_live_ranges: ctx.rng().gen_bool(),
             ..InputOptions::default()
         })
     }
@@ -9976,6 +10077,21 @@ mod tests {
         assert_eq!(redundant.len(), 3, "only generated {redundant:?}");
         assert_eq!(dead.len(), 3, "only generated {dead:?}");
         assert_eq!(regs.len(), 2, "only generated {regs:?}");
+    }
+
+    /// `InputOptionsMutator` really does vary spill slot range narrowing, so
+    /// that the checks which generate `TestInput`s exercise both paths.
+    #[test]
+    fn generates_both_spill_slot_live_range_widths() {
+        let mut session = mutatis::Session::new().seed(0);
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            let options: InputOptions = session.generate().unwrap();
+            if !seen.contains(&options.narrow_spill_slot_live_ranges) {
+                seen.push(options.narrow_spill_slot_live_ranges);
+            }
+        }
+        assert_eq!(seen.len(), 2, "only generated {seen:?}");
     }
 
     /// Every machine that `TestMachine` can describe is one that

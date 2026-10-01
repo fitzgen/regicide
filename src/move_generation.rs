@@ -72,6 +72,7 @@ use crate::{
     rpo::Rpo,
     spill_placement::SpillPlacement,
     spill_slot_allocation::{SpillSlot, SpillSlotSize, SpillSlots},
+    spilled_live_ranges::SpilledLiveRanges,
     timing::Timing,
 };
 use alloc::vec::Vec;
@@ -97,6 +98,7 @@ where
         &context.region_allocation,
         &mut context.spill_slots,
         &context.spill_placement,
+        &context.spilled_live_ranges,
         &mut context.output,
     )
 }
@@ -738,6 +740,7 @@ where
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
         spill_placement: &SpillPlacement<E>,
+        spilled_live_ranges: &SpilledLiveRanges<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         debug_assert!(self.is_reset());
@@ -780,6 +783,7 @@ where
             live_ranges,
             region_allocation,
             spill_slots,
+            spilled_live_ranges,
             output,
         )
     }
@@ -1883,6 +1887,7 @@ where
         live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
+        spilled_live_ranges: &SpilledLiveRanges<E>,
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         self.enter_pass(MovePass::Sequentialize);
@@ -1903,6 +1908,7 @@ where
                     live_ranges,
                     region_allocation,
                     spill_slots,
+                    spilled_live_ranges,
                     output,
                     chunk,
                 )?;
@@ -1950,6 +1956,7 @@ where
         live_ranges: &LiveRanges<E>,
         region_allocation: &RegionAllocation<E>,
         spill_slots: &mut SpillSlots<E>,
+        spilled_live_ranges: &SpilledLiveRanges<E>,
         output: &mut OutputInner<E>,
         chunk: &[(PackedMovePosition<E>, BatchMove<E>)],
     ) -> IResult<()>
@@ -1998,6 +2005,7 @@ where
                     region_allocation,
                     live_ranges,
                     spill_slots,
+                    spilled_live_ranges,
                     output,
                     counts,
                     events,
@@ -2101,6 +2109,7 @@ where
     region_allocation: &'a RegionAllocation<E>,
     live_ranges: &'a LiveRanges<E>,
     spill_slots: &'a mut SpillSlots<E>,
+    spilled_live_ranges: &'a SpilledLiveRanges<E>,
     output: &'a mut OutputInner<E>,
     counts: &'a mut Counts,
     events: &'a mut EventsLog<E>,
@@ -2441,11 +2450,39 @@ where
             return None;
         };
 
+        // Borrowing is only safe while the slot still belongs to `val`. Over
+        // whole live ranges it always does. Narrowed, the reservation may have
+        // ended above here and the slot gone to someone else.
+        if self.input.options.narrow_spill_slot_live_ranges
+            && !self.spilled_live_ranges.reserved_across(
+                self.borrow_block(),
+                val,
+                self.borrowed_range.clone(),
+            )
+        {
+            return None;
+        }
+
         let size = reg.with_repr32().bank(self.machine).size(self.machine);
         let bracket = self.bracket(reg, unavailable);
         (slot.size(self.spill_slots) == size
             && !self.slot_is_taken(bracket, unavailable, slot, taken))
         .then_some(slot)
+    }
+
+    /// The block the borrow sits in.
+    fn borrow_block(&self) -> Block<E> {
+        match self.pos.unpack() {
+            MovePosition::Point(point) | MovePosition::Departure(point) => self
+                .input
+                .func
+                .inst(point.inst().with_repr32())
+                .block()
+                .with_repr::<E>()
+                .expect("every block index already fit in `E` in the earlier passes"),
+            // Charged to the block it leaves, whose exit `borrow_range` names.
+            MovePosition::CriticalEdge { pred, .. } => pred,
+        }
     }
 
     /// How wide a bracket the solver puts around `reg` when we evict it.
@@ -3248,8 +3285,8 @@ mod tests {
             )?;
             crate::coalescing::coalesce(ctx, input)?;
             crate::region_allocation::region_allocate(ctx, input)?;
-            crate::spill_slot_allocation::allocate_spill_slots(ctx, input)?;
             crate::spill_placement::place_spills(ctx, input)?;
+            crate::spill_slot_allocation::allocate_spill_slots(ctx, input)?;
             generate_moves(ctx, input)
         });
 

@@ -48,6 +48,7 @@ where
 ///     redundant_move_elimination_level: MoveEliminationLevel::Global,
 ///     dead_move_elimination_level: MoveEliminationLevel::Global,
 ///     eliminate_dead_register_moves: true,
+///     narrow_spill_slot_live_ranges: false,
 /// };
 ///
 /// // Use whatever serialization format you like; here, we're using JSON.
@@ -101,6 +102,21 @@ pub struct InputOptions {
     /// [`InputOptions::dead_move_elimination_level`] is
     /// [`MoveEliminationLevel::None`].
     pub eliminate_dead_register_moves: bool,
+
+    /// Should a spill slot be reserved only across the range where its value is
+    /// both live *and* spilled, rather than across the value's whole live
+    /// range?
+    ///
+    /// A value that is spilled, reloaded, and then never spilled again does not
+    /// need its slot across the reloaded tail, and a value whose spills all sit
+    /// below its definition does not need it above them. Narrowing the
+    /// reservation to what is actually needed lets more values share a slot,
+    /// which shrinks the stack frame.
+    ///
+    /// Defaulted on deserialization, so an input captured before this option
+    /// existed still reads back as the allocation it recorded.
+    #[cfg_attr(feature = "deserialize", serde(default))]
+    pub narrow_spill_slot_live_ranges: bool,
 }
 
 impl Default for InputOptions {
@@ -117,6 +133,7 @@ impl InputOptions {
             redundant_move_elimination_level: MoveEliminationLevel::Global,
             dead_move_elimination_level: MoveEliminationLevel::Global,
             eliminate_dead_register_moves: true,
+            narrow_spill_slot_live_ranges: false,
         }
     }
 }
@@ -1868,11 +1885,16 @@ mod tests {
             redundant_move_elimination_level: MoveEliminationLevel::Local,
             dead_move_elimination_level: MoveEliminationLevel::Global,
             eliminate_dead_register_moves: false,
+            narrow_spill_slot_live_ranges: true,
         };
         let json = serde_json::to_string(&options).unwrap();
         assert_eq!(
             json,
-            r#"{"validate_input":true,"redundant_move_elimination_level":"local","dead_move_elimination_level":"global","eliminate_dead_register_moves":false}"#,
+            concat!(
+                r#"{"validate_input":true,"redundant_move_elimination_level":"local","#,
+                r#""dead_move_elimination_level":"global","eliminate_dead_register_moves":false,"#,
+                r#""narrow_spill_slot_live_ranges":true}"#,
+            ),
         );
 
         let check = |back: &InputOptions| {
@@ -1888,6 +1910,10 @@ mod tests {
             assert_eq!(
                 back.eliminate_dead_register_moves,
                 options.eliminate_dead_register_moves,
+            );
+            assert_eq!(
+                back.narrow_spill_slot_live_ranges,
+                options.narrow_spill_slot_live_ranges,
             );
         };
 
