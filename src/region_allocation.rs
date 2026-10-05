@@ -14,7 +14,7 @@ use crate::{
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
     input::{DefUse, InputInst, InputValue},
-    live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
+    live_ranges::{HintPos, LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
     machine::{Machine, Reg, RegClassMembers},
     output::{OutputInner, RegAllocation},
     region_tree::RegionTree,
@@ -125,6 +125,15 @@ fn hint_across_regions<E>(
 
         let mut hint = RegSet::new();
         hint.insert(reg.with_repr32());
+
+        // Record which end of our span the affinity meets, so a later split
+        // gives the hint only to the half that end belongs to.
+        let our_span = if region_a == region { a } else { b };
+        let pos = match our_span.start(live_ranges) <= first_span_start(live_ranges, ours) {
+            true => HintPos::Start,
+            false => HintPos::End,
+        };
+        our_span.add_hint_at(live_ranges, pos, hint);
         ours.add_hint(live_ranges, events, &hint, Some(theirs));
     }
 }
@@ -569,7 +578,7 @@ where
                     BundleAssignedNonPreferred {
                         bundle,
                         alloc,
-                        preference: bundle.preference(live_ranges).union().clone(),
+                        preference: *bundle.preference(live_ranges).union(),
                     }
                 );
                 Ok(true)
@@ -798,7 +807,7 @@ where
 
         self.fill_split_scratch(input, live_ranges, bundle);
 
-        let pref = bundle.preference(live_ranges).union().clone();
+        let pref = *bundle.preference(live_ranges).union();
 
         let rc = match bundle.constraint(live_ranges) {
             OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
@@ -881,6 +890,9 @@ where
             winning_reg.insert(reg);
 
             suffix.add_hint(live_ranges, events, &winning_reg, None);
+            // Hints attached to neither end stay true of both halves, and the
+            // suffix additionally wants whatever its own spans ask for at the
+            // end it now covers.
             suffix.add_hint(live_ranges, events, &pref, None);
 
             bundle.add_hint(live_ranges, events, &winning_reg, None);
@@ -937,7 +949,7 @@ where
 
         self.fill_split_scratch(input, live_ranges, bundle);
 
-        let pref = bundle.preference(live_ranges).union().clone();
+        let pref = *bundle.preference(live_ranges).union();
 
         let rc = match bundle.constraint(live_ranges) {
             OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
@@ -1018,6 +1030,9 @@ where
             winning_reg.insert(reg);
 
             suffix.add_hint(live_ranges, events, &winning_reg, None);
+            // Hints attached to neither end stay true of both halves, and the
+            // suffix additionally wants whatever its own spans ask for at the
+            // end it now covers.
             suffix.add_hint(live_ranges, events, &pref, None);
 
             bundle.add_hint(live_ranges, events, &winning_reg, None);
@@ -1157,7 +1172,7 @@ where
                             return output.error(Error::TooManyLiveRegs);
                         }
 
-                        let pref = bundle.preference(live_ranges).union().clone();
+                        let pref = *bundle.preference(live_ranges).union();
                         let reload =
                             bundle.narrow_to_early_half(live_ranges, input, events, output)?;
                         reload.add_hint(live_ranges, events, &pref, None);
@@ -1192,7 +1207,7 @@ where
                 return Ok(());
             }
 
-            let pref = bundle.preference(live_ranges).union().clone();
+            let pref = *bundle.preference(live_ranges).union();
 
             event!(
                 events,

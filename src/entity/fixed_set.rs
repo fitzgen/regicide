@@ -195,7 +195,9 @@ where
     }
 }
 
-// Manual impl so that we don't require `K: Clone`.
+// Manual impls so that we don't require `K: Clone` or `K: Copy`.
+impl<K, const WORDS: usize> Copy for FixedEntitySet<K, WORDS> {}
+
 impl<K, const WORDS: usize> Clone for FixedEntitySet<K, WORDS> {
     fn clone(&self) -> Self {
         Self {

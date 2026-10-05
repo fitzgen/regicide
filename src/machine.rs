@@ -1422,7 +1422,7 @@ impl MachineBuilder {
             // registers an operand of this class may go in is what makes two
             // classes the same class, and the order among them is only a
             // preference.
-            RegClassMembers::Regs(_) => ClassKey::Regs(class.member_set.clone()),
+            RegClassMembers::Regs(_) => ClassKey::Regs(class.member_set),
 
             // A class of groups needs more than that: a `RegSet` does not say
             // how the registers are grouped, so two different group lists can

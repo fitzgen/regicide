@@ -502,6 +502,22 @@ where
 
     /// The value that this span is associated with.
     val: Val<E>,
+
+    /// The hints attached to this span's start, and to its end.
+    ///
+    /// A cross-region affinity is about one edge, so it wants a register only
+    /// where the span meets that edge. Splitting would otherwise give a hint
+    /// about the entry to the half covering the exit, where it competes with
+    /// that half's own hint.
+    preference_at_start: RegPreference,
+    preference_at_end: RegPreference,
+}
+
+/// Which end of a span a hint is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HintPos {
+    Start,
+    End,
 }
 
 impl<E> LiveSpanData<E>
@@ -522,6 +538,8 @@ where
             end,
             uses,
             val,
+            preference_at_start: RegPreference::new(),
+            preference_at_end: RegPreference::new(),
         }
     }
 }
@@ -578,7 +596,7 @@ const BUNDLE_MINIMAL: u32 = 1 << 31;
 /// `intersection` holds the registers satisfying every hint, and empties as
 /// soon as two disagree, which is common once hints name single registers.
 /// `union` is the fallback: satisfying one hint still elides one move.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RegPreference {
     intersection: RegSet,
     union: RegSet,
@@ -1253,6 +1271,26 @@ where
         live_ranges.spans[self].val
     }
 
+    /// The hints attached to one end of this span.
+    #[inline]
+    pub(crate) fn preference_at(self, live_ranges: &LiveRanges<E>, pos: HintPos) -> &RegPreference {
+        let data = &live_ranges.spans[self];
+        match pos {
+            HintPos::Start => &data.preference_at_start,
+            HintPos::End => &data.preference_at_end,
+        }
+    }
+
+    /// Record that `hint` is wanted at one end of this span.
+    #[inline]
+    pub(crate) fn add_hint_at(self, live_ranges: &mut LiveRanges<E>, pos: HintPos, hint: RegSet) {
+        let data = &mut live_ranges.spans[self];
+        match pos {
+            HintPos::Start => data.preference_at_start.add_hint(hint),
+            HintPos::End => data.preference_at_end.add_hint(hint),
+        }
+    }
+
     /// The block this span lies within; spans never cross a block boundary.
     pub(crate) fn block(self, func: &impl InputFunction, live_ranges: &LiveRanges<E>) -> Block<E> {
         func.inst(self.start(live_ranges).inst().with_repr32())
@@ -1376,10 +1414,21 @@ where
 
         let bundle = live_ranges.bundles.next_key(output)?;
 
+        // Adopt what this bundle's own spans ask for at the ends they cover.
+        // A split hands each half only its own ends, so a piece never inherits
+        // a hint about an edge the other half kept.
+        let mut preference = RegPreference::new();
         for index in spans {
             let span = live_ranges.bundle_spans_storage[index];
             debug_assert!(live_ranges.span_bundle[span].is_none());
             live_ranges.span_bundle[span] = Some(bundle);
+
+            for end in [HintPos::Start, HintPos::End] {
+                let hinted = *span.preference_at(live_ranges, end).union();
+                if !hinted.is_empty() {
+                    preference.add_hint(hinted);
+                }
+            }
         }
 
         let pushed = live_ranges.bundles.push(
@@ -1388,7 +1437,7 @@ where
                 spans,
                 region,
                 constraint,
-                preference: RegPreference::new(),
+                preference,
                 reg_allocation: None,
                 rematerialized: false,
                 weight_and_flags: 0,
@@ -1671,6 +1720,8 @@ where
             end,
             uses,
             val,
+            preference_at_start,
+            preference_at_end,
         } = live_ranges.spans[old];
         debug_assert!(start < at);
         debug_assert!(at < end);
@@ -1696,12 +1747,16 @@ where
         // Rewrite the divided span in place as the first piece; because we are
         // rewriting this span in place, its uses are already associated with it
         // and its `span_bundle` entry remains valid.
-        live_ranges.spans[old] = LiveSpanData::new(start, at, val, lo_uses);
+        // Each half keeps only the hints about the end it still covers; the
+        // cut itself is hinted by neither.
+        let mut lo = LiveSpanData::new(start, at, val, lo_uses);
+        lo.preference_at_start = preference_at_start;
+        live_ranges.spans[old] = lo;
 
         // The new span takes second piece.
-        let new_span = live_ranges
-            .spans
-            .push(output, LiveSpanData::new(at, end, val, hi_uses))?;
+        let mut hi = LiveSpanData::new(at, end, val, hi_uses);
+        hi.preference_at_end = preference_at_end;
+        let new_span = live_ranges.spans.push(output, hi)?;
 
         // And the new span's uses need to be reassociated with it.
         for u in hi_uses {
@@ -1865,6 +1920,8 @@ where
             end,
             uses,
             val,
+            preference_at_start,
+            preference_at_end,
         } = live_ranges.spans[span];
 
         debug_assert_eq!(start.pos(), Position::Early);
@@ -1900,6 +1957,10 @@ where
             constraint,
             block,
         )?;
+        // The reload covers the early reads, so the start's hints go with it.
+        live_ranges.spans[reload].preference_at_start = preference_at_start;
+        live_ranges.spans[span].preference_at_start = RegPreference::new();
+        let _ = preference_at_end;
         live_ranges.spans[span].uses = EntityRange {
             start: uses.start,
             end: uses.start,
@@ -2100,12 +2161,12 @@ where
         if regs.is_empty() {
             return;
         }
-        live_ranges.bundles[self].add_hint(regs.clone());
+        live_ranges.bundles[self].add_hint(*regs);
         event!(
             events,
             BundleHint {
                 bundle: self,
-                hint: regs.clone(),
+                hint: *regs,
                 from,
             }
         );

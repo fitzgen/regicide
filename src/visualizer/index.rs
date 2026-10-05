@@ -1200,7 +1200,7 @@ mod tests {
                                 }
                                 regs
                             }
-                            Event::BundleHint { hint, .. } => hint.clone(),
+                            Event::BundleHint { hint, .. } => *hint,
                             _ => continue,
                         };
                         for reg in regs.iter() {
