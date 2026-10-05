@@ -45,8 +45,8 @@ where
         #[cfg(feature = "timing")]
         {
             let elapsed = self.start.elapsed();
-            let millis = (elapsed.as_millis() as f64) + (elapsed.as_micros() as f64 * 1000.0);
-            crate::trace!("Finish timing: {}: {millis:02}ms", self.label);
+            let millis = elapsed.as_secs_f64() * 1000.0;
+            crate::trace!("Finish timing: {}: {millis:.3}ms", self.label);
         }
     }
 }
