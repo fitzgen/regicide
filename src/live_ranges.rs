@@ -2101,6 +2101,17 @@ where
         .as_f32()
     }
 
+    /// How many of this bundle's spans carry a hint at either end.
+    pub(crate) fn num_hinted_spans(self, live_ranges: &LiveRanges<E>) -> usize {
+        self.spans(live_ranges)
+            .filter(|span| {
+                [HintPos::Start, HintPos::End]
+                    .iter()
+                    .any(|&end| !span.preference_at(live_ranges, end).is_empty())
+            })
+            .count()
+    }
+
     /// Bias this bundle towards the registers that `constraint` names, on
     /// behalf of `from`.
     ///
