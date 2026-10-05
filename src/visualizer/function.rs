@@ -447,7 +447,7 @@ where
             region: bundle.region(live_ranges),
             spans: Vec::from_iter(bundle.spans(live_ranges)),
             constraint: bundle.constraint(live_ranges),
-            preference: bundle.preference(live_ranges).clone(),
+            preference: bundle.preference(live_ranges).union().clone(),
             allocation: bundle.reg_allocation(live_ranges),
             spill_weight: finite(bundle.spill_weight(live_ranges)),
             is_minimal: bundle.is_minimal(live_ranges),

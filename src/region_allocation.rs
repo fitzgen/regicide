@@ -456,14 +456,14 @@ where
             match bundle.constraint(live_ranges) {
                 OperandConstraint::Any => {
                     let class = bundle.value_reg_class(live_ranges, input);
-                    debug_assert!(pref.is_subset_of(class.member_set(input.machine)));
+                    debug_assert!(pref.union().is_subset_of(class.member_set(input.machine)));
                     debug_assert!(matches!(
                         class.members(input.machine),
                         RegClassMembers::Regs(_)
                     ));
                 }
                 OperandConstraint::Reg(rc) => {
-                    debug_assert!(pref.is_subset_of(rc.member_set(input.machine)));
+                    debug_assert!(pref.union().is_subset_of(rc.member_set(input.machine)));
                     debug_assert!(matches!(
                         rc.members(input.machine),
                         RegClassMembers::Regs(_)
@@ -478,7 +478,11 @@ where
 
         let assigned = self.region_assignments.try_assign_to_reg(
             bundle,
-            pref.iter(),
+            pref.intersection().iter().chain(
+                pref.union()
+                    .iter()
+                    .filter(|r| !pref.intersection_contains(*r)),
+            ),
             |r| r.units(input.machine),
             bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
         );
@@ -533,7 +537,7 @@ where
                 .region_assignments
                 .try_assign_to_reg(
                     bundle,
-                    regs.iter().copied().filter(|r| !pref.contains(*r)),
+                    regs.iter().copied().filter(|r| !pref.union_contains(*r)),
                     |r| r.units(input.machine),
                     bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
                 )
@@ -565,7 +569,7 @@ where
                     BundleAssignedNonPreferred {
                         bundle,
                         alloc,
-                        preference: bundle.preference(live_ranges).clone(),
+                        preference: bundle.preference(live_ranges).union().clone(),
                     }
                 );
                 Ok(true)
@@ -633,13 +637,14 @@ where
                 .region_assignments
                 .try_evict_reg_and_assign(
                     bundle,
-                    pref.iter()
-                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
+                    pref.union()
+                        .iter()
+                        .chain(regs.iter().copied().filter(|r| !pref.union_contains(*r))),
                     |r| r.units(machine),
                     max_cost,
                     |victim, reg| {
                         let broken_hints =
-                            usize::from(victim.preference(live_ranges).contains(reg));
+                            usize::from(victim.preference(live_ranges).union_contains(reg));
                         EvictionCost::new(
                             victim.stickiness(input, live_ranges),
                             victim.is_minimal(live_ranges),
@@ -667,6 +672,7 @@ where
                             let broken_hints = usize::from(
                                 !victim
                                     .preference(live_ranges)
+                                    .union()
                                     .intersection(group.member_set(machine))
                                     .is_empty(),
                             );
@@ -792,7 +798,7 @@ where
 
         self.fill_split_scratch(input, live_ranges, bundle);
 
-        let pref = bundle.preference(live_ranges).clone();
+        let pref = bundle.preference(live_ranges).union().clone();
 
         let rc = match bundle.constraint(live_ranges) {
             OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
@@ -931,7 +937,7 @@ where
 
         self.fill_split_scratch(input, live_ranges, bundle);
 
-        let pref = bundle.preference(live_ranges).clone();
+        let pref = bundle.preference(live_ranges).union().clone();
 
         let rc = match bundle.constraint(live_ranges) {
             OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
@@ -1151,7 +1157,7 @@ where
                             return output.error(Error::TooManyLiveRegs);
                         }
 
-                        let pref = bundle.preference(live_ranges).clone();
+                        let pref = bundle.preference(live_ranges).union().clone();
                         let reload =
                             bundle.narrow_to_early_half(live_ranges, input, events, output)?;
                         reload.add_hint(live_ranges, events, &pref, None);
@@ -1186,7 +1192,7 @@ where
                 return Ok(());
             }
 
-            let pref = bundle.preference(live_ranges).clone();
+            let pref = bundle.preference(live_ranges).union().clone();
 
             event!(
                 events,

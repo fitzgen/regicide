@@ -1645,7 +1645,7 @@ mod tests {
                         }
                         if let OperandConstraint::Reg(class) = bundle.constraint(live_ranges) {
                             let members = class.member_set(input.machine);
-                            if !bundle.preference(live_ranges).is_subset_of(members) {
+                            if !bundle.preference(live_ranges).union().is_subset_of(members) {
                                 return Err(format!(
                                     "{bundle:?} prefers registers outside its own class",
                                 ));
@@ -1657,7 +1657,7 @@ mod tests {
                             let val = span.val(live_ranges);
                             let class = input.func.value(val).reg_class();
                             let members = class.member_set(input.machine);
-                            if !bundle.preference(live_ranges).is_subset_of(members) {
+                            if !bundle.preference(live_ranges).union().is_subset_of(members) {
                                 return Err(format!(
                                     "{bundle:?} prefers registers that {val:?}, one of its own \
                                      values, may not live in",

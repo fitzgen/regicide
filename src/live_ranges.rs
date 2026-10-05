@@ -11,7 +11,7 @@ use crate::input::{
     RematCost,
 };
 use crate::liveness::{Liveness, block_first_inst, block_last_inst};
-use crate::machine::{Machine, RegClassMembers};
+use crate::machine::{Machine, Reg, RegClassMembers};
 use crate::output::{OutputInner, RegAllocation};
 use crate::packed_float::PackedPositiveFloat;
 use crate::timing::Timing;
@@ -545,11 +545,8 @@ where
     /// Always already resolved, so will never contain a `Reuse` constraint.
     constraint: OperandConstraint,
 
-    /// The subset of `self.constraint`'s registers that this bundle would
-    /// prefer to be allocated within, if any.
-    ///
-    /// Empty means no preference.
-    preference: RegSet,
+    /// The registers this bundle would prefer, within `self.constraint`.
+    preference: RegPreference,
 
     /// The registers this bundle is currently allocated to.
     reg_allocation: Option<RegAllocation<E>>,
@@ -576,30 +573,79 @@ const BUNDLE_SPILL_WEIGHT_BITS: u32 = 31;
 const BUNDLE_SPILL_WEIGHT_MASK: u32 = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::MASK;
 const BUNDLE_MINIMAL: u32 = 1 << 31;
 
+/// The registers hints have asked for, kept two ways.
+///
+/// `intersection` holds the registers satisfying every hint, and empties as
+/// soon as two disagree, which is common once hints name single registers.
+/// `union` is the fallback: satisfying one hint still elides one move.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RegPreference {
+    intersection: RegSet,
+    union: RegSet,
+}
+
+impl RegPreference {
+    /// A preference nothing has hinted yet.
+    pub(crate) fn new() -> Self {
+        RegPreference {
+            intersection: RegSet::new(),
+            union: RegSet::new(),
+        }
+    }
+
+    /// Fold `hint` in.
+    pub(crate) fn add_hint(&mut self, hint: RegSet) {
+        debug_assert!(!hint.is_empty());
+
+        self.union.union_with(&hint);
+
+        if self.intersection.is_empty() {
+            // Take the first hint whole rather than intersect an empty set.
+            self.intersection = hint;
+            return;
+        }
+
+        let narrowed = self.intersection.intersection(&hint);
+
+        // Keep the existing hint over an equally arbitrary alternative.
+        if !narrowed.is_empty() {
+            self.intersection = narrowed;
+        }
+    }
+
+    /// Does every hint accept `reg`?
+    pub(crate) fn intersection_contains(&self, reg: Reg) -> bool {
+        self.intersection.contains(reg)
+    }
+
+    /// Did any hint ask for `reg`?
+    pub(crate) fn union_contains(&self, reg: Reg) -> bool {
+        self.union.contains(reg)
+    }
+
+    /// The registers satisfying every hint.
+    pub(crate) fn intersection(&self) -> &RegSet {
+        &self.intersection
+    }
+
+    /// Every register some hint asked for.
+    pub(crate) fn union(&self) -> &RegSet {
+        &self.union
+    }
+
+    /// Has anything hinted this at all?
+    pub(crate) fn is_empty(&self) -> bool {
+        self.union.is_empty()
+    }
+}
+
 impl<E> LiveBundleData<E>
 where
     E: EntityRepr,
 {
     /// Fold `hint` into this bundle's preference.
     fn add_hint(&mut self, hint: RegSet) {
-        debug_assert!(!hint.is_empty());
-
-        if self.preference.is_empty() {
-            // Nothing has hinted this bundle yet, so take the hint whole rather
-            // than intersecting it with an empty set and losing it.
-            self.preference = hint;
-            return;
-        }
-
-        let narrowed = self.preference.intersection(&hint);
-
-        if narrowed.is_empty() {
-            // Conflicting hints: keep the existing hint, rather than replacing it
-            // with an equally arbitrary alternative.
-            return;
-        }
-
-        self.preference = narrowed;
+        self.preference.add_hint(hint);
     }
 }
 
@@ -1342,7 +1388,7 @@ where
                 spans,
                 region,
                 constraint,
-                preference: RegSet::new(),
+                preference: RegPreference::new(),
                 reg_allocation: None,
                 rematerialized: false,
                 weight_and_flags: 0,
@@ -1935,7 +1981,7 @@ where
     ///
     /// Empty means no preference.
     #[inline]
-    pub(crate) fn preference(self, live_ranges: &LiveRanges<E>) -> &RegSet {
+    pub(crate) fn preference(self, live_ranges: &LiveRanges<E>) -> &RegPreference {
         &live_ranges.bundles[self].preference
     }
 
@@ -3308,7 +3354,7 @@ mod tests {
             spans: EntityRange::empty(),
             region: Region::try_new(0).unwrap(),
             constraint: OperandConstraint::Any,
-            preference: RegSet::new(),
+            preference: RegPreference::new(),
             reg_allocation: None,
             rematerialized: false,
             weight_and_flags,
@@ -3376,7 +3422,8 @@ mod tests {
         assert!(bundle.preference.is_empty());
 
         bundle.add_hint(regs(&[0, 2]));
-        assert_eq!(bundle.preference, regs(&[0, 2]));
+        assert_eq!(*bundle.preference.intersection(), regs(&[0, 2]));
+        assert_eq!(*bundle.preference.union(), regs(&[0, 2]));
     }
 
     /// A second hint narrows the preference to the registers both hints want.
@@ -3386,12 +3433,14 @@ mod tests {
         bundle.add_hint(regs(&[0, 2]));
 
         bundle.add_hint(regs(&[2, 3]));
-        assert_eq!(bundle.preference, regs(&[2]));
+        assert_eq!(*bundle.preference.intersection(), regs(&[2]));
+        assert_eq!(*bundle.preference.union(), regs(&[0, 2, 3]));
 
         // And narrowing again keeps narrowing, rather than starting over from
         // the newest hint.
         bundle.add_hint(regs(&[1, 2]));
-        assert_eq!(bundle.preference, regs(&[2]));
+        assert_eq!(*bundle.preference.intersection(), regs(&[2]));
+        assert_eq!(*bundle.preference.union(), regs(&[0, 1, 2, 3]));
     }
 
     /// ... but a hint that wants none of the registers the preference does is
@@ -3402,7 +3451,9 @@ mod tests {
         bundle.add_hint(regs(&[0, 2]));
 
         bundle.add_hint(regs(&[1, 3]));
-        assert_eq!(bundle.preference, regs(&[0, 2]));
+        assert_eq!(*bundle.preference.intersection(), regs(&[0, 2]));
+        // The union still records what the dropped hint wanted.
+        assert_eq!(*bundle.preference.union(), regs(&[0, 1, 2, 3]));
     }
 
     /// Every register held for a fixed operand, as
