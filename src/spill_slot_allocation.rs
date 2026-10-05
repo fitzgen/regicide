@@ -184,6 +184,9 @@ enum Event {
     Def,
 }
 
+/// `free_slots_index` for a slot that is not in `free_slots`.
+const NOT_FREE: u32 = u32::MAX;
+
 /// The stack slots we created, and which spilled value lives in which.
 pub struct SpillSlots<E>
 where
@@ -228,6 +231,12 @@ where
     /// in constant time.
     free_slots: [Vec<SpillSlot<E>>; RegBank::NUM_SIZES],
 
+    /// Where each slot sits in its bucket of `free_slots`, or `NOT_FREE`.
+    ///
+    /// Lets `alloc_slot` take a preferred slot out of the middle of a bucket
+    /// without scanning it.
+    free_slots_index: SecondaryMap<SpillSlot<E>, u32>,
+
     /// The current block's events, in ascending program order once sorted.
     events: Vec<(LivePoint<E>, Event, Val<E>)>,
 
@@ -254,6 +263,7 @@ where
             live_count: [0; RegBank::NUM_SIZES],
             in_use: EntitySet::new(),
             free_slots: [const { Vec::new() }; RegBank::NUM_SIZES],
+            free_slots_index: SecondaryMap::new(NOT_FREE),
             events: Vec::new(),
             live: EntitySet::new(),
             emergency: [const { Vec::new() }; RegBank::NUM_SIZES],
@@ -271,6 +281,7 @@ where
             live_count,
             in_use,
             free_slots,
+            free_slots_index,
             events,
             live,
             emergency,
@@ -286,6 +297,7 @@ where
         for free in free_slots {
             free.clear();
         }
+        free_slots_index.reset();
         events.clear();
         live.reset();
         for slots in emergency {
@@ -304,6 +316,7 @@ where
             live_count,
             in_use,
             free_slots,
+            free_slots_index,
             events,
             live,
             emergency,
@@ -317,6 +330,7 @@ where
             && live_count.iter().all(|&n| n == 0)
             && in_use.is_empty()
             && free_slots.iter().all(|free| free.is_empty())
+            && free_slots_index.is_reset()
             && events.is_empty()
             && live.is_empty()
             && emergency.iter().all(|slots| slots.is_empty())
@@ -522,7 +536,8 @@ where
                 Event::Kill => self.free(input, val),
                 Event::Def => {
                     let _ = point;
-                    self.assign(input, counts, events, val, output)?;
+                    // Defined here, so it arrives from no edge.
+                    self.assign(input, counts, events, val, output, None)?;
                 }
             }
         }
@@ -530,7 +545,9 @@ where
 
         self.in_use.reset();
         for free in &mut self.free_slots {
-            free.clear();
+            for slot in free.drain(..) {
+                self.free_slots_index[slot] = NOT_FREE;
+            }
         }
         self.live_count = [0; RegBank::NUM_SIZES];
         Ok(())
@@ -567,6 +584,8 @@ where
         debug_assert!(self.free_slots.iter().all(|free| free.is_empty()));
         for (slot, &size) in self.slots.iter() {
             if !self.in_use.contains(slot) {
+                self.free_slots_index[slot] =
+                    u32::try_from(self.free_slots[size.index()].len()).unwrap();
                 self.free_slots[size.index()].push(slot);
             }
         }
@@ -586,10 +605,63 @@ where
                 "{val:?} is live on entry to {block:?} without a slot, so it must be one of \
                  {block:?}'s parameters",
             );
-            self.assign(input, counts, events, val, output)?;
+            // Sharing the argument's slot makes the edge's move a no-op;
+            // otherwise it pays a stack-to-stack move, the most expensive kind.
+            let prefer = self.incoming_arg_slot(input, output, block, val)?;
+            self.assign(input, counts, events, val, output, prefer)?;
         }
 
         Ok(())
+    }
+
+    /// The slot already given to a value passed as `param`'s argument on some
+    /// incoming edge.
+    ///
+    /// Takes the first one found: with several predecessors the arguments may
+    /// live in different slots, and matching any one saves that edge's move
+    /// while leaving the others no worse off.
+    fn incoming_arg_slot(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        output: &mut OutputInner<E>,
+        block: Block<E>,
+        param: Val<E>,
+    ) -> IResult<Option<SpillSlot<E>>> {
+        let block32 = block.with_repr32();
+
+        let mut index = None;
+        for (i, p) in input.func.block(block32).params().enumerate() {
+            if output.with_repr::<E, _>(p)? == param {
+                index = Some(i);
+                break;
+            }
+        }
+        let Some(index) = index else {
+            return Ok(None);
+        };
+
+        for pred in input.func.block(block32).predecessors() {
+            let pred_data = input.func.block(pred);
+            for (i, succ) in pred_data.successors().enumerate() {
+                if succ != block32 {
+                    continue;
+                }
+                let Some(arg) = pred_data.successor_block_args(i).nth(index) else {
+                    continue;
+                };
+                let arg = output.with_repr::<E, _>(arg)?;
+                // Its slot has to be settled, and free here for us to take it.
+                let Some(StackAllocation::SpillSlot(slot)) = self.val_home[arg] else {
+                    continue;
+                };
+                if self.in_use.contains(slot) {
+                    continue;
+                }
+                return Ok(Some(slot));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Walk `block` backwards, recording where each spilled value is defined
@@ -665,6 +737,10 @@ where
 
     /// Give `val` a free slot of its size, creating a new slot when every
     /// existing one of that size is occupied.
+    ///
+    /// `prefer` names a slot to take if it happens to be free, which is how a
+    /// block parameter lands in the same slot as the argument feeding it and
+    /// so needs no move on the edge at all.
     fn assign(
         &mut self,
         input: &Input<'_, impl InputFunction>,
@@ -672,6 +748,7 @@ where
         events: &mut EventsLog<E>,
         val: Val<E>,
         output: &mut OutputInner<E>,
+        prefer: Option<SpillSlot<E>>,
     ) -> IResult<()> {
         debug_assert!(self.spilled.contains(val));
         debug_assert!(
@@ -683,11 +760,14 @@ where
         let num_regs = val.num_regs(input);
 
         let home = if num_regs == 1 {
-            StackAllocation::SpillSlot(self.alloc_slot(events, size, output)?)
+            StackAllocation::SpillSlot(self.alloc_slot(events, size, output, prefer)?)
         } else {
+            // A multi-slot value has no single slot to match, so the
+            // preference does not apply to it.
+            let _ = prefer;
             let start = self.group_members.next_key(output)?;
             for _ in 0..num_regs {
-                let slot = self.alloc_slot(events, size, output)?;
+                let slot = self.alloc_slot(events, size, output, None)?;
                 self.group_members.push(output, slot)?;
             }
             let end = self.group_members.next_key(output)?;
@@ -724,9 +804,24 @@ where
         events: &mut EventsLog<E>,
         size: SpillSlotSize,
         output: &mut OutputInner<E>,
+        prefer: Option<SpillSlot<E>>,
     ) -> IResult<SpillSlot<E>> {
-        match self.free_slots[size.index()].pop() {
-            Some(slot) => Ok(slot),
+        // Any free slot is as good as any other to the coloring, so taking the
+        // preferred one costs nothing and saves a stack-to-stack move.
+        if let Some(want) = prefer
+            && self.slots[want] == size
+            && self.free_slots_index[want] != NOT_FREE
+        {
+            self.take_free_slot(size, usize::try_from(self.free_slots_index[want]).unwrap());
+            return Ok(want);
+        }
+
+        let free = &self.free_slots[size.index()];
+        match free.last().copied() {
+            Some(slot) => {
+                self.take_free_slot(size, free.len() - 1);
+                Ok(slot)
+            }
             None => {
                 let slot = self.slots.push(output, size)?;
                 event!(
@@ -739,6 +834,19 @@ where
                 );
                 Ok(slot)
             }
+        }
+    }
+
+    /// Remove the slot at `i` in `size`'s bucket of `free_slots`, keeping
+    /// `free_slots_index` in step with the `swap_remove`.
+    fn take_free_slot(&mut self, size: SpillSlotSize, i: usize) {
+        let free = &mut self.free_slots[size.index()];
+        let slot = free.swap_remove(i);
+        self.free_slots_index[slot] = NOT_FREE;
+        // `swap_remove` moved the bucket's last slot into `i`, unless it was
+        // the one removed.
+        if let Some(&moved) = free.get(i) {
+            self.free_slots_index[moved] = u32::try_from(i).unwrap();
         }
     }
 
@@ -776,6 +884,8 @@ where
             debug_assert!(removed, "{val:?} held {slot:?}, so it was occupied");
             debug_assert_eq!(self.slots[slot], size);
 
+            self.free_slots_index[slot] =
+                u32::try_from(self.free_slots[size.index()].len()).unwrap();
             self.free_slots[size.index()].push(slot);
             self.live_count[size.index()] -= 1;
         }
