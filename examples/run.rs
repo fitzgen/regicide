@@ -217,7 +217,6 @@ fn collect(paths: &[String]) -> Result<Vec<PathBuf>, String> {
     Ok(inputs)
 }
 
-
 /// How many of each kind of edit an allocation introduced.
 ///
 /// These are the numbers to compare between two builds of the allocator: fewer
