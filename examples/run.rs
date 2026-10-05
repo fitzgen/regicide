@@ -10,6 +10,7 @@
 //! cargo run --example run -- corpus/
 //! cargo run --example run -- --check -q corpus/
 //! cargo run --example run -- -r none -d none corpus/one-input.postcard
+//! cargo run --release --example run -- --insts -q corpus/
 //! ```
 //!
 //! Build a corpus with `scripts/make-corpus` in the `regalloc2` repository.
@@ -47,6 +48,10 @@ whichever a file turns out to be in.
       --validate               validate each input before allocating
       --no-validate            do not validate
       --check                  check each allocation against the checker
+      --insts                  count the instructions retired while
+                               allocating each input (Linux and macOS only;
+                               leave `RUST_LOG` unset, since logging inside
+                               the allocator is counted too)
   -q, --quiet                  print only the counts, not the allocations
   -h, --help                   print this message
 
@@ -89,6 +94,18 @@ fn main() {
     let mut skipped = 0_usize;
     let mut failed = 0_usize;
 
+    let mut insts_retired = match args.count_insts {
+        true => match insts::InstsRetired::new() {
+            Ok(counter) => Some(counter),
+            Err(message) => {
+                eprintln!("{message}");
+                process::exit(1);
+            }
+        },
+        false => None,
+    };
+    let mut total_insts = 0_u64;
+
     // Held open across every input, because a corpus is large enough that
     // per-line flushing to a pipe dominates the run.
     let stdout = std::io::stdout();
@@ -125,7 +142,13 @@ fn main() {
 
         // Everything that reads the `Output` happens here, because it borrows
         // the context that printing the allocation needs back.
-        let allocated = match regicide::run(&mut context, &input) {
+        if let Some(counter) = &mut insts_retired {
+            counter.start();
+        }
+        let result = regicide::run(&mut context, &input);
+        let insts = insts_retired.as_mut().map(|counter| counter.end());
+
+        let allocated = match result {
             Ok(output) => {
                 let counts = Counts::of(&output, &input);
                 let checked = match args.check {
@@ -143,6 +166,10 @@ fn main() {
                     let _ = writeln!(out, "{}", input.func.display_with_context(&mut context));
                 }
                 let _ = writeln!(out, "  {counts}");
+                if let Some(insts) = insts {
+                    let _ = writeln!(out, "  insts-retired {insts}");
+                    total_insts += insts;
+                }
 
                 if let Err(e) = checked {
                     let _ = writeln!(out, "  CHECKER FAILED: {e}");
@@ -172,6 +199,9 @@ fn main() {
 
     let _ = writeln!(out, "=== totals ({ran} function(s)) ===");
     let _ = writeln!(out, "  {totals}");
+    if insts_retired.is_some() {
+        let _ = writeln!(out, "  insts-retired {total_insts}");
+    }
     if skipped > 0 {
         let _ = writeln!(out, "  {skipped} skipped");
     }
@@ -356,6 +386,7 @@ struct Args {
     paths: Vec<String>,
     options: OptionOverrides,
     check: bool,
+    count_insts: bool,
     quiet: bool,
 }
 
@@ -364,6 +395,7 @@ impl Args {
         let mut paths = vec![];
         let mut options = OptionOverrides::default();
         let mut check = false;
+        let mut count_insts = false;
         let mut quiet = false;
         let mut args = args;
 
@@ -403,6 +435,7 @@ impl Args {
                 "--validate" => options.validate_input = Some(true),
                 "--no-validate" => options.validate_input = Some(false),
                 "--check" => check = true,
+                "--insts" => count_insts = true,
                 "-q" | "--quiet" => quiet = true,
                 _ if name.starts_with('-') => return Err(format!("unknown flag {name}")),
                 _ => paths.push(name),
@@ -417,6 +450,7 @@ impl Args {
             paths,
             options,
             check,
+            count_insts,
             quiet,
         })
     }
@@ -428,5 +462,108 @@ fn parse_level(flag: &str, value: &str) -> Result<MoveEliminationLevel, String> 
         "local" => Ok(MoveEliminationLevel::Local),
         "global" => Ok(MoveEliminationLevel::Global),
         _ => Err(format!("{flag} wants none, local or global, not `{value}`")),
+    }
+}
+
+/// Counting the instructions this process retires, which is far less noisy
+/// than timing when comparing two builds of the allocator.
+mod insts {
+    pub struct InstsRetired(imp::State);
+
+    impl InstsRetired {
+        pub fn new() -> Result<Self, String> {
+            imp::new().map(Self)
+        }
+
+        pub fn start(&mut self) {
+            imp::start(&mut self.0);
+        }
+
+        /// The instructions retired since the last `start`.
+        pub fn end(&mut self) -> u64 {
+            imp::end(&mut self.0)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    mod imp {
+        use perf_event::{Builder, events::Hardware};
+
+        pub use perf_event::Counter as State;
+
+        pub fn new() -> Result<State, String> {
+            Builder::new()
+                .kind(Hardware::INSTRUCTIONS)
+                .build()
+                .map_err(|e| {
+                    format!(
+                        "could not create an INSTRUCTIONS hardware counter: {e}. Does this \
+                         system have one? If it does, the kernel may not fully support this \
+                         processor."
+                    )
+                })
+        }
+
+        pub fn start(counter: &mut State) {
+            counter.reset().unwrap();
+            counter.enable().unwrap();
+        }
+
+        pub fn end(counter: &mut State) -> u64 {
+            counter.disable().unwrap();
+            counter.read().unwrap()
+        }
+    }
+
+    /// User space cannot read the PMU on macOS, but the kernel keeps a
+    /// per-process count that `proc_pid_rusage` reads without sudo. It covers
+    /// every thread, which is fine because the allocator runs on one.
+    #[cfg(target_os = "macos")]
+    mod imp {
+        /// The count when the measurement started.
+        pub type State = u64;
+
+        pub fn new() -> Result<State, String> {
+            Ok(0)
+        }
+
+        pub fn start(start: &mut State) {
+            *start = read();
+        }
+
+        pub fn end(start: &mut State) -> u64 {
+            read().wrapping_sub(*start)
+        }
+
+        fn read() -> u64 {
+            // SAFETY: `rusage_info_v4` is plain old data for which all zeroes is
+            // valid, and it is large enough for the `RUSAGE_INFO_V4` flavor
+            // requested.
+            let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+            let ret = unsafe {
+                libc::proc_pid_rusage(
+                    libc::getpid(),
+                    libc::RUSAGE_INFO_V4,
+                    &mut info as *mut libc::rusage_info_v4 as *mut libc::rusage_info_t,
+                )
+            };
+            assert_eq!(ret, 0, "proc_pid_rusage failed");
+            info.ri_instructions
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    mod imp {
+        pub type State = ();
+
+        pub fn new() -> Result<State, String> {
+            Err("counting instructions retired is only supported on Linux and macOS".to_string())
+        }
+
+        pub fn start(_: &mut State) {}
+
+        pub fn end(_: &mut State) -> u64 {
+            unreachable!()
+        }
     }
 }
