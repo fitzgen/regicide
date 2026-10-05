@@ -145,8 +145,11 @@ where
     /// Affinities whose spans are in different regions.
     ///
     /// We don't merge across regions, so these are set aside and turned into
-    /// register hints after every region has been processed.
-    cross_region_affinities: Vec<(LiveSpan<E>, LiveSpan<E>)>,
+    /// register hints. Region allocation reads them back as it goes: it visits
+    /// children before parents, so by the time a parent region is allocated,
+    /// the child on the far side of the border already holds a register, and
+    /// the hint can name *that* register rather than the whole class.
+    pub(crate) cross_region_affinities: Vec<(LiveSpan<E>, LiveSpan<E>)>,
 
     /// Scratch space holding one block's reservations in
     /// `hint_reserved_registers`.
@@ -485,14 +488,12 @@ where
         &mut context.output,
     )?;
 
-    // Then propagate hints across regions.
-    hint_across_regions(
-        &context.coalescing,
-        &context.region_tree,
-        &mut context.live_ranges,
-        &mut context.events,
-        input.machine,
-    );
+    // Cross-region hints are *not* propagated here. They are propagated by
+    // region allocation, which visits children before parents and so knows
+    // which register the child actually got; see
+    // `RegionAllocation::hint_across_regions`. Hinting here could only name
+    // the child's constraint, which is almost always its whole register class
+    // and so constrains nothing.
 
     // And finally bias each reserved value's bundle towards its register.
     for region in context.region_tree.pre_order_iter() {
@@ -512,7 +513,8 @@ where
         }
     }
 
-    context.coalescing.cross_region_affinities.clear();
+    // `cross_region_affinities` deliberately survives this pass: region
+    // allocation consumes it and clears it.
     debug_assert!(
         context.coalescing.region_blocks.is_empty() && context.coalescing.hint_scratch.is_empty(),
         "a completed coalescing leaves no scratch behind",
@@ -1105,53 +1107,6 @@ fn hint_reserved_registers<E>(
     }
 
     scratch.clear();
-}
-
-/// Bias each parent region's bundle towards the registers its child region's
-/// bundle wants.
-///
-/// This is the consolation prize for an affinity that crosses a region border,
-/// across which we disallow merging. The hint travels up from child to parent:
-/// child regions are executed more frequently than parent regions, so we want
-/// the child region to remain unconstrained, making it more likely to get the
-/// allocation it wants. Additionally, we only propagate hints *after* we have
-/// coalesced bundles within each region, which keeps the inter-region hinting
-/// from pessimizing intra-region allocation: avoiding moves and spills within a
-/// region is much more important than potentially avoiding a move across
-/// regions.
-fn hint_across_regions<E>(
-    coalescing: &Coalescing<E>,
-    region_tree: &RegionTree<E>,
-    live_ranges: &mut LiveRanges<E>,
-    events: &mut EventsLog<E>,
-    machine: &Machine,
-) where
-    E: EntityRepr,
-{
-    for i in 0..coalescing.cross_region_affinities.len() {
-        let (a, b) = coalescing.cross_region_affinities[i];
-        let (Some(bundle_a), Some(bundle_b)) = (a.bundle(live_ranges), b.bundle(live_ranges))
-        else {
-            unreachable!("all spans are assigned a bundle by now")
-        };
-
-        let region_a = bundle_a.region(live_ranges);
-        let region_b = bundle_b.region(live_ranges);
-        debug_assert_ne!(region_a, region_b);
-
-        let (parent, child) = if region_b.parent(&region_tree) == Some(region_a) {
-            (bundle_a, bundle_b)
-        } else if region_a.parent(&region_tree) == Some(region_b) {
-            (bundle_b, bundle_a)
-        } else {
-            // With irreducible control flow we can get edges between sibling
-            // regions. Skip the hint in this case.
-            continue;
-        };
-
-        let constraint = child.constraint(live_ranges);
-        parent.hint(live_ranges, events, machine, constraint, Some(child));
-    }
 }
 
 #[cfg(test)]

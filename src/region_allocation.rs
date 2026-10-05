@@ -36,6 +36,18 @@ where
 
     // Reverse the pre-order so we visit children before parents.
     for region in context.region_tree.pre_order_iter().rev() {
+        // Bias this region's bundles towards the registers their counterparts
+        // across a region border already got. Children come first in this
+        // walk, so those registers are facts by now rather than guesses.
+        hint_across_regions(
+            &context.coalescing.cross_region_affinities,
+            &context.region_tree,
+            &mut context.live_ranges,
+            &mut context.events,
+            input,
+            region,
+        );
+
         context.region_allocation.allocate_region(
             input,
             &context.region_tree,
@@ -47,10 +59,74 @@ where
         )?;
     }
 
+    context.coalescing.cross_region_affinities.clear();
+
     context.counts.final_live_spans += context.live_ranges.len_spans();
     context.counts.final_bundles += context.live_ranges.len_bundles();
 
     Ok(())
+}
+
+/// Bias `region`'s bundles towards the registers their counterparts across a
+/// region border already hold, since the two sides disagreeing costs a move.
+///
+/// Hinting here rather than in coalescing is what lets the hint name a
+/// register: we walk children before parents, so the far side is assigned.
+fn hint_across_regions<E>(
+    cross_region_affinities: &[(LiveSpan<E>, LiveSpan<E>)],
+    region_tree: &RegionTree<E>,
+    live_ranges: &mut LiveRanges<E>,
+    events: &mut EventsLog<E>,
+    input: &Input<'_, impl InputFunction>,
+    region: Region<E>,
+) where
+    E: EntityRepr,
+{
+    for i in 0..cross_region_affinities.len() {
+        let (a, b) = cross_region_affinities[i];
+
+        // Afresh each time: splitting may have moved a span to another bundle.
+        let (Some(bundle_a), Some(bundle_b)) = (a.bundle(live_ranges), b.bundle(live_ranges))
+        else {
+            continue;
+        };
+
+        let (region_a, region_b) = (bundle_a.region(live_ranges), bundle_b.region(live_ranges));
+
+        // An affinity with neither side in this region is not ours to hint.
+        let (ours, theirs) = if region_a == region {
+            (bundle_a, bundle_b)
+        } else if region_b == region {
+            (bundle_b, bundle_a)
+        } else {
+            continue;
+        };
+
+        // Unassigned means the far side is a parent, or a not-yet-allocated
+        // sibling under irreducible control flow.
+        let Some(RegAllocation::Reg(reg)) = theirs.reg_allocation(live_ranges) else {
+            continue;
+        };
+        let _ = region_tree;
+
+        // `assign_to_preferred` asserts the hint is within this class.
+        let class = match ours.constraint(live_ranges) {
+            OperandConstraint::Any => ours.value_reg_class(live_ranges, input),
+            OperandConstraint::Reg(rc) => rc,
+            OperandConstraint::Stack => continue,
+            OperandConstraint::Reuse(_) => unreachable!("constraints are already resolved"),
+        };
+        let RegClassMembers::Regs(members) = class.members(input.machine) else {
+            continue;
+        };
+        if !members.contains(&reg.with_repr32()) {
+            continue;
+        }
+
+        let mut hint = RegSet::new();
+        hint.insert(reg.with_repr32());
+        ours.add_hint(live_ranges, events, &hint, Some(theirs));
+    }
 }
 
 pub struct RegionAllocation<E>

@@ -1996,6 +1996,10 @@ where
 
     /// Bias this bundle towards the registers that `constraint` names, on
     /// behalf of `from`.
+    ///
+    /// Hinting a whole class is still the right shape for a hint whose source
+    /// does not name one register.
+    #[allow(dead_code, reason = "cross-region hinting names a register instead")]
     pub(crate) fn hint(
         self,
         live_ranges: &mut LiveRanges<E>,
