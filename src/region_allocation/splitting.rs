@@ -181,7 +181,7 @@ where
     }
 
     /// The half before a cut at `at` inside `spans[index]`.
-    fn prefix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
+    pub(crate) fn prefix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
         HalfSpan {
             whole: &spans[..index],
             clipped_start: spans[index].start,
@@ -192,7 +192,7 @@ where
     }
 
     /// The half after a cut at `at` inside `spans[index]`.
-    fn suffix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
+    pub(crate) fn suffix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
         HalfSpan {
             whole: &spans[index + 1..],
             clipped_start: at,

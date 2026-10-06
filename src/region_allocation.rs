@@ -17,15 +17,15 @@ use crate::{
     live_ranges::{
         HintPos, LiveBundle, LivePoint, LiveRanges, LiveSpan, RegPreference, SpillWeight,
     },
-    machine::{Machine, Reg, RegClassMembers},
+    machine::{Machine, Reg, RegClassMembers, RegGroup, RegUnit},
     output::{OutputInner, RegAllocation},
     region_tree::RegionTree,
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
-use assignments::{Assignments, Occupant, QuerySpan};
+use assignments::{Assignments, Occupant, QuerySpan, SpanInterference};
 use core::{fmt, marker::PhantomData, ops::Range};
-use splitting::{Cut, SplitUse, WithinSpanCut};
+use splitting::{Cut, HalfSpan, SplitUse, WithinSpanCut};
 
 pub fn region_allocate<E>(
     context: &mut ContextInner<E>,
@@ -191,6 +191,31 @@ fn hint_across_regions<E>(
     relayed_regs.clear();
 }
 
+/// What making room for a split half costs in the `c`th of a split's
+/// candidates, whose units `units_of` gives.
+fn half_interference<'a, E, C, Units>(
+    interference: &'a mut SpanInterference<E>,
+    assignments: &'a Assignments<E>,
+    scratch: &'a mut Vec<LiveBundle<E>>,
+    live_ranges: &'a LiveRanges<E>,
+    units_of: impl Fn(C) -> Units + 'a,
+) -> impl FnMut((usize, C), HalfSpan<'_, E>) -> f32 + 'a
+where
+    E: EntityRepr,
+    Units: Iterator<Item = Range<RegUnit>> + Clone,
+{
+    move |(c, candidate), half| {
+        interference.weight(
+            assignments,
+            c,
+            units_of(candidate),
+            half,
+            scratch,
+            |victim| victim.spill_weight(live_ranges),
+        )
+    }
+}
+
 pub struct RegionAllocation<E>
 where
     E: EntityRepr,
@@ -221,9 +246,6 @@ where
     /// Scratch space holding the spans of the bundle being split.
     split_spans: Vec<Range<LivePoint<E>>>,
 
-    /// The value each of `split_spans` carries, at the same index.
-    split_span_vals: Vec<Val<E>>,
-
     /// Scratch space holding the uses of the bundle being split, likewise.
     split_uses: Vec<SplitUse<E>>,
 
@@ -231,8 +253,8 @@ where
     minimal_cuts: Vec<Cut<E>>,
 
     /// Scratch space for deduplicating the bundles in the way of a half, which
-    /// [`Assignments::interference_weight`] borrows for the duration of a call
-    /// and hands back empty.
+    /// `SpanInterference::weight` borrows for the duration of a call and hands
+    /// back empty.
     interference_scratch: Vec<LiveBundle<E>>,
 
     /// The registers that something clobbers in the current region.
@@ -249,6 +271,9 @@ where
     /// Scratch space for `hint_across_regions`: the registers that bundles
     /// outside the region being hinted have affinity with, by bundle.
     relayed_regs: Vec<(LiveBundle<E>, Reg<E>)>,
+
+    /// What is in the way of each span of the bundle being split.
+    split_interference: SpanInterference<E>,
 }
 
 impl<E> RegionAllocation<E>
@@ -264,7 +289,6 @@ where
             stack_bundles: Vec::new(),
             spilled: EntitySet::new(),
             split_spans: Vec::new(),
-            split_span_vals: Vec::new(),
             split_uses: Vec::new(),
             minimal_cuts: Vec::new(),
             interference_scratch: Vec::new(),
@@ -272,6 +296,7 @@ where
             region_preferences: RegSet::new(),
             non_preferred_candidates: Vec::new(),
             relayed_regs: Vec::new(),
+            split_interference: SpanInterference::new(),
         }
     }
 
@@ -284,7 +309,6 @@ where
             stack_bundles,
             spilled,
             split_spans,
-            split_span_vals,
             split_uses,
             minimal_cuts,
             interference_scratch,
@@ -292,6 +316,7 @@ where
             region_preferences,
             non_preferred_candidates,
             relayed_regs,
+            split_interference,
         } = self;
         assignments.reset();
         region_assignments.reset();
@@ -300,7 +325,6 @@ where
         stack_bundles.clear();
         spilled.reset();
         split_spans.clear();
-        split_span_vals.clear();
         split_uses.clear();
         minimal_cuts.clear();
         interference_scratch.clear();
@@ -308,6 +332,7 @@ where
         region_preferences.reset();
         non_preferred_candidates.clear();
         relayed_regs.clear();
+        split_interference.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -319,7 +344,6 @@ where
             stack_bundles,
             spilled,
             split_spans,
-            split_span_vals,
             split_uses,
             minimal_cuts,
             interference_scratch,
@@ -327,6 +351,7 @@ where
             region_preferences,
             non_preferred_candidates,
             relayed_regs,
+            split_interference,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
@@ -335,7 +360,6 @@ where
             && stack_bundles.is_empty()
             && spilled.is_reset()
             && split_spans.is_empty()
-            && split_span_vals.is_empty()
             && split_uses.is_empty()
             && minimal_cuts.is_empty()
             && interference_scratch.is_empty()
@@ -343,6 +367,7 @@ where
             && region_preferences.is_reset()
             && non_preferred_candidates.is_empty()
             && relayed_regs.is_empty()
+            && split_interference.is_empty()
     }
 
     /// The bundles that must live in memory, and so need a spill slot.
@@ -902,20 +927,12 @@ where
         bundle: LiveBundle<E>,
     ) {
         debug_assert!(self.split_spans.is_empty());
-        debug_assert!(self.split_span_vals.is_empty());
         debug_assert!(self.split_uses.is_empty());
 
         self.split_spans.extend(
             bundle
                 .spans(live_ranges)
                 .map(|s| s.start(live_ranges)..s.end(live_ranges)),
-        );
-        self.split_span_vals
-            .extend(bundle.spans(live_ranges).map(|s| s.val(live_ranges)));
-        debug_assert_eq!(
-            self.split_spans.len(),
-            self.split_span_vals.len(),
-            "`split_span_vals` must stay parallel to `split_spans`",
         );
 
         let mut prev = None;
@@ -986,50 +1003,52 @@ where
             OperandConstraint::Reuse(_) => unreachable!("already resolved"),
         };
 
+        self.split_interference
+            .reset(bundle.spans(live_ranges).map(|s| s.query(live_ranges)));
+
         let best = match rc.members(input.machine) {
             RegClassMembers::Regs(regs) => splitting::best_split_between_spans(
                 &self.split_spans,
                 &self.split_uses,
                 pref.iter()
-                    .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                |reg, half| {
-                    self.region_assignments.interference_weight(
-                        core::iter::once(reg.units(input.machine)),
-                        half.iter_indexed()
-                            .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
-                        &mut self.interference_scratch,
-                        |victim| victim.spill_weight(live_ranges),
-                    )
-                },
+                    .chain(regs.iter().copied().filter(|r| !pref.contains(*r)))
+                    .enumerate(),
+                half_interference(
+                    &mut self.split_interference,
+                    &self.region_assignments,
+                    &mut self.interference_scratch,
+                    live_ranges,
+                    |reg: Reg| core::iter::once(reg.units(input.machine)),
+                ),
             )
-            .map(|best| (best.cut, Some(best.candidate))),
+            .map(|best| (best.cut, Some(best.candidate.1))),
 
             RegClassMembers::Groups(groups) => {
                 debug_assert!(pref.is_empty());
                 splitting::best_split_between_spans(
                     &self.split_spans,
                     &self.split_uses,
-                    groups.iter().copied(),
-                    |group, half| {
-                        self.region_assignments.interference_weight(
+                    groups.iter().copied().enumerate(),
+                    half_interference(
+                        &mut self.split_interference,
+                        &self.region_assignments,
+                        &mut self.interference_scratch,
+                        live_ranges,
+                        |group: RegGroup| {
                             group
                                 .members(input.machine)
                                 .iter()
-                                .map(|r| r.units(input.machine)),
-                            half.iter_indexed()
-                                .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
-                            &mut self.interference_scratch,
-                            |victim| victim.spill_weight(live_ranges),
-                        )
-                    },
+                                .map(|r| r.units(input.machine))
+                        },
+                    ),
                 )
                 .map(|best| (best.cut, None))
             }
         };
 
         self.split_spans.clear();
-        self.split_span_vals.clear();
         self.split_uses.clear();
+        self.split_interference.clear();
 
         let Some((index, winner)) = best else {
             counts.split_between_spans_failed.inc();
@@ -1128,44 +1147,46 @@ where
             OperandConstraint::Reuse(_) => unreachable!("already resolved"),
         };
 
+        self.split_interference
+            .reset(bundle.spans(live_ranges).map(|s| s.query(live_ranges)));
+
         let (cut, winner) = match rc.members(input.machine) {
             RegClassMembers::Regs(regs) => {
                 let best = splitting::best_split_within_span(
                     &self.split_spans,
                     &self.split_uses,
                     pref.iter()
-                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r))),
-                    |reg, half| {
-                        self.region_assignments.interference_weight(
-                            core::iter::once(reg.units(input.machine)),
-                            half.iter_indexed()
-                                .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
-                            &mut self.interference_scratch,
-                            |victim| victim.spill_weight(live_ranges),
-                        )
-                    },
+                        .chain(regs.iter().copied().filter(|r| !pref.contains(*r)))
+                        .enumerate(),
+                    half_interference(
+                        &mut self.split_interference,
+                        &self.region_assignments,
+                        &mut self.interference_scratch,
+                        live_ranges,
+                        |reg: Reg| core::iter::once(reg.units(input.machine)),
+                    ),
                 )
                 .expect("already rejected unsplittable bundles");
-                (best.cut, Some(best.candidate))
+                (best.cut, Some(best.candidate.1))
             }
             RegClassMembers::Groups(groups) => {
                 debug_assert!(pref.is_empty());
                 let best = splitting::best_split_within_span(
                     &self.split_spans,
                     &self.split_uses,
-                    groups.iter().copied(),
-                    |group, half| {
-                        self.region_assignments.interference_weight(
+                    groups.iter().copied().enumerate(),
+                    half_interference(
+                        &mut self.split_interference,
+                        &self.region_assignments,
+                        &mut self.interference_scratch,
+                        live_ranges,
+                        |group: RegGroup| {
                             group
                                 .members(input.machine)
                                 .iter()
-                                .map(|r| r.units(input.machine)),
-                            half.iter_indexed()
-                                .map(|(i, r)| QuerySpan::porous_to(self.split_span_vals[i], r)),
-                            &mut self.interference_scratch,
-                            |victim| victim.spill_weight(live_ranges),
-                        )
-                    },
+                                .map(|r| r.units(input.machine))
+                        },
+                    ),
                 )
                 .expect("already rejected unsplittable bundles");
                 (best.cut, None)
@@ -1173,8 +1194,8 @@ where
         };
 
         self.split_spans.clear();
-        self.split_span_vals.clear();
         self.split_uses.clear();
+        self.split_interference.clear();
 
         // Name the span before the split rewrites it in place.
         let span = bundle
@@ -1301,7 +1322,6 @@ where
         self.fill_split_scratch(input, live_ranges, bundle);
         cuts.extend(splitting::minimal_cuts(&self.split_spans, &self.split_uses));
         self.split_spans.clear();
-        self.split_span_vals.clear();
         self.split_uses.clear();
 
         debug_assert_eq!(

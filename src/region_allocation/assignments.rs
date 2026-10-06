@@ -5,7 +5,7 @@ use crate::{
     entity::{EntityRepr, SecondaryMap},
     live_ranges::{LiveBundle, LivePoint},
     output::RegAllocation,
-    region_allocation::EvictionCost,
+    region_allocation::{EvictionCost, splitting::HalfSpan},
 };
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::{iter, ops::ControlFlow, ops::Range};
@@ -193,6 +193,187 @@ where
     reservations: SecondaryMap<RegUnit, RegUnitReservations<E>>,
 }
 
+/// The total weight of the distinct bundles in `bundles`, which is left empty.
+///
+/// Summing in sorted order makes the total independent of the order the
+/// bundles were found in.
+fn sum_distinct<E>(
+    bundles: &mut Vec<LiveBundle<E>>,
+    weight_of: impl Fn(LiveBundle<E>) -> f32,
+) -> f32
+where
+    E: EntityRepr,
+{
+    bundles.sort_unstable();
+    bundles.dedup();
+    let weight = bundles.iter().copied().map(weight_of).sum();
+    bundles.clear();
+    weight
+}
+
+/// What is in the way of each of a bundle's spans in each of its candidates.
+///
+/// Splitting prices both halves of every cut it considers, and each span lies
+/// in many of those halves. Querying each span at most once per candidate makes
+/// that linearly many queries in the number of spans, not quadratically.
+pub struct SpanInterference<E>
+where
+    E: EntityRepr,
+{
+    /// The spans being split.
+    spans: Vec<QuerySpan<E>>,
+
+    /// Where each candidate's entries start in `entries`, by candidate index,
+    /// once that candidate has been asked about.
+    rows: Vec<Option<usize>>,
+
+    /// For span `i` of a candidate whose entries start at `row`, entry
+    /// `row + i` is the range of `bundles` in its way, or `None` when a
+    /// reservation is or might be.
+    entries: Vec<Option<Range<usize>>>,
+
+    bundles: Vec<LiveBundle<E>>,
+}
+
+impl<E> SpanInterference<E>
+where
+    E: EntityRepr,
+{
+    pub const fn new() -> Self {
+        Self {
+            spans: Vec::new(),
+            rows: Vec::new(),
+            entries: Vec::new(),
+            bundles: Vec::new(),
+        }
+    }
+
+    /// Start over with the spans of a new bundle.
+    pub fn reset(&mut self, spans: impl IntoIterator<Item = QuerySpan<E>>) {
+        self.clear();
+        self.spans.extend(spans);
+    }
+
+    pub fn clear(&mut self) {
+        self.spans.clear();
+        self.rows.clear();
+        self.entries.clear();
+        self.bundles.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+            && self.rows.is_empty()
+            && self.entries.is_empty()
+            && self.bundles.is_empty()
+    }
+
+    /// The bundles in the way of span `i` in `units`, appended to `bundles`,
+    /// or `None` when a reservation is in its way.
+    fn query(
+        &mut self,
+        assignments: &Assignments<E>,
+        units: impl Iterator<Item = Range<RegUnit>>,
+        i: usize,
+    ) -> Option<Range<usize>> {
+        let start = self.bundles.len();
+        if assignments.push_interfering(units, iter::once(self.spans[i].clone()), &mut self.bundles)
+        {
+            Some(start..self.bundles.len())
+        } else {
+            self.bundles.truncate(start);
+            None
+        }
+    }
+
+    /// Where the `candidate`th candidate's entries start, querying its spans in
+    /// `units` the first time it is asked about.
+    fn row(
+        &mut self,
+        assignments: &Assignments<E>,
+        candidate: usize,
+        units: impl Iterator<Item = Range<RegUnit>> + Clone,
+    ) -> usize {
+        if self.rows.len() <= candidate {
+            self.rows.resize(candidate + 1, None);
+        }
+        if let Some(row) = self.rows[candidate] {
+            return row;
+        }
+        let row = self.entries.len();
+        self.rows[candidate] = Some(row);
+
+        // A half holds every span on its side of the cut, so one holding a
+        // span between the first and last reserved ones holds one of those
+        // too, and is infinite whatever else is in its way. Those spans need
+        // no query.
+        let n = self.spans.len();
+        let mut first_reserved = n;
+        for i in 0..n {
+            let entry = self.query(assignments, units.clone(), i);
+            let reserved = entry.is_none();
+            self.entries.push(entry);
+            if reserved {
+                first_reserved = i;
+                break;
+            }
+        }
+        self.entries.resize(row + n, None);
+        for i in (first_reserved + 1..n).rev() {
+            let entry = self.query(assignments, units.clone(), i);
+            let reserved = entry.is_none();
+            self.entries[row + i] = entry;
+            if reserved {
+                break;
+            }
+        }
+        row
+    }
+
+    /// The same as `Assignments::interference_weight` for `half` in the
+    /// `candidate`th candidate, whose units are `units`.
+    ///
+    /// `half` must be carved from the spans given to `reset`. Its divided span
+    /// is queried afresh when the cut changed it.
+    pub fn weight(
+        &mut self,
+        assignments: &Assignments<E>,
+        candidate: usize,
+        units: impl Iterator<Item = Range<RegUnit>> + Clone,
+        half: HalfSpan<'_, E>,
+        scratch: &mut Vec<LiveBundle<E>>,
+        weight_of: impl Fn(LiveBundle<E>) -> f32,
+    ) -> f32 {
+        debug_assert!(scratch.is_empty());
+
+        let row = self.row(assignments, candidate, units.clone());
+        for (i, range) in half.iter_indexed() {
+            let span = &self.spans[i];
+            let clear = if range == span.range {
+                self.entries[row + i]
+                    .clone()
+                    .map(|r| scratch.extend_from_slice(&self.bundles[r]))
+                    .is_some()
+            } else {
+                assignments.push_interfering(
+                    units.clone(),
+                    iter::once(QuerySpan {
+                        porous_to: span.porous_to,
+                        range,
+                    }),
+                    scratch,
+                )
+            };
+            if !clear {
+                scratch.clear();
+                return f32::INFINITY;
+            }
+        }
+
+        sum_distinct(scratch, weight_of)
+    }
+}
+
 /// The units one register covers.
 fn units_in(units: Range<RegUnit>) -> impl Iterator<Item = RegUnit> {
     debug_assert!(units.start <= units.end);
@@ -314,6 +495,9 @@ where
     ///
     /// A reservation cannot be evicted at any price, so a span running into
     /// one costs infinitely much to place there.
+    ///
+    /// Splitting asks this through `SpanInterference` instead.
+    #[cfg(test)]
     pub fn interference_weight(
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
@@ -323,25 +507,33 @@ where
     ) -> f32 {
         debug_assert!(scratch.is_empty());
 
-        let reserved = self.for_each_overlapping(reg_units, spans, |existing| match existing {
-            Conflict::Assignment(existing) => {
-                scratch.push(existing.bundle);
-                ControlFlow::Continue(())
-            }
-            Conflict::Reservation(_) => ControlFlow::Break(()),
-        });
-
-        if reserved.is_some() {
+        if !self.push_interfering(reg_units, spans, scratch) {
             scratch.clear();
             return f32::INFINITY;
         }
 
-        scratch.sort_unstable();
-        scratch.dedup();
+        sum_distinct(scratch, weight_of)
+    }
 
-        let weight = scratch.iter().copied().map(weight_of).sum();
-        scratch.clear();
-        weight
+    /// Push the bundles already assigned in `reg_units` that overlap `spans`
+    /// onto `out`, possibly more than once each.
+    ///
+    /// Returns `false` when a reservation is in the way, leaving `out` partly
+    /// filled.
+    fn push_interfering(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        out: &mut Vec<LiveBundle<E>>,
+    ) -> bool {
+        self.for_each_overlapping(reg_units, spans, |existing| match existing {
+            Conflict::Assignment(existing) => {
+                out.push(existing.bundle);
+                ControlFlow::Continue(())
+            }
+            Conflict::Reservation(_) => ControlFlow::Break(()),
+        })
+        .is_none()
     }
 
     /// Do the given spans conflict with any existing assignment or reservation
@@ -1452,6 +1644,88 @@ mod tests {
         Ok(())
     }
 
+    /// `SpanInterference` must price every half exactly as `interference_weight`
+    /// does, whether its divided span is intact, clipped, or widened, and
+    /// whatever order candidates are asked about in.
+    fn check_span_interference_agrees(assignments: &Assignments<u32>) -> Result<(), String> {
+        let scratch = &mut Vec::new();
+        let weight_of = |b: LiveBundle<u32>| WEIGHTS[b.index()];
+        let mut cache = SpanInterference::new();
+        let units = probe_unit_sets();
+
+        for spans in probe_span_sets() {
+            let ranges: Vec<_> = spans.iter().map(|s| s.range()).collect();
+
+            // Every prefix and suffix the kernel can carve: dividing each span
+            // at either of its ends, between them, or reaching back a point.
+            let mut halves = Vec::new();
+            for (k, range) in ranges.iter().enumerate() {
+                let mut ats = vec![range.start, range.end];
+                if range.start.next_point() < range.end {
+                    ats.push(range.start.next_point());
+                }
+                for at in ats {
+                    if range.start < at {
+                        halves.push(HalfSpan::prefix(&ranges, k, at));
+                    }
+                    if at < range.end {
+                        halves.push(HalfSpan::suffix(&ranges, k, at));
+                    }
+                }
+                if range.start > point(0) {
+                    halves.push(HalfSpan::suffix(&ranges, k, range.start.prev_point()));
+                }
+            }
+
+            // Ask about the candidates backwards and then forwards, so that
+            // each one is first asked about out of order.
+            cache.reset(spans.iter().cloned());
+            let order = (0..units.len()).rev().chain(0..units.len());
+            for candidate in order {
+                for half in &halves {
+                    let actual = cache.weight(
+                        assignments,
+                        candidate,
+                        units[candidate].iter().cloned(),
+                        *half,
+                        scratch,
+                        weight_of,
+                    );
+                    let pieces: Vec<_> = half
+                        .iter_indexed()
+                        .map(|(i, range)| QuerySpan {
+                            porous_to: spans[i].porous_to,
+                            range,
+                        })
+                        .collect();
+                    let expected = assignments.interference_weight(
+                        units[candidate].iter().cloned(),
+                        pieces.iter().cloned(),
+                        scratch,
+                        weight_of,
+                    );
+                    if actual != expected {
+                        return Err(format!(
+                            "`SpanInterference::weight({}, {pieces:?})` for {spans:?} is \
+                             {actual} but `interference_weight` is {expected}",
+                            probe_name(candidate),
+                        ));
+                    }
+                    if !scratch.is_empty() {
+                        return Err(format!(
+                            "`SpanInterference::weight({}, {pieces:?})` left {} bundles in the \
+                             scratch buffer",
+                            probe_name(candidate),
+                            scratch.len(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Which candidate did `try_assign_*`/`try_evict_*_and_assign` choose?
     ///
     /// The oracle answers in indices but the methods in registers, so map back.
@@ -2449,6 +2723,7 @@ mod tests {
                     check_no_overlaps(&assignments)?;
                     check_conflicts_agree(&assignments, &oracle)?;
                     check_interference_weight_agrees(&assignments, &oracle)?;
+                    check_span_interference_agrees(&assignments)?;
 
                     // Merging this state into an empty set of assignments must
                     // reproduce it exactly, so the oracle we already have
