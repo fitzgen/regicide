@@ -478,6 +478,46 @@ where
     Some(choice)
 }
 
+/// The best of `candidates` for cutting at `cut` into `prefix` and `suffix`.
+///
+/// A candidate's score is set by its worse half, so one whose prefix alone
+/// already scores below the best so far cannot win, and its suffix goes
+/// unpriced.
+fn best_candidate<E, C, K>(
+    cut: K,
+    prefix: HalfSpan<'_, E>,
+    suffix: HalfSpan<'_, E>,
+    min_use_weight: f32,
+    candidates: impl IntoIterator<Item = C>,
+    interference: &mut impl FnMut(C, HalfSpan<'_, E>) -> f32,
+) -> Option<SplitChoice<C, K>>
+where
+    E: EntityRepr,
+    C: Copy,
+    K: Copy,
+{
+    let mut best: Option<SplitChoice<C, K>> = None;
+    for candidate in candidates {
+        let prefix_interference = interference(candidate, prefix);
+        if best
+            .is_some_and(|best| SplitScore::new(prefix_interference, min_use_weight) < best.score)
+        {
+            continue;
+        }
+        let suffix_interference = interference(candidate, suffix);
+        let max_interference = prefix_interference.max(suffix_interference);
+        let score = SplitScore::new(max_interference, min_use_weight);
+        if best.is_none_or(|best| score > best.score) {
+            best = Some(SplitChoice {
+                cut,
+                candidate,
+                score,
+            });
+        }
+    }
+    best
+}
+
 /// The best candidate for cutting before `spans[k]`.
 fn best_candidate_between_spans<E, C>(
     spans: &[Range<LivePoint<E>>],
@@ -497,21 +537,7 @@ where
     let prefix = HalfSpan::prefix(spans, k - 1, spans[k - 1].end);
     let suffix = HalfSpan::suffix(spans, k, spans[k].start.inst_boundary_at_or_before());
 
-    let mut best: Option<SplitChoice<C, usize>> = None;
-    for candidate in candidates {
-        let prefix_interference = interference(candidate, prefix);
-        let suffix_interference = interference(candidate, suffix);
-        let max_interference = prefix_interference.max(suffix_interference);
-        let score = SplitScore::new(max_interference, min_use_weight);
-        if best.is_none_or(|best| score > best.score) {
-            best = Some(SplitChoice {
-                cut: k,
-                candidate,
-                score,
-            });
-        }
-    }
-    best
+    best_candidate(k, prefix, suffix, min_use_weight, candidates, interference)
 }
 
 /// Find the best point within a span in `spans` to split at, or return `None`
@@ -544,22 +570,14 @@ where
             debug_assert!(cut.at < spans[cut.index].end);
 
             let (prefix, suffix) = HalfSpan::split(spans, cut.index, cut.at);
-
-            let mut best: Option<SplitChoice<C, WithinSpanCut<E>>> = None;
-            for candidate in candidates.clone() {
-                let prefix_interference = interference(candidate, prefix);
-                let suffix_interference = interference(candidate, suffix);
-                let max_interference = prefix_interference.max(suffix_interference);
-                let score = SplitScore::new(max_interference, min_use_weight);
-                if best.is_none_or(|best| score > best.score) {
-                    best = Some(SplitChoice {
-                        cut,
-                        candidate,
-                        score,
-                    });
-                }
-            }
-            best
+            best_candidate(
+                cut,
+                prefix,
+                suffix,
+                min_use_weight,
+                candidates.clone(),
+                &mut interference,
+            )
         },
     )
 }
