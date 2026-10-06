@@ -11,19 +11,21 @@
 //! cargo run --example run -- --check -q corpus/
 //! cargo run --example run -- -r none -d none corpus/one-input.postcard
 //! cargo run --release --example run -- --insts -q corpus/
+//! cargo run --release --example run -- --profile 30 corpus/
 //! ```
 //!
 //! Build a corpus with `scripts/make-corpus` in the `regalloc2` repository.
 
 use regicide::{
     Context, EdgeEdit, Edit, Error, Input, InputFunction, InputOptions, InstOrEdit, Move,
-    MoveEliminationLevel, Output,
+    MoveEliminationLevel, Output, deserialize::DeserializedInput,
 };
 use std::{
     env,
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     process,
+    time::{Duration, Instant},
 };
 
 #[path = "support/encoding.rs"]
@@ -53,6 +55,10 @@ whichever a file turns out to be in.
                                leave `RUST_LOG` unset, since logging inside
                                the allocator is counted too)
   -q, --quiet                  print only the counts, not the allocations
+      --profile SECONDS        after the first pass over the inputs, keep
+                               allocating them, printing nothing, until
+                               SECONDS have elapsed, so that a sampling
+                               profiler gathers enough samples
   -h, --help                   print this message
 
 Each option defaults to what the input file itself asked for, so a run with no
@@ -86,6 +92,23 @@ fn main() {
         process::exit(1);
     }
 
+    // Read everything before allocating anything, so that a profile of this
+    // process is allocation and not deserialization.
+    let inputs: Vec<Loaded> = inputs
+        .iter()
+        .map(|path| Loaded {
+            name: path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            input: encoding::load(path).map(|input| {
+                let options = args.options.resolve(input.options());
+                (input, options)
+            }),
+        })
+        .collect();
+
     // One `Context`, reset between inputs: allocating is the thing being
     // measured, so do not pay to rebuild the allocator's state each time.
     let mut context = Context::new();
@@ -112,96 +135,115 @@ fn main() {
     let stdout = std::io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    for path in &inputs {
-        let name = path
-            .file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy();
+    // Under `--profile`, keep going in whole passes so that every input is
+    // allocated equally often.
+    let start = Instant::now();
+    let mut passes = 0_usize;
+    while passes == 0
+        || args
+            .profile
+            .is_some_and(|duration| start.elapsed() < duration)
+    {
+        let first = passes == 0;
+        for Loaded { name, input } in &inputs {
+            let (input, options) = match input {
+                Ok(input) => input,
+                Err(_) if !first => continue,
+                Err(message) => {
+                    // Naming the file matters most for a corpus that predates
+                    // an encoding change, where every entry fails the same
+                    // way.
+                    let _ = writeln!(out, "=== {name} ===\n  could not read: {message}\n");
+                    failed += 1;
+                    continue;
+                }
+            };
 
-        let input = match encoding::load(path) {
-            Ok(input) => input,
-            Err(message) => {
-                // Naming the file matters most for a corpus that predates an
-                // encoding change, where every entry fails the same way.
-                let _ = writeln!(out, "=== {name} ===\n  could not read: {message}\n");
-                failed += 1;
+            let input = Input {
+                options,
+                machine: input.machine(),
+                func: input.func(),
+            };
+
+            // Every pass allocates the same way, and the first reported it.
+            if !first {
+                let _ = regicide::run(&mut context, &input);
+                context.reset();
                 continue;
             }
-        };
 
-        let options = args.options.resolve(input.options());
-        let input = Input {
-            options: &options,
-            machine: input.machine(),
-            func: input.func(),
-        };
-
-        let _ = writeln!(out, "=== {name} ===");
-        if !args.quiet {
-            let _ = writeln!(out, "  {}", describe_options(&options));
-        }
-
-        // Everything that reads the `Output` happens here, because it borrows
-        // the context that printing the allocation needs back.
-        if let Some(counter) = &mut insts_retired {
-            counter.start();
-        }
-        let result = regicide::run(&mut context, &input);
-        let insts = insts_retired.as_mut().map(|counter| counter.end());
-
-        let allocated = match result {
-            Ok(output) => {
-                let counts = Counts::of(&output, &input);
-                let out_of_fuel = output.coalesce_out_of_fuel();
-                let checked = match args.check {
-                    true => regicide::checker::check(&input, &output).map_err(|e| format!("{e:?}")),
-                    false => Ok(()),
-                };
-                Ok((counts, out_of_fuel, checked))
+            let _ = writeln!(out, "=== {name} ===");
+            if !args.quiet {
+                let _ = writeln!(out, "  {}", describe_options(options));
             }
-            Err(e) => Err(e),
-        };
 
-        match allocated {
-            Ok((counts, out_of_fuel, checked)) => {
-                if !args.quiet {
-                    let _ = writeln!(out, "{}", input.func.display_with_context(&mut context));
-                }
-                let _ = writeln!(out, "  {counts}");
-                if let Some(insts) = insts {
-                    let _ = writeln!(out, "  insts-retired {insts}");
-                    total_insts += insts;
-                }
-                if let Some(out_of_fuel) = out_of_fuel {
-                    let _ = writeln!(out, "  coalesce-out-of-fuel {out_of_fuel}");
-                    *total_out_of_fuel.get_or_insert(0) += out_of_fuel;
-                }
+            // Everything that reads the `Output` happens here, because it
+            // borrows the context that printing the allocation needs back.
+            if let Some(counter) = &mut insts_retired {
+                counter.start();
+            }
+            let result = regicide::run(&mut context, &input);
+            let insts = insts_retired.as_mut().map(|counter| counter.end());
 
-                if let Err(e) = checked {
-                    let _ = writeln!(out, "  CHECKER FAILED: {e}");
+            let allocated = match result {
+                Ok(output) => {
+                    let counts = Counts::of(&output, &input);
+                    let out_of_fuel = output.coalesce_out_of_fuel();
+                    let checked = match args.check {
+                        true => {
+                            regicide::checker::check(&input, &output).map_err(|e| format!("{e:?}"))
+                        }
+                        false => Ok(()),
+                    };
+                    Ok((counts, out_of_fuel, checked))
+                }
+                Err(e) => Err(e),
+            };
+
+            match allocated {
+                Ok((counts, out_of_fuel, checked)) => {
+                    if !args.quiet {
+                        let _ = writeln!(out, "{}", input.func.display_with_context(&mut context));
+                    }
+                    let _ = writeln!(out, "  {counts}");
+                    if let Some(insts) = insts {
+                        let _ = writeln!(out, "  insts-retired {insts}");
+                        total_insts += insts;
+                    }
+                    if let Some(out_of_fuel) = out_of_fuel {
+                        let _ = writeln!(out, "  coalesce-out-of-fuel {out_of_fuel}");
+                        *total_out_of_fuel.get_or_insert(0) += out_of_fuel;
+                    }
+
+                    if let Err(e) = checked {
+                        let _ = writeln!(out, "  CHECKER FAILED: {e}");
+                        failed += 1;
+                    }
+
+                    totals.add(&counts);
+                    ran += 1;
+                }
+                // A property of the input rather than a bug in the allocator:
+                // this function wants more registers at once than its machine
+                // has.
+                Err(Error::TooManyLiveRegs) => {
+                    let _ = writeln!(out, "  skipped: needs more registers than the machine has");
+                    skipped += 1;
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "  FAILED: {e}");
                     failed += 1;
                 }
+            }
 
-                totals.add(&counts);
-                ran += 1;
-            }
-            // A property of the input rather than a bug in the allocator: this
-            // function wants more registers at once than its machine has.
-            Err(Error::TooManyLiveRegs) => {
-                let _ = writeln!(out, "  skipped: needs more registers than the machine has");
-                skipped += 1;
-            }
-            Err(e) => {
-                let _ = writeln!(out, "  FAILED: {e}");
-                failed += 1;
-            }
+            // `run` asserts a reset context, and the `Output` borrowed it
+            // until here.
+            context.reset();
+            let _ = writeln!(out);
         }
-
-        // `run` asserts a reset context, and the `Output` borrowed it until
-        // here.
-        context.reset();
-        let _ = writeln!(out);
+        passes += 1;
     }
+    let elapsed = start.elapsed();
 
     let _ = writeln!(out, "=== totals ({ran} function(s)) ===");
     let _ = writeln!(out, "  {totals}");
@@ -210,6 +252,13 @@ fn main() {
     }
     if let Some(total_out_of_fuel) = total_out_of_fuel {
         let _ = writeln!(out, "  coalesce-out-of-fuel {total_out_of_fuel}");
+    }
+    if args.profile.is_some() {
+        let _ = writeln!(
+            out,
+            "  profiled {passes} pass(es) in {:.3}s",
+            elapsed.as_secs_f64()
+        );
     }
     if skipped > 0 {
         let _ = writeln!(out, "  {skipped} skipped");
@@ -222,6 +271,14 @@ fn main() {
     if failed > 0 {
         process::exit(1);
     }
+}
+
+/// One input file, read and ready to allocate.
+struct Loaded {
+    name: String,
+    /// The input with the options to allocate it under, or why it could not
+    /// be read.
+    input: Result<(DeserializedInput, InputOptions), String>,
 }
 
 /// Expand the given paths into the input files to run.
@@ -397,6 +454,7 @@ struct Args {
     check: bool,
     count_insts: bool,
     quiet: bool,
+    profile: Option<Duration>,
 }
 
 impl Args {
@@ -406,6 +464,7 @@ impl Args {
         let mut check = false;
         let mut count_insts = false;
         let mut quiet = false;
+        let mut profile = None;
         let mut args = args;
 
         while let Some(arg) = args.next() {
@@ -446,6 +505,15 @@ impl Args {
                 "--check" => check = true,
                 "--insts" => count_insts = true,
                 "-q" | "--quiet" => quiet = true,
+                "--profile" => {
+                    let value = value(&name)?;
+                    let seconds = value
+                        .parse::<f64>()
+                        .ok()
+                        .and_then(|s| Duration::try_from_secs_f64(s).ok())
+                        .ok_or(format!("{name} wants a number of seconds, not `{value}`"))?;
+                    profile = Some(seconds);
+                }
                 _ if name.starts_with('-') => return Err(format!("unknown flag {name}")),
                 _ => paths.push(name),
             }
@@ -461,6 +529,7 @@ impl Args {
             check,
             count_insts,
             quiet,
+            profile,
         })
     }
 }
