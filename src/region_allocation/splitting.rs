@@ -403,22 +403,48 @@ where
     E: EntityRepr,
     C: Copy,
 {
+    middle_of_best_run(
+        between_span_cuts(spans, uses),
+        uses,
+        |&k| spans[k].start,
+        |k, min_use_weight| {
+            best_candidate_between_spans(
+                spans,
+                k,
+                min_use_weight,
+                candidates.clone(),
+                &mut interference,
+            )
+        },
+    )
+}
+
+/// The lower middle of the first run of consecutive `cuts` tied for the best
+/// score.
+///
+/// `at` gives where each cut falls among `uses`, and `best_at` scores a cut's
+/// best candidate given its `min_use_weight`.
+fn middle_of_best_run<E, C, K>(
+    cuts: impl Iterator<Item = K> + Clone,
+    uses: &[SplitUse<E>],
+    at: impl Fn(&K) -> LivePoint<E>,
+    mut best_at: impl FnMut(K, f32) -> Option<SplitChoice<C, K>>,
+) -> Option<SplitChoice<C, K>>
+where
+    E: EntityRepr,
+    C: Copy,
+    K: Copy,
+{
     let mut cursor = UseWeightCursor::new(uses);
 
     // The best run's first cut and length.
-    let mut best: Option<(SplitChoice<C, usize>, usize)> = None;
+    let mut best: Option<(SplitChoice<C, K>, usize)> = None;
     let mut run_start = 0;
     let mut run_open = false;
 
-    for (i, k) in between_span_cuts(spans, uses).enumerate() {
-        cursor.advance_to(spans[k].start);
-        let Some(choice) = best_candidate_between_spans(
-            spans,
-            k,
-            cursor.min_use_weight(),
-            candidates.clone(),
-            &mut interference,
-        ) else {
+    for (i, cut) in cuts.clone().enumerate() {
+        cursor.advance_to(at(&cut));
+        let Some(choice) = best_at(cut, cursor.min_use_weight()) else {
             continue;
         };
 
@@ -444,17 +470,8 @@ where
     }
 
     // Ties share `min_use_weight`.
-    let k = between_span_cuts(spans, uses)
-        .nth(run_start + middle)
-        .unwrap();
-    let choice = best_candidate_between_spans(
-        spans,
-        k,
-        first.score.min_use_weight,
-        candidates,
-        &mut interference,
-    )
-    .unwrap();
+    let cut = cuts.clone().nth(run_start + middle).unwrap();
+    let choice = best_at(cut, first.score.min_use_weight).unwrap();
     debug_assert!(choice.score == first.score);
     Some(choice)
 }
@@ -503,9 +520,8 @@ where
 ///
 /// `spans` must be sorted and disjoint.
 ///
-/// `candidates` and `interference` are the same as with
-/// `best_split_between_spans`, except that `interference` is handed a
-/// `HalfSpan`.
+/// `candidates`, `interference`, and the tie-break are the same as with
+/// `best_split_between_spans`.
 pub fn best_split_within_span<E, C>(
     spans: &[Range<LivePoint<E>>],
     uses: &[SplitUse<E>],
@@ -516,35 +532,34 @@ where
     E: EntityRepr,
     C: Copy,
 {
-    let mut cursor = UseWeightCursor::new(uses);
-    let mut best: Option<SplitChoice<C, WithinSpanCut<E>>> = None;
+    middle_of_best_run(
+        within_span_cuts(spans, uses),
+        uses,
+        |cut| cut.at,
+        |cut, min_use_weight| {
+            debug_assert_eq!(cut.at.pos(), Position::Early);
+            debug_assert!(spans[cut.index].start < cut.at);
+            debug_assert!(cut.at < spans[cut.index].end);
 
-    for cut in within_span_cuts(spans, uses) {
-        debug_assert_eq!(cut.at.pos(), Position::Early);
-        debug_assert!(spans[cut.index].start < cut.at);
-        debug_assert!(cut.at < spans[cut.index].end);
+            let (prefix, suffix) = HalfSpan::split(spans, cut.index, cut.at);
 
-        cursor.advance_to(cut.at);
-        let min_use_weight = cursor.min_use_weight();
-
-        let (prefix, suffix) = HalfSpan::split(spans, cut.index, cut.at);
-
-        for candidate in candidates.clone() {
-            let prefix_interference = interference(candidate, prefix);
-            let suffix_interference = interference(candidate, suffix);
-            let max_interference = prefix_interference.max(suffix_interference);
-            let score = SplitScore::new(max_interference, min_use_weight);
-            if best.is_none_or(|best| score > best.score) {
-                best = Some(SplitChoice {
-                    cut,
-                    candidate,
-                    score,
-                });
+            let mut best: Option<SplitChoice<C, WithinSpanCut<E>>> = None;
+            for candidate in candidates.clone() {
+                let prefix_interference = interference(candidate, prefix);
+                let suffix_interference = interference(candidate, suffix);
+                let max_interference = prefix_interference.max(suffix_interference);
+                let score = SplitScore::new(max_interference, min_use_weight);
+                if best.is_none_or(|best| score > best.score) {
+                    best = Some(SplitChoice {
+                        cut,
+                        candidate,
+                        score,
+                    });
+                }
             }
-        }
-    }
-
-    best
+            best
+        },
+    )
 }
 
 /// Get every cut necessary to split the given `spans` into minimal pieces.
@@ -1022,6 +1037,56 @@ mod tests {
         }
     }
 
+    /// Check that nothing scores better than `choice`, and that it won the
+    /// tie-break documented on `best_split_between_spans`.
+    fn check_tie_break<K: Copy + PartialEq + core::fmt::Debug>(
+        func: &str,
+        spans: &[Range<LivePoint<u32>>],
+        expected: &[K],
+        choice: SplitChoice<u8, K>,
+        score: impl Fn(u8, K) -> SplitScore,
+    ) -> Result<(), String> {
+        for &cut in expected {
+            for candidate in 0..NUM_CANDIDATES {
+                let other = score(candidate, cut);
+                if other > choice.score {
+                    return Err(format!(
+                        "`{func}` chose {choice:?} for {spans:?}, but cutting at {cut:?} for \
+                         candidate {candidate} scores {other:?}, which is better",
+                    ));
+                }
+            }
+        }
+
+        let cut_score = |cut| (0..NUM_CANDIDATES).map(|c| score(c, cut)).max().unwrap();
+        let run_start = expected
+            .iter()
+            .position(|&cut| cut_score(cut) == choice.score)
+            .unwrap();
+        let run_len = expected[run_start..]
+            .iter()
+            .take_while(|&&cut| cut_score(cut) == choice.score)
+            .count();
+        let middle = expected[run_start + (run_len - 1) / 2];
+        if choice.cut != middle {
+            return Err(format!(
+                "`{func}` chose {choice:?} for {spans:?}, but the middle of the first run of tied \
+                 cuts, {:?}, is {middle:?}",
+                &expected[run_start..run_start + run_len],
+            ));
+        }
+        let earliest = (0..NUM_CANDIDATES)
+            .find(|&candidate| score(candidate, middle) == choice.score)
+            .unwrap();
+        if choice.candidate != earliest {
+            return Err(format!(
+                "`{func}` chose {choice:?} for {spans:?}, but candidate {earliest} ties it at the \
+                 same cut and comes first",
+            ));
+        }
+        Ok(())
+    }
+
     /// Check everything `best_split_within_span` promises about `piece`, and
     /// return the two halves it chose, if it chose any.
     fn check_split_within_span(
@@ -1142,16 +1207,13 @@ mod tests {
             }
         };
 
-        let rank = match expected.iter().position(|c| *c == choice.cut) {
-            Some(rank) => rank,
-            None => {
-                return Err(format!(
-                    "`best_split_within_span` chose {:?} for {spans:?}, which is not one of the \
-                     admissible {expected:?}",
-                    choice.cut,
-                ));
-            }
-        };
+        if !expected.contains(&choice.cut) {
+            return Err(format!(
+                "`best_split_within_span` chose {:?} for {spans:?}, which is not one of the \
+                 admissible {expected:?}",
+                choice.cut,
+            ));
+        }
         if choice.candidate >= NUM_CANDIDATES {
             return Err(format!(
                 "`best_split_within_span` chose candidate {}, which does not exist",
@@ -1170,26 +1232,13 @@ mod tests {
             ));
         }
 
-        // Nothing scores strictly better, and among equals the earliest cut won
-        // and, within a cut, the earliest candidate.
-        for (other_rank, &cut) in expected.iter().enumerate() {
-            for candidate in 0..NUM_CANDIDATES {
-                let other = oracle_within_span_score(piece, parked, candidate, cut);
-                if other > choice.score {
-                    return Err(format!(
-                        "`best_split_within_span` chose {choice:?} for {spans:?}, but cutting at \
-                         {cut:?} for candidate {candidate} scores {other:?}, which is better",
-                    ));
-                }
-                let tied = choice.score <= other;
-                if tied && (other_rank, candidate) < (rank, choice.candidate) {
-                    return Err(format!(
-                        "`best_split_within_span` chose {choice:?} for {spans:?}, but cutting at \
-                         {cut:?} for candidate {candidate} ties it and comes first",
-                    ));
-                }
-            }
-        }
+        check_tie_break(
+            "best_split_within_span",
+            spans,
+            &expected,
+            choice,
+            |candidate, cut| oracle_within_span_score(piece, parked, candidate, cut),
+        )?;
 
         // The halves partition the piece. They hold one more span between them
         // than the piece did, because one span was divided, but the same
@@ -1332,50 +1381,13 @@ mod tests {
             ));
         }
 
-        for &cut in &expected {
-            for candidate in 0..NUM_CANDIDATES {
-                let other = oracle_score(piece, parked, candidate, cut);
-                if other > choice.score {
-                    return Err(format!(
-                        "`best_split_between_spans` chose {choice:?} for {spans:?}, but cutting at \
-                         {cut} for candidate {candidate} scores {other:?}, which is better",
-                    ));
-                }
-            }
-        }
-
-        // The tie-break; see `best_split_between_spans`.
-        let cut_score = |cut| {
-            (0..NUM_CANDIDATES)
-                .map(|candidate| oracle_score(piece, parked, candidate, cut))
-                .max()
-                .unwrap()
-        };
-        let run_start = expected
-            .iter()
-            .position(|&cut| cut_score(cut) == choice.score)
-            .unwrap();
-        let run_len = expected[run_start..]
-            .iter()
-            .take_while(|&&cut| cut_score(cut) == choice.score)
-            .count();
-        let middle = expected[run_start + (run_len - 1) / 2];
-        if choice.cut != middle {
-            return Err(format!(
-                "`best_split_between_spans` chose {choice:?} for {spans:?}, but the middle of the \
-                 first run of tied cuts, {:?}, is {middle}",
-                &expected[run_start..run_start + run_len],
-            ));
-        }
-        let earliest = (0..NUM_CANDIDATES)
-            .find(|&candidate| oracle_score(piece, parked, candidate, middle) == choice.score)
-            .unwrap();
-        if choice.candidate != earliest {
-            return Err(format!(
-                "`best_split_between_spans` chose {choice:?} for {spans:?}, but candidate \
-                 {earliest} ties it at the same cut and comes first",
-            ));
-        }
+        check_tie_break(
+            "best_split_between_spans",
+            spans,
+            &expected,
+            choice,
+            |candidate, cut| oracle_score(piece, parked, candidate, cut),
+        )?;
 
         // The halves partition the piece: every span in exactly one, order
         // preserved, both non-empty and each strictly smaller than the piece.
@@ -2739,6 +2751,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(best.cut, 2);
+    }
+
+    #[test]
+    fn equal_within_span_cuts_split_in_the_middle() {
+        // Every cut ties.
+        let spans = [span(0, 16)];
+        let uses: Vec<_> = (0..8)
+            .map(|i| SplitUse {
+                point: point(2 * i),
+                weight: 0.0,
+                cut_before_allowed: true,
+            })
+            .collect();
+        let cuts: Vec<_> = within_span_cuts(&spans, &uses).collect();
+        assert_eq!(cuts.len(), 7);
+        let best = best_split_within_span(&spans, &uses, [0u8, 1], |_, _| 0.0).unwrap();
+        assert_eq!(best.cut, cuts[3]);
+        assert_eq!(best.candidate, 0);
     }
 
     #[test]
