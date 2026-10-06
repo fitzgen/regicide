@@ -17,8 +17,8 @@
 //! Build a corpus with `scripts/make-corpus` in the `regalloc2` repository.
 
 use regicide::{
-    Context, EdgeEdit, Edit, Error, Input, InputFunction, InputOptions, InstOrEdit, Move,
-    MoveEliminationLevel, Output, deserialize::DeserializedInput,
+    Context, EdgeEdit, Edit, Error, Input, InputBlock, InputFunction, InputOptions, InstOrEdit,
+    Move, MoveEliminationLevel, Output, deserialize::DeserializedInput,
 };
 use std::{
     env,
@@ -329,6 +329,20 @@ struct Counts {
     remats: usize,
     critical_edges: usize,
     spill_slots: usize,
+
+    /// The share of the edits above that sit in blocks the input marks cold.
+    /// The allocator trades hot moves for cold ones on purpose, so a change can
+    /// improve the code while raising the total.
+    cold: ColdCounts,
+}
+
+/// The edits of [`Counts`] that land in cold blocks.
+#[derive(Default)]
+struct ColdCounts {
+    reg_moves: usize,
+    spills: usize,
+    reloads: usize,
+    remats: usize,
 }
 
 impl Counts {
@@ -338,22 +352,23 @@ impl Counts {
             ..Self::default()
         };
 
-        for (block, _) in input.func.blocks() {
+        for (block, input_block) in input.func.blocks() {
+            let cold = input_block.frequency().is_cold();
             for item in output.block_insts_and_edits(input.func, block) {
                 let InstOrEdit::Edit(edit) = item else {
                     continue;
                 };
                 match edit {
-                    Edit::Move(mv) => counts.count_move(mv),
-                    Edit::Remat(_) => counts.remats += 1,
+                    Edit::Move(mv) => counts.count_move(mv, cold),
+                    Edit::Remat(_) => counts.count_remat(cold),
                     Edit::CriticalEdge(edit) => {
                         counts.critical_edges += 1;
                         // Counted as its own kind too: splitting the edge is
                         // what the client must do, but the move is still a
                         // move once the edge is split.
                         match edit.edit {
-                            EdgeEdit::Move(mv) => counts.count_move(mv),
-                            EdgeEdit::Remat(_) => counts.remats += 1,
+                            EdgeEdit::Move(mv) => counts.count_move(mv, cold),
+                            EdgeEdit::Remat(_) => counts.count_remat(cold),
                         }
                     }
                 }
@@ -363,12 +378,19 @@ impl Counts {
         counts
     }
 
-    fn count_move(&mut self, mv: Move) {
-        match mv {
-            Move::RegReg { .. } => self.reg_moves += 1,
-            Move::Spill { .. } => self.spills += 1,
-            Move::Reload { .. } => self.reloads += 1,
-        }
+    fn count_move(&mut self, mv: Move, cold: bool) {
+        let (all, cold_only) = match mv {
+            Move::RegReg { .. } => (&mut self.reg_moves, &mut self.cold.reg_moves),
+            Move::Spill { .. } => (&mut self.spills, &mut self.cold.spills),
+            Move::Reload { .. } => (&mut self.reloads, &mut self.cold.reloads),
+        };
+        *all += 1;
+        *cold_only += usize::from(cold);
+    }
+
+    fn count_remat(&mut self, cold: bool) {
+        self.remats += 1;
+        self.cold.remats += usize::from(cold);
     }
 
     fn add(&mut self, other: &Self) {
@@ -378,6 +400,10 @@ impl Counts {
         self.remats += other.remats;
         self.critical_edges += other.critical_edges;
         self.spill_slots += other.spill_slots;
+        self.cold.reg_moves += other.cold.reg_moves;
+        self.cold.spills += other.cold.spills;
+        self.cold.reloads += other.cold.reloads;
+        self.cold.remats += other.cold.remats;
     }
 }
 
@@ -393,6 +419,11 @@ impl std::fmt::Display for Counts {
             self.remats,
             self.critical_edges,
             self.spill_slots,
+        )?;
+        write!(
+            f,
+            "\n  of which cold: moves {}  spills {}  reloads {}  remats {}",
+            self.cold.reg_moves, self.cold.spills, self.cold.reloads, self.cold.remats,
         )
     }
 }
