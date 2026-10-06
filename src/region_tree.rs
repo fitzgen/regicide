@@ -604,7 +604,6 @@ where
 
     /// Get the parent of this region, or `None` if this is the top-level
     /// region.
-    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn parent(self, region_tree: &RegionTree<E>) -> Option<Region<E>> {
         region_tree.region_parent[self]
     }

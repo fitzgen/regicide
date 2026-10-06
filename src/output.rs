@@ -723,6 +723,29 @@ impl<'a> Output<'a> {
         with_inner!(self, |inner| inner.counts.coalesce_out_of_fuel.get())
     }
 
+    /// How many cycles of the control-flow graph contain `block`, per the
+    /// region tree: zero for a block in no cycle.
+    ///
+    /// A cycle headed by the entry block is the top-level region itself, so
+    /// its blocks are at depth zero. An irreducible cycle's nesting depends on
+    /// traversal order.
+    ///
+    /// Only present for the `run` example's estimated cycles.
+    #[doc(hidden)]
+    pub fn loop_depth(&self, block: Block) -> usize {
+        with_inner!(self, |inner| {
+            let tree = &inner.region_tree;
+            let block = block.with_repr().expect("no such block in these results");
+            let mut region = block.region(tree);
+            let mut depth = 0;
+            while let Some(parent) = region.parent(tree) {
+                region = parent;
+                depth += 1;
+            }
+            depth
+        })
+    }
+
     /// The slots that make up `group`, in the order of the register group whose
     /// members they stand in for.
     pub fn spill_slot_group_members(

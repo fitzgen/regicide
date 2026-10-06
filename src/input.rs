@@ -758,7 +758,7 @@ impl BlockFrequency {
     }
 
     /// This frequency's value.
-    pub(crate) const fn as_f32(self) -> f32 {
+    pub const fn as_f32(self) -> f32 {
         self.0.as_f32()
     }
 

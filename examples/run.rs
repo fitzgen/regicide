@@ -17,8 +17,8 @@
 //! Build a corpus with `scripts/make-corpus` in the `regalloc2` repository.
 
 use regicide::{
-    Context, EdgeEdit, Edit, Error, Input, InputBlock, InputFunction, InputOptions, InstOrEdit,
-    Move, MoveEliminationLevel, Output, deserialize::DeserializedInput,
+    Allocation, BlockFrequency, Context, EdgeEdit, Edit, Error, Input, InputBlock, InputFunction,
+    InputOptions, InstOrEdit, Move, MoveEliminationLevel, Output, deserialize::DeserializedInput,
 };
 use std::{
     env,
@@ -334,6 +334,8 @@ struct Counts {
     /// The allocator trades hot moves for cold ones on purpose, so a change can
     /// improve the code while raising the total.
     cold: ColdCounts,
+
+    estimated: EstimatedCycles,
 }
 
 /// The edits of [`Counts`] that land in cold blocks.
@@ -353,22 +355,30 @@ impl Counts {
         };
 
         for (block, input_block) in input.func.blocks() {
-            let cold = input_block.frequency().is_cold();
+            let frequency = input_block.frequency();
+            let cold = frequency.is_cold();
+            let weight = EstimatedCycles::block_weight(output.loop_depth(block), frequency);
             for item in output.block_insts_and_edits(input.func, block) {
-                let InstOrEdit::Edit(edit) = item else {
-                    continue;
+                let edit = match item {
+                    InstOrEdit::Inst(inst) => {
+                        counts
+                            .estimated
+                            .count_operands(output.inst_allocs(inst), weight);
+                        continue;
+                    }
+                    InstOrEdit::Edit(edit) => edit,
                 };
                 match edit {
-                    Edit::Move(mv) => counts.count_move(mv, cold),
-                    Edit::Remat(_) => counts.count_remat(cold),
+                    Edit::Move(mv) => counts.count_move(mv, cold, weight),
+                    Edit::Remat(_) => counts.count_remat(cold, weight),
                     Edit::CriticalEdge(edit) => {
                         counts.critical_edges += 1;
                         // Counted as its own kind too: splitting the edge is
                         // what the client must do, but the move is still a
                         // move once the edge is split.
                         match edit.edit {
-                            EdgeEdit::Move(mv) => counts.count_move(mv, cold),
-                            EdgeEdit::Remat(_) => counts.count_remat(cold),
+                            EdgeEdit::Move(mv) => counts.count_move(mv, cold, weight),
+                            EdgeEdit::Remat(_) => counts.count_remat(cold, weight),
                         }
                     }
                 }
@@ -378,19 +388,33 @@ impl Counts {
         counts
     }
 
-    fn count_move(&mut self, mv: Move, cold: bool) {
-        let (all, cold_only) = match mv {
-            Move::RegReg { .. } => (&mut self.reg_moves, &mut self.cold.reg_moves),
-            Move::Spill { .. } => (&mut self.spills, &mut self.cold.spills),
-            Move::Reload { .. } => (&mut self.reloads, &mut self.cold.reloads),
+    fn count_move(&mut self, mv: Move, cold: bool, weight: f64) {
+        let (all, cold_only, estimated) = match mv {
+            Move::RegReg { .. } => (
+                &mut self.reg_moves,
+                &mut self.cold.reg_moves,
+                &mut self.estimated.reg_moves,
+            ),
+            Move::Spill { .. } => (
+                &mut self.spills,
+                &mut self.cold.spills,
+                &mut self.estimated.spills,
+            ),
+            Move::Reload { .. } => (
+                &mut self.reloads,
+                &mut self.cold.reloads,
+                &mut self.estimated.reloads,
+            ),
         };
         *all += 1;
         *cold_only += usize::from(cold);
+        *estimated += weight;
     }
 
-    fn count_remat(&mut self, cold: bool) {
+    fn count_remat(&mut self, cold: bool, weight: f64) {
         self.remats += 1;
         self.cold.remats += usize::from(cold);
+        self.estimated.remats += weight;
     }
 
     fn add(&mut self, other: &Self) {
@@ -404,6 +428,7 @@ impl Counts {
         self.cold.spills += other.cold.spills;
         self.cold.reloads += other.cold.reloads;
         self.cold.remats += other.cold.remats;
+        self.estimated.add(&other.estimated);
     }
 }
 
@@ -424,6 +449,99 @@ impl std::fmt::Display for Counts {
             f,
             "\n  of which cold: moves {}  spills {}  reloads {}  remats {}",
             self.cold.reg_moves, self.cold.spills, self.cold.reloads, self.cold.remats,
+        )?;
+        write!(f, "\n  {}", self.estimated)
+    }
+}
+
+/// A static estimate of how many cycles an allocation's code costs to run.
+///
+/// Each operand and edit costs 1 cycle when it is in a register (register
+/// operands, register-register moves, remats) and 5 when it touches the stack
+/// (stack operands, spills, reloads), times its block's weight: 10x per
+/// enclosing loop, and 0.05x for a cold block up to 10x for a hot one (see
+/// `block_weight`). The fields are those weighted counts.
+///
+/// It ignores the instructions' own costs, latency and parallelism, and uses
+/// loop depth and the input's frequency hints in place of real execution
+/// counts, so it only ranks two allocations of the same inputs.
+#[derive(Default)]
+struct EstimatedCycles {
+    reg_operands: f64,
+    stack_operands: f64,
+    reg_moves: f64,
+    remats: f64,
+    spills: f64,
+    reloads: f64,
+}
+
+impl EstimatedCycles {
+    const STACK_COST: f64 = 5.0;
+    const LOOP_WEIGHT: f64 = 10.0;
+    const COLD_WEIGHT: f64 = 0.05;
+    const HOT_WEIGHT: f64 = 10.0;
+
+    /// How much each operand and edit in a block counts.
+    ///
+    /// The frequency weight is 0.05 at `COLD`, 1 at `NORMAL` and 10 at `HOT`,
+    /// clamped outside those, and log-log linear between them, i.e. a power
+    /// of the frequency on each side of `NORMAL`.
+    fn block_weight(loop_depth: usize, frequency: BlockFrequency) -> f64 {
+        let f = f64::from(frequency.as_f32());
+        let cold = f64::from(BlockFrequency::COLD.as_f32());
+        let hot = f64::from(BlockFrequency::HOT.as_f32());
+        let frequency_weight = if f <= cold {
+            Self::COLD_WEIGHT
+        } else if f >= hot {
+            Self::HOT_WEIGHT
+        } else if f < 1.0 {
+            f.powf(Self::COLD_WEIGHT.ln() / cold.ln())
+        } else {
+            f.powf(Self::HOT_WEIGHT.ln() / hot.ln())
+        };
+        let depth = i32::try_from(loop_depth).unwrap_or(i32::MAX);
+        Self::LOOP_WEIGHT.powi(depth) * frequency_weight
+    }
+
+    fn count_operands(&mut self, allocs: &[Allocation], weight: f64) {
+        for alloc in allocs {
+            match alloc {
+                Allocation::Reg(_) => self.reg_operands += weight,
+                Allocation::Stack(_) => self.stack_operands += weight,
+            }
+        }
+    }
+
+    fn total(&self) -> f64 {
+        self.reg_operands
+            + self.reg_moves
+            + self.remats
+            + Self::STACK_COST * (self.stack_operands + self.spills + self.reloads)
+    }
+
+    fn add(&mut self, other: &Self) {
+        self.reg_operands += other.reg_operands;
+        self.stack_operands += other.stack_operands;
+        self.reg_moves += other.reg_moves;
+        self.remats += other.remats;
+        self.spills += other.spills;
+        self.reloads += other.reloads;
+    }
+}
+
+impl std::fmt::Display for EstimatedCycles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "estimated-cycles {:.1}  reg-operands {:.1}  stack-operands {:.1}  moves {:.1}  \
+             remats {:.1}  spills {:.1}  reloads {:.1}",
+            self.total(),
+            self.reg_operands,
+            self.stack_operands,
+            self.reg_moves,
+            self.remats,
+            self.spills,
+            self.reloads,
         )
     }
 }
