@@ -417,7 +417,17 @@ where
             return f32::INFINITY;
         }
 
-        scratch.extend_from_slice(&self.bundles[whole_start..whole_end]);
+        // Usually one bundle, at most, is in the way of the whole half, which
+        // needs neither the copy nor the sort.
+        let whole = &self.bundles[whole_start..whole_end];
+        let mut all = scratch.iter().chain(whole);
+        let first = all.next().copied();
+        if all.all(|&b| Some(b) == first) {
+            scratch.clear();
+            return first.into_iter().map(weight_of).sum();
+        }
+
+        scratch.extend_from_slice(whole);
         sum_distinct(scratch, weight_of)
     }
 }
