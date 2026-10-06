@@ -226,13 +226,16 @@ on a heavy input: the full trace log runs for minutes and fills the disk.
 
 The guard measures wall time with `Instant`, so a pass on a sub-millisecond
 input is dominated by noise. Sum it over many inputs, or use it on heavy
-inputs, and use `--insts` for the comparisons that decide.
+inputs, and use `--insts` for the comparisons that decide. `--profile`
+repeats the inputs and logs every pass of every repeat, so to average out
+noise on one small input, sum over a `--profile` run and divide by the
+`profiled N pass(es)` count printed in the totals.
 
 ### Which functions: `samply-text`
 
 ```bash
 samply record -s -o $R/profiles/<name>.json.gz -- \
-    $R/bins/run-$sha-prof -q <input-or-set>
+    $R/bins/run-$sha-prof -q --profile 30 <input-or-set>
 samply-text report -t -s 1 -n 80 $R/profiles/<name>.json.gz \
     > $R/profiles/<name>-tree.txt
 samply-text report -n 60 $R/profiles/<name>.json.gz \
@@ -245,9 +248,20 @@ samply-text report -n 60 $R/profiles/<name>.json.gz \
 - Read the **tree** (`-t`) first, because the flat view's self-time splits
   inlined BTree internals into dozens of rows. Add `-c` if you meet
   recursion.
-- A single typical input finishes in milliseconds, which gives too few
-  samples. Profile a whole set, or a directory of symlinks to one input
-  repeated 40 times (`ln -s`). One heavy input is plenty on its own.
+- **`--profile SECONDS`** gets enough samples out of anything. `run` reads
+  and decodes every input up front, then allocates all of them in whole
+  passes until SECONDS have elapsed, printing only on the first pass. A
+  typical input finishes in milliseconds, so without this a single input or
+  a small set gives too few samples. 30 seconds is plenty for `typical/` or
+  one input. A heavy input needs no `--profile`, because one pass already
+  takes seconds to minutes. The flag always finishes the pass it is in, so
+  on a set holding a heavy input it overshoots by up to that input's time.
+- Always pass `-q`, and leave off `--check` and `--insts`. They act only on
+  the first pass, but that pass is still in the profile.
+- Decoding the inputs still shows up, under `main` but outside
+  `regicide::run`: about 1.5 s for sqlite3's 1736 inputs, so ~5% of a
+  30-second profile of a set that size. Read percentages of
+  `regicide::run`, not of the whole process.
 - The generic parameter in a symbol (`<u8>`, `<u16>`, `<u32>`) says which
   entity representation ran (see `run_dispatch` in `src/lib.rs`). The same
   function shows up three times; add them together.
