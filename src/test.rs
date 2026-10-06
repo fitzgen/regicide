@@ -7341,6 +7341,150 @@ impl TestInput {
         input
     }
 
+    /// A value read in two sibling loops, with a block of their parent's
+    /// between them, and after both. The second loop pins a definition to
+    /// `r0` while the value is live, so the value can only have `r1` there.
+    /// The first loop holds nothing else and so could take either register,
+    /// but only `r1` avoids a move on the way into or out of one of the loops.
+    ///
+    /// Region allocation visits the second loop first. The loops share no
+    /// edge, so what the second one chose reaches the first only through the
+    /// block between them.
+    pub fn with_a_value_read_in_two_sibling_loops() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i: usize| Val::try_new(i).unwrap();
+        let inst = |i: usize| Inst::try_new(i).unwrap();
+        let block = |i: usize| Block::try_new(i).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+
+        // `v0` is the carried value; `v1` is the pinned definition.
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: inst(0),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(6),
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let read = || {
+            Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Any,
+                Some(val(0)),
+            )
+        };
+        let jump = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .iter()
+                .map(|&target| BlockCall {
+                    target: block(target),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`: define the carried value.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(val(0)),
+                )],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            jump(&[1]),
+            // `block1` and `block2`: the first loop.
+            InstData::Op {
+                operands: vec![read()],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            jump(&[2]),
+            jump(&[1, 3]),
+            // `block3`: between the loops, in their parent.
+            jump(&[4]),
+            // `block4` and `block5`: the second loop, with the pinned
+            // definition.
+            InstData::Op {
+                operands: vec![
+                    read(),
+                    Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Reg(first_reg),
+                        Some(val(1)),
+                    ),
+                ],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            jump(&[5]),
+            jump(&[4, 6]),
+            // `block6`: the read after both loops.
+            InstData::Branch {
+                operands: vec![read()],
+                clobbers: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2), inst(3)],
+            vec![inst(4)],
+            vec![inst(5)],
+            vec![inst(6), inst(7)],
+            vec![inst(8)],
+            vec![inst(9)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A loop carrying an entry parameter read only after the loop, on a path
     /// where it has been spilled: the register half of its arrival is written
     /// and never read.
@@ -9973,6 +10117,9 @@ pub fn corpus() -> Vec<TestInput> {
         },
         // Drives the early-half reload in `split_into_minimal_or_spill`.
         TestInput::with_an_early_read_under_a_full_late_half(),
+        // Two sibling loops that only agree on a register through hints
+        // relayed by their parent.
+        TestInput::with_a_value_read_in_two_sibling_loops(),
     ]
 }
 

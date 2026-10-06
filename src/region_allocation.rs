@@ -44,6 +44,7 @@ where
         hint_across_regions(
             &context.coalescing.cross_region_affinities,
             &context.region_tree,
+            &mut context.region_allocation.relayed_regs,
             &mut context.live_ranges,
             &mut context.events,
             input,
@@ -80,9 +81,16 @@ where
 ///
 /// Hinting here rather than in coalescing is what lets the hint name a
 /// register: we walk children before parents, so the far side is assigned.
+///
+/// When the far side is not assigned yet, because it is in a parent, we relay
+/// the registers that the parent's *other* neighbors already got. Two sibling
+/// loops that carry the same value through their parent otherwise each pick a
+/// register on their own, and the parent can match at most one of them, which
+/// leaves a move on the way into or out of the other loop.
 fn hint_across_regions<E>(
     cross_region_affinities: &[(LiveSpan<E>, LiveSpan<E>)],
     region_tree: &RegionTree<E>,
+    relayed_regs: &mut Vec<(LiveBundle<E>, Reg<E>)>,
     live_ranges: &mut LiveRanges<E>,
     events: &mut EventsLog<E>,
     input: &Input<'_, impl InputFunction>,
@@ -90,10 +98,30 @@ fn hint_across_regions<E>(
 ) where
     E: EntityRepr,
 {
-    for i in 0..cross_region_affinities.len() {
-        let (a, b) = cross_region_affinities[i];
+    // The registers each unassigned bundle outside this region has affinity
+    // with, sorted by bundle so that we can look them up below.
+    debug_assert!(relayed_regs.is_empty());
+    for &(a, b) in cross_region_affinities {
+        let (Some(bundle_a), Some(bundle_b)) = (a.bundle(live_ranges), b.bundle(live_ranges))
+        else {
+            continue;
+        };
+        for (unassigned, assigned) in [(bundle_a, bundle_b), (bundle_b, bundle_a)] {
+            // Our own bundles are hinted directly below.
+            if unassigned.region(live_ranges) == region {
+                continue;
+            }
+            if let (None, Some(RegAllocation::Reg(reg))) = (
+                unassigned.reg_allocation(live_ranges),
+                assigned.reg_allocation(live_ranges),
+            ) {
+                relayed_regs.push((unassigned, reg));
+            }
+        }
+    }
+    relayed_regs.sort_unstable();
 
-        // Afresh each time: splitting may have moved a span to another bundle.
+    for &(a, b) in cross_region_affinities {
         let (Some(bundle_a), Some(bundle_b)) = (a.bundle(live_ranges), b.bundle(live_ranges))
         else {
             continue;
@@ -110,11 +138,6 @@ fn hint_across_regions<E>(
             continue;
         };
 
-        // Unassigned means the far side is a parent, or a not-yet-allocated
-        // sibling under irreducible control flow.
-        let Some(RegAllocation::Reg(reg)) = theirs.reg_allocation(live_ranges) else {
-            continue;
-        };
         let _ = region_tree;
 
         // `assign_to_preferred` asserts the hint is within this class.
@@ -125,6 +148,26 @@ fn hint_across_regions<E>(
             OperandConstraint::Reuse(_) => unreachable!("constraints are already resolved"),
         };
         let RegClassMembers::Regs(members) = class.members(input.machine) else {
+            continue;
+        };
+
+        // Unassigned means the far side is a parent, or a not-yet-allocated
+        // sibling under irreducible control flow.
+        let Some(RegAllocation::Reg(reg)) = theirs.reg_allocation(live_ranges) else {
+            // Only on the bundle and not its span: the relayed registers are
+            // what another region chose, not what this edge needs, so a piece
+            // split away from here should not inherit them.
+            let first = relayed_regs.partition_point(|&(b, _)| b < theirs);
+            let mut hint = RegSet::new();
+            for &(_, reg) in relayed_regs[first..]
+                .iter()
+                .take_while(|&&(b, _)| b == theirs)
+            {
+                if members.contains(&reg.with_repr32()) {
+                    hint.insert(reg.with_repr32());
+                }
+            }
+            ours.add_hint(live_ranges, events, &hint, Some(theirs));
             continue;
         };
         if !members.contains(&reg.with_repr32()) {
@@ -144,6 +187,8 @@ fn hint_across_regions<E>(
         our_span.add_hint_at(live_ranges, pos, hint);
         ours.add_hint(live_ranges, events, &hint, Some(theirs));
     }
+
+    relayed_regs.clear();
 }
 
 pub struct RegionAllocation<E>
@@ -200,6 +245,10 @@ where
     /// Scratch space holding the registers `assign_to_non_preferred` tries, in
     /// order.
     non_preferred_candidates: Vec<Reg>,
+
+    /// Scratch space for `hint_across_regions`: the registers that bundles
+    /// outside the region being hinted have affinity with, by bundle.
+    relayed_regs: Vec<(LiveBundle<E>, Reg<E>)>,
 }
 
 impl<E> RegionAllocation<E>
@@ -222,6 +271,7 @@ where
             region_clobbers: RegSet::new(),
             region_preferences: RegSet::new(),
             non_preferred_candidates: Vec::new(),
+            relayed_regs: Vec::new(),
         }
     }
 
@@ -241,6 +291,7 @@ where
             region_clobbers,
             region_preferences,
             non_preferred_candidates,
+            relayed_regs,
         } = self;
         assignments.reset();
         region_assignments.reset();
@@ -256,6 +307,7 @@ where
         region_clobbers.reset();
         region_preferences.reset();
         non_preferred_candidates.clear();
+        relayed_regs.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -274,6 +326,7 @@ where
             region_clobbers,
             region_preferences,
             non_preferred_candidates,
+            relayed_regs,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
@@ -289,6 +342,7 @@ where
             && region_clobbers.is_reset()
             && region_preferences.is_reset()
             && non_preferred_candidates.is_empty()
+            && relayed_regs.is_empty()
     }
 
     /// The bundles that must live in memory, and so need a spill slot.
@@ -2777,6 +2831,34 @@ mod tests {
             let output =
                 crate::run(&mut context, input).expect("this function fits on this machine");
             crate::checker::check(input, &output).expect("and the allocation it gets is correct");
+        });
+    }
+
+    /// A value carried through two sibling loops gets the same register in
+    /// both, because their parent relays what the first loop allocated chose
+    /// to the second.
+    #[test]
+    fn sibling_loops_agree_on_a_value_they_both_carry() {
+        use crate::{Edit, InputFunction, InstOrEdit, Move};
+
+        let test_input = crate::test::TestInput::with_a_value_read_in_two_sibling_loops();
+        let mut context = crate::Context::new();
+
+        test_input.with_input(|input| {
+            let output =
+                crate::run(&mut context, input).expect("this function fits on this machine");
+            crate::checker::check(input, &output).expect("and the allocation is correct");
+
+            let reg_moves = input
+                .func
+                .blocks()
+                .flat_map(|(block, _)| output.block_insts_and_edits(input.func, block))
+                .filter(|item| matches!(item, InstOrEdit::Edit(Edit::Move(Move::RegReg { .. }))))
+                .count();
+            assert_eq!(
+                reg_moves, 0,
+                "the carried value should stay in one register"
+            );
         });
     }
 
