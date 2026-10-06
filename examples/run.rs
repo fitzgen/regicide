@@ -105,6 +105,7 @@ fn main() {
         false => None,
     };
     let mut total_insts = 0_u64;
+    let mut total_out_of_fuel = None;
 
     // Held open across every input, because a corpus is large enough that
     // per-line flushing to a pipe dominates the run.
@@ -151,17 +152,18 @@ fn main() {
         let allocated = match result {
             Ok(output) => {
                 let counts = Counts::of(&output, &input);
+                let out_of_fuel = output.coalesce_out_of_fuel();
                 let checked = match args.check {
                     true => regicide::checker::check(&input, &output).map_err(|e| format!("{e:?}")),
                     false => Ok(()),
                 };
-                Ok((counts, checked))
+                Ok((counts, out_of_fuel, checked))
             }
             Err(e) => Err(e),
         };
 
         match allocated {
-            Ok((counts, checked)) => {
+            Ok((counts, out_of_fuel, checked)) => {
                 if !args.quiet {
                     let _ = writeln!(out, "{}", input.func.display_with_context(&mut context));
                 }
@@ -169,6 +171,10 @@ fn main() {
                 if let Some(insts) = insts {
                     let _ = writeln!(out, "  insts-retired {insts}");
                     total_insts += insts;
+                }
+                if let Some(out_of_fuel) = out_of_fuel {
+                    let _ = writeln!(out, "  coalesce-out-of-fuel {out_of_fuel}");
+                    *total_out_of_fuel.get_or_insert(0) += out_of_fuel;
                 }
 
                 if let Err(e) = checked {
@@ -201,6 +207,9 @@ fn main() {
     let _ = writeln!(out, "  {totals}");
     if insts_retired.is_some() {
         let _ = writeln!(out, "  insts-retired {total_insts}");
+    }
+    if let Some(total_out_of_fuel) = total_out_of_fuel {
+        let _ = writeln!(out, "  coalesce-out-of-fuel {total_out_of_fuel}");
     }
     if skipped > 0 {
         let _ = writeln!(out, "  {skipped} skipped");

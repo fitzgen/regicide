@@ -717,6 +717,12 @@ impl<'a> Output<'a> {
         sizes.get(slot.index()).copied()
     }
 
+    /// Coalesces refused for lack of fuel; `None` without `trace-log`.
+    #[doc(hidden)]
+    pub fn coalesce_out_of_fuel(&self) -> Option<u64> {
+        with_inner!(self, |inner| inner.counts.coalesce_out_of_fuel.get())
+    }
+
     /// The slots that make up `group`, in the order of the register group whose
     /// members they stand in for.
     pub fn spill_slot_group_members(

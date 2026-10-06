@@ -42,6 +42,9 @@ pub enum RefusedReason {
 
     /// The two sets hold spans that are live at the same time.
     Overlap,
+
+    /// Ran out of fuel; the sets may be disjoint.
+    OutOfFuel,
 }
 
 /// Which kind of split was attempted.

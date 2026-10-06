@@ -31,6 +31,7 @@ mod dfs;
 mod dominators;
 mod error;
 mod input;
+mod interval_sets;
 mod live_ranges;
 mod liveness;
 mod machine;

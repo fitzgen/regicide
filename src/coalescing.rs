@@ -84,6 +84,7 @@ use crate::events::{Affinity, EventsLog, RefusedReason};
 use crate::input::{
     Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
 };
+use crate::interval_sets::{Fuel, IntervalSet, IntervalSetArena, Refused};
 use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation};
 use crate::liveness::{block_first_inst, block_last_inst};
 use crate::machine::{Machine, RegClassMembers};
@@ -102,28 +103,20 @@ where
     /// the set's representative names it until that bundle exists.
     span_sets: UnionFind<LiveSpan<E>>,
 
-    /// The storage for each set's linked list of spans in ascending program
-    /// order.
+    /// The disjoint-interval set for each set representative.
     ///
-    /// This allows us to put every set within this same `SecondaryMap`
-    /// allocation, avoiding a per-set `Vec` allocation.
-    ///
-    /// TODO: Investigate if avoiding allocations with this linked list is
-    /// actually faster than allocating a `Vec` (or `SmallVec`) per
-    /// bundle. Maybe there is a segment-list-style hybrid solution, where each
-    /// node in the linked list is actually an `EntityRange<LiveSpan<E>>`?
-    next_span: SecondaryMap<LiveSpan<E>, Option<LiveSpan<E>>>,
+    /// Only meaningful for set representatives.
+    interval_set: SecondaryMap<LiveSpan<E>, Option<IntervalSet<LiveSpan<E>>>>,
 
-    /// A map from the set representative to the first link in the set's linked
-    /// list within `self.next_span`.
-    set_head: SecondaryMap<LiveSpan<E>, Option<LiveSpan<E>>>,
+    /// Storage for the disjoint-interval sets.
+    interval_set_arena: IntervalSetArena<LiveSpan<E>, LivePoint<E>>,
 
-    /// A map from the set representative to the last link in the set's linked
-    /// list within `self.next_span`.
-    ///
-    /// This allows us to check whether one set's whole range is outside another
-    /// set's whole range in constant time in `sets_are_disjoint`.
-    set_tail: SecondaryMap<LiveSpan<E>, Option<LiveSpan<E>>>,
+    /// Fuel for checking span overlap within this region.
+    overlap_fuel: RegionFuel,
+
+    /// The number of out-of-fuel merge refusals we have seen thus far, to be
+    /// added to `Counts` later.
+    out_of_fuel: u64,
 
     /// A map from the set representative to where that set may be allocated:
     /// the merge of the constraints of every use of every span in the set.
@@ -163,9 +156,10 @@ where
     pub const fn new() -> Self {
         Coalescing {
             span_sets: UnionFind::new(),
-            next_span: SecondaryMap::new(None),
-            set_head: SecondaryMap::new(None),
-            set_tail: SecondaryMap::new(None),
+            interval_set_arena: IntervalSetArena::new(),
+            interval_set: SecondaryMap::new(None),
+            overlap_fuel: RegionFuel::EMPTY,
+            out_of_fuel: 0,
             set_constraint: SecondaryMap::new(OperandConstraint::Any),
             region_blocks: Vec::new(),
             val_exit_span: SecondaryMap::new(None),
@@ -178,9 +172,10 @@ where
     pub fn reset(&mut self) {
         let Self {
             span_sets,
-            next_span,
-            set_head,
-            set_tail,
+            interval_set_arena: sets,
+            interval_set: set_of_root,
+            overlap_fuel: fuel,
+            out_of_fuel,
             set_constraint,
             region_blocks,
             val_exit_span,
@@ -189,9 +184,10 @@ where
             hint_scratch,
         } = self;
         span_sets.reset();
-        next_span.reset();
-        set_head.reset();
-        set_tail.reset();
+        sets.reset();
+        set_of_root.reset();
+        *fuel = RegionFuel::EMPTY;
+        *out_of_fuel = 0;
         set_constraint.reset();
         val_exit_span.reset();
         val_entry_span.reset();
@@ -203,9 +199,10 @@ where
     pub fn is_reset(&self) -> bool {
         let Self {
             span_sets,
-            next_span,
-            set_head,
-            set_tail,
+            interval_set_arena: sets,
+            interval_set: set_of_root,
+            overlap_fuel: fuel,
+            out_of_fuel,
             set_constraint,
             region_blocks,
             val_exit_span,
@@ -214,9 +211,10 @@ where
             hint_scratch,
         } = self;
         span_sets.is_reset()
-            && next_span.is_reset()
-            && set_head.is_reset()
-            && set_tail.is_reset()
+            && sets.is_reset()
+            && set_of_root.is_reset()
+            && *fuel == RegionFuel::EMPTY
+            && *out_of_fuel == 0
             && set_constraint.is_reset()
             && region_blocks.is_empty()
             && val_exit_span.is_reset()
@@ -232,97 +230,37 @@ where
         input: &Input<'_, impl InputFunction>,
         span: LiveSpan<E>,
     ) {
-        self.next_span[span] = None;
-        self.set_head[span] = Some(span);
-        self.set_tail[span] = Some(span);
+        let set = IntervalSet::singleton(
+            &mut self.interval_set_arena,
+            span,
+            span.start(live_ranges),
+            span.end(live_ranges),
+        );
+        self.interval_set[span] = Some(set);
         self.set_constraint[span] = span.constraint(live_ranges, input);
     }
 
-    /// Do the sets represented by `ra` and `rb` hold no two spans that are live
-    /// at the same time?
-    ///
-    /// Read-only, so a `false` answer leaves both sets exactly as they were.
-    fn sets_are_disjoint(
+    /// Cross-checks `try_union`. `None` if too many pairs.
+    fn overlap_by_brute_force(
         &self,
         live_ranges: &LiveRanges<E>,
-        ra: LiveSpan<E>,
-        rb: LiveSpan<E>,
-    ) -> bool {
-        /// Maximum number of spans to test for disjointness, after which we
-        /// give up and say the span sets overlap.
-        ///
-        /// This is a soft limit on the number of spans a bundle can contain,
-        /// and not a hard limit, because of the fast path for when the whole
-        /// range of one set is fully outside the whole range of the other. This
-        /// is fine, because this limit exists to prevent quadratic behavior
-        /// where we do a linear check for overlap between two span sets for
-        /// every span set; the wholly-non-overlapping fast path is O(1) so it
-        /// still avoids the quadratic behavior.
-        const MAX_MERGE_SPANS: u32 = 200;
-
-        let (head_a, tail_a) = (self.set_head[ra].unwrap(), self.set_tail[ra].unwrap());
-        let (head_b, tail_b) = (self.set_head[rb].unwrap(), self.set_tail[rb].unwrap());
-
-        // Fast path: the whole range of one set lies outside the whole range of
-        // the other.
-        if !LivePoint::spans_overlap(
-            head_a.start(live_ranges),
-            tail_a.end(live_ranges),
-            head_b.start(live_ranges),
-            tail_b.end(live_ranges),
-        ) {
-            return true;
+        a: IntervalSet<LiveSpan<E>>,
+        b: IntervalSet<LiveSpan<E>>,
+    ) -> Option<bool> {
+        const MAX_PAIRS: usize = 4096;
+        let len = |set: IntervalSet<_>| {
+            set.iter(&self.interval_set_arena)
+                .take(MAX_PAIRS + 1)
+                .count()
+        };
+        let (len_a, len_b) = (len(a), len(b));
+        if len_a.saturating_mul(len_b) > MAX_PAIRS {
+            return None;
         }
-
-        // Every span is initially in its own bundle set, so one side being a
-        // lone span is the common, rather than corner, case. In this common
-        // case, the walk to check disjointness is exactly the same walk that
-        // splicing would perform anyway, so there is no quadratic behavior to
-        // guard against here, and bounding the walk would cost the occasional
-        // legal merge.
-        let bounded = head_a != tail_a && head_b != tail_b;
-
-        // Test whether `span_x` and `span_y` overlap, and, if not, advance
-        // `next_span_{x,y}` to the next span to test for overlap.
-        let check_spans_overlap_then_advance =
-            |span_x: LiveSpan<_>,
-             next_span_x: &mut Option<LiveSpan<_>>,
-             span_y: LiveSpan<_>,
-             next_span_y: &mut Option<LiveSpan<_>>| {
-                if span_x.overlaps(live_ranges, span_y) {
-                    return true;
-                }
-
-                // Disjoint and sorted, so whichever span ends first cannot
-                // overlap with any span in the other set either.
-                if span_x.end(live_ranges) <= span_y.start(live_ranges) {
-                    *next_span_x = self.next_span[span_x];
-                } else {
-                    *next_span_y = self.next_span[span_y];
-                }
-                false
-            };
-
-        let (mut x, mut y) = (Some(head_a), Some(head_b));
-        if bounded {
-            let mut steps = 0;
-            while let (Some(sx), Some(sy)) = (x, y) {
-                steps += 1;
-                if steps > MAX_MERGE_SPANS
-                    || check_spans_overlap_then_advance(sx, &mut x, sy, &mut y)
-                {
-                    return false;
-                }
-            }
-        } else {
-            while let (Some(sx), Some(sy)) = (x, y) {
-                if check_spans_overlap_then_advance(sx, &mut x, sy, &mut y) {
-                    return false;
-                }
-            }
-        }
-
-        true
+        Some(a.iter(&self.interval_set_arena).any(|x| {
+            b.iter(&self.interval_set_arena)
+                .any(|y| x.overlaps(live_ranges, y))
+        }))
     }
 
     /// Try to merge `a` and `b` into the same set.
@@ -339,7 +277,7 @@ where
     ) -> bool {
         // NB: this method must not mutate any state until after it is sure that
         // merging will succeed. We cannot leave half-merged state behind after
-        // refusing to merge the sets!
+        // refusing to merge the sets! `try_union` is all-or-nothing.
 
         let a = self.span_sets.find(span_a);
         let b = self.span_sets.find(span_b);
@@ -362,84 +300,47 @@ where
             return false;
         };
 
-        if !self.sets_are_disjoint(live_ranges, a, b) {
-            event!(
-                events,
-                CoalesceRefused {
-                    a: span_a,
-                    b: span_b,
-                    affinity,
-                    reason: RefusedReason::Overlap,
-                }
-            );
-            return false;
-        }
-
-        // Okay, nothing is stopping us from merging these sets. We can now
-        // mutate state and splice the sets' lists together (keeping the result
-        // sorted).
-
-        // Get a sort comparison key for the given span.
-        let compare_key =
-            |span: LiveSpan<E>| (span.start(live_ranges), span.end(live_ranges), span);
-
-        // The head and tail of the resulting spliced list.
-        let (mut head, mut tail) = (None, None);
-
-        // The next link in `a` and `b`'s lists.
-        let (mut next_a, mut next_b) = (self.set_head[a], self.set_head[b]);
-
-        loop {
-            let next = match (next_a, next_b) {
-                // Done splicing.
-                (None, None) => break,
-
-                // Done with `b`, just need to append the tail of `a`.
-                (Some(sx), None) => {
-                    next_a = self.next_span[sx];
-                    sx
-                }
-
-                // Done with `a`, just need to append the tail of `b`.
-                (None, Some(sy)) => {
-                    next_b = self.next_span[sy];
-                    sy
-                }
-
-                // Still draining both `a` and `b`: take from whichever is less
-                // than the other to keep the result sorted.
-                (Some(sx), Some(sy)) => {
-                    if compare_key(sx) <= compare_key(sy) {
-                        next_a = self.next_span[sx];
-                        sx
-                    } else {
-                        next_b = self.next_span[sy];
-                        sy
+        // A reuse tie must merge, so it is never refused for cost.
+        let mandatory = affinity == Affinity::ReuseOperand;
+        let limit = match mandatory {
+            true => u64::MAX,
+            false => self.overlap_fuel.allowance(),
+        };
+        let (set_a, set_b) = (self.interval_set[a].unwrap(), self.interval_set[b].unwrap());
+        let mut fuel = Fuel::new(limit);
+        let result = set_a.try_union(&mut self.interval_set_arena, set_b, &mut fuel);
+        self.overlap_fuel
+            .charge(fuel.spent(), result.is_err() && !mandatory);
+        let set = match result {
+            Ok(set) => set,
+            Err(refused) => {
+                debug_assert!(
+                    refused != Refused::Overlap
+                        || self.overlap_by_brute_force(live_ranges, set_a, set_b) != Some(false),
+                    "refused {a:?} and {b:?} as overlapping, but they are disjoint",
+                );
+                let reason = match refused {
+                    Refused::Overlap => RefusedReason::Overlap,
+                    Refused::OutOfFuel => {
+                        self.out_of_fuel += 1;
+                        RefusedReason::OutOfFuel
                     }
-                }
-            };
-
-            // Nothing will ever access `next_span` entries that aren't part of
-            // a linked list anymore, so we don't need to actually clear them
-            // out here. Leave this here to it is still type checked, just in
-            // case we change things in the future in such a way that we need to
-            // starting clearing entries. (The `if false` should be boiled away
-            // by the compiler's optimizer.)
-            if false {
-                self.next_span[next] = None;
+                };
+                event!(
+                    events,
+                    CoalesceRefused {
+                        a: span_a,
+                        b: span_b,
+                        affinity,
+                        reason,
+                    }
+                );
+                return false;
             }
-
-            // Link `next` into the result list.
-            match tail {
-                None => head = Some(next),
-                Some(t) => self.next_span[t] = Some(next),
-            }
-            tail = Some(next);
-        }
+        };
 
         let root = self.span_sets.union(a, b);
-        self.set_head[root] = head;
-        self.set_tail[root] = tail;
+        self.interval_set[root] = Some(set);
         self.set_constraint[root] = constraint;
         event!(
             events,
@@ -450,6 +351,52 @@ where
             }
         );
         true
+    }
+}
+
+/// One region's overlap-check budget.
+///
+/// Merges bound their own work, so only optional refusals charge `budget`;
+/// `safety_net` charges everything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RegionFuel {
+    budget: u64,
+    safety_net: u64,
+}
+
+impl RegionFuel {
+    const PER_SPAN: u64 = 32;
+    const BASE: u64 = 1024;
+    const FLOOR: u64 = 64;
+    const SAFETY_NET_PER_SPAN: u64 = 64;
+
+    const EMPTY: Self = RegionFuel {
+        budget: 0,
+        safety_net: 0,
+    };
+
+    fn new(num_spans: usize) -> Self {
+        let n = num_spans as u64;
+        let log_n = u64::from(n.max(1).ilog2()) + 1;
+        RegionFuel {
+            budget: Self::PER_SPAN * n + Self::BASE,
+            safety_net: Self::SAFETY_NET_PER_SPAN * n * log_n * log_n + Self::BASE,
+        }
+    }
+
+    fn allowance(&self) -> u64 {
+        self.budget.max(Self::FLOOR).min(self.safety_net)
+    }
+
+    fn charge(&mut self, spent: u64, wasted: bool) {
+        debug_assert!(
+            !wasted || spent < self.safety_net,
+            "the coalescing safety net ran out, which no realistic input should do",
+        );
+        self.safety_net = self.safety_net.saturating_sub(spent);
+        if wasted {
+            self.budget = self.budget.saturating_sub(spent);
+        }
     }
 }
 
@@ -476,6 +423,8 @@ where
             region,
         )?;
     }
+
+    context.counts.coalesce_out_of_fuel += core::mem::take(&mut context.coalescing.out_of_fuel);
 
     // Then build our bundles from the merged span sets.
     build_bundles(
@@ -537,11 +486,14 @@ where
         region: Region<E>,
     ) -> IResult<()> {
         // Seed each span into its own set.
+        let mut num_spans = 0;
         for block in region.blocks(&region_tree) {
             for span in block.spans(live_ranges) {
                 self.seed(live_ranges, input, span);
+                num_spans += 1;
             }
         }
+        self.overlap_fuel = RegionFuel::new(num_spans);
 
         // Temporarily take `region_blocks` out to avoid borrow issues.
         let mut region_blocks = core::mem::take(&mut self.region_blocks);
@@ -565,6 +517,7 @@ where
         region_blocks.clear();
         debug_assert!(self.region_blocks.is_empty());
         self.region_blocks = region_blocks;
+        self.overlap_fuel = RegionFuel::EMPTY;
 
         Ok(())
     }
@@ -1003,11 +956,9 @@ where
                     continue;
                 }
 
-                let head = coalescing.set_head[root];
+                let set = coalescing.interval_set[root].unwrap();
                 let constraint = coalescing.set_constraint[root];
-
-                let next_span = &coalescing.next_span;
-                let members = core::iter::successors(head, |&s| next_span[s]);
+                let members = set.iter(&coalescing.interval_set_arena);
 
                 let bundle = live_ranges.push_bundle(input, output, region, constraint, members)?;
                 event!(
@@ -2256,6 +2207,207 @@ mod tests {
             assert_eq!(num_spans, bundle.spans(live_ranges).len());
             assert_eq!(num_vals, bundle.num_vals(live_ranges));
         }
+    }
+
+    /// However many arms, each value's loop spans share one bundle.
+    #[test]
+    fn values_live_through_a_wide_switch_are_each_one_bundle_in_the_loop() {
+        let (arms, vals) = (1_000, 20);
+        let input = TestInput::with_a_loop_around_a_wide_switch(arms, vals);
+        let context = coalesce_input(&input).unwrap();
+        let live_ranges = &context.context32.live_ranges;
+        let header = Block::try_new(1).unwrap();
+        let loop_region = header.region(&context.context32.region_tree);
+
+        for v in 0..vals {
+            let val = Val::try_new(v).unwrap();
+            let mut bundles: Vec<LiveBundle> = live_ranges
+                .spans()
+                .filter(|span| span.val(live_ranges) == val)
+                .map(|span| span.bundle(live_ranges).unwrap())
+                .filter(|bundle| bundle.region(live_ranges) == loop_region)
+                .collect();
+            bundles.dedup();
+            assert_eq!(
+                bundles.len(),
+                1,
+                "{val:?} is in {} bundles inside the loop",
+                bundles.len(),
+            );
+            // Header, arms, latch.
+            assert_eq!(bundles[0].spans(live_ranges).len(), 2 * arms + 2);
+        }
+
+        #[cfg(feature = "visualizer")]
+        for (_, event) in context.context32.events.iter() {
+            if let crate::events::Event::CoalesceRefused { reason, .. } = event {
+                assert_ne!(*reason, RefusedReason::Overlap);
+                assert_ne!(*reason, RefusedReason::OutOfFuel);
+            }
+        }
+    }
+
+    /// `n` one-point intervals at `first, first + 2, ..`, as one set.
+    fn every_other_point(
+        sets: &mut IntervalSetArena<LiveSpan, u32>,
+        spans: core::ops::Range<usize>,
+        first: u32,
+    ) -> IntervalSet<LiveSpan> {
+        use crate::interval_sets::Fuel;
+        let mut set: Option<IntervalSet<LiveSpan>> = None;
+        for (i, k) in spans.enumerate() {
+            let start = first + 2 * u32::try_from(i).unwrap();
+            let one = IntervalSet::singleton(sets, LiveSpan::try_new(k).unwrap(), start, start + 1);
+            set = Some(match set {
+                None => one,
+                Some(set) => set.try_union(sets, one, &mut Fuel::new(u64::MAX)).unwrap(),
+            });
+        }
+        set.unwrap()
+    }
+
+    /// Refusing a set that sits in one gap of a large set, but for its last
+    /// span, costs `O(log n)` however often it is repeated.
+    #[test]
+    fn refusing_a_set_inside_one_gap_of_a_large_set_is_cheap() {
+        use crate::interval_sets::{Fuel, Refused};
+
+        let n = 4_096;
+        let mut sets = IntervalSetArena::<LiveSpan, u32>::new();
+        let large = every_other_point(&mut sets, 0..n, 10);
+        let end = 10 + 2 * u32::try_from(n).unwrap();
+        let small = IntervalSet::singleton(&mut sets, LiveSpan::try_new(n).unwrap(), 0, 1);
+        let last = IntervalSet::singleton(
+            &mut sets,
+            LiveSpan::try_new(n + 1).unwrap(),
+            end - 3,
+            end + 2,
+        );
+        let small = small
+            .try_union(&mut sets, last, &mut Fuel::new(u64::MAX))
+            .unwrap();
+
+        let cheap = 2 * u64::from(n.ilog2()) + 8;
+        assert!(cheap < RegionFuel::FLOOR);
+        let mut fuel = RegionFuel::new(n + 2);
+        for _ in 0..n {
+            let mut check = Fuel::new(fuel.allowance());
+            assert_eq!(
+                large.try_union(&mut sets, small, &mut check),
+                Err(Refused::Overlap)
+            );
+            assert!(check.spent() <= cheap, "spent {}", check.spent());
+            fuel.charge(check.spent(), true);
+        }
+    }
+
+    /// Two finely interleaved sets cost far more than `FLOOR` to refuse, so
+    /// once a region's budget is gone, repeated refusals stop at `FLOOR`.
+    #[test]
+    fn repeated_costly_refusals_are_capped_at_the_floor() {
+        use crate::interval_sets::{Fuel, Refused};
+
+        let n = 4_096;
+        let mut sets = IntervalSetArena::<LiveSpan, u32>::new();
+        let a = every_other_point(&mut sets, 0..n, 0);
+        let b = every_other_point(&mut sets, n..2 * n, 1);
+        let end = 2 * u32::try_from(n).unwrap();
+        let one =
+            IntervalSet::singleton(&mut sets, LiveSpan::try_new(2 * n).unwrap(), end, end + 2);
+        let a = a
+            .try_union(&mut sets, one, &mut Fuel::new(u64::MAX))
+            .unwrap();
+        let one = IntervalSet::singleton(
+            &mut sets,
+            LiveSpan::try_new(2 * n + 1).unwrap(),
+            end + 1,
+            end + 3,
+        );
+        let b = b
+            .try_union(&mut sets, one, &mut Fuel::new(u64::MAX))
+            .unwrap();
+
+        let mut unlimited = Fuel::new(u64::MAX);
+        assert_eq!(
+            a.try_union(&mut sets, b, &mut unlimited),
+            Err(Refused::Overlap)
+        );
+        assert!(unlimited.spent() > 2 * u64::try_from(n).unwrap());
+
+        let mut fuel = RegionFuel::new(2 * n + 2);
+        let mut out_of_fuel = 0;
+        for _ in 0..2 * n {
+            let allowance = fuel.allowance();
+            let mut check = Fuel::new(allowance);
+            assert!(a.try_union(&mut sets, b, &mut check).is_err());
+            fuel.charge(check.spent(), true);
+            if allowance == RegionFuel::FLOOR {
+                assert_eq!(check.spent(), RegionFuel::FLOOR);
+                out_of_fuel += 1;
+            }
+        }
+        assert_eq!(fuel.budget, 0);
+        assert!(out_of_fuel > n, "only {out_of_fuel} checks were capped");
+    }
+
+    /// A reuse tie merges even when the region has no fuel left.
+    #[test]
+    fn a_reuse_tie_is_merged_with_no_fuel_left() {
+        use crate::interval_sets::{Fuel, Refused};
+
+        let input = TestInput::with_reuse_of_a_surviving_value();
+        let (survivor, defined) = input.with_input(|input| {
+            let inst = input.func.inst(Inst::try_new(1).unwrap());
+            (
+                inst.operand(0).val().unwrap(),
+                inst.operand(1).val().unwrap(),
+            )
+        });
+
+        let mut context = Context::new();
+        input.with_input(|input| {
+            let inner = &mut context.context32;
+            analyze(inner, input).unwrap();
+            let ContextInner {
+                coalescing,
+                live_ranges,
+                events,
+                ..
+            } = inner;
+            for span in live_ranges.spans() {
+                coalescing.seed(live_ranges, input, span);
+            }
+
+            let mut pieces: Vec<LiveSpan> = live_ranges
+                .spans()
+                .filter(|&span| span.val(live_ranges) == survivor)
+                .collect();
+            pieces.sort_by_key(|span| (span.start(live_ranges), span.end(live_ranges)));
+            let (before, overwritten) = (pieces[0], pieces[1]);
+            let def = only_span(live_ranges, 0, defined.index());
+
+            // Surround `overwritten` with `def`'s set, so the tie misses the
+            // check's constant-time path.
+            coalescing.overlap_fuel = RegionFuel::new(live_ranges.len_spans());
+            let mut merge = |coalescing: &mut Coalescing<u32>, affinity, a, b| {
+                coalescing.try_merge(input.machine, live_ranges, events, affinity, a, b)
+            };
+            assert!(merge(coalescing, Affinity::CrossEdge, before, def));
+
+            // Without fuel, the check cannot decide.
+            let set = |coalescing: &mut Coalescing<u32>, span| {
+                let root = coalescing.span_sets.find(span);
+                coalescing.interval_set[root].unwrap()
+            };
+            let (a, b) = (set(coalescing, overwritten), set(coalescing, def));
+            assert_eq!(
+                a.try_union(&mut coalescing.interval_set_arena, b, &mut Fuel::new(0)),
+                Err(Refused::OutOfFuel),
+            );
+
+            coalescing.overlap_fuel = RegionFuel::EMPTY;
+            assert!(merge(coalescing, Affinity::ReuseOperand, overwritten, def));
+        });
     }
 
     /// The whole log must survive `serde_json`, which is what catches a

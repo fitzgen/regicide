@@ -8004,6 +8004,135 @@ impl TestInput {
         input
     }
 
+    /// A loop around a switch with `arms` two-block arms, and `vals` values
+    /// live through all of it. Hot arms make each arm's merge join two
+    /// multi-span sets, one surrounding the other.
+    pub fn with_a_loop_around_a_wide_switch(arms: usize, vals: usize) -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let block = |i| Block::try_new(i).unwrap();
+        let header = block(1);
+        let latch = block(2 + 2 * arms);
+        let exit = block(3 + 2 * arms);
+        let jump = |targets: Vec<Block>| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .into_iter()
+                .map(|target| BlockCall {
+                    target,
+                    args: Vec::new(),
+                })
+                .collect(),
+        };
+
+        func.values = PrimaryMap::new();
+        func.insts = PrimaryMap::new();
+        let mut blocks: Vec<Vec<Inst>> = vec![];
+        let push = |func: &mut TestFunction, output: &mut OutputInner<u32>, inst_data| {
+            func.insts.push(output, inst_data).unwrap()
+        };
+
+        let mut entry = vec![];
+        for v in 0..vals {
+            let inst = Inst::try_new(v).unwrap();
+            let val = Val::try_new(v).unwrap();
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult { inst, i: 0 },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+            entry.push(push(
+                &mut func,
+                &mut output,
+                InstData::Op {
+                    operands: vec![Operand::new(
+                        Position::Late,
+                        DefUse::Def,
+                        OperandConstraint::Any,
+                        Some(val),
+                    )],
+                    clobbers: vec![],
+                    side_effects: true,
+                },
+            ));
+        }
+        entry.push(push(&mut func, &mut output, jump(vec![header])));
+        blocks.push(entry);
+
+        blocks.push(vec![push(
+            &mut func,
+            &mut output,
+            jump((0..arms).map(|i| block(2 + 2 * i)).collect()),
+        )]);
+        for i in 0..arms {
+            let bottom = block(3 + 2 * i);
+            blocks.push(vec![push(&mut func, &mut output, jump(vec![bottom]))]);
+            blocks.push(vec![push(&mut func, &mut output, jump(vec![latch]))]);
+        }
+        blocks.push(vec![push(&mut func, &mut output, jump(vec![header, exit]))]);
+        blocks.push(vec![
+            push(
+                &mut func,
+                &mut output,
+                InstData::Op {
+                    operands: (0..vals)
+                        .map(|v| {
+                            Operand::new(
+                                Position::Early,
+                                DefUse::Use,
+                                OperandConstraint::Any,
+                                Some(Val::try_new(v).unwrap()),
+                            )
+                        })
+                        .collect(),
+                    clobbers: vec![],
+                    side_effects: true,
+                },
+            ),
+            push(
+                &mut func,
+                &mut output,
+                InstData::Op {
+                    operands: vec![],
+                    clobbers: vec![],
+                    side_effects: true,
+                },
+            ),
+        ]);
+
+        func.blocks = PrimaryMap::new();
+        for insts in blocks {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        for i in 2..=2 + 2 * arms {
+            input.set_block_frequency(block(i), BlockFrequency::HOT);
+        }
+        input.fixup();
+        input
+    }
+
     /// An input whose entry block branches back to itself, passing a value of
     /// its own for its own parameter: the one shape where the checker's entry
     /// state is met against something rather than believed. `block0` reads its

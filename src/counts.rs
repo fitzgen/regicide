@@ -48,6 +48,14 @@ impl Count {
         *self += 1u64;
     }
 
+    /// `None` without `trace-log`.
+    pub fn get(&self) -> Option<u64> {
+        #[cfg(not(feature = "trace-log"))]
+        return None;
+        #[cfg(feature = "trace-log")]
+        Some(self.count)
+    }
+
     pub fn is_reset(&self) -> bool {
         #[cfg(not(feature = "trace-log"))]
         return true;
@@ -68,6 +76,7 @@ pub struct Counts {
     pub eager_splits: Count,
     pub overwrite_splits: Count,
     pub bundles: Count,
+    pub coalesce_out_of_fuel: Count,
     pub queue_pops: Count,
     pub preferred_assignments: Count,
     pub non_preferred_assignments: Count,
@@ -114,6 +123,7 @@ impl Counts {
             eager_splits: Count::new(),
             overwrite_splits: Count::new(),
             bundles: Count::new(),
+            coalesce_out_of_fuel: Count::new(),
             queue_pops: Count::new(),
             preferred_assignments: Count::new(),
             non_preferred_assignments: Count::new(),
@@ -164,6 +174,7 @@ impl Counts {
             eager_splits,
             overwrite_splits,
             bundles,
+            coalesce_out_of_fuel,
             queue_pops,
             preferred_assignments,
             non_preferred_assignments,
@@ -206,6 +217,7 @@ impl Counts {
             && eager_splits.is_reset()
             && overwrite_splits.is_reset()
             && bundles.is_reset()
+            && coalesce_out_of_fuel.is_reset()
             && queue_pops.is_reset()
             && preferred_assignments.is_reset()
             && non_preferred_assignments.is_reset()
