@@ -223,14 +223,17 @@ where
     /// The spans being split.
     spans: Vec<QuerySpan<E>>,
 
-    /// Where each candidate's entries start in `entries`, by candidate index,
-    /// once that candidate has been asked about.
+    /// Where each candidate's row starts in `prefix`, by candidate index, once
+    /// that candidate has been asked about.
     rows: Vec<Option<usize>>,
 
-    /// For span `i` of a candidate whose entries start at `row`, entry
-    /// `row + i` is the range of `bundles` in its way, or `None` when a
-    /// reservation is or might be.
-    entries: Vec<Option<Range<usize>>>,
+    /// A row of `spans.len() + 1` entries per candidate asked about. Entry `i`
+    /// of a row is where span `i`'s conflicts start in `bundles`, and how many
+    /// of the spans before `i` count as reserved.
+    ///
+    /// A row's spans' conflicts are contiguous and in span order, so any run of
+    /// spans' conflicts is one slice of `bundles`.
+    prefix: Vec<(usize, usize)>,
 
     bundles: Vec<LiveBundle<E>>,
 }
@@ -243,7 +246,7 @@ where
         Self {
             spans: Vec::new(),
             rows: Vec::new(),
-            entries: Vec::new(),
+            prefix: Vec::new(),
             bundles: Vec::new(),
         }
     }
@@ -257,76 +260,116 @@ where
     pub fn clear(&mut self) {
         self.spans.clear();
         self.rows.clear();
-        self.entries.clear();
+        self.prefix.clear();
         self.bundles.clear();
     }
 
     pub fn is_empty(&self) -> bool {
         self.spans.is_empty()
             && self.rows.is_empty()
-            && self.entries.is_empty()
+            && self.prefix.is_empty()
             && self.bundles.is_empty()
     }
 
-    /// The bundles in the way of span `i` in `units`, appended to `bundles`,
-    /// or `None` when a reservation is in its way.
+    /// Push the bundles in the way of span `i` in `units` onto `bundles`, and
+    /// an entry for it onto `prefix` holding how many there are and whether a
+    /// reservation is in its way.
     fn query(
         &mut self,
         assignments: &Assignments<E>,
         units: impl Iterator<Item = Range<RegUnit>>,
         i: usize,
-    ) -> Option<Range<usize>> {
+    ) -> bool {
         let start = self.bundles.len();
-        if assignments.push_interfering(units, iter::once(self.spans[i].clone()), &mut self.bundles)
-        {
-            Some(start..self.bundles.len())
-        } else {
+        let clear = assignments.push_interfering(
+            units,
+            iter::once(self.spans[i].clone()),
+            &mut self.bundles,
+        );
+        if !clear {
             self.bundles.truncate(start);
-            None
         }
+        self.prefix
+            .push((self.bundles.len() - start, usize::from(!clear)));
+        clear
     }
 
-    /// Where the `candidate`th candidate's entries start, querying its spans in
+    /// The `candidate`th candidate's row of `prefix`, querying its spans in
     /// `units` the first time it is asked about.
+    #[inline]
     fn row(
         &mut self,
         assignments: &Assignments<E>,
         candidate: usize,
         units: impl Iterator<Item = Range<RegUnit>> + Clone,
+    ) -> Range<usize> {
+        let row = match self.rows.get(candidate) {
+            Some(&Some(row)) => row,
+            _ => self.fill_row(assignments, candidate, units),
+        };
+        row..row + self.spans.len() + 1
+    }
+
+    /// Query the `candidate`th candidate's spans in `units` into a new row of
+    /// `prefix`, and return where it starts.
+    #[cold]
+    #[inline(never)]
+    fn fill_row(
+        &mut self,
+        assignments: &Assignments<E>,
+        candidate: usize,
+        units: impl Iterator<Item = Range<RegUnit>> + Clone,
     ) -> usize {
+        let n = self.spans.len();
         if self.rows.len() <= candidate {
             self.rows.resize(candidate + 1, None);
         }
-        if let Some(row) = self.rows[candidate] {
-            return row;
-        }
-        let row = self.entries.len();
+        let row = self.prefix.len();
         self.rows[candidate] = Some(row);
 
-        // A half holds every span on its side of the cut, so one holding a
-        // span between the first and last reserved ones holds one of those
-        // too, and is infinite whatever else is in its way. Those spans need
-        // no query.
-        let n = self.spans.len();
-        let mut first_reserved = n;
+        // Each entry first holds a span's count of conflicts and whether it is
+        // reserved, and becomes running totals at the end.
+        //
+        // A half holds every span on its side of the cut, so one holding a span
+        // between the first and last reserved ones holds one of those too, and
+        // is infinite whatever else is in its way. Those spans are not queried,
+        // and count as reserved.
+        let mut first = n;
         for i in 0..n {
-            let entry = self.query(assignments, units.clone(), i);
-            let reserved = entry.is_none();
-            self.entries.push(entry);
-            if reserved {
-                first_reserved = i;
+            if !self.query(assignments, units.clone(), i) {
+                first = i;
                 break;
             }
         }
-        self.entries.resize(row + n, None);
-        for i in (first_reserved + 1..n).rev() {
-            let entry = self.query(assignments, units.clone(), i);
-            let reserved = entry.is_none();
-            self.entries[row + i] = entry;
-            if reserved {
-                break;
+        if first < n {
+            let tail = self.prefix.len();
+            let back = self.bundles.len();
+            for i in (first + 1..n).rev() {
+                if !self.query(assignments, units.clone(), i) {
+                    break;
+                }
             }
+            // That walk went backwards; put it in span order. Each span's own
+            // conflicts may stay reversed.
+            self.prefix[tail..].reverse();
+            self.bundles[back..].reverse();
+            let skipped = row + n - self.prefix.len();
+            self.prefix
+                .splice(tail..tail, iter::repeat_n((0, 1), skipped));
         }
+        debug_assert_eq!(self.prefix.len(), row + n);
+
+        let (mut start, mut reserved) = (self.bundles.len(), 0);
+        for (len, _) in &self.prefix[row..] {
+            start -= len;
+        }
+        for entry in &mut self.prefix[row..] {
+            let (len, is_reserved) = *entry;
+            *entry = (start, reserved);
+            start += len;
+            reserved += is_reserved;
+        }
+        self.prefix.push((start, reserved));
         row
     }
 
@@ -347,29 +390,34 @@ where
         debug_assert!(scratch.is_empty());
 
         let row = self.row(assignments, candidate, units.clone());
-        for (i, range) in half.iter_indexed() {
-            let span = &self.spans[i];
-            let clear = if range == span.range {
-                self.entries[row + i]
-                    .clone()
-                    .map(|r| scratch.extend_from_slice(&self.bundles[r]))
-                    .is_some()
+        let prefix = &self.prefix[row];
+        let whole = half.whole_indices();
+        let (whole_start, whole_reserved_before) = prefix[whole.start];
+        let (whole_end, whole_reserved_after) = prefix[whole.end];
+        let (index, range) = half.clipped();
+
+        let clear = whole_reserved_before == whole_reserved_after
+            && if half.is_intact() {
+                let (start, reserved_before) = prefix[index];
+                let (end, reserved_after) = prefix[index + 1];
+                scratch.extend_from_slice(&self.bundles[start..end]);
+                reserved_before == reserved_after
             } else {
                 assignments.push_interfering(
-                    units.clone(),
+                    units,
                     iter::once(QuerySpan {
-                        porous_to: span.porous_to,
+                        porous_to: self.spans[index].porous_to,
                         range,
                     }),
                     scratch,
                 )
             };
-            if !clear {
-                scratch.clear();
-                return f32::INFINITY;
-            }
+        if !clear {
+            scratch.clear();
+            return f32::INFINITY;
         }
 
+        scratch.extend_from_slice(&self.bundles[whole_start..whole_end]);
         sum_distinct(scratch, weight_of)
     }
 }

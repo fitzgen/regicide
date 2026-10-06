@@ -5,6 +5,8 @@ use crate::{
     input::Position,
     live_ranges::{LivePoint, touch_mid_inst},
 };
+#[cfg(test)]
+use core::iter;
 use core::{cmp::Ordering, ops::Range};
 
 /// One use of a bundle being split.
@@ -143,7 +145,7 @@ where
     WithinSpan(WithinSpanCut<E>),
 }
 
-/// One half of a within-span split.
+/// One half of a split.
 ///
 /// This exists so that the splitting kernel can hand its caller both halves
 /// without allocating or materializing the split span.
@@ -152,19 +154,20 @@ pub struct HalfSpan<'a, E>
 where
     E: EntityRepr,
 {
-    /// The spans on this side of the cut that the cut did not touch.
-    whole: &'a [Range<LivePoint<E>>],
+    /// The spans the half was carved from.
+    spans: &'a [Range<LivePoint<E>>],
 
-    /// The piece of the divided span that fell on this side.
+    /// Where the spans on this side that the cut did not touch sit in `spans`.
     ///
     /// Held unpacked rather than as a `Range`, which is not `Copy`.
+    whole_start: usize,
+    whole_end: usize,
+
+    /// The piece of the divided span that fell on this side.
     clipped_start: LivePoint<E>,
     clipped_end: LivePoint<E>,
 
-    /// Whether `clipped` comes before `whole` (suffix) or after it (prefix).
-    clipped_first: bool,
-
-    /// Where the divided span sat in the slice this half was carved from.
+    /// Where the divided span sits in `spans`.
     clipped_index: usize,
 }
 
@@ -183,10 +186,11 @@ where
     /// The half before a cut at `at` inside `spans[index]`.
     pub(crate) fn prefix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
         HalfSpan {
-            whole: &spans[..index],
+            spans,
+            whole_start: 0,
+            whole_end: index,
             clipped_start: spans[index].start,
             clipped_end: at,
-            clipped_first: false,
             clipped_index: index,
         }
     }
@@ -194,55 +198,53 @@ where
     /// The half after a cut at `at` inside `spans[index]`.
     pub(crate) fn suffix(spans: &'a [Range<LivePoint<E>>], index: usize, at: LivePoint<E>) -> Self {
         HalfSpan {
-            whole: &spans[index + 1..],
+            spans,
+            whole_start: index + 1,
+            whole_end: spans.len(),
             clipped_start: at,
             clipped_end: spans[index].end,
-            clipped_first: true,
             clipped_index: index,
         }
     }
 
-    /// How many spans this half holds.
-    ///
-    /// Never zero.
-    pub fn len(&self) -> usize {
-        self.whole.len() + 1
+    /// Where this half's undivided spans sit in the spans it was carved from.
+    pub fn whole_indices(&self) -> Range<usize> {
+        self.whole_start..self.whole_end
     }
 
-    /// Get this half's `i`th span, in ascending program order.
-    pub fn get(&self, i: usize) -> Range<LivePoint<E>> {
-        debug_assert!(i < self.len());
-        let clipped = self.clipped_start..self.clipped_end;
-        match (self.clipped_first, i) {
-            (true, 0) => clipped,
-            (true, i) => self.whole[i - 1].clone(),
-            (false, i) if i < self.whole.len() => self.whole[i].clone(),
-            (false, _) => clipped,
-        }
+    /// The piece of the divided span on this side, and where the divided span
+    /// sits in the spans the half was carved from.
+    pub fn clipped(&self) -> (usize, Range<LivePoint<E>>) {
+        (self.clipped_index, self.clipped_start..self.clipped_end)
+    }
+
+    /// Did the cut leave the divided span's piece on this side whole?
+    pub fn is_intact(&self) -> bool {
+        self.spans[self.clipped_index] == (self.clipped_start..self.clipped_end)
+    }
+
+    /// This half's spans, each paired with where it sits in the spans the half
+    /// was carved from, in ascending program order.
+    #[cfg(test)]
+    pub fn iter_indexed(&self) -> impl Iterator<Item = (usize, Range<LivePoint<E>>)> + '_ {
+        let clipped = iter::once(self.clipped());
+        let whole = self.whole_indices().map(|i| (i, self.spans[i].clone()));
+        let (before, after) = if self.clipped_index < self.whole_start {
+            (Some(clipped), None)
+        } else {
+            (None, Some(clipped))
+        };
+        before
+            .into_iter()
+            .flatten()
+            .chain(whole)
+            .chain(after.into_iter().flatten())
     }
 
     /// This half's spans, in ascending program order.
     #[cfg(test)]
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = Range<LivePoint<E>>> + Clone + '_ {
-        (0..self.len()).map(|i| self.get(i))
-    }
-
-    /// Where this half's `i`th span sat in the slice the half was carved from.
-    fn original_index(&self, i: usize) -> usize {
-        debug_assert!(i < self.len());
-        if self.clipped_first {
-            self.clipped_index + i
-        } else {
-            i
-        }
-    }
-
-    /// This half's spans, each paired with its index in the slice the half was
-    /// carved from, in ascending program order.
-    pub fn iter_indexed(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (usize, Range<LivePoint<E>>)> + Clone + '_ {
-        (0..self.len()).map(|i| (self.original_index(i), self.get(i)))
+    pub fn iter(&self) -> impl Iterator<Item = Range<LivePoint<E>>> + '_ {
+        self.iter_indexed().map(|(_, range)| range)
     }
 }
 
@@ -1171,11 +1173,10 @@ mod tests {
             ];
             for (which, half, want) in halves {
                 let got: Vec<_> = half.iter().collect();
-                if got != want || half.len() != want.len() {
+                if got != want {
                     return Err(format!(
-                        "the {which} `HalfSpan` of {cut:?} over {spans:?} is {got:?} with length \
-                         {}, but should be {want:?}",
-                        half.len(),
+                        "the {which} `HalfSpan` of {cut:?} over {spans:?} is {got:?}, but should \
+                         be {want:?}",
                     ));
                 }
             }
@@ -2742,7 +2743,8 @@ mod tests {
         // Cut 4 splits the tied cuts into runs `1..=3` and `5`.
         let spans: Vec<_> = (0..6).map(|i| span(2 * i, 2 * i + 2)).collect();
         let best = best_split_between_spans(&spans, &[], [0u8], |_, half| {
-            let is_prefix = half.get(0).start == point(0);
+            let half: Vec<_> = half.iter().collect();
+            let is_prefix = half[0].start == point(0);
             if is_prefix && half.len() == 4 {
                 1.0
             } else {
