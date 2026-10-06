@@ -1468,6 +1468,35 @@ fn order_non_preferred_candidates(
     });
 }
 
+/// The registers that something clobbers while `bundle` is live.
+///
+/// None of these can hold the bundle whole, so a hint towards one of them is
+/// one the bundle cannot honor.
+fn regs_clobbered_across<E>(
+    input: &Input<'_, impl InputFunction>,
+    live_ranges: &LiveRanges<E>,
+    bundle: LiveBundle<E>,
+) -> RegSet
+where
+    E: EntityRepr,
+{
+    let mut clobbered = RegSet::new();
+    for span in bundle.spans(live_ranges) {
+        let (start, end) = (span.start(live_ranges), span.end(live_ranges));
+        for r in span
+            .block(input.func, live_ranges)
+            .reservations(live_ranges)
+        {
+            if let (None, RegAllocation::Reg(reg)) = (r.val(live_ranges), r.reg(live_ranges))
+                && LivePoint::spans_overlap(start, end, r.start(live_ranges), r.end(live_ranges))
+            {
+                clobbered.insert(reg.with_repr32());
+            }
+        }
+    }
+    clobbered
+}
+
 /// Where `bundle`'s first span begins.
 fn first_span_start<E>(live_ranges: &LiveRanges<E>, bundle: LiveBundle<E>) -> LivePoint<E>
 where
@@ -1491,7 +1520,12 @@ where
     Priority::new(
         bundle.is_minimal(live_ranges),
         bundle_group_size(input, live_ranges, bundle),
-        bundle.num_hinted_spans(live_ranges),
+        // A hint the bundle can never honor earns it no head start over the
+        // bundles whose hints it would otherwise take.
+        bundle.num_hinted_spans(
+            live_ranges,
+            &regs_clobbered_across(input, live_ranges, bundle),
+        ),
         bundle.spans(live_ranges).len(),
     )
 }

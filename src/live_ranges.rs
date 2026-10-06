@@ -2101,13 +2101,17 @@ where
         .as_f32()
     }
 
-    /// How many of this bundle's spans carry a hint at either end.
-    pub(crate) fn num_hinted_spans(self, live_ranges: &LiveRanges<E>) -> usize {
+    /// How many of this bundle's spans carry a hint, at either end, towards
+    /// some register outside `unusable`.
+    pub(crate) fn num_hinted_spans(self, live_ranges: &LiveRanges<E>, unusable: &RegSet) -> usize {
         self.spans(live_ranges)
             .filter(|span| {
-                [HintPos::Start, HintPos::End]
-                    .iter()
-                    .any(|&end| !span.preference_at(live_ranges, end).is_empty())
+                [HintPos::Start, HintPos::End].iter().any(|&end| {
+                    span.preference_at(live_ranges, end)
+                        .union()
+                        .iter()
+                        .any(|reg| !unusable.contains(reg))
+                })
             })
             .count()
     }
