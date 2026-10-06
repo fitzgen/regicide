@@ -14,7 +14,9 @@ use crate::{
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
     input::{DefUse, InputInst, InputValue},
-    live_ranges::{HintPos, LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight},
+    live_ranges::{
+        HintPos, LiveBundle, LivePoint, LiveRanges, LiveSpan, RegPreference, SpillWeight,
+    },
     machine::{Machine, Reg, RegClassMembers},
     output::{OutputInner, RegAllocation},
     region_tree::RegionTree,
@@ -187,6 +189,17 @@ where
     /// [`Assignments::interference_weight`] borrows for the duration of a call
     /// and hands back empty.
     interference_scratch: Vec<LiveBundle<E>>,
+
+    /// The registers that something clobbers in the current region.
+    region_clobbers: RegSet,
+
+    /// The registers that any bundle queued in the current region has
+    /// preferred.
+    region_preferences: RegSet,
+
+    /// Scratch space holding the registers `assign_to_non_preferred` tries, in
+    /// order.
+    non_preferred_candidates: Vec<Reg>,
 }
 
 impl<E> RegionAllocation<E>
@@ -206,6 +219,9 @@ where
             split_uses: Vec::new(),
             minimal_cuts: Vec::new(),
             interference_scratch: Vec::new(),
+            region_clobbers: RegSet::new(),
+            region_preferences: RegSet::new(),
+            non_preferred_candidates: Vec::new(),
         }
     }
 
@@ -222,6 +238,9 @@ where
             split_uses,
             minimal_cuts,
             interference_scratch,
+            region_clobbers,
+            region_preferences,
+            non_preferred_candidates,
         } = self;
         assignments.reset();
         region_assignments.reset();
@@ -234,6 +253,9 @@ where
         split_uses.clear();
         minimal_cuts.clear();
         interference_scratch.clear();
+        region_clobbers.reset();
+        region_preferences.reset();
+        non_preferred_candidates.clear();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -249,6 +271,9 @@ where
             split_uses,
             minimal_cuts,
             interference_scratch,
+            region_clobbers,
+            region_preferences,
+            non_preferred_candidates,
         } = self;
         assignments.is_reset()
             && region_assignments.is_reset()
@@ -261,6 +286,9 @@ where
             && split_uses.is_empty()
             && minimal_cuts.is_empty()
             && interference_scratch.is_empty()
+            && region_clobbers.is_reset()
+            && region_preferences.is_reset()
+            && non_preferred_candidates.is_empty()
     }
 
     /// The bundles that must live in memory, and so need a spill slot.
@@ -405,6 +433,11 @@ where
         // below.
         for block in region.blocks(region_tree) {
             for reservation in block.reservations(live_ranges) {
+                if let (None, RegAllocation::Reg(reg)) =
+                    (reservation.val(live_ranges), reservation.reg(live_ranges))
+                {
+                    self.region_clobbers.insert(reg.with_repr32());
+                }
                 self.region_assignments.insert_reservation(
                     reservation.reg(live_ranges).units(input.machine),
                     reservation.start(live_ranges)..reservation.end(live_ranges),
@@ -479,6 +512,8 @@ where
         // Finally, commit this region's assignments.
         self.assignments.merge(&self.region_assignments);
         self.region_assignments.reset();
+        self.region_clobbers.reset();
+        self.region_preferences.reset();
 
         Ok(())
     }
@@ -493,6 +528,8 @@ where
     ) {
         let priority = compute_bundle_priority(input, live_ranges, bundle);
         self.set_bundle_priority(bundle, priority);
+        self.region_preferences
+            .union_with(bundle.preference(live_ranges).union());
         self.queue.push(PqEntry::new(phase, priority, bundle));
         event!(
             events,
@@ -611,16 +648,26 @@ where
         };
 
         let assigned = match rc.members(input.machine) {
-            RegClassMembers::Regs(regs) => self
-                .region_assignments
-                .try_assign_to_reg(
+            RegClassMembers::Regs(regs) => {
+                let candidates = &mut self.non_preferred_candidates;
+                order_non_preferred_candidates(
+                    regs,
+                    pref,
+                    &self.region_clobbers,
+                    &self.region_preferences,
+                    candidates,
+                );
+                let assigned = self.region_assignments.try_assign_to_reg(
                     bundle,
-                    regs.iter().copied().filter(|r| !pref.union_contains(*r)),
+                    candidates.iter().copied(),
                     |r| r.units(input.machine),
                     bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
-                )
-                .map(|reg| output.with_repr::<E, _>(reg).map(RegAllocation::Reg))
-                .transpose()?,
+                );
+                candidates.clear();
+                assigned
+                    .map(|reg| output.with_repr::<E, _>(reg).map(RegAllocation::Reg))
+                    .transpose()?
+            }
             RegClassMembers::Groups(groups) => {
                 debug_assert!(pref.is_empty());
                 self.region_assignments
@@ -1393,6 +1440,32 @@ where
         // the widest one is stickier than a bundle the stack could hold.
         EVICTION_COST_STICKINESS_MAX - places.clamp(1, EVICTION_COST_STICKINESS_MAX - 1)
     }
+}
+
+/// Fill `candidates` with the registers of `regs` that `pref` does not name, in
+/// the order a bundle with no usable hint should try them.
+///
+/// Registers clobbered in the region come first: a bundle that fits in one
+/// crosses no clobber, and leaves the registers that survive one to bundles
+/// that do. Within each of those, registers no bundle in the region prefers
+/// come before ones some bundle does, so that a bundle still in the queue
+/// finds the register it was hinted towards free.
+fn order_non_preferred_candidates(
+    regs: &[Reg],
+    pref: &RegPreference,
+    region_clobbers: &RegSet,
+    region_preferences: &RegSet,
+    candidates: &mut Vec<Reg>,
+) {
+    candidates.clear();
+    candidates.extend(regs.iter().copied().filter(|r| !pref.union_contains(*r)));
+    // Stable, so the class's own order breaks ties.
+    candidates.sort_by_key(|r| {
+        (
+            !region_clobbers.contains(*r),
+            region_preferences.contains(*r),
+        )
+    });
 }
 
 /// Where `bundle`'s first span begins.
@@ -2671,5 +2744,33 @@ mod tests {
                 crate::run(&mut context, input).expect("this function fits on this machine");
             crate::checker::check(input, &output).expect("and the allocation it gets is correct");
         });
+    }
+
+    /// A bundle with no usable hint tries clobbered registers first, and within
+    /// each tier leaves registers some other bundle prefers for last.
+    #[test]
+    fn non_preferred_candidates_avoid_other_bundles_hints() {
+        let reg = |i: usize| Reg::try_new(i).unwrap();
+        let set = |indices: &[usize]| {
+            let mut set = RegSet::new();
+            for &i in indices {
+                set.insert(reg(i));
+            }
+            set
+        };
+        let class: Vec<Reg> = (0..6).map(reg).collect();
+
+        let mut pref = RegPreference::new();
+        pref.add_hint(set(&[4]));
+        let clobbered = set(&[0, 1, 2]);
+        let preferred = set(&[0, 3, 4]);
+
+        let mut candidates = Vec::new();
+        order_non_preferred_candidates(&class, &pref, &clobbered, &preferred, &mut candidates);
+
+        // r4 is the bundle's own hint, already tried; r1 and r2 are clobbered
+        // and unwanted; r0 is clobbered but wanted; r5 survives the clobber
+        // and is unwanted; r3 survives it but is wanted.
+        assert_eq!(candidates, [1, 2, 0, 5, 3].map(reg));
     }
 }
