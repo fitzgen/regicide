@@ -236,6 +236,9 @@ where
     prefix: Vec<(usize, usize)>,
 
     bundles: Vec<LiveBundle<E>>,
+
+    /// Where the run of equal entries of `bundles` holding each entry starts.
+    run_starts: Vec<usize>,
 }
 
 impl<E> SpanInterference<E>
@@ -248,6 +251,7 @@ where
             rows: Vec::new(),
             prefix: Vec::new(),
             bundles: Vec::new(),
+            run_starts: Vec::new(),
         }
     }
 
@@ -262,6 +266,7 @@ where
         self.rows.clear();
         self.prefix.clear();
         self.bundles.clear();
+        self.run_starts.clear();
     }
 
     pub fn is_empty(&self) -> bool {
@@ -269,6 +274,17 @@ where
             && self.rows.is_empty()
             && self.prefix.is_empty()
             && self.bundles.is_empty()
+            && self.run_starts.is_empty()
+    }
+
+    /// The one bundle filling `bundles[range]`, `Some(None)` when that is
+    /// empty, and `None` when it holds two or more distinct bundles.
+    fn sole(&self, range: Range<usize>) -> Option<Option<LiveBundle<E>>> {
+        match range.len() {
+            0 => Some(None),
+            _ => (self.run_starts[range.end - 1] <= range.start)
+                .then(|| Some(self.bundles[range.start])),
+        }
     }
 
     /// Push the bundles in the way of span `i` in `units` onto `bundles`, and
@@ -370,6 +386,14 @@ where
             reserved += is_reserved;
         }
         self.prefix.push((start, reserved));
+
+        for i in self.run_starts.len()..self.bundles.len() {
+            let start = match i.checked_sub(1) {
+                Some(prev) if self.bundles[prev] == self.bundles[i] => self.run_starts[prev],
+                _ => i,
+            };
+            self.run_starts.push(start);
+        }
         row
     }
 
@@ -392,18 +416,21 @@ where
         let row = self.row(assignments, candidate, units.clone());
         let prefix = &self.prefix[row];
         let whole = half.whole_indices();
-        let (whole_start, whole_reserved_before) = prefix[whole.start];
-        let (whole_end, whole_reserved_after) = prefix[whole.end];
         let (index, range) = half.clipped();
 
-        let clear = whole_reserved_before == whole_reserved_after
-            && if half.is_intact() {
-                let (start, reserved_before) = prefix[index];
-                let (end, reserved_after) = prefix[index + 1];
-                scratch.extend_from_slice(&self.bundles[start..end]);
-                reserved_before == reserved_after
-            } else {
-                assignments.push_interfering(
+        // When the divided span is intact, the half is a run of undivided spans,
+        // whose conflicts are one slice of `bundles`.
+        let intact = half.is_intact();
+        let spans = if intact {
+            whole.start.min(index)..whole.end.max(index + 1)
+        } else {
+            whole
+        };
+        let (start, reserved_before) = prefix[spans.start];
+        let (end, reserved_after) = prefix[spans.end];
+        if reserved_before != reserved_after
+            || !intact
+                && !assignments.push_interfering(
                     units,
                     iter::once(QuerySpan {
                         porous_to: self.spans[index].porous_to,
@@ -411,23 +438,23 @@ where
                     }),
                     scratch,
                 )
-            };
-        if !clear {
+        {
             scratch.clear();
             return f32::INFINITY;
         }
 
         // Usually one bundle, at most, is in the way of the whole half, which
         // needs neither the copy nor the sort.
-        let whole = &self.bundles[whole_start..whole_end];
-        let mut all = scratch.iter().chain(whole);
-        let first = all.next().copied();
-        if all.all(|&b| Some(b) == first) {
-            scratch.clear();
-            return first.into_iter().map(weight_of).sum();
+        if let Some(sole) = self.sole(start..end) {
+            let mut fresh = scratch.iter().copied();
+            let sole = sole.or_else(|| fresh.next());
+            if fresh.all(|b| Some(b) == sole) {
+                scratch.clear();
+                return sole.into_iter().map(weight_of).sum();
+            }
         }
 
-        scratch.extend_from_slice(whole);
+        scratch.extend_from_slice(&self.bundles[start..end]);
         sum_distinct(scratch, weight_of)
     }
 }
