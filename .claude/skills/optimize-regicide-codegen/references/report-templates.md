@@ -87,7 +87,8 @@ YYYY-MM-DD HH:MM. Base `<sha>`.
 
 YYYY-MM-DD HH:MM. Commit `<sha>` (`WIP: ...`), measured against `<base sha>`.
 Verdict: kept / dropped (<one-line reason>). Tag (if dropped):
-`code-quality-NNN/<slug>`.
+`code-quality-NNN/<slug>`, or the patch (`../patches/NN-<slug>.patch`) if
+commits were refused.
 
 ## Idea
 

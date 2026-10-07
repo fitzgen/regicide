@@ -152,7 +152,7 @@ ls reports/                         # find the highest code-quality-NNN
 R=reports/code-quality-001          # next unused number; set in every shell
 A=~/regalloc2/reports/codegen-analysis-003   # the input analysis
 S=.claude/skills/optimize-regicide-codegen/scripts
-mkdir -p $R/{successful,unsuccessful,todo,counts,diffs,bins,logs,misc}
+mkdir -p $R/{successful,unsuccessful,todo,counts,diffs,bins,logs,misc,patches}
 ```
 
 `reports/` is gitignored (by `~/.gitignore`), so nothing in it is committed.
@@ -169,6 +169,7 @@ mkdir -p $R/{successful,unsuccessful,todo,counts,diffs,bins,logs,misc}
 | `bins/` | `run-<sha>` for each commit measured. `target/` is overwritten by the next build. |
 | `logs/` | Event logs and tallies from replaying target inputs. |
 | `misc/` | Environment, test and fuzz logs, tool gotchas, and **suggested additions to this skill** (`misc/skill-learnings.md`). |
+| `patches/` | Only if `git commit` is refused (see "Git"): `NN-<slug>.patch` per attempt, in place of commits and tags. |
 
 Put the date and time (`date '+%Y-%m-%d %H:%M'`) at the top of every file you
 write, and the commit sha every measurement was taken at.
@@ -226,13 +227,15 @@ comparing two builds.
    each report gives its offset. Write `$R/targets.tsv`:
 
    ```
-   # role	regex (searched in the input's file name)	label
-   target	tinygo-regex-0107-u0-99	tinygo countMatches, fix #1
-   guard	hashset-0009-u0-8	hashset rehash, preserve #2
+   # role	regex (searched in the input's name)	label
+   target	tinygo-regex-0107-u0-99$	tinygo countMatches, fix #1
+   guard	hashset-0009-u0-8$	hashset rehash, preserve #2
    ```
 
-   `diff_counts.py` fails the gate if a regex matches nothing, so a typo
-   cannot silently gate nothing.
+   Anchor each regex with `$`. Without it, `u0-9` also matches `u0-99`. The
+   name `diff_counts.py` searches has no `.postcard`, so `u0-99\.` matches
+   nothing. `diff_counts.py` fails the gate if a regex matches nothing, so a
+   typo cannot silently gate nothing.
 2. **Guards.** Every "thing we do well" with a corpus input becomes a
    `guard` row.
 3. **Candidates.** One `todo/NN-<slug>.md` per idea: the finding it
@@ -267,9 +270,33 @@ cargo run --release --example visualize -- \
     --input $A/corpus-X/<target>.postcard $R/logs/<target>-$sha.html
 ```
 
-- **Find the hot block in the printout.** Hot means inside the innermost
-  loop and not cold. The analysis says which loop; the printout's `-->`
-  successor lines give the CFG, so back edges are visible.
+- **Find the hot block in the printout** with `$S/loops.py`. It finds the
+  back edges and natural loops in a `run` printout and lists each loop's
+  blocks with their edit tallies, innermost first. Hot means inside the
+  innermost loop and not cold. The analysis says which loop.
+
+  ```bash
+  python3 $S/loops.py $R/logs/<target>-$sha.txt | less
+  ```
+
+- **Find a small reproducer.** A hot target can have hundreds of thousands
+  of queue pops, too many to read a decision trail. Scan the corpus for
+  small inputs with the same signature, then read one of those in full
+  (`RUST_LOG=trace`). For back-edge reload seams:
+
+  ```bash
+  # Inputs under 5e7 compile insts that spill at all, smallest first.
+  awk -F'\t' 'NR==1 {for (i=1; i<=NF; i++) c[$i]=i; next}
+      $c["status"]=="ok" && $c["insts"]<5e7 && $c["spills"]>0 \
+      {print $c["insts"]"\t"$c["path"]}' \
+      $R/counts/$sha.tsv | sort -n | cut -f2 \
+      | while read f; do $R/bins/run-$sha "$f"; done \
+      | python3 $S/loops.py --latch-reloads 3 /dev/stdin
+  ```
+
+  In 001, `sqlite3-1347-u0-1026` (a 3-block loop, 4 latch reloads, 147 queue
+  pops) showed the whole split-and-evict cascade in one screen. The target
+  it stood for, `countMatches`, had 242,695 queue pops.
 - **Re-derive the mechanism from the event counts.** The analysis's
   mechanism is a hypothesis about the code as it was. 001's explanation of
   the switch regression was wrong, and 002 found the real one from event
@@ -281,7 +308,10 @@ cargo run --release --example visualize -- \
   and `.../references/tools.md`.
 - Where the heuristic lives in a module with unit tests, and the situation
   can be built small (see `src/test.rs`), add a test that pins the behavior
-  you want. It is the cheapest regression guard you can leave behind.
+  you want. It is the cheapest regression guard you can leave behind. **Check
+  that it fails without your change.** Disable the change for one run of the
+  test (e.g. `false && ...`). 001's first test input passed at base, because
+  the allocator never hit the case it was built for.
 
 ## 4. The loop: one attempt
 
@@ -406,8 +436,27 @@ clean baseline was 402 + 8 passed, 10 ignored, about 2 minutes.
 
 **Fixture tests change with the allocation.** A visualizer fixture test
 (`fixtures_are_up_to_date`) fails when allocation changes what it renders.
-Re-bless it only after reading its diff, and record why it changed in the
-attempt's write-up; never bless blind.
+Re-bless it only after reading its diff (`REGICIDE_BLESS_FIXTURE=1 cargo test
+--all-features --lib fixtures_are_up_to_date`). Record why it changed in the
+attempt's write-up. Never bless blind. The visualizer's node tests read the
+same fixtures, so run them too:
+
+```bash
+(cd visualizer && node --test test/) 2>&1 | grep -E '^ℹ (pass|fail)|^✖'
+```
+
+The clean baseline is 125 pass, 1 fail ("an event summary names its entities
+as clickable parts", a missing `slot=`).
+
+**Some tests pin an allocation shape, not a rendering.** A test that needs a
+dead move, a spill in a loop, and so on stops testing anything when a better
+allocator stops producing that shape. Do not weaken its assertions. Find a
+new input that still has the shape. When hand edits fail, let mutatis search
+and shrink: a temporary `Check::new().iters(..).run_with(m::default::<TestInput>(),
+crate::test::corpus(), ..)` whose property returns `Err` on the wanted
+shape. Print `result.unwrap_err().unwrap_failed().value` with `{:#?}`; the
+plain `Debug` of `TestFunction` hides classes and remat costs. Then write it
+up as a named `TestInput::with_...` and add it to `corpus()`.
 
 **Fuzz** every kept attempt, in the background while you write up. The user's
 notes require `-s none`, libFuzzer flags after `--`, and enough
@@ -421,7 +470,9 @@ grep -E 'INITED|DONE|Done [0-9]+ runs|ERROR|panicked' $R/misc/fuzz-<sha>.log
 
 Require `INITED` and `Done` before calling it clean. A fuzz crash after a
 heuristic change is yours until proven otherwise: soak time on a clean HEAD
-cannot classify it as pre-existing.
+cannot classify it as pre-existing. An exit of 144 with no crash in the log
+means something outside the session killed the run. Rerun it; it is not a
+pass.
 
 ## Sightglass and Wasmtime: only when asked
 
@@ -456,6 +507,15 @@ to that step.
   commit for the duration of this work. That overrides the default "never
   commit in regicide" rule only for the `WIP` commits and tags described
   here.
+- **If the harness refuses `git commit`** (001's was refused as "Git
+  Destructive"), do not retry or work around it. Switch to patches for the
+  rest of the session, and say so at the top of `report.md`:
+  - `git diff > $R/patches/NN-<slug>.patch` once an attempt is built. Name
+    the bin `run-aNN` and the counts `aNN.tsv`, since there is no sha.
+  - A dropped attempt: restore the tree to the last kept patch (a saved copy
+    of each touched file, or `git apply -R` of the dropped delta), and check
+    that `git diff` equals the kept patch.
+  - Leave the kept work unstaged, and list the files for the user to commit.
 
 ## 5. Finish
 
@@ -501,3 +561,17 @@ Then tell the user where the report is and summarize the cumulative result.
 - **Believing a stuck replay is a hang.** Some inputs take minutes (the
   analysis's sqlite3 VDBE function took ~1 minute, some tinygo-regex inputs
   far longer). `counts.py` prints any input over 10 s as it finishes.
+- **...or that a stuck replay is slow.** In 001 a `run` child sat in state
+  `T` (stopped by something outside the session), and `counts.py`'s timeout
+  never fires on a stopped process. If the log stalls on the last few inputs,
+  run `ps -o pid,stat,command` on the `run-*` children. Replay the input by
+  itself to rule out your change, then `kill -CONT <pid>`.
+- **Reading single-sample compile time on a loaded host.** With load
+  averages of 15-25, `counts.py`'s insts swung 10% on an *unchanged*
+  allocation (switch-0004 in 001's attempt 1). Check `uptime` before reading
+  the compile-time section, and confirm any surprise with `compare.py -n 20`.
+- **Testing a split heuristic only in `split_into_minimal_or_spill`.** Most
+  shredding happens one cut at a time in `split_between_spans`, whose halves
+  are requeued. 001's attempt 3 changed only the minimal split and moved
+  nothing (122 `BundleSplitIntoMinimal` vs 2,418 `BundleSplitBetweenSpans`
+  in countMatches). Tally both events before choosing where to intervene.

@@ -10,6 +10,43 @@ in.
 Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 **negative is better**.
 
+## Latest session: `code-quality-001` (2026-10-06, base `bf6be7d`)
+
+`reports/code-quality-001/report.md` in the `regicide-codegen-improvements`
+worktree (`reports/` is gitignored, so it exists only there). Three attempts
+against analysis 003. Whether its kept change landed, and under which sha,
+is for you to check: it was left **unstaged** on branch `code-quality-001`,
+because `git commit` was refused. Look for "spill a bundle with no uses
+whole" in `git log`, or `has_nothing_to_split_for` in
+`src/region_allocation.rs`.
+
+| # | idea | verdict | result |
+| --- | --- | --- | --- |
+| 1 | non-preferred order: grow the function's register footprint in class order (fix #3) | dropped | siphashx24 x19/x20 gone, but keccak guard +0.14% and blake3 corpus +1.97%: unhinted bundles took other bundles' hinted registers inside the footprint |
+| 2 | a bundle with no uses and constraint `Any` skips splitting and goes to the stack whole (fix #1) | **kept** | countMatches -48.9%, machine.add -46.4%, VDBE -37.7%; corpora sqlite3 -46.7%, tinygo-regex -59.0%, hashset -40.6%, protobuf -29.8%; guards unchanged; compile time -21.6%; 445 better / 58 worse |
+| 3 | keep runs of unused spans together in `split_into_minimal_or_spill` | dropped | no effect on any target: after #2 the shredding is in `split_between_spans` |
+
+If #2 landed, the 003 rankings below are stale for #1 and #4. countMatches'
+hot latch went from 12 reloads to 0. Latch reloads over all 29
+countMatches loops went 410 → 211. machine.add moves 1,013 → 163. Re-measure
+before working on them. What 001 left open, ranked:
+
+1. **Seam loop depth in `SplitScore`** (finding #2). The remaining
+   countMatches seams are on depth-4 latches (block1219's six latches, 2-5
+   reloads each) and reload values the loop *does* use. `SplitScore` does
+   not see the weight of the block a cut's seam lands in.
+2. **`hashset-0004-u0-3` regressed +3.3% under #2**: in one 7,442-instruction
+   block, v126 (3,419 uses) lost callee-saved r17 and is reloaded 3,368
+   times. Why does a bundle that heavy lose its register?
+3. **Callee-saved as a `Machine` property** (fix #3). regicide's `Machine`
+   has only an order, so "is callee-saved" can only be guessed (003's probe
+   hard-coded index >= 16). regalloc2 knows it (`non_preferred_regs_by_class`).
+   Adding it is an **API change: ask the user first.**
+4. **Depth-0 reload-for-move trades** (most of #2's 58 regressions are
+   small): a zero-use bundle that could ride in a free register between two
+   uses in straight-line code now reloads. Try restricting #2 to bundles in a
+   loop region, or across a call.
+
 ## Where to start: `codegen-analysis-003` (2026-10-06, regicide `e9b676b`)
 
 `~/regalloc2/reports/codegen-analysis-003/report.md`. On cycles, only one
@@ -55,7 +92,11 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
    only cycles regression that resolves (+48%).** Where:
    `region_allocation/splitting.rs` (where the cut lands) and
    `spill_placement.rs` (its loop guard covers spills, not reload seams).
-   Status: open.
+   Status: **largely fixed by code-quality-001 #2**, if it landed. The real
+   mechanism, re-derived on `sqlite3-1347-u0-1026`: the reloaded values have
+   *no uses* in the loop. Their zero-use bundles were split per block, the
+   header and latch pieces were minimal and so won registers (evicting
+   non-minimal bundles in a cascade), and the body piece spilled.
 2. **Split scoring cannot tell cuts apart.** `interference_weight` charges a
    conflicting bundle's full weight to any half that touches it, so many cuts
    tie. The middle-of-tied-run rule (`a183083`) fixed `machine.add` (99% →
@@ -71,14 +112,19 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
    siphashx24's hottest function (`stp/ldp x19, x20` that ion does not need).
    **003 probed a fix**: keep the class's callee-saved tail behind the
    `region_preferences` key. That kept `4aa7bd5`'s move win (19 → 9), dropped
-   the save/restore, passed `--check`, and left corpus totals neutral. **A
-   good first attempt.** Note the estimate cannot see the prologue
-   save/restore, so judge it on the allocation diff and `slots`, not the
-   estimate alone.
+   the save/restore, passed `--check`, and left corpus totals neutral. But
+   the probe hard-coded the tail as class index >= 16 (or 24). regicide's
+   `Machine` does not know which registers are callee-saved. 001's in-scope
+   proxy (rank registers past the furthest one in use last) regressed keccak
+   and blake3 and was dropped. The estimate cannot see the prologue
+   save/restore, so judge any fix on the register set used, not the estimate
+   alone. Status: open, needs an API decision.
 4. **`br_table` arms end in register rotations** (9–15 moves per arm to the
    join's assignment). tinygo `machine.add` had 1,013 moves vs ion's 55, and
    sqlite3 VDBE 6,655 vs 640. Caused by between-span split pieces landing in
    different registers per arm (#2), not by `MAX_MERGE_SPANS` any more.
+   Status: **largely fixed by code-quality-001 #2** (machine.add 1,013 → 163
+   moves): many of those pieces belonged to zero-use bundles.
 5. **Register-starved straight-line code** (keccak, blake3): more spills and
    moves than ion, offset in keccak by fewer reloads (remat). No resolvable
    cycles cost. Low priority.
@@ -129,6 +175,17 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
 - **`critical-edges` is always 0** (Cranelift splits them first), and **move
   elimination is not the limiter**: both passes default to `Global`, so a
   surviving move was created by assignment, splitting or coalescing.
+- **Minimal bundles win registers and evict** (2026-10-06, `bf6be7d`).
+  `Priority` puts `is_minimal` first and `EvictionCost` ranks a minimal
+  victim as more expensive. So a zero-use piece that `split_into_minimal`
+  produced outranks and can evict a non-minimal bundle that has uses. That
+  cascade is how 003's back-edge seams arose. Any change that creates
+  minimal pieces should be checked for it (`BundleEvicted` by a piece with
+  `size: 1`).
+- **Where splitting happens** (2026-10-06, after 001 #2). In countMatches:
+  2,418 `BundleSplitBetweenSpans` vs 122 `BundleSplitIntoMinimal`. A split
+  heuristic belongs in `split_between_spans` (one cut at a time, halves
+  requeued), not in the minimal split.
 - **Event-log traps**: `SpanConstructed` span IDs are provisional (the span
   → value mapping is permuted within a block in the text log; the
   visualizer's data is right). Use the visualizer when you need the value.
@@ -149,4 +206,14 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
   switch -0.03%; better 19, worse 4. The gate passed. It is a useful example
   of plain counts and estimated cycles disagreeing.
 - The baseline `cargo test --all-features` at `36e91a7`: 402 + 8 passed, 10
-  ignored, exit 0, about 2 minutes.
+  ignored, exit 0, about 2 minutes. With 001 #2 it is 403 + 8: the new
+  `a_value_unused_in_a_loop_is_not_reloaded_inside_it`.
+- **Tests that pinned an allocation shape changed with 001 #2.**
+  `a_move_into_a_register_nothing_reads_goes` and the `dead-edits` visualizer
+  fixture now use `TestInput::with_a_register_move_overwritten_in_a_later_block`
+  (found by a mutatis shrink). `with_a_looping_value_read_only_after_the_loop`
+  no longer yields a dead move. Neither the test corpus nor 100,000 mutated
+  inputs yielded a dead register move inside a loop under 001 #2.
+- **`$S/loops.py`** finds loops, latches and per-block edits in a `run`
+  printout. `--latch-reloads N` scans for back-edge seams. At `bf6be7d` it
+  found 70 latches with >= 3 reloads in inputs under 5e7 compile insts.
