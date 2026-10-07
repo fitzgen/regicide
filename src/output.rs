@@ -735,7 +735,7 @@ impl<'a> Output<'a> {
     pub fn loop_depth(&self, block: Block) -> usize {
         with_inner!(self, |inner| {
             let block = block.with_repr().expect("no such block in these results");
-            block.loop_depth(&inner.region_tree)
+            usize::try_from(block.loop_depth(&inner.region_tree)).unwrap()
         })
     }
 

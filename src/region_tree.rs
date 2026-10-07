@@ -81,6 +81,10 @@ where
     /// for the top-level region.
     region_parent: SecondaryMap<Region<E>, Option<Region<E>>>,
 
+    /// Map from a region to how many loops enclose its blocks: zero for the
+    /// top-level region.
+    region_depth: SecondaryMap<Region<E>, u32>,
+
     /// Map from a region to the outermost region currently containing it.
     ///
     /// A new cycle absorbing a block an inner cycle already claimed must
@@ -149,6 +153,7 @@ where
             block_region: SecondaryMap::new(None),
             dfs_info: SecondaryMap::new(DfsInfo { start: 0, end: 0 }),
             region_parent: SecondaryMap::new(None),
+            region_depth: SecondaryMap::new(0),
             top_level: UnionFind::new(),
             region_blocks: SecondaryMap::new(EntityRange::empty()),
             region_blocks_storage: PrimaryMap::new(),
@@ -173,6 +178,7 @@ where
             block_region,
             dfs_info,
             region_parent,
+            region_depth,
             top_level,
             region_blocks,
             region_blocks_storage,
@@ -193,6 +199,7 @@ where
         block_region.reset();
         dfs_info.reset();
         region_parent.reset();
+        region_depth.reset();
         top_level.reset();
         region_blocks.reset();
         region_blocks_storage.reset();
@@ -216,6 +223,7 @@ where
             block_region,
             dfs_info,
             region_parent,
+            region_depth,
             top_level,
             region_blocks,
             region_blocks_storage,
@@ -236,6 +244,7 @@ where
             && block_region.is_reset()
             && dfs_info.is_reset()
             && region_parent.is_reset()
+            && region_depth.is_reset()
             && top_level.is_reset()
             && region_blocks.is_reset()
             && region_blocks_storage.is_reset()
@@ -597,7 +606,8 @@ where
         Ok(())
     }
 
-    /// Fill `pre_order` with a pre-order traversal of the region tree.
+    /// Fill `pre_order` with a pre-order traversal of the region tree, and
+    /// `region_depth` along the way.
     fn construct_pre_order(&mut self) {
         let mut pre_order = core::mem::take(&mut self.pre_order);
         let mut stack = core::mem::take(&mut self.pre_order_stack);
@@ -609,6 +619,14 @@ where
         stack.push(self.root());
         while let Some(region) = stack.pop() {
             pre_order.push(region);
+
+            // A parent is always visited before its children. A cold region
+            // is not a loop, so it has its parent's depth.
+            self.region_depth[region] = match region.parent(self) {
+                Some(parent) if self.is_cold(region) => self.region_depth[parent],
+                Some(parent) => self.region_depth[parent] + 1,
+                None => 0,
+            };
 
             // Push the children in reverse so that they are popped, and
             // therefore visited, in order.
@@ -669,14 +687,8 @@ where
     ///
     /// A cycle headed by the entry block is the top-level region itself, so its
     /// blocks are at depth zero.
-    pub(crate) fn loop_depth(self, region_tree: &RegionTree<E>) -> usize {
-        let mut region = self.region(region_tree).loop_region(region_tree);
-        let mut depth = 0;
-        while let Some(parent) = region.parent(region_tree) {
-            region = parent;
-            depth += 1;
-        }
-        depth
+    pub(crate) fn loop_depth(self, region_tree: &RegionTree<E>) -> u32 {
+        self.region(region_tree).loop_depth(region_tree)
     }
 }
 
@@ -708,6 +720,16 @@ where
     /// region.
     pub(crate) fn parent(self, region_tree: &RegionTree<E>) -> Option<Region<E>> {
         region_tree.region_parent[self]
+    }
+
+    /// How many cycles of the control-flow graph contain this region's blocks:
+    /// zero for the top-level region. A cold region is not a cycle of its own.
+    ///
+    /// A cycle headed by the entry block is the top-level region itself, so
+    /// its blocks are at depth zero. An irreducible cycle's nesting depends on
+    /// traversal order.
+    pub(crate) fn loop_depth(self, region_tree: &RegionTree<E>) -> u32 {
+        region_tree.region_depth[self]
     }
 
     /// Get the immediate child regions of this region.
@@ -1110,6 +1132,41 @@ mod tests {
 
         let backwards: Vec<usize> = tree.pre_order_iter().rev().map(|r| r.index()).collect();
         assert_eq!(backwards, alloc::vec![5, 4, 3, 2, 1, 0]);
+    }
+
+    /// Each region's memoized depth is how many ancestors it has.
+    #[test]
+    fn loop_depth_counts_ancestors() {
+        // Same shape as `pre_order_iter_is_depth_first`.
+        let tree = tree_with_shape(&[&[1, 4], &[2, 3], &[], &[], &[5], &[]]);
+        let actual: Vec<u32> = tree.pre_order_iter().map(|r| r.loop_depth(&tree)).collect();
+        assert_eq!(actual, alloc::vec![0, 1, 2, 2, 1, 2]);
+    }
+
+    /// The memoized depth counts the loops enclosing a region's blocks, which
+    /// a cold region does not add to.
+    #[test]
+    fn loop_depth_counts_enclosing_loops() -> CheckResult<TestFunction> {
+        Check::new()
+            .min_iters(2_000)
+            .run(|func: &TestFunction| -> Result<(), String> {
+                let tree = construct(func)?;
+                for region in tree.pre_order_iter() {
+                    let mut walk = region.loop_region(&tree);
+                    let mut want = 0;
+                    while let Some(parent) = walk.parent(&tree) {
+                        walk = parent.loop_region(&tree);
+                        want += 1;
+                    }
+                    if region.loop_depth(&tree) != want {
+                        return Err(format!(
+                            "{region:?} has memoized depth {}, but {want} enclosing loops",
+                            region.loop_depth(&tree),
+                        ));
+                    }
+                }
+                Ok(())
+            })
     }
 
     /// A tree that is a single chain, and one that is a single region.
