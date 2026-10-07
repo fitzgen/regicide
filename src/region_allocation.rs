@@ -1012,7 +1012,6 @@ where
         // See `has_nothing_to_split_for`.
         if has_nothing_to_split_for(live_ranges, bundle, &self.split_uses) {
             self.split_spans.clear();
-            self.split_span_vals.clear();
             counts.split_between_spans_failed.inc();
             event!(
                 events,
