@@ -1610,7 +1610,7 @@ where
         let (start, end) = (span.start(live_ranges), span.end(live_ranges));
         for r in span
             .block(input.func, live_ranges)
-            .reservations(live_ranges)
+            .reservations_near(live_ranges, start..end)
         {
             if let (None, RegAllocation::Reg(reg)) = (r.val(live_ranges), r.reg(live_ranges))
                 && LivePoint::spans_overlap(start, end, r.start(live_ranges), r.end(live_ranges))

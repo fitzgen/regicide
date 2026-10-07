@@ -2264,6 +2264,55 @@ where
     pub(crate) fn reservations(self, live_ranges: &LiveRanges<E>) -> EntityRange<Reservation<E>> {
         live_ranges.block_reservations[self]
     }
+
+    /// The subrange of this block's reservations that holds every one
+    /// overlapping `range`, and possibly a few that do not.
+    #[inline]
+    pub(crate) fn reservations_near(
+        self,
+        live_ranges: &LiveRanges<E>,
+        range: core::ops::Range<LivePoint<E>>,
+    ) -> EntityRange<Reservation<E>> {
+        // Scanning a short run is cheaper than searching it.
+        let all = self.reservations(live_ranges);
+        if all.len() <= 32 {
+            return all;
+        }
+        search_reservations(live_ranges, all, range)
+    }
+}
+
+/// See `Block::reservations_near`.
+#[inline(never)]
+fn search_reservations<E>(
+    live_ranges: &LiveRanges<E>,
+    all: EntityRange<Reservation<E>>,
+    range: core::ops::Range<LivePoint<E>>,
+) -> EntityRange<Reservation<E>>
+where
+    E: EntityRepr,
+{
+    let indices = all.indices();
+    let sorted = &live_ranges.reservations.as_slice()[indices.clone()];
+
+    // A reservation starts and ends within its instruction and the gap after
+    // it, so instruction order is enough to bound the overlapping ones: those
+    // of earlier instructions end by `range.start`'s.
+    let inst_of = |r: &ReservationData<E>| r.start.inst_boundary_at_or_before();
+    let first_inst = range.start.inst_boundary_at_or_before();
+    let first = sorted.partition_point(|r| inst_of(r) < first_inst);
+    let last = first + sorted[first..].partition_point(|r| inst_of(r) < range.end);
+    debug_assert!(
+        sorted[..first]
+            .iter()
+            .chain(&sorted[last..])
+            .all(|r| !LivePoint::spans_overlap(range.start, range.end, r.start, r.end))
+    );
+
+    EntityRange {
+        start: Reservation::new_unchecked(indices.start + first),
+        end: Reservation::new_unchecked(indices.start + last),
+    }
 }
 
 impl<E> Region<E>
@@ -2469,6 +2518,7 @@ fn collect_block_reservations<'a, E>(
 where
     E: EntityRepr,
 {
+    let block_start = reservations.len();
     for (inst, input_inst) in input_block.insts() {
         let repr32_inst = inst;
         let inst = output.with_repr(inst)?;
@@ -2562,6 +2612,12 @@ where
             )?;
         }
     }
+
+    // `Block::reservations_near` searches on this order.
+    debug_assert!(
+        reservations.as_slice()[block_start..]
+            .is_sorted_by_key(|r| r.start.inst_boundary_at_or_before())
+    );
     Ok(())
 }
 
