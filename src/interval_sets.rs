@@ -32,6 +32,14 @@ impl Fuel {
         Fuel { limit, spent: 0 }
     }
 
+    /// A limit for merging the sets of `n` intervals that only a pathological
+    /// input exhausts: O(n log^2 n).
+    pub fn safety_net(n: usize) -> u64 {
+        let n = n as u64;
+        let log_n = u64::from(n.max(1).ilog2()) + 1;
+        64 * n * log_n * log_n + 1024
+    }
+
     /// Includes a successful union's own work, so may exceed the limit.
     pub fn spent(&self) -> u64 {
         self.spent

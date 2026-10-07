@@ -25,6 +25,14 @@
 //! precisely the set of colors we must avoid, and greedily avoiding them is a
 //! complete coloring.
 //!
+//! Which free slot a value gets does not matter to the coloring, but it does to
+//! the code: a block parameter in a different slot than its argument costs a
+//! stack-to-stack move on that edge. So before the walk, we union parameters
+//! with their arguments into *slot classes* wherever their reservations do not
+//! overlap, taking the heaviest edges first since one union can rule out a
+//! later one. The walk then gives each value its class's slot when that is
+//! free, and otherwise a slot no other class has been promised there.
+//!
 //! Why use this allocation algorithm here? Why not reuse the region allocation
 //! algorithm? Hack et al showed that the above algorithm is optimal: there is
 //! no coloring that uses fewer colors (spill slots). This gives us optimally
@@ -70,11 +78,15 @@ use crate::{
     machine::RegBank,
     output::{Allocation, OutputInner, StackAllocation},
     region_allocation::RegionAllocation,
+    region_tree::RegionTree,
     rpo::Rpo,
     spilled_live_ranges::{RangeEvent, SpilledLiveRanges},
     timing::Timing,
 };
 use alloc::vec::Vec;
+use slot_classes::{SlotClasses, block_weight};
+
+mod slot_classes;
 
 define_entities! {
     /// A slot in the stack frame that a spilled value lives in.
@@ -177,6 +189,7 @@ where
         &mut context.events,
         &context.rpo,
         &context.liveness,
+        &context.region_tree,
         &context.region_allocation,
         &context.spilled_live_ranges,
         &mut context.output,
@@ -219,7 +232,10 @@ where
                 Some(block.live_in(liveness).filter(|&val| spilled.contains(val))),
                 None,
             ),
-            Ranges::Spilled(ranges) => (None, Some(ranges.live_in(block))),
+            Ranges::Spilled(ranges) => (
+                None,
+                Some(ranges.live_in(block).filter(|&val| spilled.contains(val))),
+            ),
         };
         whole
             .into_iter()
@@ -240,6 +256,15 @@ enum Event {
 
     /// The value is defined here, so it needs a slot.
     Def,
+}
+
+impl From<RangeEvent> for Event {
+    fn from(event: RangeEvent) -> Self {
+        match event {
+            RangeEvent::Kill => Event::Kill,
+            RangeEvent::Def => Event::Def,
+        }
+    }
 }
 
 /// `free_slots_index` for a slot that is not in `free_slots`.
@@ -300,6 +325,14 @@ where
     /// The emergency slots of each size, created on demand by
     /// [`Self::emergency_slot`] and bucketed by that size's base-two log.
     emergency: [Vec<SpillSlot<E>>; RegBank::NUM_SIZES],
+
+    /// Which spilled values would rather share a slot, and the slots
+    /// promised to them.
+    classes: SlotClasses<E>,
+
+    /// Scratch for `incoming_arg_slot`: each slot an argument occupies, and
+    /// the weight of the edges it arrives on.
+    votes: Vec<(SpillSlot<E>, f64)>,
 }
 
 impl<E> SpillSlots<E>
@@ -320,6 +353,8 @@ where
             events: Vec::new(),
             live: EntitySet::new(),
             emergency: [const { Vec::new() }; RegBank::NUM_SIZES],
+            classes: SlotClasses::new(),
+            votes: Vec::new(),
         }
     }
 
@@ -337,7 +372,11 @@ where
             events,
             live,
             emergency,
+            classes,
+            votes,
         } = self;
+        classes.reset();
+        votes.clear();
         slots.reset();
         groups.reset();
         group_members.reset();
@@ -370,8 +409,12 @@ where
             events,
             live,
             emergency,
+            classes,
+            votes,
         } = self;
-        slots.is_reset()
+        classes.is_reset()
+            && votes.is_empty()
+            && slots.is_reset()
             && groups.is_reset()
             && group_members.is_reset()
             && val_home.is_reset()
@@ -468,6 +511,7 @@ where
         events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
+        region_tree: &RegionTree<E>,
         region_allocation: &RegionAllocation<E>,
         spilled_live_ranges: &SpilledLiveRanges<E>,
         output: &mut OutputInner<E>,
@@ -480,8 +524,19 @@ where
         } else {
             Ranges::WholeLiveRange
         };
+        if !spilled.is_empty() {
+            self.form_classes(input, rpo, liveness, region_tree, spilled, ranges, output)?;
+        }
         self.color(
-            input, counts, events, rpo, liveness, spilled, ranges, output,
+            input,
+            counts,
+            events,
+            rpo,
+            liveness,
+            region_tree,
+            spilled,
+            ranges,
+            output,
         )?;
         debug_assert!(
             self.scratch_is_empty(),
@@ -500,6 +555,7 @@ where
         events: &mut EventsLog<E>,
         rpo: &Rpo<E>,
         liveness: &Liveness<E>,
+        region_tree: &RegionTree<E>,
         spilled: &EntitySet<Val<E>>,
         ranges: Ranges<'_, E>,
         output: &mut OutputInner<E>,
@@ -510,7 +566,15 @@ where
 
         for block in rpo.iter() {
             self.allocate_block(
-                input, counts, events, liveness, block, spilled, ranges, output,
+                input,
+                counts,
+                events,
+                liveness,
+                region_tree,
+                block,
+                spilled,
+                ranges,
+                output,
             )?;
         }
 
@@ -528,6 +592,7 @@ where
         counts: &mut Counts,
         events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
+        region_tree: &RegionTree<E>,
         block: Block<E>,
         spilled: &EntitySet<Val<E>>,
         ranges: Ranges<'_, E>,
@@ -537,28 +602,17 @@ where
         debug_assert!(self.scratch_is_empty());
 
         self.enter_block(
-            input, counts, events, liveness, block, spilled, ranges, output,
+            input,
+            counts,
+            events,
+            liveness,
+            region_tree,
+            block,
+            spilled,
+            ranges,
+            output,
         )?;
-        match ranges {
-            Ranges::WholeLiveRange => {
-                self.collect_events(input, liveness, block, spilled, output)?;
-                self.events.sort_unstable();
-            }
-            // Already in program order, and already trimmed.
-            Ranges::Spilled(spilled_live_ranges) => {
-                self.events.extend(
-                    spilled_live_ranges
-                        .events(block)
-                        .map(|(point, event, val)| {
-                            let event = match event {
-                                RangeEvent::Kill => Event::Kill,
-                                RangeEvent::Def => Event::Def,
-                            };
-                            (point, event, val)
-                        }),
-                );
-            }
-        }
+        self.block_events(input, liveness, block, spilled, ranges, output)?;
         let mut block_events = core::mem::take(&mut self.events);
         for (point, event, val) in block_events.drain(..) {
             match event {
@@ -597,6 +651,7 @@ where
         counts: &mut Counts,
         events: &mut EventsLog<E>,
         liveness: &Liveness<E>,
+        region_tree: &RegionTree<E>,
         block: Block<E>,
         spilled: &EntitySet<Val<E>>,
         ranges: Ranges<'_, E>,
@@ -640,28 +695,39 @@ where
                 "{val:?}'s slot is reserved on entry to {block:?} without having one, so its \
                  range must begin on an edge into {block:?}",
             );
-            // Sharing the argument's slot makes the edge's move a no-op;
+            // Sharing an argument's slot makes that edge's move a no-op;
             // otherwise it pays a stack-to-stack move, the most expensive kind.
-            let prefer = self.incoming_arg_slot(input, output, block, val)?;
-            self.assign(input, counts, events, val, output, prefer)?;
+            let class_slot = self.classes.slot(val);
+            let vote =
+                self.incoming_arg_slot(input, region_tree, output, block, val, class_slot)?;
+            // Where this parameter's own edges outweigh its class's slot, it
+            // follows the edges, and the class keeps its slot for the rest.
+            let prefer = vote.map(|(slot, _, _)| slot);
+            match vote {
+                Some((slot, weight, class_weight))
+                    if weight > class_weight && self.free_slots_index[slot] != NOT_FREE =>
+                {
+                    self.assign_to(input, counts, events, val, output, slot)?;
+                }
+                _ => self.assign(input, counts, events, val, output, prefer)?,
+            }
         }
 
         Ok(())
     }
 
-    /// The slot already given to a value passed as `param`'s argument on some
-    /// incoming edge.
-    ///
-    /// Takes the first one found: with several predecessors the arguments may
-    /// live in different slots, and matching any one saves that edge's move
-    /// while leaving the others no worse off.
+    /// The free slot that `param`'s already-colored arguments occupy on the
+    /// heaviest incoming edges, with those edges' weight and the weight of the
+    /// edges whose argument is in `class_slot`.
     fn incoming_arg_slot(
-        &self,
+        &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         output: &mut OutputInner<E>,
         block: Block<E>,
         param: Val<E>,
-    ) -> IResult<Option<SpillSlot<E>>> {
+        class_slot: Option<SpillSlot<E>>,
+    ) -> IResult<Option<(SpillSlot<E>, f64, f64)>> {
         let block32 = block.with_repr32();
 
         let mut index = None;
@@ -675,6 +741,38 @@ where
             return Ok(None);
         };
 
+        // A join has few distinct argument slots, so a short list beats a map.
+        let mut votes = core::mem::take(&mut self.votes);
+        debug_assert!(votes.is_empty());
+        let result = self.tally_votes(input, region_tree, output, block, index, &mut votes);
+        // The first slot found wins ties.
+        let class_weight = votes
+            .iter()
+            .find(|&&(slot, _)| Some(slot) == class_slot)
+            .map_or(0.0, |&(_, weight)| weight);
+        let best = votes
+            .iter()
+            .rev()
+            .copied()
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(slot, weight)| (slot, weight, class_weight));
+        votes.clear();
+        self.votes = votes;
+        result.map(|()| best)
+    }
+
+    /// Add up, per slot, the weight of the edges into `block` whose argument
+    /// for its `index`th parameter is in that slot and free here.
+    fn tally_votes(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+        output: &mut OutputInner<E>,
+        block: Block<E>,
+        index: usize,
+        votes: &mut Vec<(SpillSlot<E>, f64)>,
+    ) -> IResult<()> {
+        let block32 = block.with_repr32();
         for pred in input.func.block(block32).predecessors() {
             let pred_data = input.func.block(pred);
             for (i, succ) in pred_data.successors().enumerate() {
@@ -692,11 +790,114 @@ where
                 if self.in_use.contains(slot) {
                     continue;
                 }
-                return Ok(Some(slot));
+                let holder = match pred_data.len_successors() {
+                    1 => output.with_repr::<E, _>(pred)?,
+                    _ => block,
+                };
+                let weight = block_weight(input, region_tree, holder);
+                match votes.iter_mut().find(|(s, _)| *s == slot) {
+                    Some((_, w)) => *w += weight,
+                    None => votes.push((slot, weight)),
+                }
             }
         }
+        Ok(())
+    }
 
-        Ok(None)
+    /// Union block parameters with their arguments into slot classes,
+    /// wherever the members' reservations stay disjoint.
+    fn form_classes(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        rpo: &Rpo<E>,
+        liveness: &Liveness<E>,
+        region_tree: &RegionTree<E>,
+        spilled: &EntitySet<Val<E>>,
+        ranges: Ranges<'_, E>,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        if !self
+            .classes
+            .collect_affinities(input, rpo, region_tree, spilled, output)?
+        {
+            return Ok(());
+        }
+
+        // A value in no pair is a class of its own that saves no move, so it
+        // never asks for a promise and needs no reservations.
+        let affine = self.classes.take_affine();
+        let result = self.collect_ranges(input, rpo, liveness, &affine, ranges, output);
+        self.classes.restore_affine(affine);
+        result?;
+
+        self.classes.order_affinities();
+        self.classes.union_affinities();
+        Ok(())
+    }
+
+    /// Record the reservations of every value in `affine` in `self.classes`.
+    fn collect_ranges(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        rpo: &Rpo<E>,
+        liveness: &Liveness<E>,
+        affine: &EntitySet<Val<E>>,
+        ranges: Ranges<'_, E>,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        for block in rpo.iter() {
+            let block_start = block.start_point(input);
+            for val in ranges.live_in(liveness, block, affine) {
+                self.classes.open(val, block_start);
+            }
+
+            self.block_events(input, liveness, block, affine, ranges, output)?;
+            let mut events = core::mem::take(&mut self.events);
+            let result = events
+                .drain(..)
+                .try_for_each(|(point, event, val)| match event {
+                    Event::Def => {
+                        self.classes.open(val, point);
+                        Ok(())
+                    }
+                    Event::Kill => self.classes.close(output, val, point),
+                });
+            self.events = events;
+            result?;
+
+            self.classes.close_all(output, block.end_point(input))?;
+        }
+        Ok(())
+    }
+
+    /// Fill `self.events` with the reservations of the values in `set` that
+    /// begin or end within `block`, in program order.
+    fn block_events(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        liveness: &Liveness<E>,
+        block: Block<E>,
+        set: &EntitySet<Val<E>>,
+        ranges: Ranges<'_, E>,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        debug_assert!(self.events.is_empty());
+        match ranges {
+            Ranges::WholeLiveRange => {
+                self.collect_events(input, liveness, block, set, output)?;
+                self.events.sort_unstable();
+            }
+            // Already in program order, and already trimmed.
+            Ranges::Spilled(spilled_live_ranges) => {
+                self.events.extend(
+                    spilled_live_ranges
+                        .events(block)
+                        .filter(|&(_, _, val)| set.contains(val))
+                        .map(|(point, event, val)| (point, event.into(), val)),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Walk `block` backwards, recording where each spilled value is defined
@@ -794,7 +995,7 @@ where
         let num_regs = val.num_regs(input);
 
         let home = if num_regs == 1 {
-            StackAllocation::SpillSlot(self.alloc_slot(events, size, output, prefer)?)
+            StackAllocation::SpillSlot(self.alloc_class_slot(events, size, val, output, prefer)?)
         } else {
             // A multi-slot value has no single slot to match, so the
             // preference does not apply to it.
@@ -819,16 +1020,108 @@ where
             StackAllocation::SpillSlotGroup(group)
         };
 
+        self.record_home(input, counts, events, val, home);
+        Ok(())
+    }
+
+    /// Settle `val`'s stack home, which is free here, and occupy it.
+    fn record_home(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        val: Val<E>,
+        home: StackAllocation<E>,
+    ) {
         self.val_home[val] = Some(home);
         self.occupy_val_slots(input, val);
 
         counts.spill_slot_assignments.inc();
         event!(events, SpillSlotAssigned { val, slot: home });
         trace!(
-            "spill slots: assigned {val:?} to {home:?}: {num_regs} slot(s) of {} bytes",
-            size.size(),
+            "spill slots: assigned {val:?} to {home:?}: {} slot(s) of {} bytes",
+            val.num_regs(input),
+            val.reg_bank(input).size(input.machine).size(),
         );
+    }
+
+    /// Give single-slot `val` the free slot `slot`, bypassing its class.
+    fn assign_to(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        val: Val<E>,
+        output: &mut OutputInner<E>,
+        slot: SpillSlot<E>,
+    ) -> IResult<()> {
+        debug_assert!(self.val_home[val].is_none());
+        debug_assert_eq!(val.num_regs(input), 1);
+        let size = val.reg_bank(input).size(input.machine);
+        let slot = self.alloc_slot(events, size, output, Some(slot))?;
+        self.record_home(input, counts, events, val, StackAllocation::SpillSlot(slot));
         Ok(())
+    }
+
+    /// Take a free slot for single-slot `val`.
+    ///
+    /// The first time a member of a class is colored, the class is promised a
+    /// free slot that no other class's promise overlaps, so that later members
+    /// find it free. When none is left, or a value in no class needs a slot,
+    /// it takes the free slot whose promises are worth the least.
+    fn alloc_class_slot(
+        &mut self,
+        events: &mut EventsLog<E>,
+        size: SpillSlotSize,
+        val: Val<E>,
+        output: &mut OutputInner<E>,
+        prefer: Option<SpillSlot<E>>,
+    ) -> IResult<SpillSlot<E>> {
+        if let Some(slot) = self.classes.slot(val)
+            && self.free_slots_index[slot] != NOT_FREE
+        {
+            return self.alloc_slot(events, size, output, Some(slot));
+        }
+
+        let prefer =
+            prefer.filter(|&p| self.slots[p] == size && self.free_slots_index[p] != NOT_FREE);
+        let free = core::mem::take(&mut self.free_slots[size.index()]);
+        // `prefer` first, then the slot `alloc_slot` would take by default.
+        let candidates = || {
+            prefer.into_iter().chain(
+                free.iter()
+                    .rev()
+                    .copied()
+                    .filter(move |&s| Some(s) != prefer),
+            )
+        };
+
+        let slot = if !self.classes.saves_moves(val) {
+            self.classes.least_promised(candidates())
+        } else if !self.classes.awaits_promise(val) {
+            // Promised already, but that slot is taken here, which breaks the
+            // promise for `val` alone. Taking the least-promised slot instead
+            // displaces more classes downstream than it spares.
+            prefer
+        } else {
+            match candidates().find(|&slot| self.classes.try_promise(val, slot)) {
+                Some(slot) => Some(slot),
+                None => self.classes.least_promised(candidates()),
+            }
+        };
+        self.free_slots[size.index()] = free;
+
+        let num_slots = self.slots.len();
+        let slot = self.alloc_slot(events, size, output, slot)?;
+        // A new slot has nothing promised over it yet.
+        if self.slots.len() > num_slots
+            && self.classes.saves_moves(val)
+            && self.classes.awaits_promise(val)
+        {
+            let promised = self.classes.try_promise(val, slot);
+            debug_assert!(promised);
+        }
+        Ok(slot)
     }
 
     /// Take a free slot of the given size, creating a new one when every
@@ -1046,6 +1339,7 @@ mod tests {
     use crate::{
         RegClass,
         context::{Context, ContextInner},
+        entity::Inst,
         input::OperandConstraint,
         test::{TestInput, TestMachine},
     };
@@ -1057,6 +1351,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         format,
         string::String,
+        sync::atomic::{AtomicUsize, Ordering},
         vec::Vec,
     };
 
@@ -1074,6 +1369,13 @@ mod tests {
         spill_slots.in_use.insert(SpillSlot::try_new(0).unwrap());
         spill_slots.free_slots[0].push(SpillSlot::try_new(1).unwrap());
         spill_slots.live.insert(Val::try_new(0).unwrap());
+        spill_slots
+            .votes
+            .push((SpillSlot::try_new(0).unwrap(), 1.0));
+        spill_slots.classes.open(
+            Val::try_new(0).unwrap(),
+            LivePoint::new(Inst::try_new(0).unwrap(), Position::Early),
+        );
         assert!(!spill_slots.is_reset());
 
         spill_slots.reset();
@@ -1212,10 +1514,14 @@ mod tests {
 
     /// Color `test_input`, spilling every `stride`th value that has a live
     /// range, and check the properties the coloring is supposed to have.
-    fn check_coloring(test_input: &TestInput, stride: usize) -> Result<(), String> {
+    ///
+    /// Returns how many spilled values joined another's slot class, so that
+    /// the caller can check the classes' paths through the coloring were
+    /// covered.
+    fn check_coloring(test_input: &TestInput, stride: usize) -> Result<usize, String> {
         let mut context = Context::new();
 
-        test_input.with_input(|input| -> Result<(), String> {
+        test_input.with_input(|input| -> Result<usize, String> {
             let context = &mut context.context32;
             analyze(context, input)?;
 
@@ -1248,21 +1554,42 @@ mod tests {
                 .map(|(_, val)| val)
                 .collect();
 
+            // Narrowed ranges come from spill placement, which needs a real
+            // region allocation rather than a spilled set we pick, so only
+            // whole live ranges are covered here; `checker_properties` covers
+            // both.
+            let ranges = Ranges::WholeLiveRange;
             context
                 .spill_slots
-                .color(
+                .form_classes(
                     input,
-                    &mut context.counts,
-                    &mut context.events,
                     &context.rpo,
                     &context.liveness,
+                    &context.region_tree,
                     &spilled_set,
-                    Ranges::WholeLiveRange,
+                    ranges,
                     &mut context.output,
                 )
+                .and_then(|()| {
+                    context.spill_slots.color(
+                        input,
+                        &mut context.counts,
+                        &mut context.events,
+                        &context.rpo,
+                        &context.liveness,
+                        &context.region_tree,
+                        &spilled_set,
+                        ranges,
+                        &mut context.output,
+                    )
+                })
                 .map_err(|()| format!("coloring failed: {:?}", context.output.take_error()))?;
 
             let spill_slots = &context.spill_slots;
+            let classed = spilled
+                .iter()
+                .filter(|&&val| spill_slots.classes.class_of(val) != val)
+                .count();
 
             // Property 1: a value has a slot exactly when we asked for it to be
             // spilled.
@@ -1398,7 +1725,7 @@ mod tests {
                 ));
             }
 
-            Ok(())
+            Ok(classed)
         })
     }
 
@@ -1568,7 +1895,10 @@ mod tests {
 
     #[test]
     fn spill_slot_properties() -> CheckResult<TestInput> {
-        Check::new()
+        static CLASSED: AtomicUsize = AtomicUsize::new(0);
+        CLASSED.store(0, Ordering::Relaxed);
+
+        let result = Check::new()
             .min_iters(2_000)
             .min_duration(std::time::Duration::from_secs(2))
             .run_with(
@@ -1579,11 +1909,20 @@ mod tests {
                     // coloring, and then every other value, which interleaves
                     // spilled and unspilled values.
                     for stride in [1, 2] {
-                        check_coloring(test_input, stride)?;
+                        let classed = check_coloring(test_input, stride)?;
+                        CLASSED.fetch_add(classed, Ordering::Relaxed);
                     }
                     Ok(())
                 },
-            )
+            );
+
+        if result.is_ok() {
+            assert!(
+                CLASSED.load(Ordering::Relaxed) > 0,
+                "no input formed a slot class, so the class paths went unchecked",
+            );
+        }
+        result
     }
 
     /// A value whose only use must be on the stack gets a stack slot, and it is
@@ -1602,6 +1941,27 @@ mod tests {
             home => panic!("expected a single slot, got {home:?}"),
         };
         assert_eq!(slot.index(), 0);
+    }
+
+    /// A block parameter and the arguments it is passed on every edge share one
+    /// slot, so that no edge copies from one slot to another.
+    #[test]
+    fn a_param_and_all_its_args_share_a_slot() {
+        let test_input = TestInput::with_two_stack_args_to_one_stack_param();
+        crate::test::check_allocation(&test_input).expect("the allocation must be correct");
+
+        let context = allocate(&test_input).unwrap().unwrap();
+        let spill_slots = &context.context32.spill_slots;
+        let slot = |v| {
+            Val::<u32>::try_new(v)
+                .unwrap()
+                .stack_home(spill_slots)
+                .expect("every value here is spilled")
+        };
+        let (arg1, temp, arg2, param) = (slot(0), slot(1), slot(2), slot(3));
+        assert_ne!(arg1, temp, "the two values in `block1` are live at once");
+        assert_eq!(param, arg1);
+        assert_eq!(param, arg2);
     }
 
     /// Nothing spills when every use can be satisfied in a register, and then

@@ -9588,6 +9588,148 @@ impl TestInput {
         input
     }
 
+    /// Two predecessors each pass a spilled argument to one spilled block
+    /// parameter.
+    ///
+    /// `block1` spills a second value while its argument is live, and that is
+    /// the slot coloring `block2` would hand its argument first, so the two
+    /// arguments land in different slots unless their shared parameter pulls
+    /// them together.
+    pub fn with_two_stack_args_to_one_stack_param() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        let block = |b| Block::try_new(b).unwrap();
+        let val = |v| Val::try_new(v).unwrap();
+        let (arg1, temp, arg2, param) = (val(0), val(1), val(2), val(3));
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::InstResult {
+                inst: inst(1),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(2),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(5),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: block(3),
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let def = |val| InstData::Op {
+            operands: vec![Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                Some(val),
+            )],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let stack_uses = |vals: &[Val]| InstData::Op {
+            operands: vals
+                .iter()
+                .map(|&val| {
+                    Operand::new(
+                        Position::Early,
+                        DefUse::Use,
+                        OperandConstraint::Stack,
+                        Some(val),
+                    )
+                })
+                .collect(),
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let branch = |targets: Vec<BlockCall>| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets,
+        };
+
+        func.insts = PrimaryMap::new();
+        for data in [
+            // block0
+            branch(vec![
+                BlockCall {
+                    target: block(1),
+                    args: vec![],
+                },
+                BlockCall {
+                    target: block(2),
+                    args: vec![],
+                },
+            ]),
+            // block1
+            def(arg1),
+            def(temp),
+            stack_uses(&[arg1, temp]),
+            branch(vec![BlockCall {
+                target: block(3),
+                args: vec![arg1],
+            }]),
+            // block2
+            def(arg2),
+            stack_uses(&[arg2]),
+            branch(vec![BlockCall {
+                target: block(3),
+                args: vec![arg2],
+            }]),
+            // block3, with a terminator of its own so that
+            // `ensure_terminators` does not take the use away.
+            stack_uses(&[param]),
+            stack_uses(&[]),
+        ] {
+            func.insts.push(&mut output, data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (params, insts) in [
+            (vec![], vec![inst(0)]),
+            (vec![], vec![inst(1), inst(2), inst(3), inst(4)]),
+            (vec![], vec![inst(5), inst(6), inst(7)]),
+            (vec![param], vec![inst(8), inst(9)]),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A move from one spill slot to another with nowhere to stage it.
     pub fn with_a_stack_to_stack_move_and_no_free_register() -> Self {
         let mut output = OutputInner::<u32>::new();

@@ -663,6 +663,21 @@ where
     pub(crate) fn region(self, region_tree: &RegionTree<E>) -> Region<E> {
         region_tree.block_region[self].expect("every block has a region after construction")
     }
+
+    /// How many loops contain this block: the number of ancestors of its loop
+    /// region.
+    ///
+    /// A cycle headed by the entry block is the top-level region itself, so its
+    /// blocks are at depth zero.
+    pub(crate) fn loop_depth(self, region_tree: &RegionTree<E>) -> usize {
+        let mut region = self.region(region_tree).loop_region(region_tree);
+        let mut depth = 0;
+        while let Some(parent) = region.parent(region_tree) {
+            region = parent;
+            depth += 1;
+        }
+        depth
+    }
 }
 
 impl<E> Region<E>

@@ -368,7 +368,6 @@ impl RegionFuel {
     const PER_SPAN: u64 = 32;
     const BASE: u64 = 1024;
     const FLOOR: u64 = 64;
-    const SAFETY_NET_PER_SPAN: u64 = 64;
 
     const EMPTY: Self = RegionFuel {
         budget: 0,
@@ -376,11 +375,9 @@ impl RegionFuel {
     };
 
     fn new(num_spans: usize) -> Self {
-        let n = num_spans as u64;
-        let log_n = u64::from(n.max(1).ilog2()) + 1;
         RegionFuel {
-            budget: Self::PER_SPAN * n + Self::BASE,
-            safety_net: Self::SAFETY_NET_PER_SPAN * n * log_n * log_n + Self::BASE,
+            budget: Self::PER_SPAN * num_spans as u64 + Self::BASE,
+            safety_net: Fuel::safety_net(num_spans),
         }
     }
 

@@ -734,15 +734,8 @@ impl<'a> Output<'a> {
     #[doc(hidden)]
     pub fn loop_depth(&self, block: Block) -> usize {
         with_inner!(self, |inner| {
-            let tree = &inner.region_tree;
             let block = block.with_repr().expect("no such block in these results");
-            let mut region = block.region(tree).loop_region(tree);
-            let mut depth = 0;
-            while let Some(parent) = region.parent(tree) {
-                region = parent;
-                depth += 1;
-            }
-            depth
+            block.loop_depth(&inner.region_tree)
         })
     }
 
