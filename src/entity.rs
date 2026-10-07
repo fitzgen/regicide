@@ -33,6 +33,9 @@ mod sealed {
         fn new(inner: Self) -> Option<Self::NonZero>;
 
         fn get(non_zero: Self::NonZero) -> Self;
+
+        /// `index + 1`, when that fits. Otherwise some arbitrary nonzero value.
+        fn from_index_unchecked(index: usize) -> Self::NonZero;
     }
 
     macro_rules! define_non_zero_ints {
@@ -67,6 +70,16 @@ mod sealed {
                     #[inline]
                     fn get(non_zero: Self::NonZero) -> Self {
                         non_zero.get()
+                    }
+
+                    #[inline]
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        reason = "an index that does not fit is the caller's bug, which \
+                                  `Entity::new_unchecked` catches in debug builds"
+                    )]
+                    fn from_index_unchecked(index: usize) -> Self::NonZero {
+                        Self::NonZero::MIN.saturating_add(index as $t)
                     }
                 }
             )*
@@ -164,6 +177,20 @@ pub trait Entity: Sized + Copy + Debug + PartialEq + Eq + PartialOrd + Ord + Has
 
     /// TODO FITZGEN
     fn try_new(index: usize) -> Option<Self>;
+
+    /// Like `try_new`, but checking that `index` is representable only in debug
+    /// builds, for hot paths whose indices are in range by construction.
+    #[inline]
+    fn new_unchecked(index: usize) -> Self {
+        debug_assert!(
+            Self::try_new(index).is_some(),
+            "index {index} is out of range for `{}`",
+            core::any::type_name::<Self>(),
+        );
+        Self::from_bits(<Self::Repr as sealed::NonZeroInt>::from_index_unchecked(
+            index,
+        ))
+    }
 
     /// TODO FITZGEN
     fn index(self) -> usize;
@@ -619,5 +646,32 @@ mod tests {
         assert_eq!(class.with_repr::<u8>(), Some(class));
         assert_eq!(class.with_repr::<u16>(), Some(class));
         assert_eq!(class.with_repr::<u32>(), Some(class));
+    }
+
+    /// `new_unchecked` agrees with `try_new` on every index `try_new` accepts,
+    /// at each repr.
+    #[test]
+    fn new_unchecked_agrees_with_try_new() {
+        use crate::entity::Val;
+
+        fn check<K: Entity>(indices: impl IntoIterator<Item = usize>) {
+            for i in indices {
+                assert_eq!(K::new_unchecked(i), K::try_new(i).unwrap());
+            }
+        }
+
+        check::<Val<u8>>(0..=254);
+        check::<Val<u16>>((0..=1000).chain(65_000..=65_534));
+        check::<Val<u32>>([0, 1, 2, 1 << 20, u32::MAX as usize - 1]);
+        check::<RegClass>([0, 1, RegClass::MAX_REPRESENTABLE.index()]);
+    }
+
+    /// Debug builds still refuse an index the entity cannot represent.
+    #[test]
+    #[should_panic = "out of range"]
+    #[cfg(debug_assertions)]
+    fn new_unchecked_checks_in_debug() {
+        use crate::entity::Val;
+        Val::<u8>::new_unchecked(255);
     }
 }

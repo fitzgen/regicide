@@ -1,4 +1,4 @@
-use super::Entity;
+use super::{Entity, EntityRange};
 use crate::{
     error::{IResult, InternalError},
     output::OutputInner,
@@ -106,6 +106,24 @@ where
         key
     }
 
+    /// Remove every entry at or after `end`.
+    ///
+    /// `end` may be one past the last entry, as `next_key_unwrap` gives, which
+    /// removes nothing.
+    pub(crate) fn truncate(&mut self, end: K) {
+        self.elems.truncate(end.index());
+    }
+
+    /// The values of the entries in `range`.
+    pub(crate) fn slice(&self, range: EntityRange<K>) -> &[V] {
+        &self.elems[range.indices()]
+    }
+
+    /// The values of the entries in `range`, mutably.
+    pub(crate) fn slice_mut(&mut self, range: EntityRange<K>) -> &mut [V] {
+        &mut self.elems[range.indices()]
+    }
+
     /// Returns an iterator over the key-value pairs in the map.
     pub fn iter(&self) -> PrimaryMapIter<'_, K, V> {
         PrimaryMapIter {
@@ -162,6 +180,20 @@ where
     #[allow(dead_code, reason = "will probably need it")]
     pub fn as_mut_slice(&mut self) -> &mut [V] {
         &mut self.elems
+    }
+}
+
+impl<K, V> Extend<V> for PrimaryMap<K, V>
+where
+    K: Entity,
+{
+    /// Push every value from `values`, panicking if one would need a key `K`
+    /// cannot represent.
+    #[inline]
+    fn extend<I: IntoIterator<Item = V>>(&mut self, values: I) {
+        self.elems.extend(values);
+        // One comparison, since some callers extend by one value at a time.
+        assert!(self.elems.len() <= K::MAX_REPRESENTABLE.index() + 1);
     }
 }
 
@@ -529,6 +561,38 @@ mod tests {
                     assert_eq!(key, Val::try_new(expected_index).unwrap());
                 }
 
+                // Check `slice()` and `slice_mut()` over every range, including
+                // the empty ones.
+                let key = |i| Val::try_new(i).unwrap();
+                for i in 0..=values.len() {
+                    for j in i..=values.len() {
+                        let range = EntityRange {
+                            start: key(i),
+                            end: key(j),
+                        };
+                        assert_eq!(map.slice(range), &values[i..j]);
+                        assert_eq!(map.slice_mut(range), &values[i..j]);
+                    }
+                }
+                assert!(map.slice(EntityRange::empty()).is_empty());
+
+                // Check `truncate()` at every key and one past the last.
+                for k in 0..=values.len() {
+                    let mut truncated = map.clone();
+                    truncated.truncate(key(k));
+                    assert_eq!(truncated.as_slice(), &values[..k]);
+                }
+                let mut truncated = map.clone();
+                truncated.truncate(map.next_key_unwrap());
+                assert_eq!(truncated.as_slice(), &values[..]);
+
+                // Check `extend()` appends in order after existing entries.
+                let mut extended = PrimaryMap::<Val, u32>::new();
+                let (front, back) = values.split_at(values.len() / 2);
+                extended.extend(front.iter().copied());
+                extended.extend(back.iter().copied());
+                assert_eq!(extended.as_slice(), &values[..]);
+
                 // Test `reset()` method on `PrimaryMap`.
                 map.reset();
                 assert!(map.is_empty());
@@ -538,6 +602,20 @@ mod tests {
                 Ok(())
             },
         )
+    }
+
+    #[test]
+    fn primary_map_extend_up_to_max_key() {
+        let mut map = PrimaryMap::<Val<u8>, u8>::new();
+        map.extend(0..u8::MAX);
+        assert_eq!(map.len(), usize::from(u8::MAX));
+    }
+
+    #[test]
+    #[should_panic]
+    fn primary_map_extend_past_max_key() {
+        let mut map = PrimaryMap::<Val<u8>, u8>::new();
+        map.extend(0..=u8::MAX);
     }
 
     #[test]

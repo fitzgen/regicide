@@ -23,7 +23,7 @@ use crate::{
     timing::Timing,
 };
 use alloc::{collections::BinaryHeap, vec::Vec};
-use assignments::{Assignments, Occupant, QuerySpan, SpanInterference};
+use assignments::{Assignments, Occupant, QuerySpan, SpanInterference, SplitCandidate};
 use core::{fmt, marker::PhantomData, ops::Range};
 use splitting::{Cut, HalfSpan, SplitUse, WithinSpanCut};
 
@@ -222,7 +222,7 @@ where
     move |(c, candidate), half| {
         interference.weight(
             assignments,
-            c,
+            SplitCandidate::new_unchecked(c),
             units_of(candidate),
             half,
             scratch,

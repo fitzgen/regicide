@@ -2,7 +2,7 @@
 
 use crate::{
     Entity, Reg, RegGroup, RegUnit, Val,
-    entity::{EntityRepr, SecondaryMap},
+    entity::{EntityRange, EntityRepr, PrimaryMap, SecondaryMap},
     live_ranges::{LiveBundle, LivePoint},
     output::RegAllocation,
     region_allocation::{EvictionCost, splitting::HalfSpan},
@@ -211,6 +211,21 @@ where
     weight
 }
 
+define_entities! {
+    /// A span of the bundle being split, by its position in program order.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct SplitSpan = "split_span";
+
+    /// One of the registers or register groups a split is choosing among, in
+    /// the order the splitting kernel offers them.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) struct SplitCandidate = "split_candidate";
+
+    /// A slot in the arena of bundles found in the way of split spans.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct InterferenceStorageIndex = "interference_storage_index";
+}
+
 /// What is in the way of each of a bundle's spans in each of its candidates.
 ///
 /// Splitting prices both halves of every cut it considers, and each span lies
@@ -221,11 +236,11 @@ where
     E: EntityRepr,
 {
     /// The spans being split.
-    spans: Vec<QuerySpan<E>>,
+    spans: PrimaryMap<SplitSpan, QuerySpan<E>>,
 
-    /// Where each candidate's row starts in `prefix`, by candidate index, once
-    /// that candidate has been asked about.
-    rows: Vec<Option<usize>>,
+    /// Where each candidate's row starts in `prefix`, once that candidate has
+    /// been asked about.
+    rows: SecondaryMap<SplitCandidate, Option<usize>>,
 
     /// A row of `spans.len() + 1` entries per candidate asked about. Entry `i`
     /// of a row is where span `i`'s conflicts start in `bundles`, and how many
@@ -235,10 +250,11 @@ where
     /// spans' conflicts is one slice of `bundles`.
     prefix: Vec<(usize, usize)>,
 
-    bundles: Vec<LiveBundle<E>>,
+    bundles: PrimaryMap<InterferenceStorageIndex, LiveBundle<E>>,
 
-    /// Where the run of equal entries of `bundles` holding each entry starts.
-    run_starts: Vec<usize>,
+    /// Where the run of equal entries of `bundles` holding each entry starts,
+    /// once `fill_row` has filled in that entry's row.
+    run_starts: SecondaryMap<InterferenceStorageIndex, Option<usize>>,
 }
 
 impl<E> SpanInterference<E>
@@ -247,11 +263,11 @@ where
 {
     pub const fn new() -> Self {
         Self {
-            spans: Vec::new(),
-            rows: Vec::new(),
+            spans: PrimaryMap::new(),
+            rows: SecondaryMap::new(None),
             prefix: Vec::new(),
-            bundles: Vec::new(),
-            run_starts: Vec::new(),
+            bundles: PrimaryMap::new(),
+            run_starts: SecondaryMap::new(None),
         }
     }
 
@@ -262,86 +278,91 @@ where
     }
 
     pub fn clear(&mut self) {
-        self.spans.clear();
-        self.rows.clear();
+        self.spans.reset();
+        self.rows.reset();
         self.prefix.clear();
-        self.bundles.clear();
-        self.run_starts.clear();
+        self.bundles.reset();
+        self.run_starts.reset();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.spans.is_empty()
-            && self.rows.is_empty()
+        self.spans.is_reset()
+            && self.rows.is_reset()
             && self.prefix.is_empty()
-            && self.bundles.is_empty()
-            && self.run_starts.is_empty()
+            && self.bundles.is_reset()
+            && self.run_starts.is_reset()
     }
 
-    /// The one bundle filling `bundles[range]`, `Some(None)` when that is
+    /// The one bundle filling `range` of `bundles`, `Some(None)` when that is
     /// empty, and `None` when it holds two or more distinct bundles.
-    fn sole(&self, range: Range<usize>) -> Option<Option<LiveBundle<E>>> {
-        match range.len() {
+    fn sole(&self, range: EntityRange<InterferenceStorageIndex>) -> Option<Option<LiveBundle<E>>> {
+        // Not `range.len()`, which spends a branch on `EntityRange::empty`; a
+        // range built from `prefix` is never that sentinel.
+        let (start, end) = (range.start.index(), range.end.index());
+        match end - start {
             0 => Some(None),
-            _ => (self.run_starts[range.end - 1] <= range.start)
-                .then(|| Some(self.bundles[range.start])),
+            _ => {
+                let last = InterferenceStorageIndex::new_unchecked(end - 1);
+                (self.run_starts[last].unwrap() <= start).then(|| Some(self.bundles[range.start]))
+            }
         }
     }
 
-    /// Push the bundles in the way of span `i` in `units` onto `bundles`, and
+    /// Push the bundles in the way of `span` in `units` onto `bundles`, and
     /// an entry for it onto `prefix` holding how many there are and whether a
     /// reservation is in its way.
     fn query(
         &mut self,
         assignments: &Assignments<E>,
         units: impl Iterator<Item = Range<RegUnit>>,
-        i: usize,
+        span: SplitSpan,
     ) -> bool {
-        let start = self.bundles.len();
+        let start = self.bundles.next_key_unwrap();
         let clear = assignments.push_interfering(
             units,
-            iter::once(self.spans[i].clone()),
+            iter::once(self.spans[span].clone()),
             &mut self.bundles,
         );
         if !clear {
             self.bundles.truncate(start);
         }
         self.prefix
-            .push((self.bundles.len() - start, usize::from(!clear)));
+            .push((self.bundles.len() - start.index(), usize::from(!clear)));
         clear
     }
 
-    /// The `candidate`th candidate's row of `prefix`, querying its spans in
-    /// `units` the first time it is asked about.
+    /// `candidate`'s row of `prefix`, querying its spans in `units` the first
+    /// time it is asked about.
     #[inline]
     fn row(
         &mut self,
         assignments: &Assignments<E>,
-        candidate: usize,
+        candidate: SplitCandidate,
         units: impl Iterator<Item = Range<RegUnit>> + Clone,
     ) -> Range<usize> {
-        let row = match self.rows.get(candidate) {
-            Some(&Some(row)) => row,
-            _ => self.fill_row(assignments, candidate, units),
+        let row = match self.rows[candidate] {
+            Some(row) => row,
+            None => self.fill_row(assignments, candidate, units),
         };
         row..row + self.spans.len() + 1
     }
 
-    /// Query the `candidate`th candidate's spans in `units` into a new row of
-    /// `prefix`, and return where it starts.
+    /// Query `candidate`'s spans in `units` into a new row of `prefix`, and
+    /// return where it starts.
     #[cold]
     #[inline(never)]
     fn fill_row(
         &mut self,
         assignments: &Assignments<E>,
-        candidate: usize,
+        candidate: SplitCandidate,
         units: impl Iterator<Item = Range<RegUnit>> + Clone,
     ) -> usize {
         let n = self.spans.len();
-        if self.rows.len() <= candidate {
-            self.rows.resize(candidate + 1, None);
-        }
         let row = self.prefix.len();
         self.rows[candidate] = Some(row);
+        // Everything this row pushes, truncates or reverses is at or after
+        // here, and `run_starts` has nothing there yet.
+        let row_bundles = self.bundles.next_key_unwrap();
 
         // Each entry first holds a span's count of conflicts and whether it is
         // reserved, and becomes running totals at the end.
@@ -350,25 +371,31 @@ where
         // between the first and last reserved ones holds one of those too, and
         // is infinite whatever else is in its way. Those spans are not queried,
         // and count as reserved.
-        let mut first = n;
+        let mut first = None;
         for i in 0..n {
-            if !self.query(assignments, units.clone(), i) {
-                first = i;
+            let span = SplitSpan::new_unchecked(i);
+            if !self.query(assignments, units.clone(), span) {
+                first = Some(span);
                 break;
             }
         }
-        if first < n {
+        if let Some(first) = first {
             let tail = self.prefix.len();
-            let back = self.bundles.len();
-            for i in (first + 1..n).rev() {
-                if !self.query(assignments, units.clone(), i) {
+            let back = self.bundles.next_key_unwrap();
+            for i in (first.index() + 1..n).rev() {
+                if !self.query(assignments, units.clone(), SplitSpan::new_unchecked(i)) {
                     break;
                 }
             }
             // That walk went backwards; put it in span order. Each span's own
             // conflicts may stay reversed.
             self.prefix[tail..].reverse();
-            self.bundles[back..].reverse();
+            self.bundles
+                .slice_mut(EntityRange {
+                    start: back,
+                    end: self.bundles.next_key_unwrap(),
+                })
+                .reverse();
             let skipped = row + n - self.prefix.len();
             self.prefix
                 .splice(tail..tail, iter::repeat_n((0, 1), skipped));
@@ -387,25 +414,40 @@ where
         }
         self.prefix.push((start, reserved));
 
-        for i in self.run_starts.len()..self.bundles.len() {
-            let start = match i.checked_sub(1) {
-                Some(prev) if self.bundles[prev] == self.bundles[i] => self.run_starts[prev],
-                _ => i,
+        let pushed = EntityRange {
+            start: row_bundles,
+            end: self.bundles.next_key_unwrap(),
+        };
+        for i in pushed {
+            // A run may reach back into the previous row, which `sole` allows.
+            let start = match i.index().checked_sub(1) {
+                Some(prev) if self.bundles.as_slice()[prev] == self.bundles[i] => {
+                    self.run_starts[InterferenceStorageIndex::new_unchecked(prev)].unwrap()
+                }
+                _ => i.index(),
             };
-            self.run_starts.push(start);
+            self.run_starts[i] = Some(start);
         }
+        // Each row fills in its entries contiguously, so the last one stands for
+        // all of them.
+        debug_assert!(
+            self.bundles
+                .keys()
+                .next_back()
+                .is_none_or(|last| self.run_starts[last].is_some())
+        );
         row
     }
 
-    /// The same as `Assignments::interference_weight` for `half` in the
-    /// `candidate`th candidate, whose units are `units`.
+    /// The same as `Assignments::interference_weight` for `half` in
+    /// `candidate`, whose units are `units`.
     ///
     /// `half` must be carved from the spans given to `reset`. Its divided span
     /// is queried afresh when the cut changed it.
     pub fn weight(
         &mut self,
         assignments: &Assignments<E>,
-        candidate: usize,
+        candidate: SplitCandidate,
         units: impl Iterator<Item = Range<RegUnit>> + Clone,
         half: HalfSpan<'_, E>,
         scratch: &mut Vec<LiveBundle<E>>,
@@ -428,12 +470,16 @@ where
         };
         let (start, reserved_before) = prefix[spans.start];
         let (end, reserved_after) = prefix[spans.end];
+        let conflicts = EntityRange {
+            start: InterferenceStorageIndex::new_unchecked(start),
+            end: InterferenceStorageIndex::new_unchecked(end),
+        };
         if reserved_before != reserved_after
             || !intact
                 && !assignments.push_interfering(
                     units,
                     iter::once(QuerySpan {
-                        porous_to: self.spans[index].porous_to,
+                        porous_to: self.spans[SplitSpan::new_unchecked(index)].porous_to,
                         range,
                     }),
                     scratch,
@@ -445,7 +491,7 @@ where
 
         // Usually one bundle, at most, is in the way of the whole half, which
         // needs neither the copy nor the sort.
-        if let Some(sole) = self.sole(start..end) {
+        if let Some(sole) = self.sole(conflicts) {
             let mut fresh = scratch.iter().copied();
             let sole = sole.or_else(|| fresh.next());
             if fresh.all(|b| Some(b) == sole) {
@@ -454,7 +500,7 @@ where
             }
         }
 
-        scratch.extend_from_slice(&self.bundles[start..end]);
+        scratch.extend_from_slice(self.bundles.slice(conflicts));
         sum_distinct(scratch, weight_of)
     }
 }
@@ -609,11 +655,11 @@ where
         &self,
         reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
-        out: &mut Vec<LiveBundle<E>>,
+        out: &mut impl Extend<LiveBundle<E>>,
     ) -> bool {
         self.for_each_overlapping(reg_units, spans, |existing| match existing {
             Conflict::Assignment(existing) => {
-                out.push(existing.bundle);
+                out.extend(iter::once(existing.bundle));
                 ControlFlow::Continue(())
             }
             Conflict::Reservation(_) => ControlFlow::Break(()),
@@ -1770,7 +1816,7 @@ mod tests {
                 for half in &halves {
                     let actual = cache.weight(
                         assignments,
-                        candidate,
+                        SplitCandidate::try_new(candidate).unwrap(),
                         units[candidate].iter().cloned(),
                         *half,
                         scratch,
