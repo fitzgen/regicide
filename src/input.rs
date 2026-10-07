@@ -1306,6 +1306,11 @@ where
                 context.output.result(writeln!(f))?;
             }
         }
+        for edit in edits.iter().filter(|(at, _)| at.is_none()) {
+            context
+                .output
+                .result(writeln!(f, "      edit: {:?}", edit.1))?;
+        }
         if self.0.len_successors() == 0 {
             context.output.result(writeln!(f, "    --> returns"))?;
         } else {
