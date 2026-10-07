@@ -47,6 +47,51 @@ before working on them. What 001 left open, ranked:
    uses in straight-line code now reloads. Try restricting #2 to bundles in a
    loop region, or across a call.
 
+## Cold regions and cold-edge spills: `code-quality-003` (2026-10-07, landed as `f12e432`)
+
+`reports/code-quality-003/` in the `regicide-cold-blocks-as-own-regions`
+worktree. A user-directed task, not one of 003's findings. Base `bf6be7d`;
+landed together as `f12e432` ("Put cold blocks in their own regions; don't
+hoist spills out of cold blocks").
+
+| # | idea | verdict | result vs `bf6be7d` |
+| --- | --- | --- | --- |
+| 1 | split each region's cold blocks into a cold child region, allocated after every other region; no hints from cold to non-cold regions | **kept** | countMatches -1.20%, VDBE -0.06%; cold moves -45% to -65% in every corpus; better 350 / worse 20 |
+| 2 | in cold regions, priority tier for values with no spill slot yet | dropped | fixed #1's regressions, but countMatches +1.85%: a value with a slot can still arrive in a register |
+| 3 | same tier, keyed on "arrives in a register" | dropped at screen | marks ~20 of 26 cold bundles, so reorders nothing |
+| 4 | spill placement never climbs from a block into a more frequent sole predecessor; the store goes on that edge instead | **kept** | removes #1's regressions; cumulative better 372 / worse 1, guards unchanged, compile time -0.22% |
+
+What the code does now, and what to know before changing it:
+
+- **Region tree.** `RegionTree::is_cold(region)`; `Region::loop_region`
+  looks through a cold region to its loop. `Output::loop_depth`, spill
+  placement's loop guard, and property tests all use `loop_region`. A cold
+  block that names its own region (a cold loop header) stays put, so cold
+  loops are not separated.
+- **Spill placement is frequency-aware, not cold-aware.** Every check compares
+  `Block::frequency(func)`: the walk stops at a block whose sole predecessor
+  runs more often (`is_edge_spill_block`), the push-up stops before a more
+  frequent parent, and a value's stack blocks are placed most frequent first.
+  Cranelift sends only COLD or NORMAL today, so graded frequencies are
+  untested on real inputs. `a_spill_for_a_less_frequent_read_stays_on_the_edge`
+  covers HOT->NORMAL and 10->0.5.
+- **An edge store is skipped when the store above would cover another site**
+  (`store_above_covers_another_site`). Without it: 13 functions worse, 0
+  better. Redundant-move elimination cannot recover these, because it only
+  removes a store dominated by an earlier one, and edge stores sit on sibling
+  paths.
+- **`SpillSite::block()`** is the block the store runs in. For an edge store,
+  its `span()` is the predecessor's live-out span, so never derive the block
+  from the span.
+
+Open, ranked:
+
+1. **countMatches swings ±2% on tiny upstream changes**, through slot
+   assignment and redundant-move elimination, with no hot operand moving
+   (stack-to-stack reload/spill pairs 840 vs 919). A lead for #1/#2 below.
+2. **Cold loops** (a cold block heading its own region) stay in their region.
+   Check breadth before trying.
+
 ## Where to start: `codegen-analysis-003` (2026-10-06, regicide `e9b676b`)
 
 `~/regalloc2/reports/codegen-analysis-003/report.md`. On cycles, only one
@@ -206,6 +251,10 @@ byte-identically (478 inputs re-checked).
 - **Cold-block trades are intended** (since Wasmtime `00a6476`). Cranelift
   marks sunk blocks `COLD` and coalescing never merges across a cold edge, so
   some moves land in cold blocks on purpose. The estimate weights them 0.05x.
+  Since `f12e432` cold blocks are their own regions, allocated last, so a cold
+  region cannot evict anything: around a call that clobbers everything, it
+  spills whatever does not fit in the callee-saved registers its neighbors
+  left free.
 - **No loop-depth frequency from Cranelift.** Frequencies are only `COLD` or
   `NORMAL`; loop weighting comes from regicide's region tree
   (`Output::loop_depth`). A loop headed by the entry block is the top-level
@@ -252,6 +301,14 @@ byte-identically (478 inputs re-checked).
   (found by a mutatis shrink). `with_a_looping_value_read_only_after_the_loop`
   no longer yields a dead move. Neither the test corpus nor 100,000 mutated
   inputs yielded a dead register move inside a loop under 001 #2.
+- **`$S/block_costs.py` + `$S/block-costs.patch`** rank a function's
+  estimated-cycles delta by block and loop depth. In code-quality-003 this
+  explained every regression in minutes. **The patch builds only on top of a
+  tree that builds:** `7d1217e`..`f12e432` (at least) fail to compile with the
+  `run` example's features, because `has_nothing_to_split_for`'s early return
+  clears a removed `split_span_vals` field. Delete that line in the scratch
+  copy (`sed -i '' '/self.split_span_vals.clear();/d' src/region_allocation.rs`)
+  until it is fixed.
 - **`$S/loops.py`** finds loops, latches and per-block edits in a `run`
   printout. `--latch-reloads N` scans for back-edge seams. At `bf6be7d` it
   found 70 latches with >= 3 reloads in inputs under 5e7 compile insts.

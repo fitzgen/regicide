@@ -78,6 +78,10 @@ Things to know about it:
   regression.
 - **Spill slots** are not in the estimate. Watch `slots` separately: all else
   equal, smaller frames are better (a thing to preserve, see known-findings).
+- **Cold edits barely register.** At 0.05x, cutting cold moves by half in
+  every corpus (code-quality-003) moved no corpus total by more than 0.5%.
+  When the change is about slow paths, report `diff_counts.py`'s `cold moves Δ`
+  column next to the estimate.
 
 ## Invariants
 
@@ -300,6 +304,13 @@ cargo run --release --example visualize -- \
   In 001, `sqlite3-1347-u0-1026` (a 3-block loop, 4 latch reloads, 147 queue
   pops) showed the whole split-and-evict cascade in one screen. The target
   it stood for, `countMatches`, had 242,695 queue pops.
+- **Check whether any operand moved before blaming a decision.** In a big
+  function, a change can move ±2% of estimated cycles without changing one
+  `use`/`def` allocation: slot numbering shifts, so redundant-move elimination
+  removes a different set of moves. Compare the `use`/`def` lines block by
+  block (code-quality-003's `misc/operand_changes.py`). If none moved, rerun
+  both sides with `-r none`: if the ranking holds there, the cost is real;
+  either way, it is not a hot-loop decision your change made.
 - **Re-derive the mechanism from the event counts.** The analysis's
   mechanism is a hypothesis about the code as it was. 001's explanation of
   the switch regression was wrong, and 002 found the real one from event
@@ -460,6 +471,24 @@ baseline) and each heavy input.
 - **A new heavy outlier** (a superlinear blowup on some input): drop or
   rework. One codegen win cost a function 35 s → 146 s of compile time
   before (known-findings).
+- **A uniform jump across every corpus is usually inlining, not your code.**
+  In code-quality-003 a spill-placement change cost +8.7% insts on
+  `keccak_core`, an input with no cold blocks, all of it inside region
+  allocation, which the change did not touch. Removing a check later cost
+  +12%, though the code did strictly less work. Both times rustc had stopped
+  inlining something hot (`FixedEntitySet::insert`, `coalescing::coalesce`).
+  Confirm with the `timing` feature (`RUST_LOG=regicide::timing=trace`) that
+  the time moved into an untouched pass. Then find what went out of line:
+
+  ```bash
+  norm() { nm -C "$1" | grep -E ' [tT] ' | awk '{$1=$2=""; print}' \
+      | sed 's/^ *//' | grep -E '^<?regicide::' | sort -u; }
+  comm -3 <(norm $R/bins/run-<base>) <(norm $R/bins/run-<cand>)
+  ```
+
+  An `#[inline]` on the function that went out of line fixed both. Bisect
+  the edit in a scratch tree first, since a one-line restructuring (a second
+  loop over the spans) can be the trigger.
 
 ## Testing
 
@@ -511,7 +540,9 @@ Require `INITED` and `Done` before calling it clean. A fuzz crash after a
 heuristic change is yours until proven otherwise: soak time on a clean HEAD
 cannot classify it as pre-existing. An exit of 144 with no crash in the log
 means something outside the session killed the run. Rerun it; it is not a
-pass.
+pass. **Before rerunning, make sure the old run is dead** (`pgrep -fl
+'fuzz run'`). In 003 a `pkill` missed it, and both runs wrote into one log,
+which then held two `Done` lines for different builds.
 
 ## Sightglass and Wasmtime: only when asked
 
@@ -547,7 +578,8 @@ to that step.
   commit in regicide" rule only for the `WIP` commits and tags described
   here.
 - **If the harness refuses `git commit`** (001's was refused as "Git
-  Destructive"), do not retry or work around it. Switch to patches for the
+  Destructive", 003's `git add` as "Modify Shared Resources"), do not retry
+  or work around it. Switch to patches for the
   rest of the session, and say so at the top of `report.md`:
   - `git diff > $R/patches/NN-<slug>.patch` once an attempt is built. Name
     the bin `run-aNN` and the counts `aNN.tsv`, since there is no sha.
@@ -555,6 +587,10 @@ to that step.
     of each touched file, or `git apply -R` of the dropped delta), and check
     that `git diff` equals the kept patch.
   - Leave the kept work unstaged, and list the files for the user to commit.
+  - The user may stage, commit or rebase while you work (003's tip was
+    committed under a new sha mid-session). Run `git status` and `git log -3`
+    before each round. Never stage your follow-up edits on top of what they
+    staged; an `MM` file in `git status` is the expected state.
 
 ## 5. Finish
 
@@ -620,6 +656,16 @@ Then tell the user where the report is and summarize the cumulative result.
   averages of 15-25, `counts.py`'s insts swung 10% on an *unchanged*
   allocation (switch-0004 in 001's attempt 1). Check `uptime` before reading
   the compile-time section, and confirm any surprise with `compare.py -n 20`.
+- **A priority tweak cannot fix a placement problem.** In code-quality-003,
+  two cold-region priority tiers were meant to stop spills landing in hot
+  blocks. Both were dropped: whichever value a cold block spills, spill
+  placement put the store in the hot predecessor. The fix was in spill
+  placement. When the cost is *where* an edit lands, look at the pass that
+  places it first.
+- **"Has a slot" is not "was stored on this path".** A value that already has
+  a spill slot can still reach a block in a register, and spilling it there
+  needs a new store. 003's attempt 2 assumed otherwise and regressed
+  countMatches +1.85%.
 - **Testing a split heuristic only in `split_into_minimal_or_spill`.** Most
   shredding happens one cut at a time in `split_between_spans`, whose halves
   are requeued. 001's attempt 3 changed only the minimal split and moved
