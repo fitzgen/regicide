@@ -7485,9 +7485,297 @@ impl TestInput {
         input
     }
 
+    /// A value live through a loop that never reads it, where only the middle
+    /// of the loop is short of registers: `v0` is defined in `block0` and read
+    /// in `block4`, the loop is `block1` to `block3`, and `block2` alone keeps
+    /// both registers of the machine busy with `v1` and `v2`.
+    pub fn with_a_value_live_through_a_busy_loop() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i: usize| Val::try_new(i).unwrap();
+        let inst = |i: usize| Inst::try_new(i).unwrap();
+        let block = |i: usize| Block::try_new(i).unwrap();
+        let reg =
+            OperandConstraint::Reg(RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap());
+
+        func.values = PrimaryMap::new();
+        for (inst_index, i) in [(0, 0), (3, 0), (3, 1)] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: inst(inst_index),
+                            i,
+                        },
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let jump = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .iter()
+                .map(|&target| BlockCall {
+                    target: block(target),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`: define the value carried through the loop.
+            InstData::Op {
+                operands: vec![Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    Some(val(0)),
+                )],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            jump(&[1]),
+            // `block1`: the loop header, with a register to spare.
+            jump(&[2]),
+            // `block2`: fill both registers, and read them.
+            InstData::Op {
+                operands: vec![
+                    Operand::new(Position::Late, DefUse::Def, reg, Some(val(1))),
+                    Operand::new(Position::Late, DefUse::Def, reg, Some(val(2))),
+                ],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![
+                    Operand::new(Position::Early, DefUse::Use, reg, Some(val(1))),
+                    Operand::new(Position::Early, DefUse::Use, reg, Some(val(2))),
+                ],
+                clobbers: vec![],
+                targets: vec![BlockCall {
+                    target: block(3),
+                    args: vec![],
+                }],
+            },
+            // `block3`: the latch, with a register to spare too.
+            jump(&[1, 4]),
+            // `block4`: the one read of `v0`, past the loop.
+            InstData::Branch {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    Some(val(0)),
+                )],
+                clobbers: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1)],
+            vec![inst(2)],
+            vec![inst(3), inst(4)],
+            vec![inst(5)],
+            vec![inst(6)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A value that dies in a register a later block clobbers, so that the
+    /// move carrying it into that register at the top of the block between is
+    /// overwritten before anything reads it.
+    ///
+    /// `v1` lives in `r1` across `block0` and is spilled there, because it is
+    /// read at the end of `block2` from `r0`. `block1` moves it into `r0`, but
+    /// `block2` clobbers `r0` and then reloads `v1` into it, so the move is
+    /// dead, and only a pass that looks past `block1` can tell.
+    pub fn with_a_register_move_overwritten_in_a_later_block() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i: usize| Val::try_new(i).unwrap();
+        let inst = |i: usize| Inst::try_new(i).unwrap();
+        let block = |i: usize| Block::try_new(i).unwrap();
+        let reg = |i: usize| Reg::try_new(i).unwrap();
+        let first_reg = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        for (reg_class, def, remat) in [
+            (
+                TestMachine::BOTH_REGS_CLASS,
+                ValDef::BlockParam {
+                    block: block(0),
+                    i: 0,
+                },
+                NO_REMAT,
+            ),
+            (
+                TestMachine::BOTH_REGS_CLASS,
+                ValDef::InstResult {
+                    inst: inst(1),
+                    i: 0,
+                },
+                NO_REMAT,
+            ),
+            (
+                TestMachine::FIRST_REG_CLASS,
+                ValDef::InstResult {
+                    inst: inst(2),
+                    i: 0,
+                },
+                NO_REMAT,
+            ),
+            // Always rematerialized, so it holds no register across `block1`.
+            (
+                TestMachine::BOTH_REGS_CLASS,
+                ValDef::InstResult {
+                    inst: inst(4),
+                    i: 0,
+                },
+                1,
+            ),
+            (
+                TestMachine::BOTH_REGS_CLASS,
+                ValDef::InstResult {
+                    inst: inst(7),
+                    i: 0,
+                },
+                NO_REMAT,
+            ),
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class,
+                        def,
+                        remat,
+                    },
+                )
+                .unwrap();
+        }
+
+        let any = |pos, kind, v| Operand::new(pos, kind, OperandConstraint::Any, Some(val(v)));
+        let op = |operands, clobbers, side_effects| InstData::Op {
+            operands,
+            clobbers,
+            side_effects,
+        };
+        let jump = |target| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: vec![BlockCall {
+                target: block(target),
+                args: vec![],
+            }],
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`
+            op(
+                vec![any(Position::Early, DefUse::Use, 0)],
+                vec![reg(1)],
+                true,
+            ),
+            op(vec![any(Position::Late, DefUse::Def, 1)], vec![], true),
+            op(
+                vec![
+                    any(Position::Early, DefUse::Def, 2),
+                    any(Position::Late, DefUse::Use, 1),
+                ],
+                vec![],
+                true,
+            ),
+            jump(1),
+            // `block1`
+            op(vec![any(Position::Late, DefUse::Def, 3)], vec![], true),
+            op(vec![], vec![], false),
+            jump(2),
+            // `block2`: clobber `r0`, then read `v1` from it.
+            op(
+                vec![any(Position::Late, DefUse::Def, 4)],
+                vec![reg(0)],
+                false,
+            ),
+            InstData::Branch {
+                operands: vec![Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(first_reg),
+                    Some(val(1)),
+                )],
+                clobbers: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (params, insts) in [
+            (vec![val(0)], vec![inst(0), inst(1), inst(2), inst(3)]),
+            (vec![], vec![inst(4), inst(5), inst(6)]),
+            (vec![], vec![inst(7), inst(8)]),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut machine = TestMachine::two_registers();
+        // Two units for `r0`, which is what tips the allocator into putting
+        // `v1` in `r1` first.
+        machine.banks[0].regs = vec![2, 1];
+        machine.fixup();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine,
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A loop carrying an entry parameter read only after the loop, on a path
-    /// where it has been spilled: the register half of its arrival is written
-    /// and never read.
+    /// where it has been spilled.
     pub fn with_a_looping_value_read_only_after_the_loop() -> Self {
         let mut output = OutputInner::<u32>::new();
         let mut func = TestFunction::default();
@@ -7590,8 +7878,6 @@ impl TestInput {
 
         func.blocks = PrimaryMap::new();
         for (params, insts, frequency) in [
-            // Cold tips the allocator into leaving the carried value in a
-            // register *and* a slot, so there is a second copy to be dead.
             (vec![val(0)], vec![inst(0)], 1),
             (vec![], vec![inst(1)], 0),
             (vec![], vec![inst(2), inst(3)], 0),
@@ -10021,9 +10307,11 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_rematerialized_block_arg(),
         TestInput::with_two_uses_of_different_values(),
         TestInput::with_a_critical_edge(),
-        // A value carried around a loop and read only past it, left in both a
-        // register and a slot: the corpus's one dead register-to-register move.
+        // A value carried around a loop and read only past it.
         TestInput::with_a_looping_value_read_only_after_the_loop(),
+        // A register-to-register move a later block overwrites: the corpus's
+        // one dead register-to-register move.
+        TestInput::with_a_register_move_overwritten_in_a_later_block(),
         TestInput::with_values_in_two_banks_spilled_and_reloaded(),
         // A value defined outside a loop that spends part of its live range on
         // the stack inside it, which is where a spill has a region to be

@@ -994,6 +994,21 @@ where
 
         self.fill_split_scratch(input, live_ranges, bundle);
 
+        // See `has_nothing_to_split_for`.
+        if has_nothing_to_split_for(live_ranges, bundle, &self.split_uses) {
+            self.split_spans.clear();
+            self.split_span_vals.clear();
+            counts.split_between_spans_failed.inc();
+            event!(
+                events,
+                BundleSplitFailed {
+                    bundle,
+                    split: SplitKind::BetweenSpans,
+                }
+            );
+            return Ok(false);
+        }
+
         let pref = *bundle.preference(live_ranges).union();
 
         let rc = match bundle.constraint(live_ranges) {
@@ -1320,13 +1335,15 @@ where
         debug_assert!(cuts.is_empty());
 
         self.fill_split_scratch(input, live_ranges, bundle);
-        cuts.extend(splitting::minimal_cuts(&self.split_spans, &self.split_uses));
+        let spill_whole = has_nothing_to_split_for(live_ranges, bundle, &self.split_uses);
+        if !spill_whole {
+            cuts.extend(splitting::minimal_cuts(&self.split_spans, &self.split_uses));
+        }
         self.split_spans.clear();
         self.split_uses.clear();
 
-        debug_assert_eq!(
-            bundle.is_minimal(live_ranges),
-            cuts.is_empty(),
+        debug_assert!(
+            spill_whole || bundle.is_minimal(live_ranges) == cuts.is_empty(),
             "a bundle is minimal iff there is nothing left to cut",
         );
 
@@ -1540,6 +1557,26 @@ fn order_non_preferred_candidates(
             region_preferences.contains(*r),
         )
     });
+}
+
+/// Is `bundle` one that splitting cannot help, so that once it fails to get a
+/// register whole it should go to the stack whole?
+///
+/// That is a bundle no instruction reads or writes, free to live on the
+/// stack. Any piece of it that won a register would only move the load or
+/// store to the seam between pieces, and inside a loop that seam runs once per
+/// iteration where a whole spill pays only at the loop's boundary.
+///
+/// `uses` are the bundle's uses, as `fill_split_scratch` collects them.
+fn has_nothing_to_split_for<E>(
+    live_ranges: &LiveRanges<E>,
+    bundle: LiveBundle<E>,
+    uses: &[SplitUse<E>],
+) -> bool
+where
+    E: EntityRepr,
+{
+    uses.is_empty() && bundle.constraint(live_ranges) == OperandConstraint::Any
 }
 
 /// The registers that something clobbers while `bundle` is live.
@@ -2879,6 +2916,36 @@ mod tests {
                 reg_moves, 0,
                 "the carried value should stay in one register"
             );
+        });
+    }
+
+    /// A value live through a loop that never reads it stays on the stack
+    /// across the whole loop, rather than being reloaded inside it to suit a
+    /// piece that won a register at the loop's header.
+    #[test]
+    fn a_value_unused_in_a_loop_is_not_reloaded_inside_it() {
+        use crate::{Edit, InputFunction, InstOrEdit, Move};
+
+        let test_input = crate::test::TestInput::with_a_value_live_through_a_busy_loop();
+        let mut context = crate::Context::new();
+
+        test_input.with_input(|input| {
+            let output =
+                crate::run(&mut context, input).expect("this function fits on this machine");
+            crate::checker::check(input, &output).expect("and the allocation is correct");
+
+            for (block, _) in input.func.blocks() {
+                if output.loop_depth(block) == 0 {
+                    continue;
+                }
+                let reloads = output
+                    .block_insts_and_edits(input.func, block)
+                    .filter(|item| {
+                        matches!(item, InstOrEdit::Edit(Edit::Move(Move::Reload { .. })))
+                    })
+                    .count();
+                assert_eq!(reloads, 0, "{block:?} is in the loop and reloads");
+            }
         });
     }
 

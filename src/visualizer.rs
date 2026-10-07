@@ -694,12 +694,11 @@ mod tests {
                 "eliminated-edits",
                 TestInput::with_a_value_reloaded_past_a_diamond,
             ),
-            // The same, for `DeadEditEliminated`: this input spends a loop with
-            // its carried value on the stack, so the register half of the
-            // value's arrival is written and never read.
+            // The same, for `DeadEditEliminated`: this input moves a value
+            // into a register a later block overwrites before reading it.
             (
                 "dead-edits",
-                TestInput::with_a_looping_value_read_only_after_the_loop,
+                TestInput::with_a_register_move_overwritten_in_a_later_block,
             ),
             ("critical-edge", TestInput::with_a_critical_edge),
             // A read of a register the allocator does not own, naming no value.

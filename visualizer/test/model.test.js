@@ -862,19 +862,19 @@ test("a dead edit summarizes the move into a location nothing reads", () => {
   const blob = fixture("dead-edits");
   const model = modelOf(blob);
   const found = model
-    .details({ kind: "Reg", index: 1 })
+    .details({ kind: "Reg", index: 0 })
     .events.filter((event) => event.kind === "DeadEditEliminated");
-  assert.equal(found.length, 1, "the fixture drops one move into r1");
+  assert.equal(found.length, 1, "the fixture drops one move into r0");
   assert.equal(
     flat(found[0].summary),
-    "DeadEditEliminated edit=move regReg {from: r0, to: r1} index=1 pos=point inst1:early",
+    "DeadEditEliminated edit=move regReg {from: r1, to: r0} index=1 pos=point inst4:early",
   );
   assert.deepEqual(
     found[0].summary.filter((part) => part.entity).map((part) => part.entity),
     [
-      { kind: "Reg", index: 0 },
       { kind: "Reg", index: 1 },
-      { kind: "Inst", index: 1 },
+      { kind: "Reg", index: 0 },
+      { kind: "Inst", index: 4 },
     ],
   );
 });

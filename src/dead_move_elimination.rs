@@ -1417,13 +1417,11 @@ mod tests {
     /// A register-to-register move whose destination is overwritten before
     /// anything reads it goes.
     ///
-    /// The value spends the loop on the stack, so the register half of its
-    /// arrival is written and never read. The overwrite is around the back edge,
-    /// so only `Global` sees it. The visualizer's `dead-edits` fixture is built
-    /// from the same input.
+    /// The overwrite is in a later block, so only `Global` sees it. The
+    /// visualizer's `dead-edits` fixture is built from the same input.
     #[test]
     fn a_move_into_a_register_nothing_reads_goes() {
-        let test_input = TestInput::with_a_looping_value_read_only_after_the_loop();
+        let test_input = TestInput::with_a_register_move_overwritten_in_a_later_block();
         let none = allocated(&test_input, MoveEliminationLevel::None);
         let local = allocated(&test_input, MoveEliminationLevel::Local);
         let global = allocated(&test_input, MoveEliminationLevel::Global);
@@ -1435,7 +1433,7 @@ mod tests {
         assert_eq!(count(&global.edits, is_reg_reg), 0);
         assert_eq!(global.stats.eliminated_reg_reg, 1);
 
-        // The slot traffic is what the loop actually reads, and stays.
+        // The slot traffic is what the read actually needs, and stays.
         assert_eq!(count(&global.edits, is_spill), count(&none.edits, is_spill));
         assert_eq!(
             count(&global.edits, is_reload),
