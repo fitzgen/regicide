@@ -234,6 +234,24 @@ where
         }
     }
 
+    /// Record every fact in `new`, which must be sorted, deduplicated, and
+    /// share nothing with what is already known.
+    fn insert_disjoint(&mut self, new: &[Fact<E>]) {
+        debug_assert!(new.windows(2).all(|w| w[0] < w[1]));
+        debug_assert!(new.iter().all(|f| self.facts.binary_search(f).is_err()));
+
+        // Merge from the back, so each fact moves at most once.
+        let mut i = self.facts.len();
+        self.facts.extend_from_slice(new);
+        for (k, &fact) in new.iter().enumerate().rev() {
+            while i > 0 && self.facts[i - 1] > fact {
+                self.facts[i + k] = self.facts[i - 1];
+                i -= 1;
+            }
+            self.facts[i + k] = fact;
+        }
+    }
+
     /// Record that `loc` holds exactly `parts`, which must be sorted and
     /// deduplicated.
     fn set(&mut self, loc: ScalarAllocation<E>, parts: &[Part<E>]) {
@@ -366,6 +384,12 @@ where
     /// Scratch space for the renaming an edge's block arguments perform.
     renamed: Vec<Fact<E>>,
 
+    /// Scratch space for an edge's `(argument, parameter)` pairs, sorted.
+    renames: Vec<(Val<E>, Val<E>)>,
+
+    /// Scratch space for the values an edge forgets, sorted.
+    killed: Vec<Val<E>>,
+
     /// The block's outgoing critical-edge edits, as `(successor, edit index)`.
     edge_edits: Vec<(usize, usize)>,
 
@@ -495,6 +519,8 @@ where
             out: State { facts: Vec::new() },
             scratch: Vec::new(),
             renamed: Vec::new(),
+            renames: Vec::new(),
+            killed: Vec::new(),
             edge_edits: Vec::new(),
             scalars: Vec::new(),
             eliminated: Vec::new(),
@@ -515,6 +541,8 @@ where
             out,
             scratch,
             renamed,
+            renames,
+            killed,
             edge_edits,
             scalars,
             eliminated,
@@ -531,6 +559,8 @@ where
         out.clear();
         scratch.clear();
         renamed.clear();
+        renames.clear();
+        killed.clear();
         edge_edits.clear();
         scalars.clear();
         eliminated.clear();
@@ -552,6 +582,8 @@ where
             out,
             scratch,
             renamed,
+            renames,
+            killed,
             edge_edits,
             scalars,
             eliminated,
@@ -568,6 +600,8 @@ where
             && out.facts.is_empty()
             && scratch.is_empty()
             && renamed.is_empty()
+            && renames.is_empty()
+            && killed.is_empty()
             && edge_edits.is_empty()
             && scalars.is_empty()
             && eliminated.is_empty()
@@ -962,31 +996,23 @@ where
         );
 
         let mut renamed = core::mem::take(&mut self.me.renamed);
+        let mut renames = core::mem::take(&mut self.me.renames);
+        let mut killed = core::mem::take(&mut self.me.killed);
         renamed.clear();
+        renames.clear();
+        killed.clear();
 
+        // Every parameter is killed and redefined from its argument. Killing
+        // waits until every argument has been read, because a block may pass
+        // one of its own parameters back to itself.
         for (param, arg) in input_succ
             .params()
             .zip(input_pred.successor_block_args(index))
         {
             let param = Val::<E>::try_new(param.index()).unwrap();
             let arg = Val::<E>::try_new(arg.index()).unwrap();
-            for &(loc, part) in &state.facts {
-                if part.val == arg {
-                    renamed.push((
-                        loc,
-                        Part {
-                            val: param,
-                            index: part.index,
-                        },
-                    ));
-                }
-            }
-        }
-
-        // The parameters are killed only after every argument has been read,
-        // because a block may pass one of its own parameters back to itself.
-        for param in input_succ.params() {
-            state.kill(Val::<E>::try_new(param.index()).unwrap());
+            renames.push((arg, param));
+            killed.push(param);
         }
 
         // An argument the successor has no use for is forgotten here, the only
@@ -1001,15 +1027,40 @@ where
         for arg in input_pred.successor_block_args(index) {
             let arg = Val::<E>::try_new(arg.index()).unwrap();
             if !succ.is_live_in(self.liveness, arg) {
-                state.kill(arg);
+                killed.push(arg);
             }
         }
 
-        for &(loc, part) in &renamed {
-            state.insert(loc, part);
+        renames.sort_unstable();
+        killed.sort_unstable();
+        for &(loc, part) in &state.facts {
+            let first = renames.partition_point(|&(arg, _)| arg < part.val);
+            for &(_, param) in renames[first..]
+                .iter()
+                .take_while(|&&(arg, _)| arg == part.val)
+            {
+                renamed.push((
+                    loc,
+                    Part {
+                        val: param,
+                        index: part.index,
+                    },
+                ));
+            }
         }
 
+        state
+            .facts
+            .retain(|&(_, part)| killed.binary_search(&part.val).is_err());
+
+        // Each renamed fact names a parameter, all of which were just killed.
+        renamed.sort_unstable();
+        renamed.dedup();
+        state.insert_disjoint(&renamed);
+
         self.me.renamed = renamed;
+        self.me.renames = renames;
+        self.me.killed = killed;
     }
 
     /// Run one edit, whether it sits inside a block or on an edge leaving it,
