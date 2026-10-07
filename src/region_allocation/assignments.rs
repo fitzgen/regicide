@@ -909,15 +909,39 @@ where
 
             // Evicting a candidate bundle must make this bundle assignable (not
             // conflict), or else the bundle is not a valid eviction candidate.
-            let Some(other_bundle) = self.sole_conflicting_bundle(units, spans.clone()) else {
+            //
+            // The first bundle in the way is the only one this candidate could
+            // evict, so price it at once and give up on the candidate as soon as
+            // it cannot win, without looking for others.
+            let mut sole = None;
+            let rejected = self.for_each_overlapping(units, spans.clone(), |existing| {
+                let Conflict::Assignment(existing) = existing else {
+                    return ControlFlow::Break(());
+                };
+                match sole {
+                    Some((bundle, _)) if bundle == existing.bundle => ControlFlow::Continue(()),
+                    Some(_) => ControlFlow::Break(()),
+                    None => {
+                        let cost = eviction_cost(existing.bundle, candidate);
+                        if cost < best_cost {
+                            sole = Some((existing.bundle, cost));
+                            ControlFlow::Continue(())
+                        } else {
+                            ControlFlow::Break(())
+                        }
+                    }
+                }
+            });
+            if rejected.is_some() {
+                continue;
+            }
+            let Some((other_bundle, cost)) = sole else {
                 continue;
             };
 
-            let cost = eviction_cost(other_bundle, candidate);
-            if cost < best_cost {
-                best = Some((other_bundle, candidate));
-                best_cost = cost;
-            }
+            debug_assert!(cost < best_cost);
+            best = Some((other_bundle, candidate));
+            best_cost = cost;
         }
 
         let Some((other_bundle, candidate)) = best else {
