@@ -14,11 +14,17 @@
 //! Cycle membership is *not* the same as (transitive) domination: a block after
 //! a loop exits belongs to the enclosing region even though the loop dominates
 //! it.
+//!
+//! Each region's cold blocks, other than the block naming it, are split off
+//! into a *cold region* of their own, a child of that region. A cold region is
+//! not a loop, and region allocation visits every cold region after every
+//! other region, so that what happens on a cold path cannot constrain the
+//! allocation of the paths that matter.
 
 use crate::counts::Counts;
 use crate::dfs::{Dfs, DfsEvent};
 use crate::entity::{
-    EntityRange, EntityRepr, PrimaryMap, Region, RegionBlocksStorageIndex,
+    EntityRange, EntityRepr, EntitySet, PrimaryMap, Region, RegionBlocksStorageIndex,
     RegionChildrenStorageIndex, SecondaryMap,
 };
 use crate::error::IResult;
@@ -99,6 +105,12 @@ where
     /// once, and always before any of its descendants.
     pre_order: Vec<Region<E>>,
 
+    /// The regions holding only cold blocks split off from their parent.
+    cold_regions: EntitySet<Region<E>>,
+
+    /// Scratch space: each region's cold region, once it has one.
+    cold_child: SecondaryMap<Region<E>, Option<Region<E>>>,
+
     /// Scratch space: the blocks in depth-first pre-order.
     dfs_pre_order: Vec<Block<E>>,
 
@@ -143,6 +155,8 @@ where
             region_children: SecondaryMap::new(EntityRange::empty()),
             region_children_storage: PrimaryMap::new(),
             pre_order: Vec::new(),
+            cold_regions: EntitySet::new(),
+            cold_child: SecondaryMap::new(None),
             dfs_pre_order: Vec::new(),
             cycle_entries: Vec::new(),
             worklist: Vec::new(),
@@ -165,6 +179,8 @@ where
             region_children,
             region_children_storage,
             pre_order,
+            cold_regions,
+            cold_child,
             dfs_pre_order,
             cycle_entries,
             worklist,
@@ -183,6 +199,8 @@ where
         region_children.reset();
         region_children_storage.reset();
         pre_order.clear();
+        cold_regions.reset();
+        cold_child.reset();
         dfs_pre_order.clear();
         cycle_entries.clear();
         worklist.clear();
@@ -204,6 +222,8 @@ where
             region_children,
             region_children_storage,
             pre_order,
+            cold_regions,
+            cold_child,
             dfs_pre_order,
             cycle_entries,
             worklist,
@@ -222,6 +242,8 @@ where
             && region_children.is_reset()
             && region_children_storage.is_reset()
             && pre_order.is_empty()
+            && cold_regions.is_reset()
+            && cold_child.is_reset()
             && dfs_pre_order.is_empty()
             && cycle_entries.is_empty()
             && worklist.is_empty()
@@ -234,6 +256,7 @@ where
     /// Is every field that only holds state mid-construction empty?
     fn scratch_is_empty(&self) -> bool {
         self.dfs_pre_order.is_empty()
+            && self.cold_child.is_reset()
             && self.cycle_entries.is_empty()
             && self.worklist.is_empty()
             && self.pre_order_stack.is_empty()
@@ -257,6 +280,7 @@ where
         self.construct_dfs_info(func, dfs, output)?;
         self.construct_cycles(func, output)?;
         self.construct_block_regions(func, output)?;
+        self.construct_cold_regions(func, output)?;
         self.construct_region_blocks(func, output)?;
         self.construct_region_tree(output)?;
         self.construct_pre_order();
@@ -457,6 +481,43 @@ where
         Ok(())
     }
 
+    /// Move each region's cold blocks into a cold child region.
+    ///
+    /// The block naming a region stays in it, which also keeps every cold
+    /// region's own name, its first cold block, distinct from every other
+    /// region's.
+    fn construct_cold_regions(
+        &mut self,
+        func: &impl InputFunction,
+        output: &mut OutputInner<E>,
+    ) -> IResult<()> {
+        for (block, input_block) in func.blocks() {
+            if !input_block.frequency().is_cold() {
+                continue;
+            }
+            let block = output.with_repr(block)?;
+            let region = block.region(self);
+            if region.index() == block.index() {
+                continue;
+            }
+
+            let cold = match self.cold_child[region] {
+                Some(cold) => cold,
+                None => {
+                    let cold = output.entity::<Region<E>>(block.index())?;
+                    self.cold_child[region] = Some(cold);
+                    self.region_parent[cold] = Some(region);
+                    self.cold_regions.insert(cold);
+                    cold
+                }
+            };
+            self.block_region[block] = Some(cold);
+        }
+
+        self.cold_child.reset();
+        Ok(())
+    }
+
     /// Lay each region's blocks out contiguously within
     /// `region_blocks_storage`.
     fn construct_region_blocks(
@@ -565,6 +626,23 @@ where
             .expect("should always have a root after construction")
     }
 
+    /// Is this one of the cold regions split off from their parent?
+    pub(crate) fn is_cold(&self, region: Region<E>) -> bool {
+        self.cold_regions.contains(region)
+    }
+
+    /// Is `inner` the same region as `outer`, or nested inside it?
+    pub(crate) fn encloses(&self, outer: Region<E>, inner: Region<E>) -> bool {
+        let mut region = Some(inner);
+        while let Some(r) = region {
+            if r == outer {
+                return true;
+            }
+            region = r.parent(self);
+        }
+        false
+    }
+
     /// Iterate over this tree's regions in pre-order: every region appears
     /// exactly once, and always before any of its descendants.
     ///
@@ -600,6 +678,15 @@ where
             let i = RegionBlocksStorageIndex::try_new(i).unwrap();
             region_tree.region_blocks_storage[i]
         })
+    }
+
+    /// Get the innermost loop region holding this region's blocks: the region
+    /// itself, or for a cold region, its parent.
+    pub(crate) fn loop_region(self, region_tree: &RegionTree<E>) -> Region<E> {
+        match region_tree.is_cold(self) {
+            true => self.parent(region_tree).unwrap(),
+            false => self,
+        }
     }
 
     /// Get the parent of this region, or `None` if this is the top-level
@@ -1175,16 +1262,21 @@ mod tests {
                 };
 
                 // Property 1: the regions partition the blocks, and, when
-                // there is a canonical answer to compare against, group them
-                // exactly as the oracle does.
+                // there is a canonical answer to compare against, the loop
+                // regions group them exactly as the oracle does.
                 //
                 // `blocks()` covering every block once and agreeing with
                 // `Block::region` gives the partition; comparing the groupings
                 // gives the agreement.
                 let mut actual_groups: BTreeMap<Region, BTreeSet<Block>> = BTreeMap::new();
+                let mut loop_groups: BTreeMap<Region, BTreeSet<Block>> = BTreeMap::new();
                 for b in &blocks {
                     actual_groups
                         .entry(b.region(&tree))
+                        .or_default()
+                        .insert(*b);
+                    loop_groups
+                        .entry(b.region(&tree).loop_region(&tree))
                         .or_default()
                         .insert(*b);
                 }
@@ -1197,7 +1289,7 @@ mod tests {
                             .insert(*b);
                     }
                     let actual_partition: BTreeSet<&BTreeSet<Block>> =
-                        actual_groups.values().collect();
+                        loop_groups.values().collect();
                     let expected_partition: BTreeSet<&BTreeSet<Block>> =
                         expected_groups.values().collect();
                     if actual_partition != expected_partition {
@@ -1277,6 +1369,7 @@ mod tests {
                 // structure. Unlike the oracle comparison, this holds for
                 // irreducible control flow too.
                 for region in &regions {
+                    let region = &region.loop_region(&tree);
                     if *region == tree.root() {
                         continue;
                     }
@@ -1476,6 +1569,39 @@ mod tests {
 
                             curr = ancestor.parent(&tree);
                         }
+                    }
+                }
+
+                // Property 8b: a cold region is a leaf holding only cold
+                // blocks, split off from a loop region, and every cold block
+                // that does not name its region is in one.
+                for region in &regions {
+                    if !tree.is_cold(*region) {
+                        continue;
+                    }
+                    let parent = region.parent(&tree).unwrap();
+                    if tree.is_cold(parent) || region.children(&tree).len() != 0 {
+                        return Err(format!(
+                            "cold {region:?} has the cold parent {parent:?} or has children"
+                        ));
+                    }
+                    if let Some(b) = region
+                        .blocks(&tree)
+                        .find(|b| !func.block(*b).frequency().is_cold())
+                    {
+                        return Err(format!("cold {region:?} holds the non-cold {b:?}"));
+                    }
+                }
+                for b in &blocks {
+                    let region = b.region(&tree);
+                    if func.block(*b).frequency().is_cold()
+                        && region.index() != b.index()
+                        && !tree.is_cold(region)
+                    {
+                        return Err(format!(
+                            "{b:?} is cold but is in the non-cold {region:?}, which it does not \
+                             name"
+                        ));
                     }
                 }
 

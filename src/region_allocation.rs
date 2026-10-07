@@ -36,8 +36,20 @@ where
 {
     let _timing = Timing::new("region allocate");
 
-    // Reverse the pre-order so we visit children before parents.
-    for region in context.region_tree.pre_order_iter().rev() {
+    // Reverse the pre-order so we visit children before parents, and leave the
+    // cold regions for last, so that they adapt to their neighbors rather than
+    // the other way around.
+    let region_tree = &context.region_tree;
+    let regions = region_tree
+        .pre_order_iter()
+        .rev()
+        .filter(|&r| !region_tree.is_cold(r))
+        .chain(
+            region_tree
+                .pre_order_iter()
+                .filter(|&r| region_tree.is_cold(r)),
+        );
+    for region in regions {
         // Bias this region's bundles towards the registers their counterparts
         // across a region border already got. Children come first in this
         // walk, so those registers are facts by now rather than guesses.
@@ -138,7 +150,10 @@ fn hint_across_regions<E>(
             continue;
         };
 
-        let _ = region_tree;
+        // A cold path does not get a say in how anything else is allocated.
+        if region_tree.is_cold(theirs.region(live_ranges)) && !region_tree.is_cold(region) {
+            continue;
+        }
 
         // `assign_to_preferred` asserts the hint is within this class.
         let class = match ours.constraint(live_ranges) {

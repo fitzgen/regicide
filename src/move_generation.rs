@@ -1290,7 +1290,7 @@ where
         for spill_site in spill_placement.spills().iter().copied() {
             let span = spill_site.span();
             let val = span.val(live_ranges);
-            let block = span.block(func, live_ranges);
+            let block = spill_site.block();
             let home = val.stack_home(spill_slots).unwrap();
             let dst = Allocation::Stack(home);
             let arrives_in = span
@@ -3535,7 +3535,7 @@ mod tests {
             let mut stores = Vec::new();
             for site in ctx.spill_placement.spills() {
                 let val = site.val(live_ranges);
-                let block = site.span().block(func, live_ranges);
+                let block = site.block();
                 if site.point() != block.end_point(input) {
                     stores.push((PackedMovePosition::point(site.point()), val));
                     continue;

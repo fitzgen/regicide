@@ -8886,6 +8886,105 @@ impl TestInput {
         input
     }
 
+    /// A value read on the stack only on a cold arm: `block0` defines it,
+    /// `block1` reads it in a register and branches to the cold `block2`,
+    /// which reads it off the stack, or to `block3`, which does not touch it.
+    ///
+    /// `block1` is the first legal spill block above the cold read, so a
+    /// store placed there would run on the hot path too.
+    pub fn with_a_value_read_on_the_stack_on_a_cold_arm() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+        let ret = || InstData::Op {
+            operands: vec![],
+            clobbers: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the value. Two successors, so the single-successor
+            // hoist cannot carry a store from `block1` up here.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any),
+            branch(&[1, 3]),
+            // block1: read the value in a register, which makes this block a
+            // legal spill placement, then fork.
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            branch(&[2, 3]),
+            // block2, cold: read the value off the stack.
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+            ret(),
+            // block3.
+            ret(),
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for (insts, frequency) in [
+            (vec![inst(0), inst(1)], 0),
+            (vec![inst(2), inst(3)], 0),
+            (vec![inst(4), inst(5)], 1),
+            (vec![inst(6)], 0),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A loop nest: `block0` defines a value outside both loops, `block1`
     /// heads the outer loop and defines a second value, and `block2 <-> block3`
     /// is the inner loop, which reads both values off the stack.

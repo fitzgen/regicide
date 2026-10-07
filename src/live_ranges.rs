@@ -7,8 +7,8 @@ use crate::entity::{
 use crate::error::IResult;
 use crate::events::EventsLog;
 use crate::input::{
-    DefUse, Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
-    RematCost,
+    BlockFrequency, DefUse, Input, InputBlock, InputFunction, InputInst, InputValue,
+    OperandConstraint, Position, RematCost,
 };
 use crate::liveness::{Liveness, block_first_inst, block_last_inst};
 use crate::machine::{Machine, Reg, RegClassMembers};
@@ -2215,6 +2215,11 @@ where
             .with_repr::<E>()
             .expect("every instruction index already fit in `E` in the earlier passes");
         LivePoint::new(first_inst, Position::Early)
+    }
+
+    /// How often the embedder estimates this block runs.
+    pub(crate) fn frequency(self, func: &impl InputFunction) -> BlockFrequency {
+        func.block(self.with_repr32()).frequency()
     }
 
     /// The program point just past the end of this block.

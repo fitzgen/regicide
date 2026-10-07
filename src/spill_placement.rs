@@ -40,6 +40,12 @@
 //! longer post-dominates the current block, but we don't have a post-dominator
 //! tree here.)
 //!
+//! The walk also never climbs out of a block into a single predecessor that
+//! runs more often, since that would run the store more often than the reload
+//! it serves, unless the block is inside a loop the definition is outside of.
+//! The store goes on the edge from that predecessor instead, at the block's
+//! entry, reading the register the value leaves the predecessor in.
+//!
 //! A union-find over blocks records the site each walked block resolved to, so
 //! a later walk short-cuts upon reaching an earlier walk's trail and we
 //! collapse duplicate spills as they appear.
@@ -104,11 +110,17 @@ where
     /// belongs to. When the def is its block's terminator, the boundary just
     /// after it is the first point of the next block in layout order, and the
     /// spill goes on the defining block's outgoing edges. Use
-    /// `SpillSite::block` instead, which reads the block out of `span`.
+    /// `SpillSite::block` instead.
     point: LivePoint<E>,
 
     /// The span that holds the value in a register at `point`.
+    ///
+    /// For a store on the edge into `block`, this is the predecessor's span
+    /// that carries the value out along that edge.
     span: LiveSpan<E>,
+
+    /// The block the store runs in.
+    block: Block<E>,
 }
 
 impl<E> SpillSite<E>
@@ -122,9 +134,8 @@ where
     }
 
     /// The block that this spill site is in.
-    #[cfg(test)]
-    fn block(self, func: &impl InputFunction, live_ranges: &LiveRanges<E>) -> Block<E> {
-        self.span.block(func, live_ranges)
+    pub(crate) fn block(self) -> Block<E> {
+        self.block
     }
 
     /// The span holding the value in a register at this spill's point, and
@@ -231,6 +242,11 @@ where
     /// block, and it doubles as the spill's source span.
     legal: SecondaryMap<Block<E>, Option<LiveSpan<E>>>,
 
+    /// For the value currently being placed, the register span that ends at
+    /// the exit of each block that has one: the source of a store on an edge
+    /// out of that block.
+    live_out: SecondaryMap<Block<E>, Option<LiveSpan<E>>>,
+
     /// For the value currently being placed, the site each already-walked block
     /// resolved to.
     union_find: UnionFind<Block<E>>,
@@ -243,6 +259,10 @@ where
 
     /// The same blocks as `is_spill_site`, in the order we found them.
     spill_site_blocks: Vec<Block<E>>,
+
+    /// Scratch space: the blocks the value currently being placed is on the
+    /// stack in, most frequent first.
+    stack_blocks: Vec<Block<E>>,
 
     /// For the value currently being placed, the blocks it arrives in from
     /// nowhere.
@@ -274,9 +294,11 @@ where
             defs: SecondaryMap::new(None),
             spans: Vec::new(),
             legal: SecondaryMap::new(None),
+            live_out: SecondaryMap::new(None),
             union_find: UnionFind::new(),
             is_spill_site: EntitySet::new(),
             spill_site_blocks: Vec::new(),
+            stack_blocks: Vec::new(),
             arrives_from_nowhere: EntitySet::new(),
         }
     }
@@ -288,19 +310,23 @@ where
             defs,
             spans,
             legal,
+            live_out,
             union_find,
             is_spill_site,
             spill_site_blocks,
+            stack_blocks,
             arrives_from_nowhere,
         } = self;
         spills.clear();
         stack_bundles.reset();
         defs.reset();
         legal.reset();
+        live_out.reset();
         union_find.reset();
         spans.clear();
         is_spill_site.reset();
         spill_site_blocks.clear();
+        stack_blocks.clear();
         arrives_from_nowhere.reset();
     }
 
@@ -311,9 +337,11 @@ where
             defs,
             spans,
             legal,
+            live_out,
             union_find,
             is_spill_site,
             spill_site_blocks,
+            stack_blocks,
             arrives_from_nowhere,
         } = self;
         spills.is_empty()
@@ -321,9 +349,11 @@ where
             && defs.is_reset()
             && spans.is_empty()
             && legal.is_reset()
+            && live_out.is_reset()
             && union_find.is_reset()
             && is_spill_site.is_empty()
             && spill_site_blocks.is_empty()
+            && stack_blocks.is_empty()
             && arrives_from_nowhere.is_empty()
     }
 
@@ -483,33 +513,41 @@ where
         // Spills belong in the region that defines the value: a legal block
         // in a nested region is inside a loop the definition is outside of, so
         // a spill there would run once per iteration.
-        let def_region = def_block.region(region_tree);
+        let def_region = def_block.region(region_tree).loop_region(region_tree);
 
-        // Place the spill for each on-stack span.
+        // Place the spill for each on-stack span, most frequent first, so that
+        // a store on an edge into a less frequent block knows which other
+        // stores the store above it would cover.
+        debug_assert!(self.stack_blocks.is_empty());
         for &span in val_spans {
             if self.on_stack(span, live_ranges) {
-                self.place_one_spill(
-                    input,
-                    region_tree,
-                    def_block,
-                    def_region,
-                    span.block(input.func, live_ranges),
-                );
+                self.stack_blocks.push(span.block(input.func, live_ranges));
             }
         }
+        // Stable, so equally frequent blocks keep program order.
+        self.stack_blocks
+            .sort_by_key(|b| core::cmp::Reverse(b.frequency(input.func)));
+        let mut stack_blocks = core::mem::take(&mut self.stack_blocks);
+        for block in stack_blocks.drain(..) {
+            self.place_one_spill(input, region_tree, def_block, def_region, block);
+        }
+        self.stack_blocks = stack_blocks;
 
         // Gather the deduplicated spill blocks and construct our `SpillSite`s
         // for them.
         for block in self.spill_site_blocks.drain(..) {
             let (point, span) = if block == def_block {
                 (def.spill_point(), def_span)
-            } else {
-                let span = self.legal[block].expect("a site is a legal placement");
+            } else if let Some(span) = self.legal[block] {
                 (span.start(live_ranges), span)
+            } else {
+                let pred = idom(input, block).unwrap();
+                let span = self.live_out[pred].expect("a site is legal or on an edge");
+                (block.start_point(input), span)
             };
 
             trace!("spill placement: spill {val:?} in {block:?} at {point:?}");
-            self.spills.push(SpillSite { point, span });
+            self.spills.push(SpillSite { point, span, block });
             counts.spills_placed.inc();
             event!(
                 events,
@@ -523,6 +561,7 @@ where
         }
 
         self.legal.reset();
+        self.live_out.reset();
         self.is_spill_site.reset();
         self.union_find.reset();
         self.arrives_from_nowhere.reset();
@@ -569,6 +608,20 @@ where
                     .with_repr::<E>()
                     .expect("every block index already fit in `E` in the earlier passes");
                 self.arrives_from_nowhere.insert(succ);
+            }
+        }
+
+        // Record the spans for which this value is live-out of a block.
+        for &span in val_spans {
+            let block = span.block(input.func, live_ranges);
+            if span.end(live_ranges) == block.end_point(input)
+                && !self.on_stack(span, live_ranges)
+                && !span
+                    .bundle(live_ranges)
+                    .unwrap()
+                    .is_rematerialized(live_ranges)
+            {
+                self.live_out[block] = Some(span);
             }
         }
 
@@ -678,10 +731,36 @@ where
                 "the walk never climbs above the defining block",
             );
 
+            // An earlier span of this value already walked from here.
+            if self.is_spill_site.contains(spill_block) {
+                return spill_block;
+            }
+
             // Keep climbing the dominator tree until we a legal spill location
             // that is also in the definition's region (i.e. outside of a loop).
-            if self.is_legal_spill_block(spill_block, def_block)
-                && spill_block.region(region_tree) == def_region
+            let in_def_region =
+                spill_block.region(region_tree).loop_region(region_tree) == def_region;
+            if self.is_legal_spill_block(spill_block, def_block) && in_def_region {
+                return spill_block;
+            }
+
+            // Never climb into a predecessor that runs more often, when the
+            // edge from it can hold the store, unless this block is in a loop
+            // the definition is outside of: then the walk is headed out of that
+            // loop, somewhere that runs less often. And not when the store
+            // above would serve another site's spans too: then the edge adds a
+            // store rather than moving one somewhere cheaper.
+            if region_tree.encloses(
+                spill_block.region(region_tree).loop_region(region_tree),
+                def_region,
+            ) && self.is_edge_spill_block(input, spill_block)
+                && !self.store_above_covers_another_site(
+                    input,
+                    region_tree,
+                    def_block,
+                    def_region,
+                    spill_block,
+                )
             {
                 return spill_block;
             }
@@ -694,6 +773,36 @@ where
             self.union_find.union(parent, spill_block);
             spill_block = parent;
         }
+    }
+
+    /// Would the store that serves `stack_block` without an edge store also
+    /// dominate a site that another span already got?
+    ///
+    /// Walks like `first_legal_placement_up_dom_tree`, but leaves the
+    /// union-find alone.
+    fn store_above_covers_another_site(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+        def_block: Block<E>,
+        def_region: Region<E>,
+        stack_block: Block<E>,
+    ) -> bool {
+        let mut block = stack_block;
+        let above = loop {
+            block = self.union_find.find_without_path_compression(block);
+            if self.is_spill_site.contains(block)
+                || (self.is_legal_spill_block(block, def_block)
+                    && block.region(region_tree).loop_region(region_tree) == def_region)
+            {
+                break block;
+            }
+            block = idom(input, block).expect("the walk stops at the defining block");
+        };
+        let above = input.func.block(above.with_repr32());
+        self.spill_site_blocks
+            .iter()
+            .any(|&site| above.dominates(site.with_repr32()))
     }
 
     /// Keep pushing the spill block up the dominator tree until pushing any
@@ -726,6 +835,13 @@ where
                 break;
             }
 
+            // Nor into a block that runs more often. The walk is done climbing
+            // out of loops by now, so the embedder's estimate is all that is
+            // left to compare.
+            if spill_block.frequency(input.func) < parent.frequency(input.func) {
+                break;
+            }
+
             self.union_find.union(parent, spill_block);
             spill_block = parent;
         }
@@ -736,6 +852,21 @@ where
     /// Can we spill the value into its slot in `block`?
     fn is_legal_spill_block(&self, block: Block<E>, def_block: Block<E>) -> bool {
         block == def_block || self.legal[block].is_some()
+    }
+
+    /// Can we spill the value on the edge into `block` from a predecessor that
+    /// runs more often, rather than in that predecessor?
+    ///
+    /// The edge's moves run at `block`'s entry, which requires that it be
+    /// the predecessor's only way in.
+    fn is_edge_spill_block(&self, input: &Input<'_, impl InputFunction>, block: Block<E>) -> bool {
+        let input_block = input.func.block(block.with_repr32());
+        let Some(pred) = idom(input, block) else {
+            return false;
+        };
+        input_block.len_predecessors() == 1
+            && block.frequency(input.func) < pred.frequency(input.func)
+            && self.live_out[pred].is_some()
     }
 
     /// Did region allocation leave this span on the stack?
@@ -900,10 +1031,12 @@ mod tests {
                                     if span.val(live_ranges) != val {
                                         return Err(format!("{span:?} does not hold {val:?}"));
                                     }
-                                    if block != span.block(input.func, live_ranges) {
+                                    let span_block = span.block(input.func, live_ranges);
+                                    let pred = input.func.block(block).predecessors().next();
+                                    if block != span_block && pred != Some(span_block) {
                                         return Err(format!(
-                                            "{span:?} is in {:?}, not {block:?}",
-                                            span.block(input.func, live_ranges),
+                                            "{span:?} is in {span_block:?}, neither {block:?} \
+                                             nor its predecessor",
                                         ));
                                     }
                                     if !spilled.contains(&val) {
@@ -1003,6 +1136,10 @@ mod tests {
                     .is_some_and(|bundle| stack_bundles.contains(&bundle))
             };
             let block_of = |span: LiveSpan<u32>| func.inst(span.start(live_ranges).inst()).block();
+            let end_of = |block: Block| {
+                LivePoint::new(crate::liveness::block_last_inst(&func.block(block)), Position::Late)
+                    .next_point()
+            };
             let entry_of = |block: Block| {
                 LivePoint::new(block_first_inst(&func.block(block)), Position::Early)
             };
@@ -1088,15 +1225,34 @@ mod tests {
 
                 for &site in sites {
                     // Property 3: a spill reads a register, and reads it at a
-                    // point where the span it names holds the value.
+                    // point where the span it names holds the value. A store
+                    // on an edge reads the span that carries the value out of
+                    // the edge's only predecessor, which runs more often.
                     if on_stack(site.span()) {
                         return Err(format!(
                             "the spill {site:?} for {val:?} reads a span that is on the stack"
                         ));
                     }
+                    let source_block = block_of(site.span());
+                    let on_edge = source_block != site.block();
+                    if on_edge {
+                        let succ = func.block(site.block());
+                        if succ.frequency() >= func.block(source_block).frequency()
+                            || succ.len_predecessors() != 1
+                            || succ.predecessors().next() != Some(source_block)
+                            || site.span().end(live_ranges) != end_of(source_block)
+                        {
+                            return Err(format!(
+                                "the spill {site:?} for {val:?} reads {source_block:?}, which is \
+                                 not the more frequent, sole predecessor of {:?} that it leaves \
+                                 in a register",
+                                site.block(),
+                            ));
+                        }
+                    }
                     let (start, end) =
                         (site.span().start(live_ranges), site.span().end(live_ranges));
-                    if site.point() < start || site.point() > end {
+                    if !on_edge && (site.point() < start || site.point() > end) {
                         return Err(format!(
                             "the spill {site:?} for {val:?} is at {:?}, outside the span \
                              {start:?}..{end:?} it reads",
@@ -1107,7 +1263,7 @@ mod tests {
                     // Property 4: a spill goes as early in its block as it
                     // can: just past the def in the defining block, and at the
                     // block's entry everywhere else.
-                    let block = site.block(func, live_ranges);
+                    let block = site.block();
                     let expected = if block == def_b {
                         def_spill[&val]
                     } else {
@@ -1122,22 +1278,25 @@ mod tests {
 
                     // Property 5: a spill is dominated by the definition of the
                     // value it spills.
-                    if !def_b.dominates(dominators, site.block(func, live_ranges)) {
+                    if !def_b.dominates(dominators, site.block()) {
                         return Err(format!(
                             "the spill {site:?} for {val:?} is not dominated by its definition \
                              in {def_b:?}"
                         ));
                     }
 
-                    // Property 7: a spill is in the same region as the
-                    // definition of the value it spills, so it never sits
-                    // inside a loop the definition is outside of.
-                    let site_region = site.block(func, live_ranges).region(region_tree);
-                    if site_region != def_b.region(region_tree) {
+                    // Property 7: a spill never sits inside a loop the
+                    // definition of the value it spills is outside of. It is
+                    // in the definition's own loop, or else on an edge in a
+                    // loop around it.
+                    let loop_of = |b: Block| b.region(region_tree).loop_region(region_tree);
+                    let site_region = loop_of(site.block());
+                    let edge_around = on_edge && region_tree.encloses(site_region, loop_of(def_b));
+                    if site_region != loop_of(def_b) && !edge_around {
                         return Err(format!(
                             "the spill {site:?} for {val:?} is in {site_region:?}, but its \
                              definition in {def_b:?} is in {:?}",
-                            def_b.region(region_tree),
+                            loop_of(def_b),
                         ));
                     }
                 }
@@ -1153,8 +1312,8 @@ mod tests {
                     }
                     let block = block_of(span);
                     let covered = sites.iter().any(|&site| {
-                        site.block(func, live_ranges).dominates(dominators, block)
-                            && (site.block(func, live_ranges) != block
+                        site.block().dominates(dominators, block)
+                            && (site.block() != block
                                 || site.point() <= span.start(live_ranges))
                     });
                     if !covered {
@@ -1169,7 +1328,9 @@ mod tests {
                     // is outside of, and Property 7 just said the spill is out
                     // there with the definition: the region guard earned its
                     // keep here.
-                    if block.region(region_tree) != def_b.region(region_tree) {
+                    if block.region(region_tree).loop_region(region_tree)
+                        != def_b.region(region_tree).loop_region(region_tree)
+                    {
                         hoisted_out_of_a_region += 1;
                     }
                 }
@@ -1264,6 +1425,60 @@ mod tests {
         assert!(context.context32.spill_placement.spills().is_empty());
     }
 
+    /// A value read off the stack only in a block that runs less often than
+    /// its sole predecessor is stored on the edge into that block, not in the
+    /// predecessor, which would run the store more often than the read it
+    /// serves. When the two run equally often, the store stays hoisted.
+    #[test]
+    fn a_spill_for_a_less_frequent_read_stays_on_the_edge() {
+        use crate::input::BlockFrequency as F;
+
+        let pred = Block::<u32>::try_new(1).unwrap();
+        let reader = Block::<u32>::try_new(2).unwrap();
+
+        for (pred_freq, reader_freq) in [
+            (F::NORMAL, F::COLD),
+            (F::HOT, F::NORMAL),
+            (F::new(10.0), F::new(0.5)),
+            (F::NORMAL, F::NORMAL),
+        ] {
+            let mut test_input = TestInput::with_a_value_read_on_the_stack_on_a_cold_arm();
+            test_input.set_block_frequency(pred, pred_freq);
+            test_input.set_block_frequency(reader, reader_freq);
+            let context = place(&test_input).unwrap().unwrap();
+
+            test_input.with_input(|input| {
+                let ctx = &context.context32;
+                let func = input.func;
+                let live_ranges = &ctx.live_ranges;
+
+                let val = Val::<u32>::try_new(0).unwrap();
+                assert!(ctx.region_allocation.spilled().contains(val));
+
+                let sites = ctx.spill_placement.spills();
+                assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
+                let site = sites[0];
+                let why = format!("{pred:?} at {pred_freq:?}, {reader:?} at {reader_freq:?}");
+
+                if reader_freq < pred_freq {
+                    assert_eq!(site.block(), reader, "the store belongs on the edge: {why}");
+                    assert_eq!(
+                        site.point(),
+                        LivePoint::new(block_first_inst(&func.block(reader)), Position::Early),
+                        "{why}",
+                    );
+                    assert_eq!(
+                        site.span().block(func, live_ranges),
+                        pred,
+                        "the store reads the register the value leaves {pred:?} in: {why}",
+                    );
+                } else {
+                    assert_eq!(site.block(), pred, "the store stays hoisted: {why}");
+                }
+            });
+        }
+    }
+
     /// A spilled block parameter is spilled inside its own block, so the spill
     /// runs no matter which predecessor we came from.
     ///
@@ -1296,7 +1511,7 @@ mod tests {
             assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
             let site = sites[0];
             assert_eq!(site.val(live_ranges), param);
-            assert_eq!(site.block(func, live_ranges), merge);
+            assert_eq!(site.block(), merge);
             assert_eq!(
                 site.point(),
                 LivePoint::new(block_first_inst(&func.block(merge)), Position::Early),
@@ -1366,7 +1581,7 @@ mod tests {
             let site = sites[0];
             assert_eq!(site.val(live_ranges), val);
             assert_eq!(
-                site.block(func, live_ranges),
+                site.block(),
                 def_block,
                 "the spill belongs outside the loop, in the defining block",
             );
@@ -1387,9 +1602,8 @@ mod tests {
         let test_input = TestInput::with_a_nested_loop();
         let context = place(&test_input).unwrap().unwrap();
 
-        test_input.with_input(|input| {
+        test_input.with_input(|_| {
             let ctx = &context.context32;
-            let func = input.func;
             let live_ranges = &ctx.live_ranges;
             let region_tree = &ctx.region_tree;
 
@@ -1444,7 +1658,7 @@ mod tests {
                     .collect();
                 assert!(!sites.is_empty(), "expected a spill for {val:?}");
                 for site in sites {
-                    let block = site.block(func, live_ranges);
+                    let block = site.block();
                     assert_ne!(
                         block.region(region_tree),
                         inner_region,
@@ -1507,7 +1721,7 @@ mod tests {
             // So nothing is spilled there, and every spill reads a register.
             for site in ctx.spill_placement.spills() {
                 assert_ne!(
-                    site.block(func, live_ranges),
+                    site.block(),
                     crowded,
                     "{site:?} stores the value from a span that does not hold it",
                 );
@@ -1607,7 +1821,7 @@ mod tests {
             let site = sites[0];
             assert_eq!(site.val(live_ranges), val);
             assert_eq!(
-                site.block(func, live_ranges),
+                site.block(),
                 def_block,
                 "the spill belongs where the value still has a register",
             );

@@ -156,6 +156,7 @@ where
     /// # Panics
     ///
     /// Panics if `k`'s index is not less than [`Self::CAPACITY`].
+    #[inline]
     pub fn insert(&mut self, k: K) -> bool {
         let (word, bit) = self.word_and_bit(k);
         let was_present = self.words[word] & (1 << bit) != 0;

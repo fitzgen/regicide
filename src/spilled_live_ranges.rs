@@ -369,7 +369,7 @@ where
             let val = site.val(live_ranges);
             debug_assert!(spilled.contains(val));
 
-            let block = site.span().block(input.func, live_ranges);
+            let block = site.block();
             let point = if site.point() < block.end_point(input) {
                 site.point()
             } else {
@@ -544,7 +544,7 @@ where
         // reaches it.
         for site in spill_placement.spills() {
             let val = site.val(live_ranges);
-            let block = site.span().block(input.func, live_ranges);
+            let block = site.block();
             let block_end = block.end_point(input);
             if site.point() < block_end {
                 self.reads.push((block, site.point(), val));
@@ -834,7 +834,7 @@ where
 
         for site in spill_placement.spills() {
             let val = site.val(live_ranges);
-            let block = site.span().block(input.func, live_ranges);
+            let block = site.block();
             let point = site.point().min(block.end_point(input).prev_point());
             debug_assert!(
                 reserved_at(block, point, val),

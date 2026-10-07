@@ -736,7 +736,7 @@ impl<'a> Output<'a> {
         with_inner!(self, |inner| {
             let tree = &inner.region_tree;
             let block = block.with_repr().expect("no such block in these results");
-            let mut region = block.region(tree);
+            let mut region = block.region(tree).loop_region(tree);
             let mut depth = 0;
             while let Some(parent) = region.parent(tree) {
                 region = parent;
