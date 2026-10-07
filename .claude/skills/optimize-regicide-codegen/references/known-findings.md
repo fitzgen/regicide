@@ -129,6 +129,43 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
    moves than ion, offset in keccak by fewer reloads (remat). No resolvable
    cycles cost. Low priority.
 
+### Clobbers of hinted registers (code-quality-002, 2026-10-06, `bf6be7d`)
+
+`reports/code-quality-002/` in the `regicide-split-at-clobber` worktree.
+Three attempts, **all dropped**; tags
+`code-quality-002/{split-at-hinted-clobber,clobber-tie-break,per-half-split-candidates}`.
+Still valid at `642668d`: `main`'s split-pricing speedups allocate
+byte-identically (478 inputs re-checked).
+
+- **The signature is large.** In `assign_to_preferred`, a hinted register
+  whose *only* occupants over the bundle are reservations (clobbers, nothing
+  evictable) blocks 62,338 failed preferred assignments in hashset, 12,818 in
+  siphashx24, 6,681 in switch. Most such bundles go on to
+  `split_between_spans` (countMatches 22,332; VDBE 30,580; `hashset-0004-u0-3`
+  31,063), then `BundleSpilledToStack`. Probe:
+  `misc/probe-clobbered-hints.patch` in that report.
+- **The split score is blind to it.** A cut is scored for one candidate as
+  `max(I(prefix, c), I(suffix, c))`; a clobber of `c` in either half makes
+  that `INFINITY`, so every cut ties for the hinted register.
+- **Forcing a cut past the first/last clobber** (overriding the score):
+  countMatches +0.91%, VDBE +0.97%, `hashset-0077-u0-72` +6.6%. The cut lands
+  deep in loops and the leftover half reloads there.
+- **The same cut as a tie-break** among cuts tied for best: **countMatches
+  -3.55%** (-740k at depth 4, -292k at depth 3; latch block1368 went
+  8 moves + 2 spills + 17 reloads to 7 moves + 14 reloads + 1 remat), but
+  VDBE +0.52%, `hashset-0077-u0-72` +7.35%, `tinygo-regex-0156-u0-145`
+  +5.61%, typical compile insts +5.8%. A bisection put +339k of `u0-72`'s
+  +495k on **one** tie: a 25-span bundle peeled at cut 22 instead of halved
+  at 12. **The middle-of-tied-run rule (`a183083`) is load-bearing**; any
+  preference that picks a non-middle tie must leave long bundles alone.
+- **Scoring each half in its own best register** (`max(min_c I(prefix, c),
+  min_c I(suffix, c))`): VDBE -0.99%, rust-protobuf -0.95%, but
+  `hashset-0004-u0-3` reloads 10,230 -> 19,957 (+19.9%). Every cut looks
+  cheaper and nothing prices the move between differently-aimed halves.
+  Needs the seam-move term below first.
+- **Next:** the tie-break restricted to cuts near the run's middle or to
+  short bundles; or the per-half score plus a seam price.
+
 ### Things to preserve (guards)
 
 1. **Treap-based coalescing disjointness** (`efb70f6`). `coalesce-out-of-fuel`
@@ -151,7 +188,8 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
 ## Mechanisms and traps from earlier work
 
 - **`SplitScore` does not price the move a cut creates** (2026-10-05,
-  hypothesis). A free cut at a liveness hole and a within-span cut that always
+  hypothesis; 2026-10-06, code-quality-002's per-half-score attempt is
+  evidence: it is what sank it). A free cut at a liveness hole and a within-span cut that always
   needs a move score alike. Merging `split_between_spans`/`split_within_span`
   into one best-score phase was neutral to slightly worse, and `keccak_core`
   makes **0** between-span splits, so its in-region moves are not
@@ -217,3 +255,14 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
 - **`$S/loops.py`** finds loops, latches and per-block edits in a `run`
   printout. `--latch-reloads N` scans for back-edge seams. At `bf6be7d` it
   found 70 latches with >= 3 reloads in inputs under 5e7 compile insts.
+- **Compile insts fell 38% to 92% per corpus at `642668d`**
+  (`5e2b0d6`..`645db2b`, split pricing; switch unchanged), with
+  byte-identical allocation (`bf6be7d` vs `642668d`, 478 inputs). A
+  `counts.py` TSV from before that is fine for estimated cycles but **not**
+  as a compile-time baseline: rebuild the baseline at your base.
+- **Sensitive canaries for split changes:** `hashset-0077-u0-72` (depth-3
+  and depth-4 loops; +5% to +7% under every split change tried in
+  code-quality-002) and `hashset-0004-u0-3` (a call-heavy straight-line
+  test driver; reloads doubled under per-half scoring). Neither is a hot
+  function, so they are not guards, but read them first when a split change
+  moves the hashset corpus.

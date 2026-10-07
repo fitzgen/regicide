@@ -200,9 +200,12 @@ write, and the commit sha every measurement was taken at.
    ```
 
    Run it in the background and do "From analysis to backlog" meanwhile.
-   Every row must be `ok` or `skipped`; a `failed` row on the untouched tree
-   usually means the corpus predates an input-format change, and that corpus
-   cannot be used. A `timeout` (default 900 s) marks an input to keep out of
+   **Another worktree may already have this TSV** (`git worktree list`, then
+   `reports/code-quality-*/counts/<sha>.tsv`): if its `bins/run-<sha>` is
+   byte-identical to yours (`cmp`), copy the TSV and say so in
+   `environment.md`. Every row must be `ok` or `skipped`; a `failed` row on
+   the untouched tree usually means the corpus predates an input-format
+   change, and that corpus cannot be used. A `timeout` (default 900 s) marks an input to keep out of
    every comparison; note it.
 
 ## 1. Build
@@ -312,6 +315,11 @@ cargo run --release --example visualize -- \
   that it fails without your change.** Disable the change for one run of the
   test (e.g. `false && ...`). 001's first test input passed at base, because
   the allocator never hit the case it was built for.
+- **Measure the signature with a scratch probe** when no event says it
+  directly: `git archive HEAD | tar -x -C /tmp/probe`, add `trace!("PROBE
+  ...")` lines where the decision is made, build there, and tally with
+  `awk`. Never probe in the worktree. Save the probe as a patch in
+  `$R/misc/` so the numbers in `todo/` can be reproduced.
 
 ## 4. The loop: one attempt
 
@@ -355,6 +363,32 @@ For each candidate, highest-ranked first:
    write-up. Also look at the top few "most regressed" functions
    `diff_counts.py` lists: is each regression an intended trade, or
    collateral damage?
+
+   **For a big function, rank blocks before reading hunks.** A 30,000-line
+   diff is unreadable whole. Build `run` in a scratch tree with
+   `scripts/block-costs.patch`, dump both sides, and compare:
+
+   ```bash
+   for rev in $base $sha; do
+       rm -rf /tmp/bc-$rev && mkdir /tmp/bc-$rev
+       git archive $rev | tar -x -C /tmp/bc-$rev
+       patch -p1 -d /tmp/bc-$rev < $S/block-costs.patch
+       cargo build --release --example run --manifest-path /tmp/bc-$rev/Cargo.toml
+       BLOCK_COSTS=1 /tmp/bc-$rev/target/release/examples/run -q <input> \
+           2> $R/logs/<target>-$rev-blocks.txt
+   done
+   python3 $S/block_costs.py $R/logs/<target>-{$base,$sha}-blocks.txt
+   ```
+
+   It sums the delta by loop depth and lists the blocks that moved most, so
+   the hunks to read, and quote, are the top few of each list.
+
+   **When a regression is concentrated, bisect it by firing count.** In a
+   scratch build, let the new rule fire only for its first `N` occurrences
+   (an `AtomicUsize` counter and `std::env::var`, which needs `--features
+   std`), and bisect `N` on the regressed input. In code-quality-002 one
+   firing of 114 caused 70% of a +7% regression, which turned "the rule is
+   wrong" into "the rule is wrong for long bundles".
 7. **Correctness**: tests (see "Testing") and, in the background, the
    fuzzer. `counts.py` has already run the checker on every input.
 8. **Decide** (see "Decision rule").
@@ -389,6 +423,11 @@ over 10⁹ instructions).
 | fell | fails on compile time | see "Compile-time budget" |
 | fell | fails on checker or tests | **drop**. Not negotiable |
 | flat or rose | any | **drop**. Not worth the churn, even if a corpus total improved by accident; record what it did |
+
+An attempt whose screen already fails (targets flat or worse, or a
+screened corpus well past tolerance) may be dropped **at the screen**,
+without full counts, tests or fuzzing. Say so in its write-up, and say which
+of steps 5 to 7 were skipped.
 
 Also weigh, and record:
 
@@ -558,6 +597,17 @@ Then tell the user where the report is and summarize the cumulative result.
   but it must be the change you meant, visible in the diff and explained.
 - **Counting files with `ls | wc -l`.** `ls` columnizes into a pipe on this
   host. Use `ls -1` or `find`.
+- **Overriding the split score instead of extending it.** A rule that
+  picks its own cut, or prefers a non-middle cut among ties, gives up the
+  middle-of-tied-run halving (`a183083`). Long bundles then get peeled at
+  an end, and the leftover piece reloads inside a loop. Every such rule in
+  code-quality-002 regressed `hashset-0077-u0-72` by 5% to 7%.
+- **Backgrounded subshells and inline variables.** In
+  `R=... && (cmd $R) & ...`, the subshell may not see `R`; use absolute
+  paths in anything run with `&`.
+- **A compile-time baseline from before `642668d`.** Split pricing got 38%
+  to 92% cheaper there with identical allocation; an older TSV makes every
+  candidate look like a compile-time win.
 - **Believing a stuck replay is a hang.** Some inputs take minutes (the
   analysis's sqlite3 VDBE function took ~1 minute, some tinygo-regex inputs
   far longer). `counts.py` prints any input over 10 s as it finishes.
