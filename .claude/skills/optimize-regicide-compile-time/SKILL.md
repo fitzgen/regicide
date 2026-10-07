@@ -66,8 +66,10 @@ Breaking any of these makes the optimization invalid, however fast it is.
 cd <repo root>                      # this worktree; never `cd` elsewhere
 ls reports/                         # find the highest compilation-speedup-NNN
 R=reports/compilation-speedup-001   # next unused number; set in every shell
-mkdir -p $R/{successful,unsuccessful,profiles,misc,bins,bench,sets}
+mkdir -p $R/{successful,unsuccessful,profiles,misc,bins,bench}
 ```
+
+Not `sets`: `make_sets.py` creates it and refuses one that already exists.
 
 `reports/` is gitignored (by `~/.gitignore`), so nothing in it is committed.
 
@@ -152,8 +154,10 @@ The corpora are wildly uneven, and that drives the whole method. Measured on
 - **Most inputs cost 10⁶–10⁹ instructions. A few dozen cost 10¹¹–10¹³.**
   The most expensive, `tinygo-regex-0188` (1.1·10¹³ insts, ~15 minutes) and
   `sqlite3-0226` (5.2·10¹², ~8 minutes), each cost more than everything else
-  in their corpus put together. Something in
-  regicide is badly superlinear on these.
+  in their corpus put together. Split-point selection was badly
+  superlinear on these; since `1f98a23` and `645db2b` the heaviest input
+  takes seconds (see `references/known-findings.md`). Re-run the census
+  before assuming the old numbers.
 - Replaying a whole corpus in one process takes **tens of minutes to hours**.
   Before running the census, a naive `run --insts -q <corpus>` looks
   identical to a hang.
@@ -175,6 +179,10 @@ over 20 minutes on the default corpora, bounded below by the single slowest
 input (~15 minutes for `tinygo-regex-0188`). **Start it in the background
 right after the first build, and profile while it runs.** Copy the
 heavy-input list from `sets/sets.md` into `report.md`.
+
+If an earlier report has a census of exactly the tree you are starting from,
+reuse its TSV for `make_sets.py` instead. Spot-check one heavy input's
+`--insts` against it first.
 
 The sets:
 
@@ -304,6 +312,17 @@ exit, in an uncommitted edit, then remove it. Write what you learned in
 `misc/`. A distribution (for example "92% of calls see ≤4 elements") is what
 justifies a fast path.
 
+- In `src/lib.rs`, the statics and the dump function need
+  `#[allow(missing_docs)]`, or the build fails.
+- Call the dump after `out.flush()` at the end of `main` in
+  `examples/run.rs`.
+- Revert with `git checkout src examples`, and check `git status` is clean.
+
+Count before designing, not after. On `compile-speedups-002`, counters
+showed 767M span queries for 181k splits (the O(n^2)), that 95% of priced
+halves have at most one bundle in the way (the fast path), and that a
+suggested fix's target was 0.1% of the time (so it was not worth doing).
+
 ## 4. Choose what to try
 
 Rank candidates by **estimated saving × breadth**. A 30% speedup of a pass
@@ -424,6 +443,18 @@ unless the user explicitly allowed output changes.
 `compare.py` also exits 2 when the per-set totals of the allocation counts
 differ, which is a cheap early warning but not a substitute for the gate.
 
+When the user has allowed output changes, identity is not the gate. Run
+`run --check -q` once per set directory and require exit 0 from each, on top
+of the tests and the fuzzer.
+
+**Tests do not prove identity.** A property test compares a new structure
+against the old function on generated states, which covers shapes the
+kernel never produces and can miss some it does. On `compile-speedups-002`,
+a property check first built halves the kernel never creates, and an
+earlier one would have missed out-of-order candidate queries. Run the gate
+even when the tests are thorough, and mutate the new code once (break one
+line, confirm a test fails) to check the test can see it.
+
 ## Measuring
 
 **Wall time is what matters. Instructions retired is the quiet proxy.**
@@ -449,6 +480,13 @@ python3 $S/compare.py -n 10 --csv $R/bench/<slug>-heavyNN.csv \
     | tee $R/bench/<slug>-heavyNN.txt
 ```
 
+`compare.py` prints a `round N/M done` line per round; add
+`| grep -v '^round'` before `tee` to keep the saved result readable.
+
+**Use `-n 5` or more.** With 3 samples per build, Mann-Whitney's p can never
+go below 0.081, even when every candidate sample beats every baseline
+sample, so `-n 3` can never come out significant. `-n 6` reaches p=0.0051.
+
 `compare.py` interleaves the two builds (ABAB, alternating which goes first),
 then prints for `insts` and `wall`: mean, median, min, CV, the relative change
 of the mean, a 99% bootstrap CI for it, and a Mann–Whitney p-value. It calls
@@ -465,8 +503,12 @@ not significant.
 
 - Run `uptime` and check `ps` first. Do not run `compare.py` alongside your
   own census, the correctness gate, the fuzzer, or a build: they share cores
-  and the memory bus. Run the correctness gate during `insts`-only screening
-  if you must, but **not** during the wall-time run that decides.
+  and the memory bus. Run the correctness gate during `insts`-only
+  screening if you must, but **not** during the wall-time run that decides.
+- Other sessions can push the load from ~8 to ~90 in minutes. At load
+  56-87, `typical/` wall CV reached 72-92%, and wall could not resolve
+  effects under ~10%, though insts still resolved 3%. Record `uptime` with
+  every result.
 - The `typical/` wall time includes decoding every input, a constant cost
   shared by both builds that dilutes the relative delta. Interpret the
   decision on `insts`, and the magnitude on both.
@@ -546,3 +588,16 @@ Then tell the user where the report is and summarize the cumulative result.
   meaningless.
 - **Counting files with `ls | wc -l`.** `ls` columnizes into a pipe on this
   host. Use `ls -1` or `find`.
+- **Implicit call-order contracts.** A cache filled "when the caller asks
+  about candidate N for the first time, which is right after N-1" breaks,
+  in release with an out-of-bounds panic, as soon as a later optimization
+  skips a candidate. Index caches by key, and fill on first use in any
+  order.
+- **Inlining a one-time fill into a hot function.** It cost +1.4% insts on
+  `typical/`. Split it out as `#[cold] #[inline(never)]` and keep the hit
+  path `#[inline]`.
+- **The branch moving under you.** The user may rebase or reword your
+  commits between turns (the WIP prefix gets dropped, shas change). Before
+  building on it, check `git log`, and compare patches by content
+  (`git show <old> --format=` vs `<new>`) rather than trusting shas in the
+  report.
