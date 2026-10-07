@@ -1,0 +1,382 @@
+{
+ "options": {
+  "validate_input": true,
+  "redundant_move_elimination_level": "global",
+  "dead_move_elimination_level": "global",
+  "eliminate_dead_register_moves": true,
+  "narrow_spill_slot_live_ranges": false,
+  "hoist_demanded_moves": true
+ },
+ "machine": {
+  "version": 3,
+  "banks": [
+   {
+    "size": 1
+   }
+  ],
+  "registers": [
+   {
+    "bank": 0,
+    "units": {
+     "start": 0,
+     "end": 2
+    }
+   },
+   {
+    "bank": 0,
+    "units": {
+     "start": 2,
+     "end": 3
+    }
+   },
+   {
+    "bank": 0,
+    "units": {
+     "start": 3,
+     "end": 4
+    }
+   }
+  ],
+  "groups": [
+   {
+    "bank": 0,
+    "members": [
+     0,
+     1
+    ]
+   }
+  ],
+  "classes": [
+   {
+    "bank": 0,
+    "spill_cost": 1.0,
+    "members": {
+     "regs": [
+      0,
+      1,
+      2
+     ]
+    }
+   }
+  ]
+ },
+ "func": {
+  "version": 3,
+  "entry_block": 0,
+  "values": [
+   {
+    "reg_class": 0,
+    "remat_cost": null
+   },
+   {
+    "reg_class": 0,
+    "remat_cost": null
+   },
+   {
+    "reg_class": 0,
+    "remat_cost": null
+   },
+   {
+    "reg_class": 0,
+    "remat_cost": null
+   },
+   {
+    "reg_class": 0,
+    "remat_cost": null
+   },
+   {
+    "reg_class": 0,
+    "remat_cost": null
+   }
+  ],
+  "insts": [
+   {
+    "block": 0,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "def",
+      "constraint": "any",
+      "val": 0
+     }
+    ],
+    "clobbers": []
+   },
+   {
+    "block": 0,
+    "operands": [
+     {
+      "pos": "late",
+      "kind": "def",
+      "constraint": "any",
+      "val": 1
+     }
+    ],
+    "clobbers": []
+   },
+   {
+    "block": 0,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": "any",
+      "val": 0
+     }
+    ],
+    "clobbers": [
+     0,
+     1
+    ]
+   },
+   {
+    "block": 0,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "def",
+      "constraint": {
+       "reg": 0
+      },
+      "val": 2
+     }
+    ],
+    "clobbers": []
+   },
+   {
+    "block": 0,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "def",
+      "constraint": {
+       "reg": 0
+      },
+      "val": 3
+     },
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": "any",
+      "val": 0
+     }
+    ],
+    "clobbers": []
+   },
+   {
+    "block": 1,
+    "operands": [],
+    "clobbers": []
+   },
+   {
+    "block": 2,
+    "operands": [],
+    "clobbers": []
+   },
+   {
+    "block": 3,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": "stack",
+      "val": 3
+     }
+    ],
+    "clobbers": [
+     0
+    ]
+   },
+   {
+    "block": 3,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "def",
+      "constraint": {
+       "reg": 0
+      },
+      "val": 5
+     },
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": "any",
+      "val": 1
+     }
+    ],
+    "clobbers": [
+     2
+    ]
+   },
+   {
+    "block": 3,
+    "operands": [],
+    "clobbers": []
+   },
+   {
+    "block": 4,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": {
+       "reg": 0
+      },
+      "val": 0
+     }
+    ],
+    "clobbers": []
+   },
+   {
+    "block": 4,
+    "operands": [],
+    "clobbers": []
+   },
+   {
+    "block": 5,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": {
+       "reg": 0
+      },
+      "val": 0
+     }
+    ],
+    "clobbers": []
+   },
+   {
+    "block": 5,
+    "operands": [],
+    "clobbers": [
+     1,
+     2
+    ]
+   },
+   {
+    "block": 5,
+    "operands": [
+     {
+      "pos": "early",
+      "kind": "use",
+      "constraint": "any",
+      "val": 2
+     }
+    ],
+    "clobbers": []
+   }
+  ],
+  "blocks": [
+   {
+    "frequency": 1.0,
+    "params": [],
+    "insts": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ],
+    "successors": [
+     {
+      "block": 1,
+      "args": []
+     },
+     {
+      "block": 2,
+      "args": []
+     }
+    ],
+    "predecessors": []
+   },
+   {
+    "frequency": 1.0,
+    "params": [],
+    "insts": [
+     5
+    ],
+    "successors": [
+     {
+      "block": 3,
+      "args": [
+       1
+      ]
+     }
+    ],
+    "predecessors": [
+     0
+    ]
+   },
+   {
+    "frequency": 1.0,
+    "params": [],
+    "insts": [
+     6
+    ],
+    "successors": [
+     {
+      "block": 3,
+      "args": [
+       1
+      ]
+     }
+    ],
+    "predecessors": [
+     0
+    ]
+   },
+   {
+    "frequency": 1.0,
+    "params": [
+     4
+    ],
+    "insts": [
+     7,
+     8,
+     9
+    ],
+    "successors": [
+     {
+      "block": 4,
+      "args": []
+     },
+     {
+      "block": 5,
+      "args": []
+     }
+    ],
+    "predecessors": [
+     1,
+     2
+    ]
+   },
+   {
+    "frequency": 1.0,
+    "params": [],
+    "insts": [
+     10,
+     11
+    ],
+    "successors": [],
+    "predecessors": [
+     3
+    ]
+   },
+   {
+    "frequency": 1.0,
+    "params": [],
+    "insts": [
+     12,
+     13,
+     14
+    ],
+    "successors": [],
+    "predecessors": [
+     3
+    ]
+   }
+  ]
+ }
+}

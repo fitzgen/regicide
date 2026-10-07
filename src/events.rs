@@ -529,6 +529,35 @@ where
         index: usize,
     },
 
+    /// A move was inserted before a block's terminator because every one of
+    /// the block's successors would otherwise write the same value into its
+    /// destination first thing. See `crate::demanded_moves`.
+    EditHoisted {
+        /// Where the move goes.
+        pos: PackedMovePosition<E>,
+
+        /// The move.
+        edit: EdgeEdit<E>,
+
+        /// Its index in the edit list as move generation left it, counting on
+        /// from that list's end: it was not in that list.
+        index: usize,
+    },
+
+    /// A move or rematerialization was dropped because a move hoisted above it
+    /// already put its value where it writes.
+    HoistedEditEliminated {
+        /// Where the edit was.
+        pos: PackedMovePosition<E>,
+
+        /// The edit that is not happening.
+        edit: EdgeEdit<E>,
+
+        /// Which edit it was, with the same numbering `Event::MoveEmitted`
+        /// uses.
+        index: usize,
+    },
+
     /// An edit was placed on a critical edge, which the client has to split.
     CriticalEdgeEdit {
         /// The predecessor the edge leaves.
@@ -661,6 +690,8 @@ mod viz_enabled {
                 Self::MoveEmitted { .. } => "MoveEmitted",
                 Self::EditEliminated { .. } => "EditEliminated",
                 Self::DeadEditEliminated { .. } => "DeadEditEliminated",
+                Self::EditHoisted { .. } => "EditHoisted",
+                Self::HoistedEditEliminated { .. } => "HoistedEditEliminated",
                 Self::CriticalEdgeEdit { .. } => "CriticalEdgeEdit",
             }
         }
@@ -1021,6 +1052,16 @@ mod viz_enabled {
                     pos,
                     edit,
                     index: _,
+                }
+                | Self::EditHoisted {
+                    pos,
+                    edit,
+                    index: _,
+                }
+                | Self::HoistedEditEliminated {
+                    pos,
+                    edit,
+                    index: _,
                 } => {
                     visit_move_position(*pos, f);
                     visit_edge_edit(*edit, f);
@@ -1308,6 +1349,16 @@ mod viz_enabled {
             index: _,
         }
         DeadEditEliminated {
+            pos: (MOVE_POSITION),
+            edit: (EDGE_EDIT),
+            index: _,
+        }
+        EditHoisted {
+            pos: (MOVE_POSITION),
+            edit: (EDGE_EDIT),
+            index: _,
+        }
+        HoistedEditEliminated {
             pos: (MOVE_POSITION),
             edit: (EDGE_EDIT),
             index: _,

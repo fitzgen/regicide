@@ -451,7 +451,6 @@ where
 
     /// Is this slot one of the emergency slots that move generation borrows,
     /// rather than one a value was assigned?
-    #[cfg(feature = "visualizer")]
     pub(crate) fn is_emergency(&self, slot: SpillSlot<E>) -> bool {
         self.emergency.iter().flatten().any(|&s| s == slot)
     }

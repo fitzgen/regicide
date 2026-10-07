@@ -47,6 +47,9 @@ whichever a file turns out to be in.
       --narrow-slots           reserve each spill slot only where its value is
                                both live and spilled
       --no-narrow-slots        reserve it across the whole live range
+      --hoist-demanded         hoist moves every successor of a block makes
+                               first into that block, when cheaper
+      --no-hoist-demanded      do not
       --validate               validate each input before allocating
       --no-validate            do not validate
       --check                  check each allocation against the checker
@@ -478,29 +481,16 @@ struct EstimatedCycles {
 impl EstimatedCycles {
     const STACK_COST: f64 = 5.0;
     const LOOP_WEIGHT: f64 = 10.0;
-    const COLD_WEIGHT: f64 = 0.05;
-    const HOT_WEIGHT: f64 = 10.0;
 
     /// How much each operand and edit in a block counts.
     ///
-    /// The frequency weight is 0.05 at `COLD`, 1 at `NORMAL` and 10 at `HOT`,
-    /// clamped outside those, and log-log linear between them, i.e. a power
-    /// of the frequency on each side of `NORMAL`.
+    /// The frequency weight is `BlockFrequency::estimate_weight`, the one
+    /// demanded-move hoisting prices its choices with: 0.05 at `COLD`, 1 at
+    /// `NORMAL` and 10 at `HOT`, clamped outside those, and linear in the
+    /// logarithm of the frequency between them.
     fn block_weight(loop_depth: usize, frequency: BlockFrequency) -> f64 {
-        let f = f64::from(frequency.as_f32());
-        let cold = f64::from(BlockFrequency::COLD.as_f32());
-        let hot = f64::from(BlockFrequency::HOT.as_f32());
-        let frequency_weight = if f <= cold {
-            Self::COLD_WEIGHT
-        } else if f >= hot {
-            Self::HOT_WEIGHT
-        } else if f < 1.0 {
-            f.powf(Self::COLD_WEIGHT.ln() / cold.ln())
-        } else {
-            f.powf(Self::HOT_WEIGHT.ln() / hot.ln())
-        };
         let depth = i32::try_from(loop_depth).unwrap_or(i32::MAX);
-        Self::LOOP_WEIGHT.powi(depth) * frequency_weight
+        Self::LOOP_WEIGHT.powi(depth) * frequency.estimate_weight()
     }
 
     fn count_operands(&mut self, allocs: &[Allocation], weight: f64) {
@@ -555,12 +545,13 @@ fn describe_options(options: &InputOptions) -> String {
     };
     format!(
         "options: validate {}, redundant-moves {}, dead-moves {}, dead-reg-moves {}, \
-         narrow-slots {}",
+         narrow-slots {}, hoist-demanded {}",
         options.validate_input,
         level(options.redundant_move_elimination_level),
         level(options.dead_move_elimination_level),
         options.eliminate_dead_register_moves,
         options.narrow_spill_slot_live_ranges,
+        options.hoist_demanded_moves,
     )
 }
 
@@ -575,6 +566,7 @@ struct OptionOverrides {
     dead_move_elimination_level: Option<MoveEliminationLevel>,
     eliminate_dead_register_moves: Option<bool>,
     narrow_spill_slot_live_ranges: Option<bool>,
+    hoist_demanded_moves: Option<bool>,
 }
 
 impl OptionOverrides {
@@ -593,6 +585,9 @@ impl OptionOverrides {
             narrow_spill_slot_live_ranges: self
                 .narrow_spill_slot_live_ranges
                 .unwrap_or(from_file.narrow_spill_slot_live_ranges),
+            hoist_demanded_moves: self
+                .hoist_demanded_moves
+                .unwrap_or(from_file.hoist_demanded_moves),
         }
     }
 }
@@ -649,6 +644,8 @@ impl Args {
                 "--no-dead-reg-moves" => options.eliminate_dead_register_moves = Some(false),
                 "--narrow-slots" => options.narrow_spill_slot_live_ranges = Some(true),
                 "--no-narrow-slots" => options.narrow_spill_slot_live_ranges = Some(false),
+                "--hoist-demanded" => options.hoist_demanded_moves = Some(true),
+                "--no-hoist-demanded" => options.hoist_demanded_moves = Some(false),
                 "--validate" => options.validate_input = Some(true),
                 "--no-validate" => options.validate_input = Some(false),
                 "--check" => check = true,

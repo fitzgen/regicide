@@ -176,6 +176,20 @@ where
         &self.elems
     }
 
+    /// Get the values whose keys are in `range`, in key order.
+    pub fn range(&self, range: EntityRange<K>) -> &[V] {
+        &self.elems[range.indices()]
+    }
+
+    /// The range of keys from `start` to the next key not yet pushed: what
+    /// was pushed since `start = self.next_key_unwrap()`.
+    pub(crate) fn range_from(&self, start: K) -> EntityRange<K> {
+        EntityRange {
+            start,
+            end: self.next_key_unwrap(),
+        }
+    }
+
     /// Get this map's values as a mutable slice, in key order.
     #[allow(dead_code, reason = "will probably need it")]
     pub fn as_mut_slice(&mut self) -> &mut [V] {

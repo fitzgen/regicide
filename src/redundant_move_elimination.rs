@@ -34,7 +34,10 @@ use crate::{
     Entity as _, Input,
     context::ContextInner,
     counts::Counts,
-    entity::{Block, EntityRepr, EntitySet, Inst, SecondaryMap, Val},
+    entity::{
+        Block, EntityRange, EntityRepr, EntitySet, Inst, PrimaryMap, SecondaryMap,
+        TerminatorFactsStorageIndex, Val, WrittenPartsStorageIndex,
+    },
     error::IResult,
     events::EventsLog,
     input::{DefUse, InputBlock, InputFunction, InputInst, MoveEliminationLevel},
@@ -117,7 +120,7 @@ where
 /// For values that fit in multiple registers, as part of a `RegGroup`, this
 /// holds the `index`th part of the value that fits in a register.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct Part<E>
+pub(crate) struct Part<E>
 where
     E: EntityRepr,
 {
@@ -128,7 +131,7 @@ where
 const _U8_INDEX_HOLDS_ALL_PARTS: () = assert!(crate::RegGroup::MAX_SIZE < (u8::MAX as usize));
 
 /// One machine location, and one part it is known to hold.
-type Fact<E> = (ScalarAllocation<E>, Part<E>);
+pub(crate) type Fact<E> = (ScalarAllocation<E>, Part<E>);
 
 /// What the machine holds: the parts each location is known to contain.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -373,8 +376,108 @@ where
     /// generation left it. See `crate::remove_eliminated_edits`.
     pub(crate) eliminated: Vec<usize>,
 
+    /// What the rewrite learned along the way, for demanded-move hoisting.
+    pub(crate) recorded: Recorded<E>,
+
     #[cfg(test)]
     test_stats: TestStats,
+}
+
+/// What the rewrite walk knew at the points demanded-move hoisting asks about,
+/// recorded as it went so that hoisting need not run the analysis again.
+///
+/// Only filled when `Recorded::enabled` was set before the pass ran.
+pub(crate) struct Recorded<E>
+where
+    E: EntityRepr,
+{
+    /// Whether to record anything at all.
+    pub(crate) enabled: bool,
+
+    /// For each edit, by index into the edit list as move generation left it,
+    /// where its written parts sit within `written_parts`, or `None` for an
+    /// edit the rewrite eliminated or never reached.
+    written: Vec<Option<EntityRange<WrittenPartsStorageIndex>>>,
+
+    /// Contiguous storage for every surviving edit's written parts: what its
+    /// destination holds after it runs, sorted and deduplicated.
+    written_parts: PrimaryMap<WrittenPartsStorageIndex, Part<E>>,
+
+    /// For each block whose state just before its terminator was recorded,
+    /// where those facts sit within `before_terminator_facts`.
+    before_terminator: SecondaryMap<Block<E>, Option<EntityRange<TerminatorFactsStorageIndex>>>,
+
+    /// Contiguous storage for those states.
+    before_terminator_facts: PrimaryMap<TerminatorFactsStorageIndex, Fact<E>>,
+}
+
+impl<E> Recorded<E>
+where
+    E: EntityRepr,
+{
+    const fn new() -> Self {
+        Self {
+            enabled: false,
+            written: Vec::new(),
+            written_parts: PrimaryMap::new(),
+            before_terminator: SecondaryMap::new(None),
+            before_terminator_facts: PrimaryMap::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        let Self {
+            enabled,
+            written,
+            written_parts,
+            before_terminator,
+            before_terminator_facts,
+        } = self;
+        *enabled = false;
+        written.clear();
+        written_parts.reset();
+        before_terminator.reset();
+        before_terminator_facts.reset();
+    }
+
+    fn is_reset(&self) -> bool {
+        let Self {
+            enabled,
+            written,
+            written_parts,
+            before_terminator,
+            before_terminator_facts,
+        } = self;
+        !*enabled
+            && written.is_empty()
+            && written_parts.is_reset()
+            && before_terminator.is_reset()
+            && before_terminator_facts.is_reset()
+    }
+
+    /// The parts the edit at `index` leaves in its destination, which may be
+    /// none at all, or `None` for an edit that is not happening.
+    pub(crate) fn written(&self, index: usize) -> Option<&[Part<E>]> {
+        let range = (*self.written.get(index)?)?;
+        Some(self.written_parts.range(range))
+    }
+
+    /// The facts holding just before `block`'s terminator, if they were
+    /// recorded.
+    pub(crate) fn before_terminator(&self, block: Block<E>) -> Option<&[Fact<E>]> {
+        Some(
+            self.before_terminator_facts
+                .range(self.before_terminator[block]?),
+        )
+    }
+
+    fn record_written(&mut self, index: usize, parts: impl Iterator<Item = Part<E>>) {
+        let start = self.written_parts.next_key_unwrap();
+        for part in parts {
+            self.written_parts.push_unwrap(part);
+        }
+        self.written[index] = Some(self.written_parts.range_from(start));
+    }
 }
 
 impl<E> RedundantMoveElimination<E>
@@ -395,6 +498,7 @@ where
             edge_edits: Vec::new(),
             scalars: Vec::new(),
             eliminated: Vec::new(),
+            recorded: Recorded::new(),
             #[cfg(test)]
             test_stats: TestStats::new(),
         }
@@ -414,6 +518,7 @@ where
             edge_edits,
             scalars,
             eliminated,
+            recorded,
             #[cfg(test)]
             test_stats,
         } = self;
@@ -429,6 +534,7 @@ where
         edge_edits.clear();
         scalars.clear();
         eliminated.clear();
+        recorded.reset();
         #[cfg(test)]
         {
             *test_stats = TestStats::default();
@@ -449,6 +555,7 @@ where
             edge_edits,
             scalars,
             eliminated,
+            recorded,
             #[cfg(test)]
                 test_stats: _,
         } = self;
@@ -464,6 +571,7 @@ where
             && edge_edits.is_empty()
             && scalars.is_empty()
             && eliminated.is_empty()
+            && recorded.is_reset()
     }
 }
 
@@ -512,7 +620,7 @@ pub(crate) fn scalars_of<E>(
 /// A critical-edge edit wraps the transfer that runs on the edge; every other
 /// edit is one already. The list is the single copy of all of them, so nothing
 /// here needs its own.
-fn edge_edit_at<E>(move_generation: &MoveGeneration<E>, index: usize) -> EdgeEdit<E>
+pub(crate) fn edge_edit_at<E>(move_generation: &MoveGeneration<E>, index: usize) -> EdgeEdit<E>
 where
     E: EntityRepr,
 {
@@ -610,6 +718,11 @@ where
     /// `Local` never ran the fixpoint, so every block starts from the empty
     /// state: the bottom of the lattice, and so sound.
     fn rewrite(&mut self, level: MoveEliminationLevel) {
+        if self.me.recorded.enabled {
+            let len = self.move_generation.edits().len();
+            self.me.recorded.written.resize(len, None);
+        }
+
         for block in self.rpo.iter() {
             // Unreachable, and so with no edits to drop.
             if level == MoveEliminationLevel::Global && self.me.entry_state[block].is_none() {
@@ -726,11 +839,16 @@ where
         // before that edge's arguments are renamed into this block's parameters.
         let mut renamed = false;
 
+        let terminator =
+            Inst::<E>::try_new(crate::liveness::block_last_inst(&input_block).index()).unwrap();
         let mut iter = block_iter(move_generation, func, wide);
         while let Some((item, index)) = iter.next_indexed() {
             let edit = match item {
                 InstOrEdit::Inst(inst) => {
                     self.rename_arriving_edge(&mut state, block, &mut renamed);
+                    if inst == terminator && mode == Mode::Rewrite && self.me.recorded.enabled {
+                        self.record_before_terminator(&state, block);
+                    }
                     self.apply_inst(&mut state, inst);
                     continue;
                 }
@@ -789,6 +907,24 @@ where
         self.me.state = state;
         self.me.out = out;
         self.me.edge_edits = edge_edits;
+    }
+
+    /// Keep the state just before `block`'s terminator, when demanded-move
+    /// hoisting may want to insert there.
+    ///
+    /// That is only ever a block whose every successor has it as its only
+    /// predecessor; see `crate::demanded_moves`.
+    fn record_before_terminator(&mut self, state: &State<E>, block: Block<E>) {
+        if !crate::demanded_moves::may_hoist_into(self.input.func, block.with_repr32()) {
+            return;
+        }
+        let recorded = &mut self.me.recorded;
+        let start = recorded.before_terminator_facts.next_key_unwrap();
+        for &fact in &state.facts {
+            recorded.before_terminator_facts.push_unwrap(fact);
+        }
+        recorded.before_terminator[block] =
+            Some(recorded.before_terminator_facts.range_from(start));
     }
 
     /// Rename what this block's one incoming edge left it, if it has one and if
@@ -904,6 +1040,11 @@ where
                 } else {
                     state.clobber(machine, dest);
                     state.insert(dest, part);
+                    if mode == Mode::Rewrite && self.me.recorded.enabled {
+                        self.me
+                            .recorded
+                            .record_written(index, core::iter::once(part));
+                    }
                 }
                 return;
             }
@@ -940,6 +1081,11 @@ where
                 test_stat!(self.me, near_miss);
             }
             state.copy_into(machine, to, from, &mut scratch);
+            if mode == Mode::Rewrite && self.me.recorded.enabled {
+                self.me
+                    .recorded
+                    .record_written(index, scratch.iter().copied());
+            }
         }
 
         self.me.scratch = scratch;
@@ -1166,10 +1312,11 @@ mod tests {
         let mut test_input = test_input.clone();
         test_input.options.redundant_move_elimination_level = level;
 
-        // These tests measure *this* pass; at its default level the other one
-        // would delete edits of its own, and every assertion below would read
-        // the sum of the two.
+        // These tests measure *this* pass; at their default levels the others
+        // would change edits of their own, and every assertion below would
+        // read the sum of them.
         test_input.options.dead_move_elimination_level = MoveEliminationLevel::None;
+        test_input.options.hoist_demanded_moves = false;
 
         let mut context = Context::new();
         let result = test_input.with_input(|input| -> Result<Option<Run>, String> {
@@ -1763,9 +1910,10 @@ mod tests {
             crate::test::corpus(),
             |test_input: &TestInput| -> Result<(), String> {
                 // `removed` reads `EditEliminated` alone, so this has to be the
-                // only pass dropping edits.
+                // only pass changing the edits.
                 let mut test_input = test_input.clone();
                 test_input.options.dead_move_elimination_level = MoveEliminationLevel::None;
+                test_input.options.hoist_demanded_moves = false;
 
                 let mut context = Context::new();
                 let result = test_input.with_input(|input| -> Result<(), String> {

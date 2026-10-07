@@ -463,14 +463,15 @@ pub struct BlockData {
 /// `BlockData::frequency`.
 ///
 /// `NORMAL` comes first so that a default, unmutated block is neither hot nor
-/// cold.
-const BLOCK_FREQUENCIES: [BlockFrequency; 6] = [
+/// cold. Zero is below `COLD`, which an embedder may also report.
+const BLOCK_FREQUENCIES: [BlockFrequency; 7] = [
     BlockFrequency::NORMAL,
     BlockFrequency::COLD,
     BlockFrequency::new(0.5),
     BlockFrequency::new(10.0),
     BlockFrequency::HOT,
     BlockFrequency::new(10_000.0),
+    BlockFrequency::new(0.0),
 ];
 
 #[derive(Clone, Hash)]
@@ -3446,6 +3447,280 @@ impl TestInput {
         input
     }
 
+    /// One value spilled across a clobber of every register in the entry block,
+    /// which then forks, and read in a register first thing on each arm: each
+    /// arm reloads it into the same register, which is the shape
+    /// demanded-move hoisting merges into one reload before the fork.
+    ///
+    /// `arms` is how many arms the fork has, at least two.
+    pub fn with_a_value_reloaded_on_every_arm(arms: usize) -> Self {
+        assert!(arms >= 2);
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let terminator = || InstData::Op {
+            operands: vec![],
+            clobbers: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        let mut insts = vec![
+            // `block0`: define the value in a register, clobber both
+            // registers so that it can only cross on the stack, and fork.
+            op(Position::Late, DefUse::Def, OperandConstraint::Reg(class)),
+            InstData::Op {
+                operands: vec![],
+                clobbers: vec![
+                    crate::Reg::try_new(0).unwrap(),
+                    crate::Reg::try_new(1).unwrap(),
+                ],
+                side_effects: true,
+            },
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: (1..=arms)
+                    .map(|i| BlockCall {
+                        target: block(i),
+                        args: Vec::new(),
+                    })
+                    .collect(),
+            },
+        ];
+        // Each arm: read it in a register, and return.
+        for _ in 0..arms {
+            insts.push(op(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(class),
+            ));
+            insts.push(terminator());
+        }
+        for inst_data in insts {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: vec![inst(0), inst(1), inst(2)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+        for i in 0..arms {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts: vec![inst(3 + 2 * i), inst(4 + 2 * i)],
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A join whose terminator is its only instruction, and which forks to two
+    /// arms that each first reload a spilled value into the register the
+    /// join's parameter arrives in. The parameter is read only past a clobber,
+    /// so it is spilled as it arrives.
+    ///
+    /// ```text
+    /// block0: inst0  late def v0 (reg)
+    ///         inst1  clobber both registers      // v0 crosses on the stack
+    ///         inst2  late def v1 (rc0)           // pinned to r0
+    ///         inst3  --> block1, block2
+    /// block1: inst4  --> block3(v1)
+    /// block2: inst5  --> block3(v1)
+    /// block3(v2 in r0):
+    ///         inst6  --> block4, block5          // the join's only instruction
+    /// block4: inst7  early use v0 (rc0)
+    ///         inst8  clobber both registers
+    ///         inst9  early use v2 (rc0), return
+    /// block5: the same as block4
+    /// ```
+    ///
+    /// A move into `r0` hoisted before `block3`'s terminator would sit in the
+    /// same gap the parameter arrives in, which `Output::block_param_allocs`
+    /// promises holds it once that gap's edits have run.
+    pub fn with_a_reload_demanded_where_a_parameter_arrives() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let v = |i| Val::try_new(i).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let inst = |i| Inst::try_new(i).unwrap();
+        let first = RegClass::try_new(0).unwrap();
+        let both = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        for (class, def) in [
+            (
+                TestMachine::BOTH_REGS_CLASS,
+                ValDef::InstResult {
+                    inst: inst(0),
+                    i: 0,
+                },
+            ),
+            (
+                0,
+                ValDef::InstResult {
+                    inst: inst(2),
+                    i: 0,
+                },
+            ),
+            (
+                0,
+                ValDef::BlockParam {
+                    block: block(3),
+                    i: 0,
+                },
+            ),
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: class,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |operands: Vec<Operand>| InstData::Op {
+            operands,
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let branch = |targets: Vec<(Block, Vec<Val>)>| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .into_iter()
+                .map(|(target, args)| BlockCall { target, args })
+                .collect(),
+        };
+        let use_ = |val, class| {
+            Operand::new(
+                Position::Early,
+                DefUse::Use,
+                OperandConstraint::Reg(class),
+                Some(val),
+            )
+        };
+        let clobber = || InstData::Op {
+            operands: vec![],
+            clobbers: vec![
+                crate::Reg::try_new(0).unwrap(),
+                crate::Reg::try_new(1).unwrap(),
+            ],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst_data in [
+            // `block0`
+            op(vec![Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Reg(both),
+                Some(v(0)),
+            )]),
+            clobber(),
+            op(vec![Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Reg(first),
+                Some(v(1)),
+            )]),
+            branch(vec![(block(1), vec![]), (block(2), vec![])]),
+            // `block1` and `block2`
+            branch(vec![(block(3), vec![v(1)])]),
+            branch(vec![(block(3), vec![v(1)])]),
+            // `block3`
+            branch(vec![(block(4), vec![]), (block(5), vec![])]),
+            // `block4` and `block5`
+            op(vec![use_(v(0), first)]),
+            clobber(),
+            op(vec![use_(v(2), first)]),
+            op(vec![use_(v(0), first)]),
+            clobber(),
+            op(vec![use_(v(2), first)]),
+        ] {
+            func.insts.push(&mut output, inst_data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (insts, params) in [
+            (vec![inst(0), inst(1), inst(2), inst(3)], vec![]),
+            (vec![inst(4)], vec![]),
+            (vec![inst(5)], vec![]),
+            (vec![inst(6)], vec![v(2)]),
+            (vec![inst(7), inst(8), inst(9)], vec![]),
+            (vec![inst(10), inst(11), inst(12)], vec![]),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A single-block input with one instruction that ties a def to a use: the
     /// def carries a `Reuse` naming the use operand, whose own constraint is
     /// `use_constraint`.
@@ -6045,6 +6320,7 @@ impl TestInput {
     pub fn disable_move_elimination(&mut self) {
         self.options.redundant_move_elimination_level = MoveEliminationLevel::None;
         self.options.dead_move_elimination_level = MoveEliminationLevel::None;
+        self.options.hoist_demanded_moves = false;
     }
 
     /// Report `remat` for every value in this function that may legally carry
@@ -10425,6 +10701,19 @@ impl Mutate<InputOptions> for InputOptionsMutator {
                 ctx.rng().gen_bool()
             };
             Ok(())
+        })?;
+
+        mutations.mutation(|ctx| {
+            // Not hoisting leaves the edits as the other passes left them.
+            options.hoist_demanded_moves = if ctx.shrink() {
+                if !options.hoist_demanded_moves {
+                    return Err(mutatis::error::Error::exhausted());
+                }
+                false
+            } else {
+                ctx.rng().gen_bool()
+            };
+            Ok(())
         })
     }
 }
@@ -10436,6 +10725,7 @@ impl Generate<InputOptions> for InputOptionsMutator {
             dead_move_elimination_level: gen_move_elimination_level(ctx)?,
             eliminate_dead_register_moves: ctx.rng().gen_bool(),
             narrow_spill_slot_live_ranges: ctx.rng().gen_bool(),
+            hoist_demanded_moves: ctx.rng().gen_bool(),
             ..InputOptions::default()
         })
     }
@@ -10497,6 +10787,8 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::default(),
         TestInput::with_more_spill_slot_groups_than_a_u8_can_index(),
         TestInput::with_spilled_merge_param(),
+        TestInput::with_a_value_reloaded_on_every_arm(2),
+        TestInput::with_a_reload_demanded_where_a_parameter_arrives(),
         TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
         TestInput::with_use_constraints(&[OperandConstraint::Stack]),
         TestInput::with_use_constraints(&[OperandConstraint::Stack, OperandConstraint::Reg(class)]),

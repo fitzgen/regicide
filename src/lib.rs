@@ -27,6 +27,7 @@ mod coalescing;
 mod context;
 mod counts;
 mod dead_move_elimination;
+mod demanded_moves;
 mod dfs;
 mod dominators;
 mod error;
@@ -159,35 +160,40 @@ fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Res
     }
 }
 
-/// Drop the edits that redundant- and dead-move elimination proved unnecessary.
+/// Drop the edits that redundant- and dead-move elimination proved unnecessary,
+/// and apply demanded-move hoisting's changes.
 ///
-/// Neither pass removes its own. Both number their indices against the edit list
-/// as move generation left it, as do the `index` fields of every event they log
-/// and of `Event::MoveEmitted`, so the removal happens once, here, after both
-/// have run.
+/// No pass removes its own. All three number their indices against the edit
+/// list as move generation left it, as do the `index` fields of every event they
+/// log and of `Event::MoveEmitted`, so the removal happens once, here, after all
+/// of them have run.
 fn remove_eliminated_edits<E>(context: &mut ContextInner<E>)
 where
     E: EntityRepr,
 {
     let redundant = &context.redundant_move_elimination.eliminated;
     let dead = &mut context.dead_move_elimination;
+    let hoisted = &context.demanded_moves;
 
-    // Each list is sorted and duplicate free, and the two are disjoint because
-    // dead-move elimination skips every index the other pass took, so the merge
-    // is strictly increasing as `remove_edits` requires.
+    // Each list is sorted and duplicate free, and they are disjoint because
+    // each later pass skips every index an earlier one took, so the merge is
+    // strictly increasing as `remove_and_insert_edits` requires.
     dead.to_remove.clear();
     dead.to_remove
-        .reserve(redundant.len() + dead.eliminated.len());
+        .reserve(redundant.len() + dead.eliminated.len() + hoisted.eliminated.len());
     dead.to_remove.extend(redundant.iter().copied());
     dead.to_remove.extend(dead.eliminated.iter().copied());
+    dead.to_remove.extend(hoisted.eliminated.iter().copied());
     dead.to_remove.sort_unstable();
     debug_assert!(
         dead.to_remove.windows(2).all(|w| w[0] < w[1]),
-        "the two passes' eliminated-edit lists must each be sorted and be \
+        "the passes' eliminated-edit lists must each be sorted and be \
          disjoint from one another",
     );
 
-    context.move_generation.remove_edits(&dead.to_remove);
+    context
+        .move_generation
+        .remove_and_insert_edits(&dead.to_remove, &hoisted.inserted);
 }
 
 /// Is `E` likely wide enough to describe this allocation problem?
@@ -265,8 +271,10 @@ where
         &context.spill_slots,
     )?;
 
+    context.redundant_move_elimination.recorded.enabled = demanded_moves::wants_recording(input);
     redundant_move_elimination::eliminate_redundant_moves(context, input)?;
     dead_move_elimination::eliminate_dead_moves(context, input)?;
+    demanded_moves::hoist_demanded_moves(context, input)?;
 
     remove_eliminated_edits(context);
 

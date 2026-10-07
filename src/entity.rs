@@ -467,6 +467,27 @@ define_entities! {
     /// TODO FITZGEN
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct RegionChildrenStorageIndex = "region_children_storage_index";
+
+    /// An index into redundant-move elimination's recorded written parts.
+    ///
+    /// This and the three below are always used at `u32`, whatever the
+    /// context's representation: they count edits and facts, which a function
+    /// can have far more of than values or blocks.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct WrittenPartsStorageIndex = "written_parts_storage_index";
+
+    /// An index into redundant-move elimination's recorded pre-terminator
+    /// facts.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct TerminatorFactsStorageIndex = "terminator_facts_storage_index";
+
+    /// An index into demanded-move hoisting's entry demands.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct EntryDemandsStorageIndex = "entry_demands_storage_index";
+
+    /// An index into demanded-move hoisting's decisions.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct DecisionsStorageIndex = "decisions_storage_index";
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

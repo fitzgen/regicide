@@ -2432,6 +2432,33 @@
           }
         }
       },
+      "EditHoisted": {
+        "edit": {
+          "move": {
+            "regReg": {
+              "from": "Reg",
+              "to": "Reg"
+            },
+            "reload": {
+              "from": "SpillSlot",
+              "to": "Reg"
+            },
+            "spill": {
+              "from": "Reg",
+              "to": "SpillSlot"
+            }
+          },
+          "remat": {
+            "dest": "Reg",
+            "val": "Val"
+          }
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        }
+      },
       "HalfMoveDest": {
         "alloc": {
           "reg": "Reg",
@@ -2465,6 +2492,33 @@
           "slotGroup": "SpillSlotGroup"
         },
         "val": "Val"
+      },
+      "HoistedEditEliminated": {
+        "edit": {
+          "move": {
+            "regReg": {
+              "from": "Reg",
+              "to": "Reg"
+            },
+            "reload": {
+              "from": "SpillSlot",
+              "to": "Reg"
+            },
+            "spill": {
+              "from": "Reg",
+              "to": "SpillSlot"
+            }
+          },
+          "remat": {
+            "dest": "Reg",
+            "val": "Val"
+          }
+        },
+        "pos": {
+          "criticalEdge": {
+            "pred": "Block"
+          }
+        }
       },
       "MoveEmitted": {
         "move": {

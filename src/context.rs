@@ -1,10 +1,11 @@
 use crate::{
-    coalescing::Coalescing, counts::Counts, dead_move_elimination::DeadMoveElimination, dfs::Dfs,
-    entity::EntityRepr, events::EventsLog, live_ranges::LiveRanges, liveness::Liveness,
-    move_generation::MoveGeneration, output::OutputInner,
-    redundant_move_elimination::RedundantMoveElimination, region_allocation::RegionAllocation,
-    region_tree::RegionTree, rpo::Rpo, spill_placement::SpillPlacement,
-    spill_slot_allocation::SpillSlots, spilled_live_ranges::SpilledLiveRanges,
+    coalescing::Coalescing, counts::Counts, dead_move_elimination::DeadMoveElimination,
+    demanded_moves::DemandedMoves, dfs::Dfs, entity::EntityRepr, events::EventsLog,
+    live_ranges::LiveRanges, liveness::Liveness, move_generation::MoveGeneration,
+    output::OutputInner, redundant_move_elimination::RedundantMoveElimination,
+    region_allocation::RegionAllocation, region_tree::RegionTree, rpo::Rpo,
+    spill_placement::SpillPlacement, spill_slot_allocation::SpillSlots,
+    spilled_live_ranges::SpilledLiveRanges,
 };
 
 /// TODO FITZGEN
@@ -104,6 +105,7 @@ pub(crate) struct ContextInner<E: EntityRepr> {
     pub move_generation: MoveGeneration<E>,
     pub redundant_move_elimination: RedundantMoveElimination<E>,
     pub dead_move_elimination: DeadMoveElimination<E>,
+    pub demanded_moves: DemandedMoves<E>,
     pub output: OutputInner<E>,
 }
 
@@ -125,6 +127,7 @@ impl<E: EntityRepr> ContextInner<E> {
             move_generation: MoveGeneration::new(),
             redundant_move_elimination: RedundantMoveElimination::new(),
             dead_move_elimination: DeadMoveElimination::new(),
+            demanded_moves: DemandedMoves::new(),
             output: OutputInner::new(),
         }
     }
@@ -146,6 +149,7 @@ impl<E: EntityRepr> ContextInner<E> {
             move_generation,
             redundant_move_elimination,
             dead_move_elimination,
+            demanded_moves,
             output,
         } = self;
         counts.reset();
@@ -163,6 +167,7 @@ impl<E: EntityRepr> ContextInner<E> {
         move_generation.reset();
         redundant_move_elimination.reset();
         dead_move_elimination.reset();
+        demanded_moves.reset();
         output.reset();
     }
 
@@ -183,6 +188,7 @@ impl<E: EntityRepr> ContextInner<E> {
             move_generation,
             redundant_move_elimination,
             dead_move_elimination,
+            demanded_moves,
             output,
         } = self;
         counts.is_reset()
@@ -200,6 +206,7 @@ impl<E: EntityRepr> ContextInner<E> {
             && move_generation.is_reset()
             && redundant_move_elimination.is_reset()
             && dead_move_elimination.is_reset()
+            && demanded_moves.is_reset()
             && output.is_reset()
     }
 }

@@ -49,6 +49,7 @@ where
 ///     dead_move_elimination_level: MoveEliminationLevel::Global,
 ///     eliminate_dead_register_moves: true,
 ///     narrow_spill_slot_live_ranges: false,
+///     hoist_demanded_moves: true,
 /// };
 ///
 /// // Use whatever serialization format you like; here, we're using JSON.
@@ -117,6 +118,23 @@ pub struct InputOptions {
     /// existed still reads back as the allocation it recorded.
     #[cfg_attr(feature = "deserialize", serde(default))]
     pub narrow_spill_slot_live_ranges: bool,
+
+    /// Should the register allocator hoist a move that every successor of a
+    /// block would otherwise make first thing, into that block, when that is
+    /// cheaper?
+    ///
+    /// Only blocks that are the sole predecessor of each of their successors
+    /// take a hoisted move, so a move never runs on a path that did not
+    /// already make it.
+    ///
+    /// This option is enabled by default, and has no effect unless
+    /// [`InputOptions::redundant_move_elimination_level`] is
+    /// [`MoveEliminationLevel::Global`].
+    ///
+    /// Defaulted to `false` on deserialization, so an input captured before
+    /// this option existed still reads back as the allocation it recorded.
+    #[cfg_attr(feature = "deserialize", serde(default))]
+    pub hoist_demanded_moves: bool,
 }
 
 impl Default for InputOptions {
@@ -134,6 +152,7 @@ impl InputOptions {
             dead_move_elimination_level: MoveEliminationLevel::Global,
             eliminate_dead_register_moves: true,
             narrow_spill_slot_live_ranges: false,
+            hoist_demanded_moves: true,
         }
     }
 }
@@ -777,6 +796,45 @@ impl BlockFrequency {
         // and trait comparison is not available in a `const fn`.
         self.0.bits() <= Self::COLD.0.bits()
     }
+
+    /// How much one execution of a block at this frequency weighs in
+    /// regicide's cost estimates: 0.05 at or below `COLD`, 1 at `NORMAL`, 10
+    /// at or above `HOT`, and linear in the logarithm of the frequency
+    /// between those.
+    ///
+    /// Shared by demanded-move hoisting and the `run` example's estimated
+    /// cycles, so that the two agree exactly.
+    #[doc(hidden)]
+    pub fn estimate_weight(self) -> f64 {
+        const COLD_WEIGHT: f64 = 0.05;
+        const HOT_WEIGHT: f64 = 10.0;
+
+        if self.is_cold() {
+            return COLD_WEIGHT;
+        }
+        if self >= Self::HOT {
+            return HOT_WEIGHT;
+        }
+
+        // Strictly between `COLD` and `HOT`, so positive and finite.
+        let log2 = |f: Self| f64::from(log2_approx(f.as_f32()));
+        let f = log2(self);
+        if f <= 0.0 {
+            1.0 + (f / log2(Self::COLD)) * (COLD_WEIGHT - 1.0)
+        } else {
+            1.0 + (f / log2(Self::HOT)) * (HOT_WEIGHT - 1.0)
+        }
+    }
+}
+
+/// A base-two logarithm of a positive, finite `x` that `core` can compute:
+/// exact at powers of two, linear in between, and monotone.
+fn log2_approx(x: f32) -> f32 {
+    debug_assert!(x > 0.0 && x.is_finite());
+    let bits = x.to_bits();
+    let exponent = i16::try_from((bits >> 23) & 0xff).unwrap() - 127;
+    let mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    f32::from(exponent) + (mantissa - 1.0)
 }
 
 /// A block in an [`InputFunction`].
@@ -1891,6 +1949,7 @@ mod tests {
             dead_move_elimination_level: MoveEliminationLevel::Global,
             eliminate_dead_register_moves: false,
             narrow_spill_slot_live_ranges: true,
+            hoist_demanded_moves: false,
         };
         let json = serde_json::to_string(&options).unwrap();
         assert_eq!(
@@ -1898,7 +1957,7 @@ mod tests {
             concat!(
                 r#"{"validate_input":true,"redundant_move_elimination_level":"local","#,
                 r#""dead_move_elimination_level":"global","eliminate_dead_register_moves":false,"#,
-                r#""narrow_spill_slot_live_ranges":true}"#,
+                r#""narrow_spill_slot_live_ranges":true,"hoist_demanded_moves":false}"#,
             ),
         );
 
@@ -1920,11 +1979,61 @@ mod tests {
                 back.narrow_spill_slot_live_ranges,
                 options.narrow_spill_slot_live_ranges,
             );
+            assert_eq!(back.hoist_demanded_moves, options.hoist_demanded_moves);
         };
 
         check(&serde_json::from_str(&json).unwrap());
 
         let bytes = postcard::to_allocvec(&options).unwrap();
         check(&postcard::from_bytes(&bytes).unwrap());
+    }
+
+    #[test]
+    fn log2_approx_is_exact_at_powers_of_two_and_monotone() {
+        for e in -30_i16..30 {
+            assert_eq!(log2_approx(2.0_f32.powi(e.into())), f32::from(e));
+        }
+        let mut last = f32::NEG_INFINITY;
+        let mut x = 1e-7_f32;
+        while x < 1e3 {
+            let y = log2_approx(x);
+            assert!(y >= last);
+            last = y;
+            x *= 1.01;
+        }
+    }
+
+    /// Every frequency has a weight, including the ones below `COLD` that an
+    /// embedder may report, and the weight never falls as frequency rises.
+    #[test]
+    fn every_frequency_has_a_monotone_weight() {
+        assert_eq!(BlockFrequency::new(0.0).estimate_weight(), 0.05);
+        assert_eq!(BlockFrequency::COLD.estimate_weight(), 0.05);
+        assert_eq!(BlockFrequency::NORMAL.estimate_weight(), 1.0);
+        assert_eq!(BlockFrequency::HOT.estimate_weight(), 10.0);
+        assert_eq!(BlockFrequency::new(1e9).estimate_weight(), 10.0);
+
+        let mut last = 0.0;
+        let mut f = 1e-9_f32;
+        while f < 1e4 {
+            let w = BlockFrequency::new(f).estimate_weight();
+            assert!(w >= last, "{f}: {w} < {last}");
+            last = w;
+            f *= 1.05;
+        }
+    }
+
+    /// An options blob from before `hoist_demanded_moves` existed still reads,
+    /// and reads it as off, which is how that input was allocated.
+    #[cfg(feature = "deserialize")]
+    #[test]
+    fn options_from_before_hoisting_read_it_as_off() {
+        let options: InputOptions = serde_json::from_str(concat!(
+            r#"{"validate_input":true,"redundant_move_elimination_level":"global","#,
+            r#""dead_move_elimination_level":"global","eliminate_dead_register_moves":true,"#,
+            r#""narrow_spill_slot_live_ranges":false}"#,
+        ))
+        .unwrap();
+        assert!(!options.hoist_demanded_moves);
     }
 }

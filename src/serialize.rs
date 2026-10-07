@@ -607,7 +607,8 @@ mod tests {
     "redundant_move_elimination_level": "global",
     "dead_move_elimination_level": "global",
     "eliminate_dead_register_moves": true,
-    "narrow_spill_slot_live_ranges": false
+    "narrow_spill_slot_live_ranges": false,
+    "hoist_demanded_moves": true
   },
   "machine": {
     "version": 3,

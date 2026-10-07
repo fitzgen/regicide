@@ -365,6 +365,40 @@ where
     }
 }
 
+impl<E> DeadMoveElimination<E>
+where
+    E: EntityRepr,
+{
+    /// Is any unit of `reg` possibly read after `block`'s bottom, per the
+    /// fixpoint?
+    ///
+    /// Only meaningful after a `Global` run that tracked registers. `None` for a
+    /// block the pass never numbered.
+    pub(crate) fn reg_may_be_live_out(
+        &self,
+        machine: &crate::machine::Machine,
+        block: Block<E>,
+        reg: Reg<E>,
+    ) -> Option<bool> {
+        let i = self.rpo_index[block];
+        let live_out = self.live_out.get(usize::try_from(i).ok()?)?;
+        Some(
+            reg.iter_units(machine)
+                .any(|unit| live_out.units.contains(unit)),
+        )
+    }
+
+    /// Is `slot` possibly read after `block`'s bottom, per the fixpoint?
+    ///
+    /// Only meaningful after a `Global` run. `None` for a block the pass never
+    /// numbered.
+    pub(crate) fn slot_may_be_live_out(&self, block: Block<E>, slot: SpillSlot<E>) -> Option<bool> {
+        let i = self.rpo_index[block];
+        let live_out = self.live_out.get(usize::try_from(i).ok()?)?;
+        Some(live_out.slots.contains(slot))
+    }
+}
+
 impl<E> Default for DeadMoveElimination<E>
 where
     E: EntityRepr,
@@ -1000,10 +1034,11 @@ mod tests {
         let mut test_input = test_input.clone();
         test_input.options.dead_move_elimination_level = level;
 
-        // These tests measure *this* pass; at its default level the other one
-        // would delete edits of its own, and every assertion below would read
-        // the sum of the two.
+        // These tests measure *this* pass; at their default levels the others
+        // would change edits of their own, and every assertion below would
+        // read the sum of them.
         test_input.options.redundant_move_elimination_level = MoveEliminationLevel::None;
+        test_input.options.hoist_demanded_moves = false;
 
         let mut context = Context::new();
         let result = test_input.with_input(|input| -> Result<Option<Run>, String> {

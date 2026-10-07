@@ -729,6 +729,54 @@ where
         });
     }
 
+    /// Drop the edits at `remove`, as `remove_edits` does, and merge in the
+    /// edits in `insert`, which must be sorted by position.
+    ///
+    /// An inserted edit goes after every existing edit at its position.
+    pub(crate) fn remove_and_insert_edits(
+        &mut self,
+        remove: &[usize],
+        insert: &[(PackedMovePosition<E>, Edit<E>)],
+    ) {
+        if insert.is_empty() {
+            self.remove_edits(remove);
+            return;
+        }
+        debug_assert!(
+            insert.windows(2).all(|w| w[0].0 <= w[1].0),
+            "the edits to insert must be sorted by position",
+        );
+        debug_assert!(
+            remove.windows(2).all(|w| w[0] < w[1]),
+            "the indices to remove must be strictly increasing and free of duplicates",
+        );
+
+        let old = core::mem::take(&mut self.edits);
+        let mut edits = Vec::with_capacity(old.len() - remove.len() + insert.len());
+        let mut remove = remove.iter().copied().peekable();
+        let mut insert = insert.iter().copied().peekable();
+        for (i, (pos, edit)) in old.into_iter().enumerate() {
+            while let Some(&(new_pos, new_edit)) = insert.peek() {
+                if new_pos >= pos {
+                    break;
+                }
+                edits.push((new_pos, new_edit));
+                insert.next();
+            }
+            if remove.peek() == Some(&i) {
+                remove.next();
+                continue;
+            }
+            edits.push((pos, edit));
+        }
+        debug_assert!(
+            remove.peek().is_none(),
+            "every index to remove must address an edit"
+        );
+        edits.extend(insert);
+        self.edits = edits;
+    }
+
     fn generate(
         &mut self,
         input: &Input<'_, impl InputFunction>,

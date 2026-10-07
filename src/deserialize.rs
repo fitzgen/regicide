@@ -1241,6 +1241,11 @@ mod round_trip_tests {
                         "{name}",
                     );
                     assert_eq!(
+                        deserialized.options().hoist_demanded_moves,
+                        input.options.hoist_demanded_moves,
+                        "{name}",
+                    );
+                    assert_eq!(
                         format!("{:?}", deserialized.machine()),
                         format!("{:?}", input.machine),
                         "{name}",
