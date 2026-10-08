@@ -500,7 +500,13 @@ where
             }
         }
 
-        scratch.extend_from_slice(self.bundles.slice(conflicts));
+        // One entry per run of equal bundles is enough for the sum.
+        let mut end = conflicts.end.index();
+        while end > conflicts.start.index() {
+            let last = InterferenceStorageIndex::new_unchecked(end - 1);
+            scratch.push(self.bundles[last]);
+            end = self.run_starts[last].unwrap();
+        }
         sum_distinct(scratch, weight_of)
     }
 }

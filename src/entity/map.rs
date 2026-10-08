@@ -115,6 +115,7 @@ where
     }
 
     /// The values of the entries in `range`.
+    #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn slice(&self, range: EntityRange<K>) -> &[V] {
         &self.elems[range.indices()]
     }
