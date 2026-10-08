@@ -409,11 +409,12 @@ where
         between_span_cuts(spans, uses),
         uses,
         |&k| spans[k].start,
-        |k, min_use_weight| {
+        |k, min_use_weight, floor| {
             best_candidate_between_spans(
                 spans,
                 k,
                 min_use_weight,
+                floor,
                 candidates.clone(),
                 &mut interference,
             )
@@ -425,12 +426,13 @@ where
 /// score.
 ///
 /// `at` gives where each cut falls among `uses`, and `best_at` scores a cut's
-/// best candidate given its `min_use_weight`.
+/// best candidate given its `min_use_weight` and the best score so far, below
+/// which it may give up early with `None` or any lesser choice.
 fn middle_of_best_run<E, C, K>(
     cuts: impl Iterator<Item = K> + Clone,
     uses: &[SplitUse<E>],
     at: impl Fn(&K) -> LivePoint<E>,
-    mut best_at: impl FnMut(K, f32) -> Option<SplitChoice<C, K>>,
+    mut best_at: impl FnMut(K, f32, Option<SplitScore>) -> Option<SplitChoice<C, K>>,
 ) -> Option<SplitChoice<C, K>>
 where
     E: EntityRepr,
@@ -446,7 +448,11 @@ where
 
     for (i, cut) in cuts.clone().enumerate() {
         cursor.advance_to(at(&cut));
-        let Some(choice) = best_at(cut, cursor.min_use_weight()) else {
+        let floor = best.as_ref().map(|(best, _)| best.score);
+        let Some(choice) = best_at(cut, cursor.min_use_weight(), floor) else {
+            // Every candidate fell below the best, which ends its run. Without
+            // a best, there are no candidates at all.
+            run_open = false;
             continue;
         };
 
@@ -473,7 +479,7 @@ where
 
     // Ties share `min_use_weight`.
     let cut = cuts.clone().nth(run_start + middle).unwrap();
-    let choice = best_at(cut, first.score.min_use_weight).unwrap();
+    let choice = best_at(cut, first.score.min_use_weight, None).unwrap();
     debug_assert!(choice.score == first.score);
     Some(choice)
 }
@@ -481,13 +487,15 @@ where
 /// The best of `candidates` for cutting at `cut` into `prefix` and `suffix`.
 ///
 /// A candidate's score is set by its worse half, so one whose prefix alone
-/// already scores below the best so far cannot win, and its suffix goes
-/// unpriced.
+/// already scores below the best so far, or below `floor`, cannot win, and its
+/// suffix goes unpriced. When no candidate reaches `floor`, the result is
+/// `None` or some choice below it.
 fn best_candidate<E, C, K>(
     cut: K,
     prefix: HalfSpan<'_, E>,
     suffix: HalfSpan<'_, E>,
     min_use_weight: f32,
+    floor: Option<SplitScore>,
     candidates: impl IntoIterator<Item = C>,
     interference: &mut impl FnMut(C, HalfSpan<'_, E>) -> f32,
 ) -> Option<SplitChoice<C, K>>
@@ -497,11 +505,11 @@ where
     K: Copy,
 {
     let mut best: Option<SplitChoice<C, K>> = None;
+    // The greater of `floor` and the best score so far.
+    let mut bound = floor;
     for candidate in candidates {
         let prefix_interference = interference(candidate, prefix);
-        if best
-            .is_some_and(|best| SplitScore::new(prefix_interference, min_use_weight) < best.score)
-        {
+        if bound.is_some_and(|bound| SplitScore::new(prefix_interference, min_use_weight) < bound) {
             continue;
         }
         let suffix_interference = interference(candidate, suffix);
@@ -513,6 +521,9 @@ where
                 candidate,
                 score,
             });
+            if bound.is_none_or(|bound| score > bound) {
+                bound = Some(score);
+            }
         }
     }
     best
@@ -523,6 +534,7 @@ fn best_candidate_between_spans<E, C>(
     spans: &[Range<LivePoint<E>>],
     k: usize,
     min_use_weight: f32,
+    floor: Option<SplitScore>,
     candidates: impl IntoIterator<Item = C>,
     interference: &mut impl FnMut(C, HalfSpan<'_, E>) -> f32,
 ) -> Option<SplitChoice<C, usize>>
@@ -537,7 +549,15 @@ where
     let prefix = HalfSpan::prefix(spans, k - 1, spans[k - 1].end);
     let suffix = HalfSpan::suffix(spans, k, spans[k].start.inst_boundary_at_or_before());
 
-    best_candidate(k, prefix, suffix, min_use_weight, candidates, interference)
+    best_candidate(
+        k,
+        prefix,
+        suffix,
+        min_use_weight,
+        floor,
+        candidates,
+        interference,
+    )
 }
 
 /// Find the best point within a span in `spans` to split at, or return `None`
@@ -564,7 +584,7 @@ where
         within_span_cuts(spans, uses),
         uses,
         |cut| cut.at,
-        |cut, min_use_weight| {
+        |cut, min_use_weight, floor| {
             debug_assert_eq!(cut.at.pos(), Position::Early);
             debug_assert!(spans[cut.index].start < cut.at);
             debug_assert!(cut.at < spans[cut.index].end);
@@ -575,6 +595,7 @@ where
                 prefix,
                 suffix,
                 min_use_weight,
+                floor,
                 candidates.clone(),
                 &mut interference,
             )
@@ -2771,6 +2792,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(best.cut, 2);
+
+        // Cut 3 splits them into runs `1..=2` and `4..=5`, and the first run's
+        // middle is its first cut. Cut 3's prefix alone already loses, so its
+        // suffix goes unpriced, but it still ends the run.
+        let best = best_split_between_spans(&spans, &[], [0u8], |_, half| {
+            let half: Vec<_> = half.iter().collect();
+            let is_prefix = half[0].start == point(0);
+            if is_prefix && half.len() == 3 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .unwrap();
+        assert_eq!(best.cut, 1);
     }
 
     #[test]
