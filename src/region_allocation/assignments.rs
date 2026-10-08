@@ -7,7 +7,7 @@ use crate::{
     output::RegAllocation,
     region_allocation::{EvictionCost, splitting::HalfSpan},
 };
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::vec::Vec;
 use core::{iter, ops::ControlFlow, ops::Range};
 
 /// A span offered to the matrix, together with which reservations it may see
@@ -106,7 +106,93 @@ where
 /// When a bundle is assigned to a unit as part of assigning its register or
 /// register group, we add an entry to the unit's associated
 /// `RegUnitAssignments` for each span in that bundle.
-type RegUnitAssignments<E> = BTreeMap<AssignmentKey<E>, Assignment<E>>;
+type RegUnitAssignments<E> = UnitMap<E, Assignment<E>>;
+
+/// One register unit's entries, sorted by key.
+#[derive(Clone, Debug)]
+struct UnitMap<E, V>
+where
+    E: EntityRepr,
+{
+    /// A sorted vector rather than a B-tree: splitting and eviction search
+    /// these far more often than anything changes them.
+    entries: Vec<(AssignmentKey<E>, V)>,
+}
+
+impl<E, V> UnitMap<E, V>
+where
+    E: EntityRepr,
+{
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Where `key` is, or would go.
+    fn search(&self, key: AssignmentKey<E>) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&key, |(k, _)| *k)
+    }
+
+    /// The entries whose keys are before `end`.
+    fn before(&self, end: AssignmentKey<E>) -> &[(AssignmentKey<E>, V)] {
+        let i = self.entries.partition_point(|(k, _)| *k < end);
+        &self.entries[..i]
+    }
+
+    fn get(&self, key: AssignmentKey<E>) -> Option<&V> {
+        let i = self.search(key).ok()?;
+        Some(&self.entries[i].1)
+    }
+
+    fn remove(&mut self, key: AssignmentKey<E>) {
+        if let Ok(i) = self.search(key) {
+            self.entries.remove(i);
+        }
+    }
+
+    /// Insert `value` at `key`, which must not be in the map yet.
+    fn insert(&mut self, key: AssignmentKey<E>, value: V) {
+        match self.search(key) {
+            Ok(_) => debug_assert!(false, "{key:?} is already in the map"),
+            Err(i) => self.entries.insert(i, (key, value)),
+        }
+    }
+
+    /// Add all of `other`'s entries, none of whose keys may be in `self`.
+    fn merge(&mut self, other: &Self)
+    where
+        V: Clone,
+    {
+        // Merge from the back, into the room the copies of `other` make.
+        let mut i = self.entries.len();
+        self.entries.extend(other.entries.iter().cloned());
+        for (j, theirs) in other.entries.iter().enumerate().rev() {
+            while i > 0 && self.entries[i - 1].0 > theirs.0 {
+                self.entries.swap(i - 1, i + j);
+                i -= 1;
+            }
+            self.entries[i + j] = theirs.clone();
+        }
+        debug_assert!(self.entries.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+}
+
+impl<'a, E, V> IntoIterator for &'a UnitMap<E, V>
+where
+    E: EntityRepr,
+{
+    type Item = &'a (AssignmentKey<E>, V);
+    type IntoIter = core::slice::Iter<'a, (AssignmentKey<E>, V)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
 
 /// A register unit held for a fixed operand.
 ///
@@ -158,7 +244,7 @@ where
 }
 
 /// A map of all the reservations on a register unit.
-type RegUnitReservations<E> = BTreeMap<AssignmentKey<E>, ReservationEntry<E>>;
+type RegUnitReservations<E> = UnitMap<E, ReservationEntry<E>>;
 
 /// A conflict at a register unit over a span.
 enum Conflict<'a, E>
@@ -559,7 +645,8 @@ where
     ) -> impl Iterator<Item = &Assignment<E>> {
         let (start, end) = (span.start, span.end);
         self.assignments[unit]
-            .range(..AssignmentKey::new(end))
+            .before(AssignmentKey::new(end))
+            .iter()
             .rev()
             .take_while(move |(_, existing)| start < existing.end)
             .filter(move |(existing_key, existing)| {
@@ -576,7 +663,8 @@ where
     ) -> impl Iterator<Item = &ReservationEntry<E>> {
         let (start, end) = (span.start, span.end);
         self.reservations[unit]
-            .range(..AssignmentKey::new(end))
+            .before(AssignmentKey::new(end))
+            .iter()
             .rev()
             .take_while(move |(_, existing)| start < existing.end)
             .filter(move |(existing_key, existing)| {
@@ -761,10 +849,10 @@ where
             for span in spans.clone() {
                 let key = AssignmentKey::new(span.range().start);
                 if unit_assignments
-                    .get(&key)
+                    .get(key)
                     .is_some_and(|existing| existing.bundle == bundle)
                 {
-                    unit_assignments.remove(&key);
+                    unit_assignments.remove(key);
                 }
             }
         }
@@ -784,14 +872,13 @@ where
         for unit in iter_reg_units(reg_units) {
             for span in spans.clone() {
                 let range = span.range();
-                let old_entry = self.assignments[unit].insert(
+                self.assignments[unit].insert(
                     AssignmentKey::new(range.start),
                     Assignment {
                         end: range.end,
                         bundle,
                     },
                 );
-                debug_assert!(old_entry.is_none());
             }
         }
     }
@@ -827,7 +914,7 @@ where
                     span.start,
                     span.end,
                 );
-                let old_entry = self.reservations[unit].insert(
+                self.reservations[unit].insert(
                     AssignmentKey::new(span.start),
                     ReservationEntry {
                         end: span.end,
@@ -835,7 +922,6 @@ where
                         porous_to,
                     },
                 );
-                debug_assert!(old_entry.is_none());
             }
         }
     }
@@ -1038,11 +1124,7 @@ where
                 }
             }
 
-            let unit_assignments = &mut self.assignments[unit];
-            for (key, assignment) in other_unit_assignments {
-                let old_entry = unit_assignments.insert(*key, assignment.clone());
-                debug_assert!(old_entry.is_none());
-            }
+            self.assignments[unit].merge(other_unit_assignments);
         }
 
         for (unit, other_unit_reservations) in other.reservations.iter() {
@@ -1064,11 +1146,7 @@ where
                 }
             }
 
-            let unit_reservations = &mut self.reservations[unit];
-            for (key, reservation) in other_unit_reservations {
-                let old_entry = unit_reservations.insert(*key, reservation.clone());
-                debug_assert!(old_entry.is_none());
-            }
+            self.reservations[unit].merge(other_unit_reservations);
         }
     }
 }
@@ -3046,6 +3124,29 @@ mod tests {
             &[qspan(0, 6, 1)],
         );
         check_agree(&b, &b_oracle).unwrap();
+    }
+
+    #[test]
+    fn merge_interleaved() {
+        let mut a = Assignments::<u32>::new();
+        let mut b = Assignments::<u32>::new();
+        let mut oracle = Oracle::default();
+
+        // Each side ends up with spans both before and after the other's.
+        for (i, start) in [0, 2, 4, 6].into_iter().enumerate() {
+            let side = if i % 3 == 0 { &mut a } else { &mut b };
+            let span = qspan(start, start + 2, 1);
+            assert!(
+                side.try_assign_to_reg(bundle(i), [reg(R0)], reg_units, [span.clone()].into_iter())
+                    .is_some()
+            );
+            oracle_insert(&mut oracle, bundle(i), &[reg_units(reg(R0))], &[span]);
+        }
+
+        a.merge(&b);
+        check_agree(&a, &oracle).unwrap();
+        check_no_overlaps(&a).unwrap();
+        check_conflicts_agree(&a, &oracle).unwrap();
     }
 
     /// Merging assignments that are in the way of each other is a bug in the
