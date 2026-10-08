@@ -229,6 +229,8 @@ where
             ScalarAllocation::Stack(_) => true,
         };
         if alone {
+            // Most locations hold nothing, and even an empty `drain` costs more
+            // than the check.
             let range = self.range_of(loc);
             if !range.is_empty() {
                 self.facts.drain(range);
@@ -1067,8 +1069,9 @@ where
             .retain(|&(_, part)| killed.binary_search(&part.val).is_err());
 
         // Each renamed fact names a parameter, all of which were just killed.
+        // No duplicates: each parameter has one argument, and each of its
+        // facts one source fact.
         renamed.sort_unstable();
-        renamed.dedup();
         state.insert_disjoint(&renamed);
 
         self.me.renamed = renamed;

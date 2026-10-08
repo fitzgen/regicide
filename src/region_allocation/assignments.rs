@@ -698,21 +698,37 @@ where
         reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> Option<LiveBundle<E>> {
+        self.sole_conflicting_bundle_with(reg_units, spans, |_| Some(()))
+            .map(|(bundle, ())| bundle)
+    }
+
+    /// Like `sole_conflicting_bundle`, but `accept` sees the first bundle as
+    /// soon as it is found, and may reject it by returning `None`, which stops
+    /// the search early.
+    fn sole_conflicting_bundle_with<T>(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        mut accept: impl FnMut(LiveBundle<E>) -> Option<T>,
+    ) -> Option<(LiveBundle<E>, T)> {
         let mut sole = None;
-        let too_many = self.for_each_overlapping(reg_units, spans, |existing| {
+        let rejected = self.for_each_overlapping(reg_units, spans, |existing| {
             let Conflict::Assignment(existing) = existing else {
                 return ControlFlow::Break(());
             };
-            match sole {
-                Some(bundle) if bundle == existing.bundle => ControlFlow::Continue(()),
+            match &sole {
+                Some((bundle, _)) if *bundle == existing.bundle => ControlFlow::Continue(()),
                 Some(_) => ControlFlow::Break(()),
-                None => {
-                    sole = Some(existing.bundle);
-                    ControlFlow::Continue(())
-                }
+                None => match accept(existing.bundle) {
+                    Some(accepted) => {
+                        sole = Some((existing.bundle, accepted));
+                        ControlFlow::Continue(())
+                    }
+                    None => ControlFlow::Break(()),
+                },
             }
         });
-        if too_many.is_some() { None } else { sole }
+        if rejected.is_some() { None } else { sole }
     }
 
     /// Call `f` with everything already occupying any of `reg_units` over
@@ -919,29 +935,12 @@ where
             // The first bundle in the way is the only one this candidate could
             // evict, so price it at once and give up on the candidate as soon as
             // it cannot win, without looking for others.
-            let mut sole = None;
-            let rejected = self.for_each_overlapping(units, spans.clone(), |existing| {
-                let Conflict::Assignment(existing) = existing else {
-                    return ControlFlow::Break(());
-                };
-                match sole {
-                    Some((bundle, _)) if bundle == existing.bundle => ControlFlow::Continue(()),
-                    Some(_) => ControlFlow::Break(()),
-                    None => {
-                        let cost = eviction_cost(existing.bundle, candidate);
-                        if cost < best_cost {
-                            sole = Some((existing.bundle, cost));
-                            ControlFlow::Continue(())
-                        } else {
-                            ControlFlow::Break(())
-                        }
-                    }
-                }
-            });
-            if rejected.is_some() {
-                continue;
-            }
-            let Some((other_bundle, cost)) = sole else {
+            let Some((other_bundle, cost)) =
+                self.sole_conflicting_bundle_with(units, spans.clone(), |victim| {
+                    let cost = eviction_cost(victim, candidate);
+                    (cost < best_cost).then_some(cost)
+                })
+            else {
                 continue;
             };
 

@@ -2265,8 +2265,8 @@ where
         live_ranges.block_reservations[self]
     }
 
-    /// The subrange of this block's reservations that holds every one
-    /// overlapping `range`, and possibly a few that do not.
+    /// A subrange of this block's reservations that holds every one
+    /// overlapping `range`, and possibly others that do not.
     #[inline]
     pub(crate) fn reservations_near(
         self,
@@ -2506,9 +2506,10 @@ pub(crate) fn fixed_operand_of(
 /// instructions.
 ///
 /// Instructions are walked in program order and hold their registers no
-/// further than the gap after them, so the reservations come out sorted by
-/// start point. See `ReservationData` for why a fixed operand gets one instead
-/// of a constraint.
+/// further than the gap after them, so the reservations come out in
+/// non-decreasing order of their instruction. Within one instruction they are
+/// not sorted by start point: a late operand may precede an early one. See
+/// `ReservationData` for why a fixed operand gets one instead of a constraint.
 fn collect_block_reservations<'a, E>(
     input: &Input<'_, impl InputFunction>,
     reservations: &mut PrimaryMap<Reservation<E>, ReservationData<E>>,
@@ -2567,10 +2568,8 @@ where
         }
 
         // A val-less reservation for each register the instruction destroys,
-        // over the late half a definition of it would have held. Running after
-        // the operand pass still leaves the whole run sorted by start point:
-        // `inst:Late` is at or after anything this instruction's operands
-        // produced, and before anything the next instruction produces.
+        // over the late half a definition of it would have held. These belong
+        // to this instruction too, so the run stays in instruction order.
         let core::ops::Range { start, end } = held_range(DefUse::Def, Position::Late, inst);
         for reg in input_inst.clobbers().iter() {
             // `is_non_allocatable` indexes the machine's registers, and
