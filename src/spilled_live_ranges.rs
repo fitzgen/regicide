@@ -40,7 +40,6 @@
 
 use crate::{
     Block, Entity as _, Val,
-    btree::{BTreeSet, BTreeSetArena},
     entity::{EntityRepr, EntitySet, SecondaryMap},
     error::IResult,
     input::{DefUse, Input, InputBlock as _, InputFunction, InputInst as _, OperandConstraint},
@@ -49,6 +48,7 @@ use crate::{
     output::OutputInner,
     region_allocation::RegionAllocation,
     rpo::Rpo,
+    sorted_vec::SortedVec,
     spill_placement::SpillPlacement,
     timing::Timing,
 };
@@ -71,14 +71,12 @@ pub struct SpilledLiveRanges<E>
 where
     E: EntityRepr,
 {
-    arena: BTreeSetArena<E, Val<E>>,
-
     /// The values whose slot is reserved on entry to each block.
-    live_in: SecondaryMap<Block<E>, BTreeSet<E, Val<E>>>,
+    live_in: SecondaryMap<Block<E>, SortedVec<Val<E>>>,
 
     /// The values whose slot is reserved at each block's exit: everything
     /// reserved on entry to any successor.
-    live_out: SecondaryMap<Block<E>, BTreeSet<E, Val<E>>>,
+    live_out: SecondaryMap<Block<E>, SortedVec<Val<E>>>,
 
     /// The point each value's reservation begins at, which dominates every
     /// other point in its range.
@@ -112,7 +110,7 @@ where
     block_events: SecondaryMap<Block<E>, (u32, u32)>,
 
     /// The reservations live at the point being processed.
-    live: BTreeSet<E, Val<E>>,
+    live: SortedVec<Val<E>>,
 
     /// Holds a set's values so a walk can mutate the set it came from.
     scratch: Vec<Val<E>>,
@@ -137,9 +135,8 @@ where
 {
     pub const fn new() -> Self {
         Self {
-            arena: BTreeSetArena::new(),
-            live_in: SecondaryMap::new(BTreeSet::new()),
-            live_out: SecondaryMap::new(BTreeSet::new()),
+            live_in: SecondaryMap::new(SortedVec::new()),
+            live_out: SecondaryMap::new(SortedVec::new()),
             head: SecondaryMap::new(None),
             head_block: SecondaryMap::new(None),
             is_function_param: EntitySet::new(),
@@ -149,7 +146,7 @@ where
             block_reads: SecondaryMap::new((0, 0)),
             events: Vec::new(),
             block_events: SecondaryMap::new((0, 0)),
-            live: BTreeSet::new(),
+            live: SortedVec::new(),
             scratch: Vec::new(),
             worklist: Vec::new(),
             on_worklist: EntitySet::new(),
@@ -158,7 +155,6 @@ where
 
     pub fn reset(&mut self) {
         let Self {
-            arena,
             live_in,
             live_out,
             head,
@@ -175,9 +171,8 @@ where
             worklist,
             on_worklist,
         } = self;
-        live.clear(arena);
+        live.clear();
         scratch.clear();
-        arena.reset();
         live_in.reset();
         live_out.reset();
         head.reset();
@@ -195,7 +190,6 @@ where
 
     pub fn is_reset(&self) -> bool {
         let Self {
-            arena,
             live_in,
             live_out,
             head,
@@ -212,8 +206,7 @@ where
             worklist,
             on_worklist,
         } = self;
-        arena.is_reset()
-            && live_in.is_reset()
+        live_in.is_reset()
             && live_out.is_reset()
             && head.is_reset()
             && head_block.is_reset()
@@ -232,7 +225,7 @@ where
 
     /// The values whose slot is reserved on entry to `block`.
     pub(crate) fn live_in(&self, block: Block<E>) -> impl Iterator<Item = Val<E>> + '_ {
-        self.live_in[block].iter(&self.arena).copied()
+        self.live_in[block].iter().copied()
     }
 
     /// The reservations that begin and end within `block`, in program order.
@@ -259,7 +252,7 @@ where
     ) -> bool {
         debug_assert!(range.start < range.end);
 
-        let mut reserved = self.live_in[block].contains(&self.arena, &val);
+        let mut reserved = self.live_in[block].contains(&val);
         for (point, event, v) in self.events(block) {
             if v != val {
                 continue;
@@ -664,48 +657,42 @@ where
             self.on_worklist.remove(block);
 
             // Through `scratch`, so `live_in` and `live_out` are never borrowed
-            // at once.
+            // at once, and in one sorted union rather than an insert per value.
             self.scratch.clear();
             for succ in input.func.block(block.with_repr32()).successors() {
                 let Some(succ) = succ.with_repr::<E>() else {
                     continue;
                 };
-                self.scratch
-                    .extend(self.live_in[succ].iter(&self.arena).copied());
+                self.scratch.extend(self.live_in[succ].iter().copied());
             }
-            self.live_out[block].clear(&mut self.arena);
-            for val in self.scratch.drain(..) {
-                self.live_out[block].insert(&mut self.arena, val);
-            }
+            self.live_out[block].clear();
+            self.live_out[block].union_with_unsorted(&mut self.scratch);
 
-            self.live.clear(&mut self.arena);
-            self.scratch
-                .extend(self.live_out[block].iter(&self.arena).copied());
+            self.live.clear();
+            self.scratch.extend(self.live_out[block].iter().copied());
             let (start, end) = self.block_reads[block];
             self.scratch.extend(
                 self.reads[start as usize..end as usize]
                     .iter()
                     .map(|&(_, _, val)| val),
             );
-            for val in self.scratch.drain(..) {
-                self.live.insert(&mut self.arena, val);
-            }
+            self.live.union_with_unsorted(&mut self.scratch);
 
             // Nothing is reserved above its head, not even around a back edge:
             // every path to a read rewrites the slot on its way through.
             let (start, end) = self.block_heads[block];
             for &(_, val) in &self.heads_in_block[start as usize..end as usize] {
-                self.live.remove(&mut self.arena, &val);
+                self.live.remove(&val);
             }
 
-            self.scratch.extend(self.live.iter(&self.arena).copied());
-            let mut changed = false;
-            for val in self.scratch.drain(..) {
-                // Below its head, which is what lets the coloring treat the
-                // head as the value's one definition.
-                debug_assert!(dominates(input, self.head_block[val].unwrap(), block,));
-                changed |= self.live_in[block].insert(&mut self.arena, val);
-            }
+            // Below its head, which is what lets the coloring treat the head as
+            // the value's one definition.
+            debug_assert!(self.live.iter().all(|&val| dominates(
+                input,
+                self.head_block[val].unwrap(),
+                block
+            )));
+            let changed = self.live_in[block].union_with(&self.live);
 
             if changed {
                 for pred in input.func.block(block.with_repr32()).predecessors() {
@@ -719,7 +706,7 @@ where
             }
         }
 
-        self.live.clear(&mut self.arena);
+        self.live.clear();
     }
 
     /// Turn the reservation sets into the events spill slot allocation walks.
@@ -728,19 +715,15 @@ where
             let first = self.events.len();
 
             // Anything reserved at the exit outlives the block, so no kill here.
-            self.live.clear(&mut self.arena);
-            self.scratch
-                .extend(self.live_out[block].iter(&self.arena).copied());
-            for val in self.scratch.drain(..) {
-                self.live.insert(&mut self.arena, val);
-            }
+            self.live.clear();
+            self.live.union_with(&self.live_out[block]);
 
             // Backwards, so the first read we meet for a value is its last.
             let (start, end) = self.block_reads[block];
             let block_end = block.end_point(input);
             for i in (start as usize..end as usize).rev() {
                 let (_, point, val) = self.reads[i];
-                if self.live.insert(&mut self.arena, val) {
+                if self.live.insert(val) {
                     // Exclusive, and after the last read, so one value's last
                     // read and another's first write can share a gap without
                     // sharing a slot.
@@ -757,7 +740,7 @@ where
             for &(_, val) in &self.heads_in_block[start as usize..end as usize] {
                 let head = self.head[val].unwrap();
                 self.events.push((block, head, RangeEvent::Def, val));
-                if !self.live.remove(&mut self.arena, &val) {
+                if !self.live.remove(&val) {
                     self.events.push((
                         block,
                         head.inst_boundary_after().min(block_end),
@@ -775,7 +758,7 @@ where
             );
         }
 
-        self.live.clear(&mut self.arena);
+        self.live.clear();
     }
 
     /// Every spilled value has a head, unless it is defined in an unreachable

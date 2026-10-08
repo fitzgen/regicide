@@ -22,7 +22,6 @@ mod entity;
 #[macro_use]
 mod events;
 
-mod btree;
 mod coalescing;
 mod context;
 mod counts;
@@ -44,6 +43,7 @@ mod redundant_move_elimination;
 mod region_allocation;
 mod region_tree;
 mod rpo;
+mod sorted_vec;
 mod spill_placement;
 mod spill_slot_allocation;
 mod spilled_live_ranges;

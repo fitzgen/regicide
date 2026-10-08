@@ -58,7 +58,6 @@
 
 use crate::{
     Inst,
-    btree::{BTreeSet, BTreeSetArena},
     counts::Counts,
     entity::{
         Block, Entity as _, EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap, Val,
@@ -68,6 +67,7 @@ use crate::{
     live_ranges::{LivePoint, Use, UseData},
     output::OutputInner,
     rpo::Rpo,
+    sorted_vec::SortedVec,
     timing::Timing,
 };
 use alloc::vec::Vec;
@@ -76,24 +76,21 @@ pub struct Liveness<E>
 where
     E: EntityRepr,
 {
-    /// Storage for our live sets.
-    arena: BTreeSetArena<E, Val<E>>,
-
     /// The values live on entry to each block, not counting the block's own
     /// parameters, which are defined at exactly that point.
-    live_in: SecondaryMap<Block<E>, BTreeSet<E, Val<E>>>,
+    live_in: SecondaryMap<Block<E>, SortedVec<Val<E>>>,
 
     /// The values live at each block's exit: everything live on entry to any
     /// successor, plus the arguments the block passes along its outgoing edges,
     /// which its terminator uses.
-    live_out: SecondaryMap<Block<E>, BTreeSet<E, Val<E>>>,
+    live_out: SecondaryMap<Block<E>, SortedVec<Val<E>>>,
 
     /// Scratch holding the values live at the point currently being processed.
-    live: BTreeSet<E, Val<E>>,
+    live: SortedVec<Val<E>>,
 
     /// Scratch holding the values that are live across the control-flow edge
     /// currently being processed.
-    live_across_edge: BTreeSet<E, Val<E>>,
+    live_across_edge: SortedVec<Val<E>>,
 
     /// The worklist of blocks that need to be (re)processed.
     worklist: Vec<Block<E>>,
@@ -138,11 +135,10 @@ where
 {
     pub const fn new() -> Self {
         Liveness {
-            arena: BTreeSetArena::new(),
-            live_in: SecondaryMap::new(BTreeSet::new()),
-            live_out: SecondaryMap::new(BTreeSet::new()),
-            live: BTreeSet::new(),
-            live_across_edge: BTreeSet::new(),
+            live_in: SecondaryMap::new(SortedVec::new()),
+            live_out: SecondaryMap::new(SortedVec::new()),
+            live: SortedVec::new(),
+            live_across_edge: SortedVec::new(),
             worklist: Vec::new(),
             on_worklist: EntitySet::new(),
             span_end: SecondaryMap::new(None),
@@ -154,7 +150,6 @@ where
 
     pub fn reset(&mut self) {
         let Self {
-            arena,
             live_in,
             live_out,
             live,
@@ -166,9 +161,8 @@ where
             pending_head,
             finished,
         } = self;
-        live.clear(arena);
-        live_across_edge.clear(arena);
-        arena.reset();
+        live.clear();
+        live_across_edge.clear();
         live_in.reset();
         live_out.reset();
         worklist.clear();
@@ -181,7 +175,6 @@ where
 
     pub fn is_reset(&self) -> bool {
         let Self {
-            arena,
             live_in,
             live_out,
             live,
@@ -193,8 +186,7 @@ where
             pending_head,
             finished,
         } = self;
-        arena.is_reset()
-            && live_in.is_reset()
+        live_in.is_reset()
             && live_out.is_reset()
             && live.is_empty()
             && live_across_edge.is_empty()
@@ -228,7 +220,7 @@ where
             // entry block's parameters, which are the function's parameters.
             // Anything else live here is used before it is defined.
             let entry = output.with_repr(func.entry_block())?;
-            for val in self.live_in[entry].iter(&self.arena) {
+            for val in self.live_in[entry].iter() {
                 debug_assert!(
                     func.block(func.entry_block())
                         .params()
@@ -267,7 +259,6 @@ where
         output: &mut OutputInner<E>,
     ) -> IResult<()> {
         let Self {
-            arena,
             live_in,
             live_out,
             live,
@@ -285,11 +276,10 @@ where
             counts.liveness_iterations.inc();
 
             // Recompute this block's live-out set from its successors.
-            live_out[block].clear(arena);
+            live_out[block].clear();
             transfer_edges(
                 &func.block(block.with_repr32()),
                 func,
-                arena,
                 live_in,
                 live_across_edge,
                 &mut live_out[block],
@@ -297,13 +287,13 @@ where
             )?;
 
             // Walk backwards from the block's exit to its entry.
-            live.clear(arena);
-            live.union_with(arena, &live_out[block]);
-            transfer_insts(&func.block(block.with_repr32()), arena, live, output)?;
+            live.clear();
+            live.union_with(&live_out[block]);
+            transfer_insts(&func.block(block.with_repr32()), live, output)?;
 
             // If the live-out set grew, then we need to re-enqueue our
             // predecessors for processing.
-            if live_in[block].union_with(arena, live) {
+            if live_in[block].union_with(live) {
                 for pred in func.block(block.with_repr32()).predecessors() {
                     let pred = output.with_repr(pred)?;
                     if rpo.is_reachable(pred) && !on_worklist.contains(pred) {
@@ -314,7 +304,7 @@ where
             }
         }
 
-        live.clear(arena);
+        live.clear();
         Ok(())
     }
 
@@ -331,7 +321,6 @@ where
         output: &mut OutputInner<E>,
     ) -> IResult<BlockSpans<'a, E>> {
         let Self {
-            arena,
             live_in: _,
             live_out,
             live,
@@ -363,8 +352,8 @@ where
         // arguments this block passes along its outgoing edges are already in
         // here, courtesy of `transfer_edges`, which is why they need no `Use`
         // record of their own: their spans reach the block's end regardless.
-        live.union_with(arena, &live_out[block]);
-        for val in live.iter(arena) {
+        live.union_with(&live_out[block]);
+        for val in live.iter() {
             span_end[*val] = Some(block_end);
             pending_head[*val] = NO_PENDING_USE;
         }
@@ -375,7 +364,7 @@ where
             |output, point, i, kind, val| {
                 let use_data = UseData::new(point, i);
                 match kind {
-                    DefUse::Def if live.remove(arena, &val) => {
+                    DefUse::Def if live.remove(&val) => {
                         // The value is live after this instruction, so its span
                         // starts here and runs to wherever the backwards walk last
                         // saw it.
@@ -399,7 +388,7 @@ where
                         finished.push((point, end, val, span_uses));
                     }
                     DefUse::Use => {
-                        if live.insert(arena, val) {
+                        if live.insert(val) {
                             // The first use the backwards walk has seen, so it
                             // is the last one in program order, and the span
                             // ends just after it.
@@ -424,12 +413,12 @@ where
         // destination of a move along an edge, and `transfer_edges` already
         // keeps an argument live only when the parameter it feeds is live-in,
         // so a dead parameter generates no move and needs no register.
-        for val in live.iter(arena) {
+        for val in live.iter() {
             let end = span_end[*val].unwrap();
             let span_uses = flush_pending_uses(pending_uses, pending_head, *val, uses, output)?;
             finished.push((block_start, end, *val, span_uses));
         }
-        live.clear(arena);
+        live.clear();
         pending_uses.clear();
 
         if cfg!(debug_assertions) {
@@ -467,25 +456,25 @@ where
     /// Get the values that are live on entry to this block.
     #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn live_in(self, liveness: &Liveness<E>) -> impl Iterator<Item = Val<E>> + '_ {
-        liveness.live_in[self].iter(&liveness.arena).copied()
+        liveness.live_in[self].iter().copied()
     }
 
     /// Get the values that are live at this block's exit.
     #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn live_out(self, liveness: &Liveness<E>) -> impl Iterator<Item = Val<E>> + '_ {
-        liveness.live_out[self].iter(&liveness.arena).copied()
+        liveness.live_out[self].iter().copied()
     }
 
     /// Is `val` live on entry to this block?
     #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn is_live_in(self, liveness: &Liveness<E>, val: Val<E>) -> bool {
-        liveness.live_in[self].contains(&liveness.arena, &val)
+        liveness.live_in[self].contains(&val)
     }
 
     /// Is `val` live at this block's exit?
     #[allow(dead_code, reason = "will probably need it")]
     pub(crate) fn is_live_out(self, liveness: &Liveness<E>, val: Val<E>) -> bool {
-        liveness.live_out[self].contains(&liveness.arena, &val)
+        liveness.live_out[self].contains(&val)
     }
 
     /// How many values are live on entry to this block?
@@ -587,10 +576,9 @@ where
 fn transfer_edges<'a, E>(
     input_block: &impl InputBlock<'a>,
     func: &impl InputFunction,
-    arena: &mut BTreeSetArena<E, Val<E>>,
-    live_in: &SecondaryMap<Block<E>, BTreeSet<E, Val<E>>>,
-    live_across_edge: &mut BTreeSet<E, Val<E>>,
-    live_out: &mut BTreeSet<E, Val<E>>,
+    live_in: &SecondaryMap<Block<E>, SortedVec<Val<E>>>,
+    live_across_edge: &mut SortedVec<Val<E>>,
+    live_out: &mut SortedVec<Val<E>>,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
@@ -603,25 +591,25 @@ where
         );
 
         let s = output.with_repr(successor)?;
-        live_across_edge.clear(arena);
+        live_across_edge.clear();
 
         // Add values that are live-in to the successor.
-        live_across_edge.union_with(arena, &live_in[s]);
+        live_across_edge.union_with(&live_in[s]);
 
         // Remove block parameters defined on the edge.
         for param in func.block(successor).params() {
             let param = output.with_repr(param)?;
-            live_across_edge.remove(arena, &param);
+            live_across_edge.remove(&param);
         }
-        live_out.union_with(arena, live_across_edge);
+        live_out.union_with(live_across_edge);
 
         // Add block arguments that flow into a live block parameter.
         let args = input_block.successor_block_args(i);
         for (arg, param) in args.zip(func.block(successor).params()) {
             let param = output.with_repr(param)?;
-            if live_in[s].contains(arena, &param) {
+            if live_in[s].contains(&param) {
                 let arg = output.with_repr(arg)?;
-                live_out.insert(arena, arg);
+                live_out.insert(arg);
             }
         }
     }
@@ -711,8 +699,7 @@ where
 /// Walk `input_block`'s instructions backwards, removing defs and adding uses.
 fn transfer_insts<'a, E>(
     input_block: &impl InputBlock<'a>,
-    arena: &mut BTreeSetArena<E, Val<E>>,
-    live: &mut BTreeSet<E, Val<E>>,
+    live: &mut SortedVec<Val<E>>,
     output: &mut OutputInner<E>,
 ) -> IResult<()>
 where
@@ -723,10 +710,10 @@ where
         // vs. removing defs here because the input is in SSA.
         match kind {
             DefUse::Def => {
-                live.remove(arena, &val);
+                live.remove(&val);
             }
             DefUse::Use => {
-                live.insert(arena, val);
+                live.insert(val);
             }
         }
         Ok(())
