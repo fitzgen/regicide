@@ -52,8 +52,11 @@ use crate::{
     spill_slot_allocation::{SpillSlot, SpillSlots},
     timing::Timing,
 };
-use alloc::vec::Vec;
-use core::{cmp::Ordering, ops::Range};
+use alloc::{collections::BinaryHeap, vec::Vec};
+use core::{
+    cmp::{Ordering, Reverse},
+    ops::Range,
+};
 
 macro_rules! test_stat {
     ( $me:expr, $field:ident ) => {{
@@ -377,8 +380,10 @@ where
     /// a block the analysis has not reached.
     entry_state: SecondaryMap<Block<E>, Option<Facts>>,
 
-    /// Blocks whose entry state changed since their successors were computed.
-    worklist: Vec<Block<E>>,
+    /// Blocks whose entry state changed since their successors were computed,
+    /// by position in reverse post-order, earliest first, so that a block's
+    /// predecessors mostly settle before it is visited.
+    worklist: BinaryHeap<Reverse<u32>>,
 
     /// The set blocks in `self.worklist`.
     on_worklist: EntitySet<Block<E>>,
@@ -527,7 +532,7 @@ where
         Self {
             entry_facts: Vec::new(),
             entry_state: SecondaryMap::new(None),
-            worklist: Vec::new(),
+            worklist: BinaryHeap::new(),
             on_worklist: EntitySet::new(),
             seed: State { facts: Vec::new() },
             state: State { facts: Vec::new() },
@@ -756,7 +761,8 @@ where
         self.meet_into(entry, &seed);
         self.me.seed = seed;
 
-        while let Some(block) = self.me.worklist.pop() {
+        while let Some(Reverse(i)) = self.me.worklist.pop() {
+            let block = self.rpo.at(i);
             self.me.on_worklist.remove(block);
             self.visit_block(block, Mode::Analyze);
         }
@@ -827,7 +833,7 @@ where
     /// Queue `block` for another analysis visit, if it is not queued already.
     fn enqueue(&mut self, block: Block<E>) {
         if self.me.on_worklist.insert(block) {
-            self.me.worklist.push(block);
+            self.me.worklist.push(Reverse(self.rpo.index_of(block)));
         }
     }
 

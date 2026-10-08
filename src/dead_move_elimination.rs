@@ -29,7 +29,7 @@ use crate::{
     Entity as _, Input,
     context::ContextInner,
     counts::Counts,
-    entity::{Block, EntityRepr, EntitySet, Inst, SecondaryMap, Val},
+    entity::{Block, EntityRepr, EntitySet, Inst, Val},
     error::IResult,
     events::EventsLog,
     hash_set::FxHashSet,
@@ -206,20 +206,12 @@ pub(crate) struct DeadMoveElimination<E>
 where
     E: EntityRepr,
 {
-    /// The reachable blocks in reverse post-order, so a worklist index can be
-    /// turned back into a block.
-    by_rpo: Vec<Block<E>>,
-
-    /// Each reachable block's cached live-out set, indexed by
-    /// reverse-post-order index rather than by block.
+    /// Each reachable block's cached live-out set, indexed by its
+    /// `Rpo::index_of` rather than by block.
     ///
     /// Not a `SecondaryMap`: its `IndexMut` requires `V: Clone` and clones the
     /// default to grow, and it would carry unreachable blocks too.
     live_out: Vec<LiveSet<E>>,
-
-    /// Each block's index in the reverse post-order, for `live_out` and for the
-    /// worklist key.
-    rpo_index: SecondaryMap<Block<E>, u32>,
 
     /// The live set at the program point the walk has reached.
     live: LiveSet<E>,
@@ -271,9 +263,7 @@ where
 {
     pub const fn new() -> Self {
         Self {
-            by_rpo: Vec::new(),
             live_out: Vec::new(),
-            rpo_index: SecondaryMap::new(u32::MAX),
             live: LiveSet::new(),
             saturated: false,
             edge: LiveSet::new(),
@@ -292,9 +282,7 @@ where
 
     pub fn reset(&mut self) {
         let Self {
-            by_rpo,
             live_out,
-            rpo_index,
             live,
             saturated,
             edge,
@@ -309,9 +297,7 @@ where
             #[cfg(test)]
             test_stats,
         } = self;
-        by_rpo.clear();
         live_out.clear();
-        rpo_index.reset();
         live.clear();
         *saturated = false;
         edge.clear();
@@ -331,9 +317,7 @@ where
 
     pub fn is_reset(&self) -> bool {
         let Self {
-            by_rpo,
             live_out,
-            rpo_index,
             live,
             saturated,
             edge,
@@ -348,9 +332,7 @@ where
             #[cfg(test)]
                 test_stats: _,
         } = self;
-        by_rpo.is_empty()
-            && live_out.is_empty()
-            && rpo_index.is_reset()
+        live_out.is_empty()
             && live.is_empty()
             && !*saturated
             && edge.is_empty()
@@ -373,15 +355,16 @@ where
     /// fixpoint?
     ///
     /// Only meaningful after a `Global` run that tracked registers. `None` for a
-    /// block the pass never numbered.
+    /// block the pass never numbered: an unreachable one, or any after a run
+    /// that kept no live-out sets.
     pub(crate) fn reg_may_be_live_out(
         &self,
         machine: &crate::machine::Machine,
+        rpo: &Rpo<E>,
         block: Block<E>,
         reg: Reg<E>,
     ) -> Option<bool> {
-        let i = self.rpo_index[block];
-        let live_out = self.live_out.get(usize::try_from(i).ok()?)?;
+        let live_out = self.live_out_of(rpo, block)?;
         Some(
             reg.iter_units(machine)
                 .any(|unit| live_out.units.contains(unit)),
@@ -391,11 +374,23 @@ where
     /// Is `slot` possibly read after `block`'s bottom, per the fixpoint?
     ///
     /// Only meaningful after a `Global` run. `None` for a block the pass never
-    /// numbered.
-    pub(crate) fn slot_may_be_live_out(&self, block: Block<E>, slot: SpillSlot<E>) -> Option<bool> {
-        let i = self.rpo_index[block];
-        let live_out = self.live_out.get(usize::try_from(i).ok()?)?;
+    /// numbered; see `reg_may_be_live_out`.
+    pub(crate) fn slot_may_be_live_out(
+        &self,
+        rpo: &Rpo<E>,
+        block: Block<E>,
+        slot: SpillSlot<E>,
+    ) -> Option<bool> {
+        let live_out = self.live_out_of(rpo, block)?;
         Some(live_out.slots.contains(slot))
+    }
+
+    /// `block`'s cached live-out set, if the pass numbered it.
+    fn live_out_of(&self, rpo: &Rpo<E>, block: Block<E>) -> Option<&LiveSet<E>> {
+        if !rpo.is_reachable(block) {
+            return None;
+        }
+        self.live_out.get(rpo.index_of(block) as usize)
     }
 }
 
@@ -443,7 +438,8 @@ where
         self.rewrite(level);
     }
 
-    /// Number the reachable blocks, and give each one an empty cached live-out.
+    /// Give each reachable block an empty cached live-out, at its
+    /// `Rpo::index_of`.
     ///
     /// Empty is the bottom of the lattice, which is sound even for a block with
     /// no successors: a returned value is a `Use` on the terminator, spill slots
@@ -451,16 +447,7 @@ where
     /// one parallel-move sequence.
     fn index_blocks(&mut self) {
         let len = self.rpo.iter().len();
-        self.me.rpo_index.reserve(len);
-        self.me.by_rpo.reserve(len);
-        self.me.live_out.reserve(len);
-
-        for (i, block) in self.rpo.iter().enumerate() {
-            let i = u32::try_from(i).expect("a function has fewer than `u32::MAX` blocks");
-            self.me.rpo_index[block] = i;
-            self.me.by_rpo.push(block);
-            self.me.live_out.push(LiveSet::new());
-        }
+        self.me.live_out.resize_with(len, LiveSet::new);
     }
 
     /// Run the fixpoint over block live-out sets.
@@ -470,7 +457,7 @@ where
         }
 
         while let Some(i) = self.me.worklist.pop() {
-            let block = self.block_at(i);
+            let block = self.rpo.at(i);
             self.me.on_worklist.remove(block);
             self.counts.dead_move_elimination_iterations.inc();
             test_stat!(self.me, block_visits);
@@ -497,17 +484,10 @@ where
         }
     }
 
-    /// The block at `i` in the reverse post-order.
-    fn block_at(&self, i: u32) -> Block<E> {
-        let block = self.me.by_rpo[i as usize];
-        debug_assert_eq!(self.me.rpo_index[block], i);
-        block
-    }
-
     /// Queue `block` for another analysis visit, if it is not queued already.
     fn enqueue(&mut self, block: Block<E>) {
         if self.me.on_worklist.insert(block) {
-            self.me.worklist.push(self.me.rpo_index[block]);
+            self.me.worklist.push(self.rpo.index_of(block));
         }
     }
 
@@ -598,7 +578,7 @@ where
                 test_stat!(self.me, saturated_blocks);
             }
             Seed::LiveOut => {
-                let i = self.me.rpo_index[block];
+                let i = self.rpo.index_of(block);
                 self.me.live.copy_from(&self.me.live_out[i as usize]);
                 self.me.saturated = false;
             }
@@ -749,7 +729,7 @@ where
                     "a saturated set is never propagated, so it never has to be \
                      turned into bits for a meet",
                 );
-                let i = self.me.rpo_index[pred];
+                let i = self.rpo.index_of(pred);
                 let mut live_out = core::mem::take(&mut self.me.live_out[i as usize]);
                 let grew = live_out.union_with(&self.me.live);
                 self.me.live_out[i as usize] = live_out;

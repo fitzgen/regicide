@@ -1,7 +1,7 @@
 use crate::{
     Block,
     dfs::{Dfs, DfsEvent},
-    entity::{EntityRepr, EntitySet},
+    entity::{EntityRepr, EntitySet, SecondaryMap},
     error::IResult,
     input::InputFunction,
     output::OutputInner,
@@ -20,6 +20,9 @@ where
     /// Whether each block is reachable from the entry block, i.e. whether it
     /// appears in `blocks`.
     reachable: EntitySet<Block<E>>,
+
+    /// Each reachable block's position in `blocks`.
+    post_order_index: SecondaryMap<Block<E>, u32>,
 }
 
 impl<E> Rpo<E>
@@ -30,18 +33,28 @@ where
         Rpo {
             blocks: Vec::new(),
             reachable: EntitySet::new(),
+            post_order_index: SecondaryMap::new(u32::MAX),
         }
     }
 
     pub fn reset(&mut self) {
-        let Self { blocks, reachable } = self;
+        let Self {
+            blocks,
+            reachable,
+            post_order_index,
+        } = self;
         blocks.clear();
         reachable.reset();
+        post_order_index.reset();
     }
 
     pub fn is_reset(&self) -> bool {
-        let Self { blocks, reachable } = self;
-        blocks.is_empty() && reachable.is_reset()
+        let Self {
+            blocks,
+            reachable,
+            post_order_index,
+        } = self;
+        blocks.is_empty() && reachable.is_reset() && post_order_index.is_reset()
     }
 
     /// Construct this `Rpo` in place for the given function.
@@ -62,7 +75,11 @@ where
                 DfsEvent::Pre(block) => {
                     self.reachable.insert(block);
                 }
-                DfsEvent::Post(block) => self.blocks.push(block),
+                DfsEvent::Post(block) => {
+                    self.post_order_index[block] = u32::try_from(self.blocks.len())
+                        .expect("a function has fewer than `u32::MAX` blocks");
+                    self.blocks.push(block);
+                }
                 DfsEvent::AfterEdge(..) => {}
             }
         }
@@ -77,6 +94,19 @@ where
     /// appears after every block it dominates.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Block<E>> + DoubleEndedIterator + '_ {
         self.blocks.iter().copied().rev()
+    }
+
+    /// The `i`th block in reverse post-order.
+    pub fn at(&self, i: u32) -> Block<E> {
+        self.blocks[self.blocks.len() - 1 - i as usize]
+    }
+
+    /// The position of reachable `block` in reverse post-order, so that
+    /// `self.at(self.index_of(block)) == block`.
+    pub fn index_of(&self, block: Block<E>) -> u32 {
+        debug_assert!(self.is_reachable(block));
+        let len = u32::try_from(self.blocks.len()).unwrap();
+        len - 1 - self.post_order_index[block]
     }
 
     /// Is the given block reachable from the function's entry block?
@@ -199,6 +229,18 @@ mod tests {
                         "`Rpo::iter` yields {blocks:?} forwards but {:?} backwards",
                         rpo.iter().rev().collect::<Vec<_>>(),
                     ));
+                }
+                // Property 7: `at` and `index_of` agree with `iter`.
+                for (i, &block) in blocks.iter().enumerate() {
+                    let i = u32::try_from(i).unwrap();
+                    if rpo.index_of(block) != i || rpo.at(i) != block {
+                        return Err(format!(
+                            "{block:?} is at {i} in `Rpo::iter`, but `index_of` says {} and \
+                             `at({i})` is {:?}",
+                            rpo.index_of(block),
+                            rpo.at(i),
+                        ));
+                    }
                 }
                 if rpo.iter().len() != blocks.len() {
                     return Err(format!(

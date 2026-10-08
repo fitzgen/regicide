@@ -944,11 +944,12 @@ where
         match loc {
             ScalarAllocation::Reg(reg) => self
                 .dead
-                .reg_may_be_live_out(self.input.machine, block, reg)
+                .reg_may_be_live_out(self.input.machine, self.rpo, block, reg)
                 .unwrap_or(false),
-            ScalarAllocation::Stack(slot) => {
-                self.dead.slot_may_be_live_out(block, slot).unwrap_or(false)
-            }
+            ScalarAllocation::Stack(slot) => self
+                .dead
+                .slot_may_be_live_out(self.rpo, block, slot)
+                .unwrap_or(false),
         }
     }
 
