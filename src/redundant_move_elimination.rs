@@ -223,6 +223,19 @@ where
 
     /// Forget the contents of every location that overlaps `loc`.
     fn clobber(&mut self, machine: &Machine, loc: ScalarAllocation<E>) {
+        // A location nothing else overlaps holds its facts in one run.
+        let alone = match loc {
+            ScalarAllocation::Reg(reg) => reg.stands_alone(machine),
+            ScalarAllocation::Stack(_) => true,
+        };
+        if alone {
+            let range = self.range_of(loc);
+            if !range.is_empty() {
+                self.facts.drain(range);
+            }
+            return;
+        }
+
         self.facts
             .retain(|&(other, _)| !Interfere::interfere(machine, other, loc));
     }
