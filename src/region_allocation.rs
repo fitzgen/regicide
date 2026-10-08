@@ -275,6 +275,12 @@ where
     /// The registers that something clobbers in the current region.
     region_clobbers: RegSet,
 
+    /// The queued bundles that clobbers leave at most half their class to.
+    ///
+    /// Set when a bundle is queued, alongside its priority, so that eviction
+    /// does not walk its blocks' reservations again.
+    clobber_bound: EntitySet<LiveBundle<E>>,
+
     /// The registers that any bundle queued in the current region has
     /// preferred.
     region_preferences: RegSet,
@@ -308,6 +314,7 @@ where
             minimal_cuts: Vec::new(),
             interference_scratch: Vec::new(),
             region_clobbers: RegSet::new(),
+            clobber_bound: EntitySet::new(),
             region_preferences: RegSet::new(),
             non_preferred_candidates: Vec::new(),
             relayed_regs: Vec::new(),
@@ -328,6 +335,7 @@ where
             minimal_cuts,
             interference_scratch,
             region_clobbers,
+            clobber_bound,
             region_preferences,
             non_preferred_candidates,
             relayed_regs,
@@ -344,6 +352,7 @@ where
         minimal_cuts.clear();
         interference_scratch.clear();
         region_clobbers.reset();
+        clobber_bound.reset();
         region_preferences.reset();
         non_preferred_candidates.clear();
         relayed_regs.clear();
@@ -363,6 +372,7 @@ where
             minimal_cuts,
             interference_scratch,
             region_clobbers,
+            clobber_bound,
             region_preferences,
             non_preferred_candidates,
             relayed_regs,
@@ -379,6 +389,7 @@ where
             && minimal_cuts.is_empty()
             && interference_scratch.is_empty()
             && region_clobbers.is_reset()
+            && clobber_bound.is_reset()
             && region_preferences.is_reset()
             && non_preferred_candidates.is_empty()
             && relayed_regs.is_empty()
@@ -607,6 +618,7 @@ where
         self.assignments.merge(&self.region_assignments);
         self.region_assignments.reset();
         self.region_clobbers.reset();
+        self.clobber_bound.reset();
         self.region_preferences.reset();
 
         Ok(())
@@ -620,7 +632,13 @@ where
         bundle: LiveBundle<E>,
         phase: Phase,
     ) {
-        let priority = compute_bundle_priority(input, live_ranges, bundle);
+        let clobbered = regs_clobbered_across(input, live_ranges, bundle);
+        if is_clobber_bound(input, live_ranges, bundle, &clobbered) {
+            self.clobber_bound.insert(bundle);
+        } else {
+            self.clobber_bound.remove(bundle);
+        }
+        let priority = compute_bundle_priority(input, live_ranges, bundle, &clobbered);
         self.set_bundle_priority(bundle, priority);
         self.region_preferences
             .union_with(bundle.preference(live_ranges).union());
@@ -840,14 +858,51 @@ where
         };
 
         // The most we are willing to pay for eviction. This bundle holds no
-        // register, so evicting it doesn't break any hints. We never break a
-        // hint to make room for a bundle that has none of its own.
+        // register, so evicting it doesn't break any hints, and so it may only
+        // break a victim's hint where that hint yields (below).
         let max_cost = EvictionCost::new(
             bundle.stickiness(input, live_ranges),
             bundle.is_minimal(live_ranges),
             0,
             SpillWeight::new(bundle.spill_weight(live_ranges)),
         );
+
+        // A clobber-bound bundle fits only in the few registers that survive
+        // its clobbers, and failing reloads at up to every one of its uses. A
+        // far lighter victim's hint saves at most a move per span, so it does
+        // not protect a victim with fewer spans than this bundle has uses.
+        // A victim with no uses keeps its hint: the hint is all that places
+        // it, and taking its register only moves its load or store.
+        let (hints_yield_below, num_uses) = if self.clobber_bound.contains(bundle) {
+            (
+                bundle.spill_weight(live_ranges) / HINT_YIELDS_TO_HEAVIER_FACTOR,
+                bundle
+                    .spans(live_ranges)
+                    .map(|s| s.uses(live_ranges).len())
+                    .sum(),
+            )
+        } else {
+            (0.0, 0)
+        };
+
+        // What evicting `victim` costs, where `hinted` says whether it is
+        // hinted towards the register (or group) it would give up.
+        let eviction_cost = |victim: LiveBundle<E>, hinted: bool| {
+            let weight = victim.spill_weight(live_ranges);
+            let yields = || {
+                weight < hints_yield_below
+                    && victim.spans(live_ranges).len() < num_uses
+                    && victim
+                        .spans(live_ranges)
+                        .any(|s| !s.uses(live_ranges).is_empty())
+            };
+            EvictionCost::new(
+                victim.stickiness(input, live_ranges),
+                victim.is_minimal(live_ranges),
+                usize::from(hinted && !yields()),
+                SpillWeight::new(weight),
+            )
+        };
 
         let bundle_spans = |b: LiveBundle<E>| b.spans(live_ranges).map(|s| s.query(live_ranges));
 
@@ -862,14 +917,7 @@ where
                     |r| r.units(machine),
                     max_cost,
                     |victim, reg| {
-                        let broken_hints =
-                            usize::from(victim.preference(live_ranges).union_contains(reg));
-                        EvictionCost::new(
-                            victim.stickiness(input, live_ranges),
-                            victim.is_minimal(live_ranges),
-                            broken_hints,
-                            SpillWeight::new(victim.spill_weight(live_ranges)),
-                        )
+                        eviction_cost(victim, victim.preference(live_ranges).union_contains(reg))
                     },
                     bundle_spans,
                 )
@@ -888,19 +936,12 @@ where
                         |g| g.members(machine).iter().map(|r| r.units(machine)),
                         max_cost,
                         |victim, group| {
-                            let broken_hints = usize::from(
-                                !victim
-                                    .preference(live_ranges)
-                                    .union()
-                                    .intersection(group.member_set(machine))
-                                    .is_empty(),
-                            );
-                            EvictionCost::new(
-                                victim.stickiness(input, live_ranges),
-                                victim.is_minimal(live_ranges),
-                                broken_hints,
-                                SpillWeight::new(victim.spill_weight(live_ranges)),
-                            )
+                            let hinted = !victim
+                                .preference(live_ranges)
+                                .union()
+                                .intersection(group.member_set(machine))
+                                .is_empty();
+                            eviction_cost(victim, hinted)
                         },
                         bundle_spans,
                     )
@@ -1547,6 +1588,10 @@ where
     }
 }
 
+/// How many times heavier than a hinted victim a clobber-bound bundle must be
+/// before the victim's hint may stop protecting it from eviction.
+const HINT_YIELDS_TO_HEAVIER_FACTOR: f32 = 8.0;
+
 /// Fill `candidates` with the registers of `regs` that `pref` does not name, in
 /// the order a bundle with no usable hint should try them.
 ///
@@ -1634,10 +1679,12 @@ where
         .start(live_ranges)
 }
 
+/// `clobbered` is `regs_clobbered_across` for `bundle`.
 fn compute_bundle_priority<E>(
     input: &Input<'_, impl InputFunction>,
     live_ranges: &LiveRanges<E>,
     bundle: LiveBundle<E>,
+    clobbered: &RegSet,
 ) -> Priority
 where
     E: EntityRepr,
@@ -1647,12 +1694,33 @@ where
         bundle_group_size(input, live_ranges, bundle),
         // A hint the bundle can never honor earns it no head start over the
         // bundles whose hints it would otherwise take.
-        bundle.num_hinted_spans(
-            live_ranges,
-            &regs_clobbered_across(input, live_ranges, bundle),
-        ),
+        bundle.num_hinted_spans(live_ranges, clobbered),
         bundle.spans(live_ranges).len(),
     )
+}
+
+/// Do the clobbers across `bundle` (`clobbered`) leave it at most half of
+/// the registers in its class?
+fn is_clobber_bound<E>(
+    input: &Input<'_, impl InputFunction>,
+    live_ranges: &LiveRanges<E>,
+    bundle: LiveBundle<E>,
+    clobbered: &RegSet,
+) -> bool
+where
+    E: EntityRepr,
+{
+    if clobbered.is_empty() {
+        return false;
+    }
+    let rc = match bundle.constraint(live_ranges) {
+        OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
+        OperandConstraint::Reg(rc) => rc,
+        OperandConstraint::Stack => return false,
+        OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
+    };
+    let members = rc.member_set(input.machine);
+    2 * members.difference(clobbered).len() <= members.len()
 }
 
 fn bundle_group_size<E>(
