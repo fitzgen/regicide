@@ -409,13 +409,13 @@ where
         between_span_cuts(spans, uses),
         uses,
         |&k| spans[k].start,
-        |k, min_use_weight, floor, unreachable| {
+        |k, min_use_weight, floor, beaten| {
             best_candidate_between_spans(
                 spans,
                 k,
                 min_use_weight,
                 floor,
-                unreachable,
+                beaten,
                 candidates.clone(),
                 &mut interference,
             )
@@ -423,13 +423,13 @@ where
     )
 }
 
-/// The candidates, by position, whose prefix has already come out infinite.
+/// The candidates, by position, that can win no later cut.
 ///
 /// Fixed-size, so the kernel needs no allocation; candidates beyond it are
 /// never recorded, which only costs them the shortcut.
-struct UnreachableCandidates([u64; 8]);
+struct BeatenCandidates([u64; 8]);
 
-impl UnreachableCandidates {
+impl BeatenCandidates {
     fn new() -> Self {
         Self([0; 8])
     }
@@ -453,7 +453,7 @@ impl UnreachableCandidates {
 /// `at` gives where each cut falls among `uses`, and `best_at` scores a cut's
 /// best candidate given its `min_use_weight` and the best score so far, below
 /// which it may give up early with `None` or any lesser choice. `best_at` also
-/// gets the `UnreachableCandidates` the cuts so far have found.
+/// gets the `BeatenCandidates` the cuts so far have found.
 fn middle_of_best_run<E, C, K>(
     cuts: impl Iterator<Item = K> + Clone,
     uses: &[SplitUse<E>],
@@ -462,7 +462,7 @@ fn middle_of_best_run<E, C, K>(
         K,
         f32,
         Option<SplitScore>,
-        &mut UnreachableCandidates,
+        &mut BeatenCandidates,
     ) -> Option<SplitChoice<C, K>>,
 ) -> Option<SplitChoice<C, K>>
 where
@@ -476,12 +476,12 @@ where
     let mut best: Option<(SplitChoice<C, K>, usize)> = None;
     let mut run_start = 0;
     let mut run_open = false;
-    let mut unreachable = UnreachableCandidates::new();
+    let mut beaten = BeatenCandidates::new();
 
     for (i, cut) in cuts.clone().enumerate() {
         cursor.advance_to(at(&cut));
         let floor = best.as_ref().map(|(best, _)| best.score);
-        let Some(choice) = best_at(cut, cursor.min_use_weight(), floor, &mut unreachable) else {
+        let Some(choice) = best_at(cut, cursor.min_use_weight(), floor, &mut beaten) else {
             // Every candidate fell below the best, which ends its run. Without
             // a best, there are no candidates at all.
             run_open = false;
@@ -515,7 +515,7 @@ where
         cut,
         first.score.min_use_weight,
         None,
-        &mut UnreachableCandidates::new(),
+        &mut BeatenCandidates::new(),
     )
     .unwrap();
     debug_assert!(choice.score == first.score);
@@ -529,17 +529,18 @@ where
 /// suffix goes unpriced. When no candidate reaches `floor`, the result is
 /// `None` or some choice below it.
 ///
-/// Cuts come in program order, so each cut's prefix holds every earlier cut's.
-/// A candidate whose prefix is infinite here is infinite at every later cut,
-/// and is recorded in `unreachable`; once `floor` is finite, such a candidate
-/// goes unpriced altogether.
+/// Cuts come in program order, so each cut's prefix holds every earlier cut's
+/// and costs at least as much, while the best score only rises. A candidate
+/// whose prefix is infinite, or already costs more than the best score's
+/// interference, can win no later cut; it is recorded in `beaten`, and once
+/// `floor` is finite it goes unpriced altogether.
 fn best_candidate<E, C, K>(
     cut: K,
     prefix: HalfSpan<'_, E>,
     suffix: HalfSpan<'_, E>,
     min_use_weight: f32,
     floor: Option<SplitScore>,
-    unreachable: &mut UnreachableCandidates,
+    beaten: &mut BeatenCandidates,
     candidates: impl IntoIterator<Item = C>,
     interference: &mut impl FnMut(C, HalfSpan<'_, E>) -> f32,
 ) -> Option<SplitChoice<C, K>>
@@ -553,12 +554,16 @@ where
     let mut bound = floor;
     let finite_floor = floor.is_some_and(|floor| floor.max_interference.is_finite());
     for (i, candidate) in candidates.into_iter().enumerate() {
-        if finite_floor && unreachable.contains(i) {
+        if finite_floor && beaten.contains(i) {
             continue;
         }
         let prefix_interference = interference(candidate, prefix);
-        if prefix_interference == f32::INFINITY {
-            unreachable.insert(i);
+        // Strictly more, since a tie in interference can still win on use
+        // weight at a later cut.
+        if prefix_interference == f32::INFINITY
+            || bound.is_some_and(|bound| prefix_interference > bound.max_interference)
+        {
+            beaten.insert(i);
         }
         if bound.is_some_and(|bound| SplitScore::new(prefix_interference, min_use_weight) < bound) {
             continue;
@@ -586,7 +591,7 @@ fn best_candidate_between_spans<E, C>(
     k: usize,
     min_use_weight: f32,
     floor: Option<SplitScore>,
-    unreachable: &mut UnreachableCandidates,
+    beaten: &mut BeatenCandidates,
     candidates: impl IntoIterator<Item = C>,
     interference: &mut impl FnMut(C, HalfSpan<'_, E>) -> f32,
 ) -> Option<SplitChoice<C, usize>>
@@ -607,7 +612,7 @@ where
         suffix,
         min_use_weight,
         floor,
-        unreachable,
+        beaten,
         candidates,
         interference,
     )
@@ -637,7 +642,7 @@ where
         within_span_cuts(spans, uses),
         uses,
         |cut| cut.at,
-        |cut, min_use_weight, floor, unreachable| {
+        |cut, min_use_weight, floor, beaten| {
             debug_assert_eq!(cut.at.pos(), Position::Early);
             debug_assert!(spans[cut.index].start < cut.at);
             debug_assert!(cut.at < spans[cut.index].end);
@@ -649,7 +654,7 @@ where
                 suffix,
                 min_use_weight,
                 floor,
-                unreachable,
+                beaten,
                 candidates.clone(),
                 &mut interference,
             )
