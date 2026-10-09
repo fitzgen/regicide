@@ -11,7 +11,7 @@
 
 use crate::{
     Block, Entity as _, Val,
-    entity::{EntityRepr, EntitySet, SecondaryMap},
+    entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
     error::{IResult, InternalError},
     input::{Input, InputBlock as _, InputFunction},
     interval_sets::{Fuel, IntervalSet, IntervalSetArena},
@@ -28,6 +28,10 @@ define_entities! {
     /// One stretch of a spilled value's slot reservation within a block.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     struct SlotRange = "slot_range";
+
+    /// An entry in the storage of every value's class partners.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct PartnerIndex = "partner_index";
 }
 
 /// The slot classes of one function's spilled values, and the slots promised
@@ -80,6 +84,18 @@ where
 
     /// The total weight of each parameter's entries in `affinities`.
     param_weight: SecondaryMap<Val<E>, f64>,
+
+    /// The affinities that ended up inside a class, once from each end, as
+    /// `(val, partner, weight)`, until `index_partners` sorts them into
+    /// `partners`.
+    class_affinities: Vec<(Val<E>, Val<E>, f64)>,
+
+    /// Each value's class partners, with the weight of their affinity: a
+    /// range of `partner_storage`.
+    partners: SecondaryMap<Val<E>, EntityRange<PartnerIndex<E>>>,
+
+    /// Storage for `partners`.
+    partner_storage: PrimaryMap<PartnerIndex<E>, (Val<E>, f64)>,
 }
 
 impl<E> SlotClasses<E>
@@ -102,6 +118,9 @@ where
             affinities: Vec::new(),
             affine: EntitySet::new(),
             param_weight: SecondaryMap::new(0.0),
+            class_affinities: Vec::new(),
+            partners: SecondaryMap::new(EntityRange::empty()),
+            partner_storage: PrimaryMap::new(),
         }
     }
 
@@ -121,6 +140,9 @@ where
             affinities,
             affine,
             param_weight,
+            class_affinities,
+            partners,
+            partner_storage,
         } = self;
         sets.reset();
         class_ranges.reset();
@@ -136,6 +158,9 @@ where
         affinities.clear();
         affine.reset();
         param_weight.reset();
+        class_affinities.clear();
+        partners.reset();
+        partner_storage.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -154,6 +179,9 @@ where
             affinities,
             affine,
             param_weight,
+            class_affinities,
+            partners,
+            partner_storage,
         } = self;
         sets.is_reset()
             && class_ranges.is_reset()
@@ -169,6 +197,9 @@ where
             && affinities.is_empty()
             && affine.is_reset()
             && param_weight.is_reset()
+            && class_affinities.is_empty()
+            && partners.is_reset()
+            && partner_storage.is_reset()
     }
 
     /// Record every spilled argument and the spilled parameter it feeds, both
@@ -306,6 +337,8 @@ where
             let a = self.sets.find(arg);
             let b = self.sets.find(param);
             if a == b {
+                self.class_affinities.push((arg, param, weight));
+                self.class_affinities.push((param, arg, weight));
                 continue;
             }
             let (Some(set_a), Some(set_b)) = (self.class_ranges[a], self.class_ranges[b]) else {
@@ -321,6 +354,8 @@ where
                 self.class_ranges[b] = None;
                 self.class_ranges[root] = Some(set);
                 self.class_weight[root] = joined;
+                self.class_affinities.push((arg, param, weight));
+                self.class_affinities.push((param, arg, weight));
                 trace!("spill slots: {arg:?} and {param:?} would rather share a slot");
             }
         }
@@ -331,10 +366,46 @@ where
         self.fuel = Fuel::safety_net(self.num_ranges);
     }
 
+    /// Index each value's class partners, once `union_affinities` has
+    /// settled the classes.
+    pub fn index_partners(&mut self, output: &mut OutputInner<E>) -> IResult<()> {
+        self.class_affinities.sort_by_key(|&(val, _, _)| val);
+        let affinities = core::mem::take(&mut self.class_affinities);
+        let result = affinities.chunk_by(|a, b| a.0 == b.0).try_for_each(|run| {
+            let start = self.partner_storage.next_key(output)?;
+            for &(_, partner, weight) in run {
+                self.partner_storage.push(output, (partner, weight))?;
+            }
+            let end = self.partner_storage.next_key(output)?;
+            self.partners[run[0].0] = EntityRange { start, end };
+            Ok(())
+        });
+        self.class_affinities = affinities;
+        self.class_affinities.clear();
+        result
+    }
+
     /// The slot promised to `val`'s class, if any.
     pub fn slot(&mut self, val: Val<E>) -> Option<SpillSlot<E>> {
         let class = self.sets.find(val);
         self.class_slot[class]
+    }
+
+    /// The weight of the affinities `val` shares with its own class that
+    /// keeping it in `slot` would satisfy: those whose partner is already in
+    /// `slot`, or has no slot yet and so may follow the class there.
+    pub fn weight_in_slot(
+        &self,
+        val: Val<E>,
+        slot: SpillSlot<E>,
+        home: impl Fn(Val<E>) -> Option<SpillSlot<E>>,
+    ) -> f64 {
+        self.partners[val]
+            .into_iter()
+            .map(|i| self.partner_storage[i])
+            .filter(|&(partner, _)| home(partner).is_none_or(|s| s == slot))
+            .map(|(_, weight)| weight)
+            .sum()
     }
 
     /// Does keeping `val`'s class in one slot save any move?

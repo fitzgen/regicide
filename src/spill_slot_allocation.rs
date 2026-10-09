@@ -330,9 +330,22 @@ where
     /// promised to them.
     classes: SlotClasses<E>,
 
-    /// Scratch for `incoming_arg_slot`: each slot an argument occupies, and
-    /// the weight of the edges it arrives on.
+    /// Scratch for `tally_votes`: each slot an argument occupies, and the
+    /// weight of the edges it arrives on.
     votes: Vec<(SpillSlot<E>, f64)>,
+
+    /// Scratch for `enter_block`: the parameters it colors, with their index.
+    params: Vec<(usize, Val<E>)>,
+
+    /// Scratch for `color_params`: each parameter's candidate slots.
+    pairs: Vec<SlotPair<E>>,
+
+    /// Scratch for `match_params`: the slots it has matched.
+    claimed: EntitySet<SpillSlot<E>>,
+
+    /// The slot `match_params` matched each parameter of the block being
+    /// entered to.
+    matched: SecondaryMap<Val<E>, Option<SpillSlot<E>>>,
 }
 
 impl<E> SpillSlots<E>
@@ -355,6 +368,10 @@ where
             emergency: [const { Vec::new() }; RegBank::NUM_SIZES],
             classes: SlotClasses::new(),
             votes: Vec::new(),
+            params: Vec::new(),
+            pairs: Vec::new(),
+            claimed: EntitySet::new(),
+            matched: SecondaryMap::new(None),
         }
     }
 
@@ -374,9 +391,17 @@ where
             emergency,
             classes,
             votes,
+            params,
+            pairs,
+            claimed,
+            matched,
         } = self;
         classes.reset();
         votes.clear();
+        params.clear();
+        pairs.clear();
+        claimed.reset();
+        matched.reset();
         slots.reset();
         groups.reset();
         group_members.reset();
@@ -411,9 +436,17 @@ where
             emergency,
             classes,
             votes,
+            params,
+            pairs,
+            claimed,
+            matched,
         } = self;
         classes.is_reset()
             && votes.is_empty()
+            && params.is_empty()
+            && pairs.is_empty()
+            && claimed.is_empty()
+            && matched.is_reset()
             && slots.is_reset()
             && groups.is_reset()
             && group_members.is_reset()
@@ -430,7 +463,10 @@ where
 
     /// Is every field that only holds state mid-walk empty?
     fn scratch_is_empty(&self) -> bool {
-        self.live_count.iter().all(|&n| n == 0)
+        self.params.is_empty()
+            && self.pairs.is_empty()
+            && self.claimed.is_empty()
+            && self.live_count.iter().all(|&n| n == 0)
             && self.in_use.is_empty()
             && self.free_slots.iter().all(|free| free.is_empty())
             && self.events.is_empty()
@@ -676,36 +712,125 @@ where
             }
         }
 
-        for val in ranges.live_in(liveness, block, spilled) {
-            if self.val_home[val].is_some() {
-                continue;
-            }
-            debug_assert!(
-                match ranges {
-                    Ranges::WholeLiveRange => input
+        // Over whole live ranges, every value colored here is a parameter of
+        // this block; a spilled live range begins inside the block holding its
+        // head, never on an edge, so there is nothing to color.
+        debug_assert!(
+            ranges
+                .live_in(liveness, block, spilled)
+                .filter(|&val| self.val_home[val].is_none())
+                .all(|val| matches!(ranges, Ranges::WholeLiveRange)
+                    && input
                         .func
                         .block(block.with_repr32())
                         .params()
-                        .any(|param| param.with_repr::<E>() == Some(val)),
-                    // A spilled live range begins inside the block holding its
-                    // head, never on an edge, so this value is already colored.
-                    Ranges::Spilled(_) => false,
-                },
-                "{val:?}'s slot is reserved on entry to {block:?} without having one, so its \
-                 range must begin on an edge into {block:?}",
-            );
+                        .any(|param| param.with_repr::<E>() == Some(val))),
+            "a value whose slot is reserved on entry to {block:?} without having one must be \
+             one of its parameters",
+        );
+        if let Ranges::Spilled(_) = ranges {
+            return Ok(());
+        }
+
+        let mut params = core::mem::take(&mut self.params);
+        debug_assert!(params.is_empty());
+        let mut result = Ok(());
+        for (index, param) in input.func.block(block.with_repr32()).params().enumerate() {
+            match output.with_repr::<E, _>(param) {
+                Ok(param)
+                    if spilled.contains(param)
+                        && self.val_home[param].is_none()
+                        && block.is_live_in(liveness, param) =>
+                {
+                    params.push((index, param));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            }
+        }
+        let result = result.and_then(|()| {
+            self.color_params(input, counts, events, region_tree, block, output, &params)
+        });
+        params.clear();
+        self.params = params;
+        result
+    }
+
+    /// Color `params`, the `(index, value)`s of `block`'s parameters whose
+    /// ranges begin on its incoming edges, in parameter order.
+    fn color_params(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        region_tree: &RegionTree<E>,
+        block: Block<E>,
+        output: &mut OutputInner<E>,
+        params: &[(usize, Val<E>)],
+    ) -> IResult<()> {
+        let mut pairs = core::mem::take(&mut self.pairs);
+        debug_assert!(pairs.is_empty());
+        let result = self.color_params_with(
+            input,
+            counts,
+            events,
+            region_tree,
+            block,
+            output,
+            params,
+            &mut pairs,
+        );
+        pairs.clear();
+        self.pairs = pairs;
+        // Only an error leaves a match untaken.
+        for &(_, val) in params {
+            self.matched[val] = None;
+        }
+        result
+    }
+
+    fn color_params_with(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        counts: &mut Counts,
+        events: &mut EventsLog<E>,
+        region_tree: &RegionTree<E>,
+        block: Block<E>,
+        output: &mut OutputInner<E>,
+        params: &[(usize, Val<E>)],
+        pairs: &mut Vec<SlotPair<E>>,
+    ) -> IResult<()> {
+        for &(index, param) in params {
+            self.param_pairs(input, region_tree, block, output, index, param, pairs)?;
+        }
+        self.match_params(pairs);
+
+        // In parameter order, since taking a slot reorders the free list that
+        // the unmatched parameters below choose from.
+        for &(_, val) in params {
+            if let Some(slot) = self.matched[val].take() {
+                self.assign_to(input, counts, events, val, output, slot)?;
+            }
+        }
+
+        for &(_, val) in params {
+            if self.val_home[val].is_some() {
+                continue;
+            }
             // Sharing an argument's slot makes that edge's move a no-op;
             // otherwise it pays a stack-to-stack move, the most expensive kind.
-            let class_slot = self.classes.slot(val);
-            let vote =
-                self.incoming_arg_slot(input, region_tree, output, block, val, class_slot)?;
             // Where this parameter's own edges outweigh its class's slot, it
             // follows the edges, and the class keeps its slot for the rest.
+            let free_slots_index = &self.free_slots_index;
+            let vote = best_vote(pairs, val, self.classes.slot(val), |slot| {
+                free_slots_index[slot] != NOT_FREE
+            });
             let prefer = vote.map(|(slot, _, _)| slot);
             match vote {
-                Some((slot, weight, class_weight))
-                    if weight > class_weight && self.free_slots_index[slot] != NOT_FREE =>
-                {
+                Some((slot, weight, class_weight)) if weight > class_weight => {
                     self.assign_to(input, counts, events, val, output, slot)?;
                 }
                 _ => self.assign(input, counts, events, val, output, prefer)?,
@@ -715,49 +840,97 @@ where
         Ok(())
     }
 
-    /// The free slot that `param`'s already-colored arguments occupy on the
-    /// heaviest incoming edges, with those edges' weight and the weight of the
-    /// edges whose argument is in `class_slot`.
-    fn incoming_arg_slot(
+    /// Match the parameters in `pairs` to slots in `matched`, heaviest pair
+    /// first, each parameter and slot at most once.
+    ///
+    /// The parameters of a join compete for the same free slots, so taking
+    /// them one at a time lets an early parameter take the slot a later one
+    /// needs more, and that one in turn displaces the next.
+    fn match_params(&mut self, pairs: &mut [SlotPair<E>]) {
+        // A vote wins a tie with a class pair: the vote counts arguments
+        // already in the slot, while the class pair also counts partners not
+        // colored yet, which may end up elsewhere. Stable, so that ties keep
+        // parameter order and, for one parameter, `tally_votes`'s order.
+        pairs.sort_by(|a, b| {
+            b.matchable
+                .cmp(&a.matchable)
+                .then(b.weight.total_cmp(&a.weight))
+        });
+        debug_assert!(self.claimed.is_empty());
+        for pair in pairs.iter().take_while(|pair| pair.matchable) {
+            if self.matched[pair.param].is_none() && !self.claimed.contains(pair.slot) {
+                self.matched[pair.param] = Some(pair.slot);
+                self.claimed.insert(pair.slot);
+            }
+        }
+        self.claimed.reset();
+        // Back in parameter order, for `best_vote`.
+        pairs.sort_by_key(|pair| pair.order);
+    }
+
+    /// Push the `index`th parameter `param`'s candidate slots onto `pairs`:
+    /// each free slot its colored arguments occupy, weighed by their edges,
+    /// and its class's slot, weighed by the affinities with its class that the
+    /// slot would keep.
+    fn param_pairs(
         &mut self,
         input: &Input<'_, impl InputFunction>,
         region_tree: &RegionTree<E>,
-        output: &mut OutputInner<E>,
         block: Block<E>,
+        output: &mut OutputInner<E>,
+        index: usize,
         param: Val<E>,
-        class_slot: Option<SpillSlot<E>>,
-    ) -> IResult<Option<(SpillSlot<E>, f64, f64)>> {
-        let block32 = block.with_repr32();
-
-        let mut index = None;
-        for (i, p) in input.func.block(block32).params().enumerate() {
-            if output.with_repr::<E, _>(p)? == param {
-                index = Some(i);
-                break;
-            }
-        }
-        let Some(index) = index else {
-            return Ok(None);
-        };
-
-        // A join has few distinct argument slots, so a short list beats a map.
+        pairs: &mut Vec<SlotPair<E>>,
+    ) -> IResult<()> {
         let mut votes = core::mem::take(&mut self.votes);
         debug_assert!(votes.is_empty());
         let result = self.tally_votes(input, region_tree, output, block, index, &mut votes);
-        // The first slot found wins ties.
-        let class_weight = votes
+
+        let class_slot = self.classes.slot(param);
+        let class_vote = votes
             .iter()
             .find(|&&(slot, _)| Some(slot) == class_slot)
             .map_or(0.0, |&(_, weight)| weight);
-        let best = votes
-            .iter()
-            .rev()
-            .copied()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(slot, weight)| (slot, weight, class_weight));
+        let size = param.reg_bank(input).size(input.machine);
+        let single = param.num_regs(input) == 1;
+
+        let mut push = |slot, weight, is_class, matchable| {
+            pairs.push(SlotPair {
+                order: pairs.len(),
+                param,
+                slot,
+                weight,
+                is_class,
+                matchable,
+            });
+        };
+        if result.is_ok() {
+            for &(slot, weight) in &votes {
+                let matchable = single && self.slots[slot] == size && Some(slot) != class_slot;
+                push(slot, weight, false, matchable);
+            }
+            if let Some(slot) = class_slot
+                && single
+                && self.free_slots_index[slot] != NOT_FREE
+            {
+                let val_home = &self.val_home;
+                let kept = self
+                    .classes
+                    .weight_in_slot(param, slot, |val| match val_home[val] {
+                        Some(StackAllocation::SpillSlot(s)) => Some(s),
+                        _ => None,
+                    });
+                // A vote can come from an argument outside the class, which
+                // `kept` does not see, and `kept` from edges into other blocks.
+                let weight = class_vote.max(kept);
+                if weight > 0.0 {
+                    push(slot, weight, true, true);
+                }
+            }
+        }
         votes.clear();
         self.votes = votes;
-        result.map(|()| best)
+        result
     }
 
     /// Add up, per slot, the weight of the edges into `block` whose argument
@@ -831,7 +1004,7 @@ where
 
         self.classes.order_affinities();
         self.classes.union_affinities();
-        Ok(())
+        self.classes.index_partners(output)
     }
 
     /// Record the reservations of every value in `affine` in `self.classes`.
@@ -1252,6 +1425,57 @@ where
             );
         }
     }
+}
+
+/// A slot one of a join's parameters could take, and what taking it is worth.
+#[derive(Clone, Copy)]
+struct SlotPair<E>
+where
+    E: EntityRepr,
+{
+    /// Where this pair was pushed, so that `match_params` can undo its sort.
+    order: usize,
+
+    param: Val<E>,
+    slot: SpillSlot<E>,
+
+    /// For a vote, the weight of the edges whose argument is in `slot`; for
+    /// the class pair, that of the class affinities `slot` keeps.
+    weight: f64,
+
+    /// Is this the class pair, rather than a vote?
+    is_class: bool,
+
+    /// May `match_params` give `param` this slot? Not if `param` takes more
+    /// than one slot, nor for a slot of another size, nor for a vote for the
+    /// class slot, which the class pair already counts.
+    matchable: bool,
+}
+
+/// The heaviest of `param`'s votes in `pairs` for a slot that `is_free`
+/// still, and the weight of its vote for `class_slot` if that is free too.
+/// `pairs` are in push order, so the first slot `tally_votes` found wins a tie.
+fn best_vote<E>(
+    pairs: &[SlotPair<E>],
+    param: Val<E>,
+    class_slot: Option<SpillSlot<E>>,
+    is_free: impl Fn(SpillSlot<E>) -> bool,
+) -> Option<(SpillSlot<E>, f64, f64)>
+where
+    E: EntityRepr,
+{
+    let votes = || {
+        pairs
+            .iter()
+            .filter(|pair| pair.param == param && !pair.is_class && is_free(pair.slot))
+    };
+    let class_weight = votes()
+        .find(|pair| Some(pair.slot) == class_slot)
+        .map_or(0.0, |pair| pair.weight);
+    votes()
+        .rev()
+        .max_by(|a, b| a.weight.total_cmp(&b.weight))
+        .map(|pair| (pair.slot, pair.weight, class_weight))
 }
 
 impl<E> Default for SpillSlots<E>
@@ -1961,6 +2185,41 @@ mod tests {
         assert_ne!(arg1, temp, "the two values in `block1` are live at once");
         assert_eq!(param, arg1);
         assert_eq!(param, arg2);
+    }
+
+    /// Each parameter of a join keeps the slot it shares with the most edges,
+    /// even when another parameter, colored first, would rather have it too.
+    #[test]
+    fn a_param_does_not_take_a_slot_another_param_needs_more() {
+        let test_input = TestInput::with_two_params_competing_for_a_slot();
+        crate::test::check_allocation(&test_input).expect("the allocation must be correct");
+
+        let context = allocate(&test_input).unwrap().unwrap();
+        let spill_slots = &context.context32.spill_slots;
+        let slot = |v| Val::<u32>::try_new(v).unwrap().stack_home(spill_slots);
+        let (v1, v4) = (slot(1), slot(4));
+        assert!(v4.is_some(), "the loop's second parameter is spilled");
+        assert_eq!(
+            v4, v1,
+            "`v4` shares its slot with its entry argument, and `v1` is in no other class",
+        );
+    }
+
+    /// A parameter whose argument's slot weighs exactly as much as its class's
+    /// slot takes the argument's: that weight is an argument already there,
+    /// while the class's counts a partner not colored yet.
+    #[test]
+    fn a_param_takes_its_arguments_slot_over_a_tied_class_slot() {
+        let test_input = TestInput::with_a_param_torn_between_a_vote_and_its_class();
+        crate::test::check_allocation(&test_input).expect("the allocation must be correct");
+
+        let context = allocate(&test_input).unwrap().unwrap();
+        let spill_slots = &context.context32.spill_slots;
+        let slot = |v| Val::<u32>::try_new(v).unwrap().stack_home(spill_slots);
+        let (arg, class_partner, param) = (slot(4), slot(2), slot(6));
+        assert!(param.is_some(), "`block3`'s first parameter is spilled");
+        assert_ne!(arg, class_partner, "the two slots are distinct");
+        assert_eq!(param, arg, "`v6` shares its slot with its argument `v4`");
     }
 
     /// Nothing spills when every use can be satisfied in a register, and then

@@ -9864,6 +9864,363 @@ impl TestInput {
         input
     }
 
+    /// A join whose spilled parameter has two equally weighted claims on its
+    /// slot: the slot one of its arguments is already in, and its class's slot,
+    /// which it shares with an argument not colored yet.
+    ///
+    /// `block2` is entered from `block0` and `block1`, which pass `v0` to all
+    /// three of its parameters, and from `block3`, which passes `v6`. `block2`
+    /// branches to `block3` with `v4`, defined in `block2`, for both of
+    /// `block3`'s parameters.
+    pub fn with_a_param_torn_between_a_vote_and_its_class() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        let block = |b| Block::try_new(b).unwrap();
+        let val = |v| Val::try_new(v).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::BlockParam {
+                block: block(0),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: block(2),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: block(2),
+                i: 1,
+            },
+            ValDef::BlockParam {
+                block: block(2),
+                i: 2,
+            },
+            ValDef::InstResult {
+                inst: inst(7),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(7),
+                i: 1,
+            },
+            ValDef::BlockParam {
+                block: block(3),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: block(3),
+                i: 1,
+            },
+            ValDef::InstResult {
+                inst: inst(9),
+                i: 0,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: 0,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let r0 = Reg::try_new(0).unwrap();
+        let reg = OperandConstraint::Reg(RegClass::try_new(0).unwrap());
+        let operand = |pos, kind, constraint, v| Operand::new(pos, kind, constraint, Some(val(v)));
+        let call = |b, args: &[usize]| BlockCall {
+            target: block(b),
+            args: args.iter().map(|&v| val(v)).collect(),
+        };
+        let op = |operands, clobbers, side_effects| InstData::Op {
+            operands,
+            clobbers,
+            side_effects,
+        };
+        let branch = |operands, clobbers, targets| InstData::Branch {
+            operands,
+            clobbers,
+            targets,
+        };
+        use DefUse::{Def, Use};
+        use OperandConstraint::{Any, Stack};
+        use Position::{Early, Late};
+
+        func.insts = PrimaryMap::new();
+        for data in [
+            // block0
+            op(vec![operand(Late, Use, Any, 0)], vec![r0], false),
+            op(vec![], vec![], true),
+            op(vec![], vec![], false),
+            branch(
+                vec![operand(Early, Use, Any, 0)],
+                vec![r0],
+                vec![call(2, &[0, 0, 0])],
+            ),
+            // block1
+            op(
+                vec![
+                    operand(Early, Use, reg, 0),
+                    operand(Early, Use, Stack, 0),
+                    operand(Early, Use, Stack, 0),
+                ],
+                vec![],
+                true,
+            ),
+            op(vec![operand(Late, Use, Stack, 0)], vec![r0], false),
+            branch(vec![], vec![r0], vec![call(2, &[0, 0, 0])]),
+            // block2
+            op(
+                vec![operand(Early, Def, Any, 4), operand(Late, Def, Any, 5)],
+                vec![],
+                false,
+            ),
+            branch(
+                vec![operand(Early, Use, Stack, 2)],
+                vec![r0],
+                vec![call(1, &[]), call(3, &[4, 4])],
+            ),
+            // block3
+            op(
+                vec![
+                    operand(Late, Use, reg, 0),
+                    operand(Early, Use, Stack, 0),
+                    operand(Early, Def, Stack, 8),
+                ],
+                vec![],
+                true,
+            ),
+            branch(
+                vec![operand(Early, Use, Any, 0)],
+                vec![r0],
+                vec![call(2, &[6, 6, 6])],
+            ),
+        ] {
+            func.insts.push(&mut output, data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (params, insts) in [
+            (vec![val(0)], vec![inst(0), inst(1), inst(2), inst(3)]),
+            (vec![], vec![inst(4), inst(5), inst(6)]),
+            (vec![val(1), val(2), val(3)], vec![inst(7), inst(8)]),
+            (vec![val(6), val(7)], vec![inst(9), inst(10)]),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut machine = TestMachine {
+            banks: vec![TestBank {
+                log2_size: 0,
+                regs: vec![1],
+                non_allocatable: 0,
+                groups: Vec::new(),
+                classes: vec![TestClass {
+                    members: TestClassMembers::Regs(vec![0]),
+                    spill_cost: 0,
+                }],
+            }],
+            regs_per_bank: None,
+        };
+        machine.fixup();
+
+        let mut input = TestInput {
+            options: InputOptions {
+                validate_input: false,
+                ..InputOptions::default()
+            },
+            machine,
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A loop whose header takes two spilled parameters, where coloring them in
+    /// order lets the first take the slot the second needs more.
+    ///
+    /// `block0` passes `v2` and `v1` to `block1`'s `v3` and `v4`, and the back
+    /// edge passes `v4` to both. `v2` stays live through `block1`, so its slot
+    /// is taken there, and `v3`, colored first, would take `v1`'s free slot,
+    /// the one `v4` shares with its entry argument.
+    pub fn with_two_params_competing_for_a_slot() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        let block = |b| Block::try_new(b).unwrap();
+        let val = |v| Val::try_new(v).unwrap();
+
+        func.values = PrimaryMap::new();
+        for def in [
+            ValDef::BlockParam {
+                block: block(0),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(1),
+                i: 0,
+            },
+            ValDef::InstResult {
+                inst: inst(4),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: block(1),
+                i: 0,
+            },
+            ValDef::BlockParam {
+                block: block(1),
+                i: 1,
+            },
+        ] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: 0,
+                        def,
+                        remat: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let operand = |pos, kind, constraint, v| Operand::new(pos, kind, constraint, Some(val(v)));
+        let reg = OperandConstraint::Reg(RegClass::try_new(0).unwrap());
+        let call = |b, args: &[usize]| BlockCall {
+            target: block(b),
+            args: args.iter().map(|&v| val(v)).collect(),
+        };
+        let nop = || InstData::Op {
+            operands: vec![],
+            clobbers: vec![],
+            side_effects: false,
+        };
+
+        func.insts = PrimaryMap::new();
+        for data in [
+            // block0
+            InstData::Op {
+                operands: vec![operand(
+                    Position::Late,
+                    DefUse::Use,
+                    OperandConstraint::Any,
+                    0,
+                )],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            InstData::Op {
+                operands: vec![operand(
+                    Position::Early,
+                    DefUse::Def,
+                    OperandConstraint::Any,
+                    1,
+                )],
+                clobbers: vec![],
+                side_effects: true,
+            },
+            nop(),
+            nop(),
+            InstData::Branch {
+                operands: vec![
+                    operand(Position::Late, DefUse::Def, OperandConstraint::Any, 2),
+                    operand(Position::Early, DefUse::Use, reg, 0),
+                ],
+                clobbers: vec![],
+                targets: vec![call(1, &[2, 1]), call(2, &[])],
+            },
+            // block1
+            InstData::Op {
+                operands: vec![
+                    operand(Position::Late, DefUse::Use, OperandConstraint::Stack, 0),
+                    operand(Position::Early, DefUse::Use, OperandConstraint::Stack, 3),
+                    operand(Position::Early, DefUse::Use, reg, 0),
+                ],
+                clobbers: vec![],
+                side_effects: false,
+            },
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: vec![call(1, &[4, 4]), call(0, &[2])],
+            },
+            // block2
+            InstData::Branch {
+                operands: vec![],
+                clobbers: vec![],
+                targets: vec![],
+            },
+        ] {
+            func.insts.push(&mut output, data).unwrap();
+        }
+
+        func.blocks = PrimaryMap::new();
+        for (params, insts) in [
+            (
+                vec![val(0)],
+                vec![inst(0), inst(1), inst(2), inst(3), inst(4)],
+            ),
+            (vec![val(3), val(4)], vec![inst(5), inst(6)]),
+            (vec![], vec![inst(7)]),
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params,
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut machine = TestMachine {
+            banks: vec![TestBank {
+                log2_size: 0,
+                regs: vec![1],
+                non_allocatable: 0,
+                groups: Vec::new(),
+                classes: vec![TestClass {
+                    members: TestClassMembers::Regs(vec![0]),
+                    spill_cost: 0,
+                }],
+            }],
+            regs_per_bank: Some(1),
+        };
+        machine.fixup();
+
+        let mut input = TestInput {
+            options: InputOptions {
+                dead_move_elimination_level: crate::MoveEliminationLevel::Local,
+                eliminate_dead_register_moves: false,
+                hoist_demanded_moves: false,
+                ..InputOptions::default()
+            },
+            machine,
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// Two predecessors each pass a spilled argument to one spilled block
     /// parameter.
     ///
@@ -10787,6 +11144,8 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::default(),
         TestInput::with_more_spill_slot_groups_than_a_u8_can_index(),
         TestInput::with_spilled_merge_param(),
+        TestInput::with_two_params_competing_for_a_slot(),
+        TestInput::with_a_param_torn_between_a_vote_and_its_class(),
         TestInput::with_a_value_reloaded_on_every_arm(2),
         TestInput::with_a_reload_demanded_where_a_parameter_arrives(),
         TestInput::with_use_constraints(&[OperandConstraint::Reg(class)]),
