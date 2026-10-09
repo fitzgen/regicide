@@ -2138,10 +2138,10 @@ where
         self.spans(live_ranges)
             .filter(|span| {
                 [HintPos::Start, HintPos::End].iter().any(|&end| {
-                    span.preference_at(live_ranges, end)
+                    !span
+                        .preference_at(live_ranges, end)
                         .union()
-                        .iter()
-                        .any(|reg| !unusable.contains(reg))
+                        .is_subset_of(unusable)
                 })
             })
             .count()
