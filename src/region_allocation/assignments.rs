@@ -433,6 +433,63 @@ where
         row..row + self.spans.len() + 1
     }
 
+    /// Fill `candidate`'s row from one unit, merging the unit's entries
+    /// against the bundle's spans in one pass.
+    ///
+    /// The entries and the spans both ascend, so this is
+    /// `O(spans + entries in range)` where a search per span is
+    /// `O(spans * log entries)`. Returns `false`, having written nothing,
+    /// when the unit cannot be filled this way.
+    fn fill_row_from_one_unit(
+        &mut self,
+        assignments: &Assignments<E>,
+        unit: RegUnit,
+        row: usize,
+    ) -> bool {
+        let n = self.spans.len();
+        let Some(last) = self.spans.keys().next_back() else {
+            return false;
+        };
+        let bundle_end = self.spans[last].range.end;
+
+        // A reservation is a job for the per-span path, which knows how to
+        // skip the spans between the first and last reserved one.
+        let reservations = assignments.reservations[unit].before(AssignmentKey::new(bundle_end));
+        if !reservations.is_empty() {
+            return false;
+        }
+
+        let entries = assignments.assignments[unit].before(AssignmentKey::new(bundle_end));
+        let mut e = 0;
+        for i in 0..n {
+            let range = self.spans[SplitSpan::new_unchecked(i)].range.clone();
+            let start = self.bundles.next_key_unwrap();
+
+            // Spans ascend, so an entry ending before this span's start
+            // cannot reach a later one either.
+            while e < entries.len() && entries[e].1.end <= range.start {
+                e += 1;
+            }
+            // All of these end after the span's start, so any that begins
+            // before its end overlaps it.
+            let mut j = e;
+            while j < entries.len() && entries[j].0.start < range.end {
+                debug_assert!(LivePoint::spans_overlap(
+                    range.start,
+                    range.end,
+                    entries[j].0.start,
+                    entries[j].1.end,
+                ));
+                self.bundles.push_unwrap(entries[j].1.bundle);
+                j += 1;
+            }
+
+            self.prefix.push((self.bundles.len() - start.index(), 0));
+        }
+        debug_assert_eq!(self.prefix.len(), row + n);
+        true
+    }
+
     /// Query `candidate`'s spans in `units` into a new row of `prefix`, and
     /// return where it starts.
     #[cold]
@@ -449,6 +506,17 @@ where
         // Everything this row pushes, truncates or reverses is at or after
         // here, and `run_starts` has nothing there yet.
         let row_bundles = self.bundles.next_key_unwrap();
+
+        // One unit with nothing reserved is filled in a single sweep.
+        let mut only = units.clone().flat_map(units_in);
+        if let (Some(unit), None) = (only.next(), only.next()) {
+            if self.fill_row_from_one_unit(assignments, unit, row) {
+                self.finish_row(row, row_bundles);
+                return row;
+            }
+            debug_assert_eq!(self.prefix.len(), row);
+            debug_assert_eq!(self.bundles.next_key_unwrap(), row_bundles);
+        }
 
         // Each entry first holds a span's count of conflicts and whether it is
         // reserved, and becomes running totals at the end.
@@ -488,7 +556,13 @@ where
                 .reverse();
         }
         debug_assert_eq!(self.prefix.len(), row + n);
+        self.finish_row(row, row_bundles);
+        row
+    }
 
+    /// Turn a freshly-filled row's per-span counts into the running totals
+    /// the readers want, and record where each new conflict's run starts.
+    fn finish_row(&mut self, row: usize, row_bundles: InterferenceStorageIndex) {
         let (mut start, mut reserved) = (self.bundles.len(), 0);
         for (len, _) in &self.prefix[row..] {
             start -= len;
@@ -523,7 +597,6 @@ where
                 .next_back()
                 .is_none_or(|last| self.run_starts[last].is_some())
         );
-        row
     }
 
     /// The same as `Assignments::interference_weight` for `half` in
