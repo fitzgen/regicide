@@ -939,17 +939,7 @@ where
         reg_units: impl Fn(Reg) -> Range<RegUnit>,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> Option<Reg> {
-        debug_assert!(spans.len() > 0);
-
-        for reg in candidates {
-            let units = iter::once(reg_units(reg));
-            if !self.conflicts(units.clone(), spans.clone()) {
-                self.insert_assignment(bundle, units, spans);
-                return Some(reg);
-            }
-        }
-
-        None
+        self.try_assign(bundle, candidates, |reg| iter::once(reg_units(reg)), spans)
     }
 
     /// Try to insert an assignment of `bundle` to one of the candidate register
@@ -969,13 +959,46 @@ where
     where
         GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
     {
+        self.try_assign(bundle, candidates, group_units, spans)
+    }
+
+    /// `try_assign_to_reg` and `try_assign_to_reg_group`, for candidates whose
+    /// units `candidate_units` gives.
+    fn try_assign<C, Units>(
+        &mut self,
+        bundle: LiveBundle<E>,
+        candidates: impl IntoIterator<Item = C>,
+        candidate_units: impl Fn(C) -> Units,
+        spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+    ) -> Option<C>
+    where
+        C: Copy,
+        Units: Iterator<Item = Range<RegUnit>> + Clone,
+    {
         debug_assert!(spans.len() > 0);
 
-        for group in candidates {
-            let units = group_units(group);
-            if !self.conflicts(units.clone(), spans.clone()) {
-                self.insert_assignment(bundle, units, spans);
-                return Some(group);
+        // Where the last candidate first ran into something. Neighboring
+        // candidates are usually blocked at the same busy point, so checking
+        // that span first usually rules a candidate out in one query, and the
+        // scan after it need not ask about it again.
+        let mut blocked_at: Option<QuerySpan<E>> = None;
+        for candidate in candidates {
+            let units = candidate_units(candidate);
+            if let Some(span) = &blocked_at
+                && self.conflicts(units.clone(), iter::once(span.clone()))
+            {
+                continue;
+            }
+            let conflict = spans.clone().find(|span| {
+                Some(span) != blocked_at.as_ref()
+                    && self.conflicts(units.clone(), iter::once(span.clone()))
+            });
+            match conflict {
+                Some(span) => blocked_at = Some(span),
+                None => {
+                    self.insert_assignment(bundle, units, spans);
+                    return Some(candidate);
+                }
             }
         }
 
