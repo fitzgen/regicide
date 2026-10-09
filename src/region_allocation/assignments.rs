@@ -473,18 +473,19 @@ where
                     break;
                 }
             }
-            // That walk went backwards; put it in span order. Each span's own
-            // conflicts may stay reversed.
-            self.prefix[tail..].reverse();
+            // That walk went backwards; put it in span order, after the skipped
+            // spans. Each span's own conflicts may stay reversed.
+            let walked = self.prefix.len() - tail;
+            let skipped = row + n - self.prefix.len();
+            self.prefix.resize(row + n, (0, 1));
+            self.prefix[tail..].rotate_left(walked);
+            self.prefix[tail + skipped..].reverse();
             self.bundles
                 .slice_mut(EntityRange {
                     start: back,
                     end: self.bundles.next_key_unwrap(),
                 })
                 .reverse();
-            let skipped = row + n - self.prefix.len();
-            self.prefix
-                .splice(tail..tail, iter::repeat_n((0, 1), skipped));
         }
         debug_assert_eq!(self.prefix.len(), row + n);
 
@@ -1891,6 +1892,9 @@ mod tests {
             vec![s(0, 1), s(7, 8)],
             vec![s(1, 2), s(3, 5), s(6, 8)],
             vec![s(0, 4), s(4, 8)],
+            // Enough spans that a reservation in the middle leaves several on
+            // each side, which `fill_row` walks from both ends.
+            vec![s(0, 1), s(2, 3), s(3, 4), s(5, 6), s(7, 8)],
         ]
     }
 
