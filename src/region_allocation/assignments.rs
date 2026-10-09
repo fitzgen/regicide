@@ -783,40 +783,84 @@ where
     /// writing the evicted bundles into.
     pub(crate) fn sole_conflicting_bundle(
         &self,
-        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        reg_units: impl Iterator<Item = Range<RegUnit>> + Clone,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) -> Option<LiveBundle<E>> {
-        self.sole_conflicting_bundle_with(reg_units, spans, |_| Some(()))
+        self.sole_conflicting_bundle_with(reg_units, spans, &mut None, |_| Some(()))
             .map(|(bundle, ())| bundle)
     }
 
     /// Like `sole_conflicting_bundle`, but `accept` sees the first bundle as
     /// soon as it is found, and may reject it by returning `None`, which stops
-    /// the search early.
+    /// the search early. When a reservation is what rules the candidate out,
+    /// `reserved_at` is set to the span it is over.
+    ///
+    /// Spans are asked about one at a time, so that a reservation can be pinned
+    /// to its span. The answer does not depend on that: two distinct bundles or
+    /// any reservation rule the candidate out, and `accept` sees the same sole
+    /// bundle either way.
     fn sole_conflicting_bundle_with<T>(
         &self,
-        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        reg_units: impl Iterator<Item = Range<RegUnit>> + Clone,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        reserved_at: &mut Option<QuerySpan<E>>,
         mut accept: impl FnMut(LiveBundle<E>) -> Option<T>,
     ) -> Option<(LiveBundle<E>, T)> {
-        let mut sole = None;
-        let rejected = self.for_each_overlapping(reg_units, spans, |existing| {
-            let Conflict::Assignment(existing) = existing else {
-                return ControlFlow::Break(());
-            };
-            match &sole {
-                Some((bundle, _)) if *bundle == existing.bundle => ControlFlow::Continue(()),
-                Some(_) => ControlFlow::Break(()),
-                None => match accept(existing.bundle) {
-                    Some(accepted) => {
-                        sole = Some((existing.bundle, accepted));
-                        ControlFlow::Continue(())
+        let mut sole: Option<(LiveBundle<E>, T)> = None;
+        for span in spans {
+            // `Some(true)` when a reservation rules the candidate out, and
+            // `Some(false)` for anything else that does.
+            let rejected = self.for_each_overlapping(
+                reg_units.clone(),
+                iter::once(span.clone()),
+                |existing| {
+                    let Conflict::Assignment(existing) = existing else {
+                        return ControlFlow::Break(true);
+                    };
+                    match &sole {
+                        Some((bundle, _)) if *bundle == existing.bundle => {
+                            ControlFlow::Continue(())
+                        }
+                        Some(_) => ControlFlow::Break(false),
+                        None => match accept(existing.bundle) {
+                            Some(accepted) => {
+                                sole = Some((existing.bundle, accepted));
+                                ControlFlow::Continue(())
+                            }
+                            None => ControlFlow::Break(false),
+                        },
                     }
-                    None => ControlFlow::Break(()),
                 },
+            );
+            match rejected {
+                None => {}
+                Some(by_reservation) => {
+                    if by_reservation {
+                        *reserved_at = Some(span);
+                    }
+                    return None;
+                }
             }
-        });
-        if rejected.is_some() { None } else { sole }
+        }
+        sole
+    }
+
+    /// Does a reservation that `span` may not share hold one of `reg_units`
+    /// over it?
+    fn reserved(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        span: &QuerySpan<E>,
+    ) -> bool {
+        self.for_each_overlapping(
+            reg_units,
+            iter::once(span.clone()),
+            |existing| match existing {
+                Conflict::Reservation(_) => ControlFlow::Break(()),
+                Conflict::Assignment(_) => ControlFlow::Continue(()),
+            },
+        )
+        .is_some()
     }
 
     /// Call `f` with everything already occupying any of `reg_units` over
@@ -1034,9 +1078,22 @@ where
         // caller's ordering of `candidates` decides.
         let mut best_cost = max_cost;
 
+        // Where a reservation last ruled a candidate out. Neighboring candidates
+        // are usually held for the same fixed operand, so checking that span
+        // first usually rules a candidate out in one query.
+        let mut reserved_at = None;
+
         for candidate in candidates {
             let units = candidate_units(candidate);
             debug_assert!(self.conflicts(units.clone(), spans.clone()));
+
+            // A reservation cannot be evicted, so one anywhere rules the
+            // candidate out whatever else is in its way.
+            if let Some(span) = &reserved_at
+                && self.reserved(units.clone(), span)
+            {
+                continue;
+            }
 
             // Evicting a candidate bundle must make this bundle assignable (not
             // conflict), or else the bundle is not a valid eviction candidate.
@@ -1044,12 +1101,15 @@ where
             // The first bundle in the way is the only one this candidate could
             // evict, so price it at once and give up on the candidate as soon as
             // it cannot win, without looking for others.
-            let Some((other_bundle, cost)) =
-                self.sole_conflicting_bundle_with(units, spans.clone(), |victim| {
+            let Some((other_bundle, cost)) = self.sole_conflicting_bundle_with(
+                units,
+                spans.clone(),
+                &mut reserved_at,
+                |victim| {
                     let cost = eviction_cost(victim, candidate);
                     (cost < best_cost).then_some(cost)
-                })
-            else {
+                },
+            ) else {
                 continue;
             };
 
