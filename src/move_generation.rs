@@ -462,6 +462,9 @@ where
     /// Scratch for the pass's walk over every value's spans.
     spans: Vec<LiveSpan<E>>,
 
+    /// Scratch for sorting `spans`: each span beside its sort key.
+    keyed_spans: Vec<(u128, LiveSpan<E>)>,
+
     /// Scratch, live only while visiting one block, sorted by the instruction
     /// and value each entry answers for.
     reservation_in_outs: Vec<ReservationInOut<E>>,
@@ -546,6 +549,7 @@ where
             edges: PrimaryMap::new(),
             param_of: SecondaryMap::new(None),
             spans: Vec::new(),
+            keyed_spans: Vec::new(),
             reservation_in_outs: Vec::new(),
             batch_moves: Vec::new(),
             expanded: Vec::new(),
@@ -569,6 +573,7 @@ where
             edges,
             param_of,
             spans,
+            keyed_spans,
             reservation_in_outs,
             batch_moves,
             expanded,
@@ -588,6 +593,7 @@ where
         edges.reset();
         param_of.reset();
         spans.clear();
+        keyed_spans.clear();
         reservation_in_outs.clear();
         batch_moves.clear();
         expanded.clear();
@@ -610,6 +616,7 @@ where
             edges,
             param_of,
             spans,
+            keyed_spans,
             reservation_in_outs,
             batch_moves,
             expanded,
@@ -629,6 +636,7 @@ where
             && edges.is_reset()
             && param_of.is_reset()
             && spans.is_empty()
+            && keyed_spans.is_empty()
             && reservation_in_outs.is_empty()
             && batch_moves.is_empty()
             && expanded.is_empty()
@@ -918,14 +926,22 @@ where
         let mut spans = core::mem::take(&mut self.spans);
         debug_assert!(spans.is_empty());
 
-        spans.extend(live_ranges.spans());
-        spans.sort_unstable_by_key(|&span| {
-            (
-                span.val(live_ranges),
-                span.start(live_ranges),
-                span.end(live_ranges),
-            )
-        });
+        // Sort keys packed beside each span, so the sort compares integers
+        // rather than chasing each span's data on every comparison. The span
+        // itself comes last, which makes every key distinct and breaks ties
+        // between spans of one value over one range by span order.
+        let mut keyed = core::mem::take(&mut self.keyed_spans);
+        keyed.extend(live_ranges.spans().map(|span| {
+            let key = (span.val(live_ranges).index() as u128) << 96
+                | (span.start(live_ranges).to_bits() as u128) << 64
+                | (span.end(live_ranges).to_bits() as u128) << 32
+                | span.index() as u128;
+            (key, span)
+        }));
+        keyed.sort_unstable_by_key(|&(key, _)| key);
+        spans.extend(keyed.iter().map(|&(_, span)| span));
+        keyed.clear();
+        self.keyed_spans = keyed;
 
         let result = (|| -> IResult<()> {
             for value_spans in spans.chunk_by(|a, b| a.val(live_ranges) == b.val(live_ranges)) {
