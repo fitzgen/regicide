@@ -207,30 +207,7 @@ where
         EdgeEdit::Move(Move::RegReg { .. }) | EdgeEdit::Remat(_) => 1.0,
         EdgeEdit::Move(Move::Spill { .. }) | EdgeEdit::Move(Move::Reload { .. }) => 5.0,
     };
-    base * block_weight(input, region_tree, block)
-}
-
-/// How much one execution of `block` weighs: ten times per enclosing loop,
-/// times `BlockFrequency::estimate_weight`.
-fn block_weight<E>(
-    input: &Input<'_, impl InputFunction>,
-    region_tree: &RegionTree<E>,
-    block: Block<E>,
-) -> f64
-where
-    E: EntityRepr,
-{
-    const LOOP_WEIGHT: f64 = 10.0;
-
-    let mut weight = input
-        .func
-        .block(block.with_repr32())
-        .frequency()
-        .estimate_weight();
-    for _ in 0..block.region(region_tree).loop_depth(region_tree) {
-        weight *= LOOP_WEIGHT;
-    }
-    weight
+    base * block.weight(input, region_tree)
 }
 
 /// The move from `from` to `to`, or `None` when no single move can make it:
@@ -1222,7 +1199,7 @@ mod tests {
         result
     }
 
-    /// `block_weight`, read through the public results, as the `run`
+    /// `Block::weight`, read through the public results, as the `run`
     /// example's estimated cycles read it.
     fn estimate_weight(
         input: &Input<'_, impl InputFunction>,
@@ -1251,22 +1228,16 @@ mod tests {
                 crate::run_dispatch(&mut context, input).unwrap();
                 let weight = match context.which.unwrap() {
                     #[cfg(feature = "entity-repr-8")]
-                    WhichContext::Context8 => block_weight(
-                        input,
-                        &context.context8.region_tree,
-                        Block::try_new(0).unwrap(),
-                    ),
+                    WhichContext::Context8 => Block::try_new(0)
+                        .unwrap()
+                        .weight(input, &context.context8.region_tree),
                     #[cfg(feature = "entity-repr-16")]
-                    WhichContext::Context16 => block_weight(
-                        input,
-                        &context.context16.region_tree,
-                        Block::try_new(0).unwrap(),
-                    ),
-                    WhichContext::Context32 => block_weight(
-                        input,
-                        &context.context32.region_tree,
-                        Block::try_new(0).unwrap(),
-                    ),
+                    WhichContext::Context16 => Block::try_new(0)
+                        .unwrap()
+                        .weight(input, &context.context16.region_tree),
+                    WhichContext::Context32 => Block::try_new(0)
+                        .unwrap()
+                        .weight(input, &context.context32.region_tree),
                 };
                 assert!((weight - want).abs() < 1e-6, "{frequency:?}: {weight}");
             });

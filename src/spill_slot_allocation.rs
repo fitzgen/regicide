@@ -84,7 +84,7 @@ use crate::{
     timing::Timing,
 };
 use alloc::vec::Vec;
-use slot_classes::{SlotClasses, block_weight};
+use slot_classes::SlotClasses;
 
 mod slot_classes;
 
@@ -966,7 +966,7 @@ where
                     1 => output.with_repr::<E, _>(pred)?,
                     _ => block,
                 };
-                let weight = block_weight(input, region_tree, holder);
+                let weight = holder.weight(input, region_tree);
                 match votes.iter_mut().find(|(s, _)| *s == slot) {
                     Some((_, w)) => *w += weight,
                     None => votes.push((slot, weight)),

@@ -28,7 +28,7 @@ use crate::entity::{
     RegionChildrenStorageIndex, SecondaryMap,
 };
 use crate::error::IResult;
-use crate::input::InputFunction;
+use crate::input::{Input, InputFunction};
 use crate::output::OutputInner;
 use crate::timing::Timing;
 use crate::union_find::UnionFind;
@@ -689,6 +689,51 @@ where
     /// blocks are at depth zero.
     pub(crate) fn loop_depth(self, region_tree: &RegionTree<E>) -> u32 {
         self.region(region_tree).loop_depth(region_tree)
+    }
+
+    /// How much one execution of this block weighs, as the estimated cycles
+    /// count it: ten times per enclosing loop, times
+    /// `BlockFrequency::estimate_weight`.
+    ///
+    /// The frequency weight saturates at `COLD` and `HOT`, so blocks the
+    /// embedder tells apart beyond those can weigh the same; `Block::runs_more`
+    /// breaks such ties.
+    pub(crate) fn weight(
+        self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+    ) -> f64 {
+        const LOOP_WEIGHT: f64 = 10.0;
+
+        let mut weight = self.frequency(input.func).estimate_weight();
+        for _ in 0..self.loop_depth(region_tree) {
+            weight *= LOOP_WEIGHT;
+        }
+        weight
+    }
+
+    /// Does this block run more often than `other`: does it weigh more, or as
+    /// much at a higher frequency?
+    pub(crate) fn runs_more(
+        self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+        other: Block<E>,
+    ) -> bool {
+        self.runs_cmp(input, region_tree, other).is_gt()
+    }
+
+    /// Order this block and `other` by how often they run, as `runs_more`
+    /// does.
+    pub(crate) fn runs_cmp(
+        self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+        other: Block<E>,
+    ) -> core::cmp::Ordering {
+        self.weight(input, region_tree)
+            .total_cmp(&other.weight(input, region_tree))
+            .then(self.frequency(input.func).cmp(&other.frequency(input.func)))
     }
 }
 

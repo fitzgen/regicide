@@ -9261,6 +9261,206 @@ impl TestInput {
         input
     }
 
+    /// A loop that defines a value and reads it in a register every iteration,
+    /// and an exit that reads it off the stack.
+    ///
+    /// `block1` heads the loop, defines the value and reads it in a register,
+    /// then branches to the exit `block2` or the latch `block3`. Every block is
+    /// equally frequent, so only the loop says the exit runs less often than
+    /// `block1`.
+    pub fn with_a_value_read_on_the_stack_after_a_loop_exit() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(1).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+        let ret = || InstData::Op {
+            operands: vec![],
+            clobbers: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0
+            branch(&[1]),
+            // block1, the loop header: define the value and read it in a
+            // register, then exit or go on.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any),
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            branch(&[2, 3]),
+            // block2, the exit: read the value off the stack.
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+            ret(),
+            // block3, the latch.
+            branch(&[1]),
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0)],
+            vec![inst(1), inst(2), inst(3)],
+            vec![inst(4), inst(5)],
+            vec![inst(6)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
+    /// A value defined before a loop, read in a register inside it, and read
+    /// off the stack after the loop exits.
+    ///
+    /// `block0` defines the value and reads it in a register; `block1` heads
+    /// the loop and reads it in a register too, then branches to the exit
+    /// `block2` or the latch `block3`. The exit runs as often as `block0`, so
+    /// the store belongs in `block0` rather than on the exit edge: both run
+    /// once per call, and `block0` dominates every later read.
+    pub fn with_a_value_from_before_a_loop_read_on_the_stack_after_it() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(usize::from(TestMachine::BOTH_REGS_CLASS)).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(0).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+        let ret = || InstData::Op {
+            operands: vec![],
+            clobbers: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: define the value and read it in a register.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any),
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            branch(&[1]),
+            // block1, the loop header: read the value in a register, which
+            // makes this block a legal spill placement, then exit or go on.
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            branch(&[2, 3]),
+            // block2, the exit: read the value off the stack.
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+            ret(),
+            // block3, the latch.
+            branch(&[1]),
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0), inst(1), inst(2)],
+            vec![inst(3), inst(4)],
+            vec![inst(5), inst(6)],
+            vec![inst(7)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A loop nest: `block0` defines a value outside both loops, `block1`
     /// heads the outer loop and defines a second value, and `block2 <-> block3`
     /// is the inner loop, which reads both values off the stack.
@@ -11201,6 +11401,8 @@ pub fn corpus() -> Vec<TestInput> {
         TestInput::with_a_critical_edge(),
         // A value carried around a loop and read only past it.
         TestInput::with_a_looping_value_read_only_after_the_loop(),
+        TestInput::with_a_value_read_on_the_stack_after_a_loop_exit(),
+        TestInput::with_a_value_from_before_a_loop_read_on_the_stack_after_it(),
         // A register-to-register move a later block overwrites: the corpus's
         // one dead register-to-register move.
         TestInput::with_a_register_move_overwritten_in_a_later_block(),

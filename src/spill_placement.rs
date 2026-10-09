@@ -44,7 +44,10 @@
 //! runs more often, since that would run the store more often than the reload
 //! it serves, unless the block is inside a loop the definition is outside of.
 //! The store goes on the edge from that predecessor instead, at the block's
-//! entry, reading the register the value leaves the predecessor in.
+//! entry, reading the register the value leaves the predecessor in. How often
+//! a block runs is `Block::weight`, the embedder's estimate ten times over per
+//! enclosing loop, so a loop exit is such an edge unless the embedder rates the
+//! exit at least ten times hotter per loop level.
 //!
 //! A union-find over blocks records the site each walked block resolved to, so
 //! a later walk short-cuts upon reaching an earlier walk's trail and we
@@ -526,7 +529,7 @@ where
         }
         // Stable, so equally frequent blocks keep program order.
         self.stack_blocks
-            .sort_by_key(|b| core::cmp::Reverse(b.frequency(input.func)));
+            .sort_by(|&a, &b| b.runs_cmp(input, region_tree, a));
         let mut stack_blocks = core::mem::take(&mut self.stack_blocks);
         for block in stack_blocks.drain(..) {
             self.place_one_spill(input, region_tree, def_block, def_region, block);
@@ -748,21 +751,27 @@ where
             // edge from it can hold the store, unless this block is in a loop
             // the definition is outside of: then the walk is headed out of that
             // loop, somewhere that runs less often. And not when the store
-            // above would serve another site's spans too: then the edge adds a
-            // store rather than moving one somewhere cheaper.
+            // above runs no more often than the edge, or would serve another
+            // site's spans too: then the edge adds a store rather than moving
+            // one somewhere cheaper.
+            //
+            // The store above is the first legal block in the definition's
+            // region, not wherever a later edge on the way would put it: an
+            // edge between here and there is only cheaper than this one if it
+            // runs less often, and this edge already runs less often than its
+            // predecessor.
             if region_tree.encloses(
                 spill_block.region(region_tree).loop_region(region_tree),
                 def_region,
-            ) && self.is_edge_spill_block(input, spill_block)
-                && !self.store_above_covers_another_site(
-                    input,
-                    region_tree,
-                    def_block,
-                    def_region,
-                    spill_block,
-                )
+            ) && self.is_edge_spill_block(input, region_tree, spill_block)
             {
-                return spill_block;
+                let above =
+                    self.store_above(input, region_tree, def_block, def_region, spill_block);
+                if above.runs_more(input, region_tree, spill_block)
+                    && !self.covers_another_site(input, above)
+                {
+                    return spill_block;
+                }
             }
 
             let parent = idom(input, spill_block).expect(
@@ -775,30 +784,34 @@ where
         }
     }
 
-    /// Would the store that serves `stack_block` without an edge store also
-    /// dominate a site that another span already got?
+    /// The block that would hold the store serving `stack_block` without an
+    /// edge store.
     ///
     /// Walks like `first_legal_placement_up_dom_tree`, but leaves the
     /// union-find alone.
-    fn store_above_covers_another_site(
+    fn store_above(
         &self,
         input: &Input<'_, impl InputFunction>,
         region_tree: &RegionTree<E>,
         def_block: Block<E>,
         def_region: Region<E>,
         stack_block: Block<E>,
-    ) -> bool {
+    ) -> Block<E> {
         let mut block = stack_block;
-        let above = loop {
+        loop {
             block = self.union_find.find_without_path_compression(block);
             if self.is_spill_site.contains(block)
                 || (self.is_legal_spill_block(block, def_block)
                     && block.region(region_tree).loop_region(region_tree) == def_region)
             {
-                break block;
+                return block;
             }
             block = idom(input, block).expect("the walk stops at the defining block");
-        };
+        }
+    }
+
+    /// Would a store in `above` dominate a site that another span already got?
+    fn covers_another_site(&self, input: &Input<'_, impl InputFunction>, above: Block<E>) -> bool {
         let above = input.func.block(above.with_repr32());
         self.spill_site_blocks
             .iter()
@@ -858,14 +871,21 @@ where
     /// runs more often, rather than in that predecessor?
     ///
     /// The edge's moves run at `block`'s entry, which requires that it be
-    /// the predecessor's only way in.
-    fn is_edge_spill_block(&self, input: &Input<'_, impl InputFunction>, block: Block<E>) -> bool {
+    /// the predecessor's only way in. A predecessor in a loop `block` leaves
+    /// runs more often too, unless the embedder rates `block` at least ten
+    /// times hotter per loop level.
+    fn is_edge_spill_block(
+        &self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+        block: Block<E>,
+    ) -> bool {
         let input_block = input.func.block(block.with_repr32());
         let Some(pred) = idom(input, block) else {
             return false;
         };
         input_block.len_predecessors() == 1
-            && block.frequency(input.func) < pred.frequency(input.func)
+            && pred.runs_more(input, region_tree, block)
             && self.live_out[pred].is_some()
     }
 
@@ -1237,7 +1257,7 @@ mod tests {
                     let on_edge = source_block != site.block();
                     if on_edge {
                         let succ = func.block(site.block());
-                        if succ.frequency() >= func.block(source_block).frequency()
+                        if !source_block.runs_more(input, region_tree, site.block())
                             || succ.len_predecessors() != 1
                             || succ.predecessors().next() != Some(source_block)
                             || site.span().end(live_ranges) != end_of(source_block)
@@ -1441,6 +1461,9 @@ mod tests {
             (F::HOT, F::NORMAL),
             (F::new(10.0), F::new(0.5)),
             (F::NORMAL, F::NORMAL),
+            // Both beyond where the estimate's weight saturates.
+            (F::new(10_000.0), F::HOT),
+            (F::COLD, F::new(0.0)),
         ] {
             let mut test_input = TestInput::with_a_value_read_on_the_stack_on_a_cold_arm();
             test_input.set_block_frequency(pred, pred_freq);
@@ -1477,6 +1500,66 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A store for a read after a loop exit goes on the exit edge, not in the
+    /// loop that defines the value, even when the embedder rates every block
+    /// the same.
+    #[test]
+    fn a_spill_for_a_read_after_a_loop_exit_stays_on_the_exit_edge() {
+        let test_input = TestInput::with_a_value_read_on_the_stack_after_a_loop_exit();
+        let context = place(&test_input).unwrap().unwrap();
+        let header = Block::<u32>::try_new(1).unwrap();
+        let exit = Block::<u32>::try_new(2).unwrap();
+
+        test_input.with_input(|input| {
+            let ctx = &context.context32;
+            let val = Val::<u32>::try_new(0).unwrap();
+            assert!(ctx.region_allocation.spilled().contains(val));
+
+            let sites = ctx.spill_placement.spills();
+            assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
+            assert_eq!(sites[0].block(), exit, "the store belongs on the exit edge");
+            assert_eq!(
+                sites[0].span().block(input.func, &ctx.live_ranges),
+                header,
+                "the store reads the register the value leaves the loop in",
+            );
+        });
+    }
+
+    /// A store for a read after a loop exit does not go on the exit edge when
+    /// the block above the loop, where the walk would otherwise put it, runs no
+    /// more often than the exit.
+    #[test]
+    fn a_spill_climbs_past_an_exit_edge_no_cheaper_than_the_store_above() {
+        let test_input = TestInput::with_a_value_from_before_a_loop_read_on_the_stack_after_it();
+        let context = place(&test_input).unwrap().unwrap();
+        let def_block = Block::<u32>::try_new(0).unwrap();
+        let header = Block::<u32>::try_new(1).unwrap();
+        let exit = Block::<u32>::try_new(2).unwrap();
+
+        test_input.with_input(|input| {
+            let ctx = &context.context32;
+            let region_tree = &ctx.region_tree;
+            let val = Val::<u32>::try_new(0).unwrap();
+            assert!(ctx.region_allocation.spilled().contains(val));
+
+            // The premise: the exit's sole predecessor is in the loop and runs
+            // more often, so the exit would hold an edge store, and the block
+            // above runs exactly as often as the exit.
+            assert!(header.runs_more(input, region_tree, exit));
+            assert!(!def_block.runs_more(input, region_tree, exit));
+            assert!(!exit.runs_more(input, region_tree, def_block));
+
+            let sites = ctx.spill_placement.spills();
+            assert_eq!(sites.len(), 1, "expected a single spill, got {sites:?}");
+            assert_eq!(
+                sites[0].block(),
+                def_block,
+                "the store stays in the defining block"
+            );
+        });
     }
 
     /// A spilled block parameter is spilled inside its own block, so the spill

@@ -10,7 +10,7 @@
 //! free.
 
 use crate::{
-    Block, Entity as _, Val,
+    Entity as _, Val,
     entity::{EntityRange, EntityRepr, EntitySet, PrimaryMap, SecondaryMap},
     error::{IResult, InternalError},
     input::{Input, InputBlock as _, InputFunction},
@@ -235,7 +235,7 @@ where
                         1 => block,
                         _ => succ,
                     };
-                    let weight = block_weight(input, region_tree, holder);
+                    let weight = holder.weight(input, region_tree);
                     self.affinities.push((weight, arg, param));
                     self.affine.insert(arg);
                     self.affine.insert(param);
@@ -472,24 +472,4 @@ where
     pub fn class_of(&self, val: Val<E>) -> Val<E> {
         self.sets.find_without_path_compression(val)
     }
-}
-
-/// How often `block` runs relative to the function's entry: 10x per enclosing
-/// loop, and a twentieth for a cold block.
-pub(super) fn block_weight<E>(
-    input: &Input<'_, impl InputFunction>,
-    region_tree: &RegionTree<E>,
-    block: Block<E>,
-) -> f64
-where
-    E: EntityRepr,
-{
-    let mut weight = 1.0;
-    for _ in 0..block.loop_depth(region_tree) {
-        weight *= 10.0;
-    }
-    if block.frequency(input.func).is_cold() {
-        weight *= 0.05;
-    }
-    weight
 }
