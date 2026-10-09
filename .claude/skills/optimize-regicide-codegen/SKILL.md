@@ -82,6 +82,14 @@ Things to know about it:
   every corpus (code-quality-003) moved no corpus total by more than 0.5%.
   When the change is about slow paths, report `diff_counts.py`'s `cold moves Δ`
   column next to the estimate.
+- **It charges every block at its own weight, as if each ran that often.** So
+  merging edits that sibling paths each make (one copy per predecessor of a
+  join, sunk into the join; or the mirror, hoisted out of a branch's arms)
+  looks like a win although each path still runs exactly one copy. Before
+  trusting a saving from moving edits between siblings, ask whether the
+  dynamic count on any one path changes. If not, it saves code size, not
+  cycles, and is out of scope (code-quality-009's
+  `unsuccessful/sink-common-pred-moves.md`).
 
 ## Invariants
 
@@ -200,8 +208,11 @@ write, and the commit sha every measurement was taken at.
 
    ```bash
    python3 $S/counts.py -b $R/bins/run-$sha -o $R/counts/$sha.tsv \
-       $A/corpus-* <cited earlier corpora> 2> $R/misc/counts-$sha.log
+       $A/corpus-*/ <cited earlier corpora> 2> $R/misc/counts-$sha.log
    ```
+
+   Keep the trailing `/`: analysis 006 has `corpus-*.stderr` files beside its
+   corpus directories, and `$A/corpus-*` feeds them in as `failed` inputs.
 
    Run it in the background and do "From analysis to backlog" meanwhile.
    **Another worktree may already have this TSV** (`git worktree list`, then
@@ -277,6 +288,9 @@ cargo run --release --example visualize -- \
     --input $A/corpus-X/<target>.postcard $R/logs/<target>-$sha.html
 ```
 
+- **Weighted, not counted.** A printout's plain edit counts mislead: one
+  depth-4 reload outweighs 10,000 at depth 0. `$S/edit_costs.py` (with a
+  `BLOCK_COSTS=1` dump, see step 6 of "The loop") weighs them.
 - **Find the hot block in the printout** with `$S/loops.py`. It finds the
   back edges and natural loops in a `run` printout and lists each loop's
   blocks with their edit tallies, innermost first. Hot means inside the
@@ -327,10 +341,36 @@ cargo run --release --example visualize -- \
   test (e.g. `false && ...`). 001's first test input passed at base, because
   the allocator never hit the case it was built for.
 - **Measure the signature with a scratch probe** when no event says it
-  directly: `git archive HEAD | tar -x -C /tmp/probe`, add `trace!("PROBE
-  ...")` lines where the decision is made, build there, and tally with
-  `awk`. Never probe in the worktree. Save the probe as a patch in
-  `$R/misc/` so the numbers in `todo/` can be reproduced.
+  directly: `$S/scratch.sh /tmp/probe [REV]` makes a buildable copy (a bare
+  `git archive` of `src` and `examples` does not build; see the script), add
+  `trace!("PROBE ...")` lines where the decision is made, build there, and
+  tally with `awk` or a short Python script. Never probe in the worktree.
+  Save the probe as a patch and any tally scripts in `$R/misc/` so the
+  numbers in `todo/` can be reproduced.
+  - Save the raw stderr and pull the probe lines out with `grep -a PROBE`.
+    Log lines carry a timestamp prefix, so `^PROBE` matches nothing. In
+    code-quality-009 a macOS `sed` over the raw log silently lost 3,300 of
+    3,533 probe lines on countMatches, where `grep -a` found them all: check
+    the probe-line count before reading an absence as a finding.
+  - Events name spans and bundles, not values. To follow one value through
+    region allocation, log the bundle's values, blocks and preference at
+    each `set_reg_allocation` (code-quality-009's `probe_bundle` in
+    `unsuccessful/sibling-reg.md`).
+  - **Classify by who caused it, not by the symptom.** In code-quality-009,
+    "class member found its slot taken" looked like code-quality-002's
+    loner problem. Splitting it by *who* held the slot showed 231k of 296k
+    weight was another parameter of the same join, colored a moment before
+    (`misc/cascade_share.py` there). That split pointed at the fix.
+- **Size a remaining cost before choosing the next attempt.** After a kept
+  change, `$S/edit_costs.py` on the heaviest inputs shows edit cost by kind
+  and loop depth, what deep-loop register moves are for (call arguments,
+  parameter registers at jumps, ...), and how much of the reload cost sits
+  on latches. It took minutes to rule ideas in or out in code-quality-009.
+- **Probe before porting a fix to a sibling code path.** After
+  code-quality-009 made edge stores weigh loop depth, the push-up step in
+  spill placement still compared frequency only. A probe found it never
+  climbs into a deeper block on the 40 heaviest inputs, so changing it
+  would be a no-op.
 
 ## 4. The loop: one attempt
 
@@ -343,18 +383,36 @@ For each candidate, highest-ranked first:
 
    ```bash
    cargo build --release --example run
+   T='(tinygo-regex-0107-u0-99|sqlite3-0226-u0-181|...)'   # targets, guards, canaries
    python3 $S/counts.py -b target/release/examples/run \
-       -o /tmp/screen.tsv --only '<target regex>' <corpora>
-   python3 $S/diff_counts.py <(grep -E '^corpus|<target regex>' $R/counts/$base.tsv) \
-       /tmp/screen.tsv --targets $R/targets.tsv
+       -o /tmp/screen.tsv --only "$T\.postcard\$" <corpora>
+   awk -F'\t' -v t="^$T\$" 'NR==1 || $2 ~ t' $R/counts/$base.tsv > /tmp/screen-base.tsv
+   python3 $S/diff_counts.py /tmp/screen-base.tsv /tmp/screen.tsv --targets $R/targets.tsv
    ```
 
-   Read the targets table and ignore the gate: guards are not in the
-   screen, so it fails on them by design. If the targets do not move, or
-   move the wrong way, rethink before going further. Iterating here is
-   cheap.
-4. **Commit** as `WIP: <one line on what it does>` (see "Git"), build, and
-   copy to `$R/bins/run-<sha>`.
+   `--only` searches the input's **path**, which ends in `.postcard`, so the
+   `$`-anchored names from `targets.tsv` match nothing there; anchor on
+   `\.postcard$` instead. The baseline filter matches the TSV's `name`
+   column, which has no suffix. Put the guards and the known canaries in
+   `T` too: then the screen's gate means something, and a guard that moves
+   shows up before the full run. Save the three commands as
+   `$R/misc/screen.sh BASE` and rerun it for every variant.
+
+   If the targets do not move, or move the wrong way, rethink before going
+   further. Iterating here is cheap.
+
+   **Screen variants of one idea against each other** before committing to
+   one. In code-quality-009 the first variant of the kept attempt 1 cost the
+   VDBE guard +445; reading the one guard block that regressed showed the
+   weighting was wrong, and the fourth variant cost nothing. Record each
+   variant's numbers in the attempt's write-up and its patch in
+   `$R/patches/`.
+4. **Commit** as `WIP: <one line on what it does>`, with a body that sums
+   up the attempt's codegen effect (see "Git"), build, and copy to
+   `$R/bins/run-<sha>`. If a later variant of the same idea replaces it
+   before the decision, `git commit --amend` it: one idea, one commit.
+   Remeasure after amending; reuse a TSV only after `cmp`-ing the
+   allocation on the targets, since the binary always differs.
 5. **Full counts** over every corpus (`counts.py`, as in Setup, into
    `$R/counts/<sha>.tsv`), and diff against the last kept commit:
 
@@ -381,8 +439,7 @@ For each candidate, highest-ranked first:
 
    ```bash
    for rev in $base $sha; do
-       rm -rf /tmp/bc-$rev && mkdir /tmp/bc-$rev
-       git archive $rev | tar -x -C /tmp/bc-$rev
+       $S/scratch.sh /tmp/bc-$rev $rev
        patch -p1 -d /tmp/bc-$rev < $S/block-costs.patch
        cargo build --release --example run --manifest-path /tmp/bc-$rev/Cargo.toml
        BLOCK_COSTS=1 /tmp/bc-$rev/target/release/examples/run -q <input> \
@@ -392,7 +449,15 @@ For each candidate, highest-ranked first:
    ```
 
    It sums the delta by loop depth and lists the blocks that moved most, so
-   the hunks to read, and quote, are the top few of each list.
+   the hunks to read, and quote, are the top few of each list. Keep the
+   `/tmp/bc-<sha>` builds for the session: every later attempt needs the
+   last kept commit's dump, and `edit_costs.py` reads the same dumps.
+
+   **A small guard regression is a lead, not noise.** Read it the same way:
+   rank its blocks, then find the decision. In code-quality-009 a +50 on the
+   VDBE guard (0.003%) was the *unmatched* parameters' free-list order
+   changing because matched ones were assigned in a different order. The
+   fix kept the gain and made the guard exactly flat.
 
    **When a regression is concentrated, bisect it by firing count.** In a
    scratch build, let the new rule fire only for its first `N` occurrences
@@ -439,6 +504,11 @@ An attempt whose screen already fails (targets flat or worse, or a
 screened corpus well past tolerance) may be dropped **at the screen**,
 without full counts, tests or fuzzing. Say so in its write-up, and say which
 of steps 5 to 7 were skipped.
+
+An idea rejected **before** implementing, because a probe shows it cannot
+move estimated cycles or would only change code size, is not an attempt.
+Write it up in `unsuccessful/` anyway, say it was not counted against the
+user's attempt budget, and list it in `report.md` below the attempts table.
 
 Also weigh, and record:
 
@@ -499,8 +569,16 @@ grep -E '^test result|FAILED|panicked' $R/misc/test-<sha>.txt
 
 Check `exit=`, not the grep: when the test build fails to compile there are
 no `test result` lines at all, and an empty grep looks like a pass. regicide
-has `cfg(test)` struct literals only the test build sees. At `36e91a7` the
-clean baseline was 402 + 8 passed, 10 ignored, about 2 minutes.
+has `cfg(test)` struct literals only the test build sees. At `cf70ddd` the
+clean baseline was 421 + 8 passed, 10 ignored, about 2 minutes.
+
+**Property tests can encode the rule you are changing.** In
+code-quality-009, `spill_placement_properties` checked that an edge store
+sits below a *more frequent* predecessor, by `BlockFrequency` alone. Making
+spill placement weigh loop depth failed it, correctly. Update such a
+property to the new definition, computed independently of the pass (there,
+from the region tree's loop depth and `BlockFrequency::estimate_weight`),
+and say so in the write-up. Never loosen it to make it pass.
 
 **Fixture tests change with the allocation.** A visualizer fixture test
 (`fixtures_are_up_to_date`) fails when allocation changes what it renders.
@@ -542,7 +620,14 @@ cannot classify it as pre-existing. An exit of 144 with no crash in the log
 means something outside the session killed the run. Rerun it; it is not a
 pass. **Before rerunning, make sure the old run is dead** (`pgrep -fl
 'fuzz run'`). In 003 a `pkill` missed it, and both runs wrote into one log,
-which then held two `Done` lines for different builds.
+which then held two `Done` lines for different builds. **Scope every
+`pgrep`/`pkill` to this worktree's path** (`pgrep -fl "$PWD/fuzz"`): other
+worktrees fuzz at the same time, and in 009 `pkill -f
+'fuzz/target.*allocate'` matched another session's run. Prefer waiting for
+your own run to finish over killing anything.
+
+Fuzz the commit you keep, not an earlier variant of it: an amended commit is
+a different build.
 
 ## Sightglass and Wasmtime: only when asked
 
@@ -568,6 +653,27 @@ to that step.
   explicit path (`git add src/foo.rs`), never `git add -A`/`.`: untracked
   files like `visualizer-plans/` must not be committed, and `reports/` is
   ignored anyway.
+- **Every `WIP` commit body sums up its codegen effect**, so `git log` alone
+  tells the next reader what each commit bought. Write it once the full
+  counts are in (amend the commit then), and keep it short:
+
+  ```
+  WIP: color a join's spilled parameters heaviest (parameter, slot) pair first
+
+  Parameters of a join were given slots one at a time, so an early one
+  could take the slot a later one needed and displace it in turn.
+
+  Estimated cycles vs cf70ddd (codegen-analysis-006 corpora):
+  countMatches -18.2%, regexp.compile -5.0%; tinygo-regex -10.4%,
+  protobuf -1.6%, hashset -1.0%, sqlite3 -0.3%, others 0.
+  Better 59 / worse 0; guards unchanged. countMatches slot-to-slot
+  copies 641 -> 42. Compile time -0.5%.
+  ```
+
+  One or two sentences on the mechanism, then the targets, the corpora that
+  moved, better/worse, guards, the plain-count signature that tells the
+  story, and compile time. A dropped attempt's body says why it was dropped
+  (its tag keeps it reachable).
 - Each dropped attempt: commit it, tag it (`code-quality-NNN/<slug>`), record
   the sha in `unsuccessful/<slug>.md`, then `git reset --hard HEAD^`. The tag
   keeps the sha reachable so the report's reference does not rot. Check
@@ -597,7 +703,8 @@ to that step.
 `report.md` must end with:
 
 - the base and final shas, and the `WIP` commits in order with one-line
-  results;
+  results (check that each kept commit's body carries its codegen summary,
+  with the final numbers);
 - the **cumulative** base-vs-tip diff: per corpus, and per target and guard,
   in estimated cycles and plain counts, plus the compile-time delta;
 - every attempt in a table, kept and dropped, linking to its file;
@@ -666,6 +773,27 @@ Then tell the user where the report is and summarize the cumulative result.
   a spill slot can still reach a block in a register, and spilling it there
   needs a new store. 003's attempt 2 assumed otherwise and regressed
   countMatches +1.85%.
+- **Comparing `Block::frequency` to find a loop exit.** Cranelift rates every
+  block inside a loop NORMAL, the same as the code after it, so a
+  frequency-only rule cannot see a loop exit. Use the estimate's own weight,
+  `Block::weight` in `region_tree.rs` (frequency weight x 10 per enclosing
+  loop), and `Block::runs_more`/`runs_cmp` to compare two blocks: the
+  frequency weight saturates at `COLD` and `HOT`, so they break weight ties
+  by raw frequency. That one change was code-quality-009's -14% on
+  countMatches.
+- **Fixing one decision at a time in a pass that makes them in a batch.**
+  `enter_block` colored a join's parameters one after another, each taking
+  its best free slot. A later parameter that needed that slot more was
+  displaced, and displaced the next: five parameters shifted by one slot at
+  one depth-4 join. Greedy matching over (weight, parameter, slot) pairs,
+  heaviest first, fixed 870 → 70 mismatched pairs in countMatches. Look for
+  the same shape wherever a pass assigns a group of things that compete for
+  one pool.
+- **Biasing the next assignment instead of the decision that caused it.**
+  code-quality-009 attempt 3 put a split value's sibling register first in
+  an unhinted piece's candidates: regexp.compile +3.9%, and it never fired
+  on keccak/blake3's seams, whose pieces are hinted. Seam moves come from
+  where the cut went; the fix belongs in the split score.
 - **Testing a split heuristic only in `split_into_minimal_or_spill`.** Most
   shredding happens one cut at a time in `split_between_spans`, whose halves
   are requeued. 001's attempt 3 changed only the minimal split and moved

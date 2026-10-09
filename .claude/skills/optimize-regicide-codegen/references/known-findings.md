@@ -10,7 +10,120 @@ in.
 Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 **negative is better**.
 
-## Latest session: `code-quality-001` (2026-10-06, base `bf6be7d`)
+## Latest session: `code-quality-009` (2026-10-08, base `cf70ddd`)
+
+`reports/code-quality-009/report.md` in the `regicide-codegen-improvements`
+worktree. Against **analysis 006** (`~/regalloc2/reports/codegen-analysis-006/`,
+which measured `cf70ddd`). Branch `code-quality-009`: the two `WIP`
+commits end at `31bda60`, with this skill update on top. Check `git log`
+for whether they landed and under which shas.
+
+| # | idea | verdict | result vs `cf70ddd` |
+| --- | --- | --- | --- |
+| 1 | color a join's spilled parameters heaviest (parameter, slot) pair first (`4b4de9e`) | **kept** | countMatches -18.2%, regexp.compile -5.0%, tinygo -10.4%; 59 better / 0 worse; slot copies in countMatches 641 → 42 (ion: 49) |
+| 2 | spill placement weighs loop depth, not just frequency (`31bda60`) | **kept** | countMatches -14.1% more, regexp.compile -8.8%, sqlite3 -1.3%, VDBE guard -0.6%; 73 better / 1 worse (+6) |
+| 3 | an unhinted piece of a split value tries its sibling's register first | dropped at screen | regexp.compile +3.9%; never fires on keccak/blake3 seams (hinted pieces) |
+
+Cumulative: tinygo-regex -17.6%, protobuf -2.2%, sqlite3 -1.6%, hashset
+-1.2%; countMatches -29.7%, regexp.compile -13.4%; 96 better / 1 worse;
+compile time -0.15%. Two new tests:
+`a_param_does_not_take_a_slot_another_param_needs_more`,
+`a_spill_for_a_read_after_a_loop_exit_stays_on_the_exit_edge`.
+
+What the code does now, and what to know before changing it:
+
+- **Slot classes and parameter matching** (`spill_slot_allocation.rs`).
+  `enter_block` walks a join's parameters once, in parameter order, and
+  `param_pairs` tallies each one's votes once into `SlotPair`s, which both
+  `match_params` and the unmatched fallback (`best_vote`) read.
+  `match_params` matches greedily over the pairs: each free slot a colored
+  argument occupies, weighed by `tally_votes`, and the class slot, weighed
+  by the larger of that slot's vote and `SlotClasses::weight_in_slot`
+  (class affinities whose partner is in that slot or not colored yet; a
+  typed range per value into `partner_storage`). Matched slots are then
+  **assigned in parameter order**: assigning in pair order reshuffled the
+  free list the unmatched parameters fall back to, which cost the VDBE
+  guard +50. Weighing the class slot by *all* the parameter's class
+  affinities (variant b) cost sqlite3-2507 +3.9%: a parameter held a class
+  slot none of its edges reused.
+- **A vote beats the class slot on a tie** (review-002 #2, kept by the
+  user's decision 2026-10-09). The review asked for the reverse, to keep
+  the class's promise. Measured: 12 worse / 6 better, countMatches +260,
+  gate fails. The class weight counts uncolored partners optimistically
+  (sqlite3-2851: a back-edge argument that later lands elsewhere), while a
+  vote is an argument already in the slot. Pinned by
+  `a_param_takes_its_arguments_slot_over_a_tied_class_slot`. A rework that
+  discounts uncolored partners was offered and not tried.
+- **Spill placement weighs `Block::weight`** (`spill_placement.rs`, via
+  `Block::runs_more`/`runs_cmp` in `region_tree.rs`, which break weight ties
+  by raw frequency since the frequency weight saturates at `COLD`/`HOT`):
+  `is_edge_spill_block` and the most-frequent-first order of a value's stack
+  blocks use it. Slot classes and `tally_votes` use `Block::weight` too
+  (they had a private loop-and-cold weight; review-002 #3 unified them, with
+  identical allocation on all 3,179 inputs). An edge store is also taken only
+  when the store it replaces (`store_above`) runs more often than the edge;
+  without that, 10 small regressions where an edge store sat at the same
+  depth as the store above (sqlite3-0121 +100). The push-up step still
+  compares frequency only; a probe found it never climbs into a deeper block
+  on the 40 heaviest inputs.
+- **Not changed, and why:** VDBE head re-stores (analysis 006 #4) are of
+  values defined in the loop, so loop depth gives no reason to move them.
+- **Slot-class history.** Slot classes landed as `3c6c16c` (code-quality-002
+  in this worktree: countMatches -8%). That session's three "loners" variants
+  (tags `code-quality-002/loners-*`) failed because they attacked values in
+  no class; its backlog #1 ("displaced members cascade") was the parameter
+  cascade attempt 1 above fixed. After attempt 1, countMatches has 70
+  same-class mismatched pairs (2.8k weight) and 81 cross-class (1k): not
+  worth another attempt.
+
+Open, ranked (measured at `31bda60`):
+
+1. **Latch reloads from a loop-wide cut.** countMatches `v3250`: one use per
+   iteration (`block1221`, depth 4), but `split_between_spans` cut its
+   loop-wide bundle at span 12; the prefix holding the use got `r9`, the
+   suffixes spilled whole, and all 7 latches of the depth-4 loop reload it.
+   Latch reloads: 629k of countMatches' 4.1M reload cost, 301k of
+   `sqlite3-2510`'s 2.2M. This is the split-score seam term again (see
+   "Clobbers of hinted registers" below for what has failed).
+2. **machine.add arm stubs** (006 #2): 6.6k of 11.5k est. cycles are edits in
+   single-successor stubs; 8 early exits store loop-carried `v67..v69`,
+   `v119`, `v120` for the exits' join. The stores are already on edges at the
+   loop's own depth, so attempt 2's rule has nothing to move.
+3. **Fixed-register moves** (call arguments) are the largest deep-loop move
+   class in 7 of the 14 heaviest functions (78% in `sqlite3-2492-u0-1910`,
+   94% in `sqlite3-1504-u0-1159`). Cost 1 each.
+4. **Callee-saved cost model** (006 #3): needs a `Machine` API change; ask.
+
+## Analysis 006 (2026-10-08, regicide `cf70ddd`)
+
+`~/regalloc2/reports/codegen-analysis-006/`. On cycles only **tinygo-regex
+(+21.4%)** and **siphashx24 (+1.25%)** are regressions; sqlite3 (-4%),
+keccak, hashset and kotlin-richards are cycles *wins* despite more
+instructions (regicide trades memory for register moves). Corpora:
+`corpus-{blake3,hashset,keccak,kotlin,protobuf,siphashx24,sqlite3,tinygo-regex}/`
+(3,179 distinct inputs). Its `corpus-*.stderr` files sit beside them: glob
+with `corpus-*/`.
+
+| benchmark | function | input |
+| --- | --- | --- |
+| tinygo-regex | `countMatches` | `tinygo-regex-0107-u0-99` |
+| tinygo-regex | `regexp.compile` (slot-copy signature, cold at runtime) | `tinygo-regex-0252-u0-239` |
+| tinygo-regex | `(*machine).add` | `tinygo-regex-0241-u0-229` |
+| tinygo-regex | `MatchRunePos` (preserve: whole-function coalescing) | `tinygo-regex-0235-u0-223` |
+| sqlite3 | VDBE (preserve: pointers in callee-saved) | `sqlite3-0226-u0-181` |
+| kotlin-richards | `function[71]` (preserve: inner loops in registers) | `kotlin-richards-0086-u0-64` |
+| hashset | `benchmark()`, `rehash` | `hashset-0004-u0-3`, `hashset-0009-u0-8` |
+| rust-protobuf | `encode_varint` | `rust-protobuf-0039-u0-31` |
+| keccak | `keccak_core` (preserve: remat, small frame) | `shootout-keccak-0005-u0-4` |
+| siphashx24 | core (in-loop parity; fix #3) | `libsodium-siphashx24-0044-u0-34` |
+
+Its five "things to fix", and status after code-quality-009: #1 slot-class
+promises **addressed** (attempt 1); #2 loop-exit stubs **partly** (attempt 2
+moved the stores; the stubs' reloads and machine.add's permutations remain);
+#3 callee-saved **open** (API); #4 VDBE head re-stores **open** (small in
+the estimate); #5 keccak/blake3 seam moves **open** (no cycles cost).
+
+## `code-quality-001` (2026-10-06, base `bf6be7d`)
 
 `reports/code-quality-001/report.md` in the `regicide-codegen-improvements`
 worktree (`reports/` is gitignored, so it exists only there). Three attempts
@@ -92,7 +205,7 @@ Open, ranked:
 2. **Cold loops** (a cold block heading its own region) stay in their region.
    Check breadth before trying.
 
-## Where to start: `codegen-analysis-003` (2026-10-06, regicide `e9b676b`)
+## Analysis 003 (2026-10-06, regicide `e9b676b`; superseded by 006 above)
 
 `~/regalloc2/reports/codegen-analysis-003/report.md`. On cycles, only one
 benchmark resolves as a regression: **tinygo-regex, +48%**. Everything else
@@ -294,7 +407,8 @@ byte-identically (478 inputs re-checked).
   of plain counts and estimated cycles disagreeing.
 - The baseline `cargo test --all-features` at `36e91a7`: 402 + 8 passed, 10
   ignored, exit 0, about 2 minutes. With 001 #2 it is 403 + 8: the new
-  `a_value_unused_in_a_loop_is_not_reloaded_inside_it`.
+  `a_value_unused_in_a_loop_is_not_reloaded_inside_it`. At `cf70ddd`: 421 +
+  8; at `31bda60` (code-quality-009, after review-002): 425 + 8.
 - **Tests that pinned an allocation shape changed with 001 #2.**
   `a_move_into_a_register_nothing_reads_goes` and the `dead-edits` visualizer
   fixture now use `TestInput::with_a_register_move_overwritten_in_a_later_block`
@@ -303,12 +417,21 @@ byte-identically (478 inputs re-checked).
   inputs yielded a dead register move inside a loop under 001 #2.
 - **`$S/block_costs.py` + `$S/block-costs.patch`** rank a function's
   estimated-cycles delta by block and loop depth. In code-quality-003 this
-  explained every regression in minutes. **The patch builds only on top of a
-  tree that builds:** `7d1217e`..`f12e432` (at least) fail to compile with the
-  `run` example's features, because `has_nothing_to_split_for`'s early return
-  clears a removed `split_span_vals` field. Delete that line in the scratch
-  copy (`sed -i '' '/self.split_span_vals.clear();/d' src/region_allocation.rs`)
-  until it is fixed.
+  explained every regression in minutes. Both are in `scripts/` since
+  code-quality-009 (the patch regenerated against `31bda60`'s
+  `examples/run.rs`; `patch -p1`). **The patch builds only on top of a tree
+  that builds:** `7d1217e`..`f12e432` fail to compile with the `run`
+  example's features (`split_span_vals`, fixed by `64611a8`).
+- **`$S/scratch.sh DIR [REV]`** makes a buildable scratch copy for probes and
+  patched builds. A `git archive` of `src examples` alone fails: the crate
+  `include_str!`s `README.md` and `visualizer/` files, and the workspace
+  needs `fuzz/Cargo.toml`. `cp` is aliased verbose on this host, and the
+  fuzz corpus is huge: never copy `fuzz/` whole.
+- **`$S/edit_costs.py PRINTOUT BLOCKS`** weighs one input's edits by kind and
+  loop depth, classifies deep-loop register moves (fixed-register use, jump
+  into a parameter register, jump keeping a live-through register, other),
+  and sums latch reloads. At `31bda60`, countMatches: depth-4 reloads 3.2M of
+  11.0M est. cycles, latch reloads 629k, deep-loop moves 51% call setup.
 - **`$S/loops.py`** finds loops, latches and per-block edits in a `run`
   printout. `--latch-reloads N` scans for back-edge seams. At `bf6be7d` it
   found 70 latches with >= 3 reloads in inputs under 5e7 compile insts.

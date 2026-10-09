@@ -98,6 +98,12 @@ The finding and mechanism (from `todo/`), with the evidence.
 
 What the commit does, in a paragraph. Files touched.
 
+## Variants
+
+Only if more than one was screened: one row per variant (what differed, the
+targets, the guard that decided), and which was committed. Their patches
+are in `../patches/`.
+
 ## Result
 
 `diff_counts.py` excerpt: the targets table, the per-corpus table, better /
@@ -130,3 +136,33 @@ Typical-set insts Δ, heavy inputs, and `compare.py` if it was needed.
 What was learned: why it did not work, what would be needed instead, what it
 suggests trying next.
 ```
+
+## The `WIP` commit body
+
+Written once the full counts are in (amend), so that `git log` alone says what
+each commit bought. Short: the mechanism in a sentence or two, then the
+numbers.
+
+```
+WIP: <one line on what it does>
+
+<What the allocator did wrong, and what it does now, in one or two
+sentences. Be concise.>
+
+Estimated cycles vs <base sha> (codegen-analysis-NNN corpora):
+
+* <target> -x.x%
+* <target> -x.x%
+* <corpus> -x.x%
+* <corpus> -x.x%
+* others 0.
+
+Better N / worse M.
+
+<The plain-count signature that tells the story, e.g. "Slot copies 641 -> 42">.
+
+Compile time +x.x% <compile time unit, e.g. "insts" or "wall time">.
+```
+
+A dropped attempt's commit (kept reachable by its tag) says instead why it
+was dropped, in the same few lines.
