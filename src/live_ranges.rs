@@ -2742,10 +2742,15 @@ fn reservation_aware_constraint(
     inst: Inst,
     operand: usize,
 ) -> OperandConstraint {
-    if fixed_operand_of(input.func, input.machine, inst, operand).is_some() {
+    // `fixed_operand_of`, without computing the constraint twice.
+    let constraint = reuse_aware_constraint(input.func, input.machine, inst, operand);
+    if let OperandConstraint::Reg(class) = constraint
+        && class.fixed_reg(input.machine).is_some()
+        && input.func.inst(inst).operand(operand).val().is_some()
+    {
         return OperandConstraint::Any;
     }
-    reuse_aware_constraint(input.func, input.machine, inst, operand)
+    constraint
 }
 
 /// Rewrite the provisional span keys in the events a block's span construction
