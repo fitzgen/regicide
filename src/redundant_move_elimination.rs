@@ -181,10 +181,13 @@ where
     fn range_of(&self, loc: ScalarAllocation<E>) -> Range<usize> {
         let lo = self.facts.partition_point(|&(other, _)| other < loc);
 
-        // TODO: It is likely that `hi` is very near `lo`; we should investigate
-        // using a galloping search here, instead of a second binary search, to
-        // avoid cache misses.
-        let hi = lo + self.facts[lo..].partition_point(|&(other, _)| other == loc);
+        // A location holds a handful of parts at most, usually none or one,
+        // so walking beats a second search that re-descends the whole vector.
+        let hi = lo
+            + self.facts[lo..]
+                .iter()
+                .take_while(|&&(other, _)| other == loc)
+                .count();
 
         lo..hi
     }
