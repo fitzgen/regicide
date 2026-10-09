@@ -59,7 +59,8 @@ Ranked, with estimated saving and the profile evidence for each.
 # <Title>
 
 YYYY-MM-DD HH:MM. Commit `<sha>` (`WIP: ...`), measured against `<base sha>`.
-Verdict: kept / dropped (<one-line reason>).
+Verdict: kept / dropped (<one-line reason>). The commit's message body holds
+the same per-set result (see SKILL.md, "Git: commit messages").
 
 ## Idea
 

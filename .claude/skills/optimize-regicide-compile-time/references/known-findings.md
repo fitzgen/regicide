@@ -130,7 +130,10 @@ fill queries via `push_interfering` 11.6%), `assign_via_eviction` 13.0%,
 redundant-move `analyze` 10.5%, `assign_to_non_preferred` 6.5%,
 `generate_moves` 4.8%.
 
-**Status:** open. Ideas not yet tried, ranked:
+**Status:** mostly done by `compile-speedups-003` and `-004` (see the
+section at the end). Items 1, 3 and 5 were done in 003; item 4 was tried
+in 004 and lost (pricing the suffix first gave up the prefix prune, +5.4%);
+item 2 was counted in 004 and only 7% of rows qualify. Original list:
 
 1. `assign_via_eviction`: 8.1M candidate probes making 42M B-tree span
    queries for only 48.5k evictions on `typical/` (counted at `777c130`).
@@ -157,7 +160,10 @@ allocation. A separate superlinearity from the splitting ones. It is
 `heavy/01` in `compilation-speedup-002`'s sets, and is now the
 second-heaviest input.
 
-**Status:** open, not profiled.
+**Status:** open, not profiled. Probably affected by `compile-speedups-004`,
+which replaced liveness's `BTreeSet`s with sorted vectors (liveness pass
+-75% on `typical/`), but that input is not in `codegen-analysis-006` and was
+not re-measured.
 
 ## Tooling facts (2026-10-05)
 
@@ -187,3 +193,59 @@ second-heaviest input.
 - The baseline `cargo test --all-features` at `e53b573`: 389 + 8 passed,
   10 ignored, exit 0, about 2 minutes. At `645db2b`: 402 + 8 passed, 10
   ignored.
+
+## Session `compile-speedups-004` (2026-10-08, base `cf70ddd`, tip `2bac3d3`)
+
+Corpora `codegen-analysis-006` (keccak, sqlite3, tinygo-regex; 3,849
+inputs, 2,666 distinct under 1e10 insts). Only two heavy inputs, each
+~1e10 insts and ~1 s: `tinygo-regex-0117` and `-0188`. Fifteen attempts,
+fourteen kept, all output-identical. Cumulative, n=30 / n=10, load 3-5:
+`typical/` -47.9% insts, -40.3% wall (7.26 s -> 4.33 s); heavy/00 -58.8%
+wall; heavy/01 -48.8% wall. Report: `reports/compilation-speedup-004/`.
+
+What worked, largest first (typical insts):
+
+| change | typical | where |
+| --- | ---: | --- |
+| RME fixpoint worklist in RPO instead of LIFO (4.8 visits/block -> ~1) | -17.5% | `redundant_move_elimination.rs` |
+| Per-unit assignment/reservation maps: sorted `Vec`, not `BTreeMap` | -12.1% | `region_allocation/assignments.rs` (`UnitMap`) |
+| Liveness value sets: sorted `Vec` with merge-based `union_with` | -9.0% | `btree.rs` |
+| Retire split candidates whose prefix already exceeds the best score's interference | -7.6% | `splitting.rs` (`Beaten`) |
+| Retire split candidates whose prefix went infinite | -5.1% | `splitting.rs` |
+| Prune split suffixes against the best of *all* cuts so far | -3.8% | `splitting.rs` (`floor`) |
+| Check where the last register candidate was blocked first (assignment, eviction) | -1.3% each | `assignments.rs` |
+| Counting sort of non-preferred candidates; usable-hint count as a subset test; constraint computed once; packed `u128` span sort keys; rotate instead of splice in `fill_row` | -0.35% to -1% each | various |
+
+What lost or did nothing (screened or measured):
+
+- Galloping / "search near the last hit" in `UnitMap` (+0.9% and +2.4%,
+  two designs): 98% of consecutive searches land within one entry, but a
+  binary search over a few hundred entries is ~8 steps and threading a
+  cursor costs more.
+- Pricing the suffix first when it was infinite at the last cut: +5.4%;
+  it loses the prefix-first prune.
+- Keeping per-unit `Vec` capacity across `Assignments::reset` by walking
+  every unit: neutral.
+- Packed sort key for `resolve`'s `(HalfMoveKey, Allocation)`: +0.4%; the
+  keys are already inline.
+- Skipping the per-edge RME state copy on edges with nothing to apply:
+  neutral once the worklist was fixed.
+- Reordering the overlap and kind tests in `regs_clobbered_across`:
+  neutral (85% of spans are in blocks with no reservations).
+
+**Where the time goes at `2bac3d3`** (`typical/`): region allocate 46%,
+generate moves 13%, coalesce 13%, live ranges 8%, RME 8%, liveness 2.6%.
+samply: `split_between_spans` (u16) 19.7%, of which
+`SpanInterference::weight` 13.3% and `fill_row` 9.5%; `generate_moves`
+7.5%; `assign_via_eviction` 4.6%.
+
+**Status:** open. `fill_row` is the top item: 1.67M rows and 32M binary
+searches on `typical/`. Ruled out: lazy filling (96% of a row is read),
+reuse across splits (7% of rows), faster searches (above), direct queries
+for once-read rows (13% of rows, 5% of queries). Untried: a per-unit,
+per-block summary that lets a query skip units with nothing assigned in the
+span's block. Also open: eviction probes blocked by a second bundle (not a
+reservation) could use attempt 9's "blocked at" shortcut too.
+
+The baseline `cargo test --all-features` at `cf70ddd`: 421 + 8 passed, 10
+ignored. At `2bac3d3`: 424 + 8 passed, 10 ignored.

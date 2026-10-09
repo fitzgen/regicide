@@ -43,6 +43,9 @@ Breaking any of these makes the optimization invalid, however fast it is.
 - **One optimization per `WIP` commit**, and **failed attempts are also
   committed**, so they have a sha for the report, and then dropped from the
   branch (see "Git").
+- **Every `WIP` commit message carries its result**: a body summarizing the
+  measured speedup per set, or why it was dropped (see "Git: commit
+  messages"). The branch should read as its own short report.
 - **Write the report as you go.** After every attempt, before starting the
   next. A reboot must cost at most the attempt in flight.
 - Match the surrounding code's style; load the `writing-code-comments` skill
@@ -79,7 +82,7 @@ Not `sets`: `make_sets.py` creates it and refuses one that already exists.
 | `successful/<slug>.md` | One per kept optimization: commit sha, what and why, measurements, links into `profiles/` and `bench/`. |
 | `unsuccessful/<slug>.md` | One per dropped attempt: commit sha (it stays reachable from the tag, see "Git"), what, why it failed, measurements. |
 | `profiles/` | Raw `samply` profiles (`.json.gz`), the `samply-text` reports made from them, timing logs, disassembly. |
-| `misc/` | Environment and host load, the census, tool gotchas, and **suggested additions to this skill** (`misc/skill-learnings.md`). |
+| `misc/` | Environment and host load, the census, counters, screens (`misc/screens.md` plus `screened-<slug>.diff`), tool gotchas, and **suggested additions to this skill** (`misc/skill-learnings.md`). |
 | `bins/` | A copy of the `run` binary for each commit measured, named `run-<sha>` (and `run-<sha>-prof` for profiling builds). Comparisons need two binaries side by side. |
 | `bench/` | Raw per-sample CSVs from `scripts/compare.py`, so any verdict can be re-checked. |
 | `sets/` | The input sets (symlinks) from `scripts/make_sets.py`. |
@@ -148,8 +151,12 @@ What the `run` example builds. This matters when interpreting numbers:
 
 ## 2. Census and input sets
 
-The corpora are wildly uneven, and that drives the whole method. Measured on
-`codegen-analysis-002`'s six corpora at `e53b573`:
+The corpora are wildly uneven, and that drives the whole method. Since the
+split-pricing fixes of `compile-speedups-002` through `004`, the heaviest
+input of `codegen-analysis-006` costs ~1·10¹⁰ instructions (about a second),
+so heavy inputs may now be cheap enough to gate and measure on every attempt;
+check `sets/sets.md`. Historically, on `codegen-analysis-002`'s six corpora at
+`e53b573`:
 
 - **Most inputs cost 10⁶–10⁹ instructions. A few dozen cost 10¹¹–10¹³.**
   The most expensive, `tinygo-regex-0188` (1.1·10¹³ insts, ~15 minutes) and
@@ -321,7 +328,15 @@ justifies a fast path.
 Count before designing, not after. On `compile-speedups-002`, counters
 showed 767M span queries for 181k splits (the O(n^2)), that 95% of priced
 halves have at most one bundle in the way (the fast path), and that a
-suggested fix's target was 0.1% of the time (so it was not worth doing).
+suggested fix's target was 0.1% of the time (so it was not worth doing). On
+`compile-speedups-004`, counters ruled out two plausible caches in minutes
+(reusing a parent split's rows: 7% of rows qualify; filling rows lazily: 96%
+of each row is read), and found the RME fixpoint visiting each block 4.8
+times.
+
+Counters chase the cheapest thing to count, so also count the *other*
+shortcuts a change would disturb. A reordering that skips 5.7M of one kind
+of work can lose more by disabling an existing prune that fired more often.
 
 ## 4. Choose what to try
 
@@ -336,6 +351,25 @@ Kinds of optimization, roughly in order of how often they pay off here:
   Find the loop nest that grows with function size, with a counter, and
   break it: an index instead of a scan, an interval structure instead of
   repeated range searches, incremental update instead of recomputation.
+- **Fixpoint visit order.** Count analysis visits against reachable blocks
+  for every dataflow fixpoint. A LIFO worklist on a forward analysis made
+  RME visit each block 4.8 times (15 on one heavy input); visiting in
+  reverse post-order cut the pass by 79% and `typical/` by 17.5%, with
+  identical output, since a monotone fixpoint does not depend on visit
+  order. Backward analyses want post-order.
+- **Prune against the best so far, and generalize a prune that works.**
+  When a nested search keeps a running best, pass it down as a floor
+  (`compile-speedups-004` attempt 2), and look for monotonicity: a split's
+  prefix only grows with the cut, so a candidate whose prefix is infinite,
+  or already strictly above the best score, can win no later cut (attempts
+  6 and 11, -5.1% and then -7.6% of `typical/`). Once a prune is exact for
+  a special case, ask what property it really relies on. Mind strict
+  versus non-strict at tie boundaries.
+- **Remember where the last candidate was blocked.** Loops over candidate
+  registers are usually ruled out by the same busy span for neighbor after
+  neighbor (87% of failed assignment tries). Checking that span first is
+  exact and cheap (attempts 8 and 9, -1.3% of `typical/` each). Keep the
+  span itself, not its index into an iterator.
 - **Don't recompute.** Does a later pass rebuild something an earlier pass
   already had (liveness, RPO, block-to-region maps, use lists)? Could it be
   kept in the `Context` and reused?
@@ -345,7 +379,17 @@ Kinds of optimization, roughly in order of how often they pay off here:
 - **Data structures.** Replace a `BTreeMap` with a sorted `Vec` and binary
   search when it is built once and read many times, or a hash map with an
   entity-indexed `SecondaryMap` when keys are dense, or a `Vec<Vec<_>>` with
-  one flat vector plus offsets.
+  one flat vector plus offsets. Grep the hot passes for `BTreeMap` and
+  `BTreeSet` early: on `compile-speedups-004` this was the biggest
+  constant-factor win twice (per-unit assignment maps, -12% of `typical/`;
+  liveness's value sets with whole-set unions done as one linear merge, -9%
+  and -27% on a heavy input). A sorted `Vec` keeps the iteration order, so
+  output cannot change.
+- **Sort keys.** A `sort_unstable_by_key` whose key closure reads through an
+  entity map chases memory on every comparison; packing the key into a
+  `u128` beside the entity (with the entity index last, so the order is
+  total) is a small, safe win. When the key is already stored inline in the
+  sorted elements, packing loses.
 - **Layout and size.** Shrink hot types: bit-pack flags, use narrower indices
   (the `EntityRepr` machinery exists for this), use `Option<NonZero…>`, and
   reorder fields. Check sizes with a temporary
@@ -362,6 +406,13 @@ Kinds of optimization, roughly in order of how often they pay off here:
 - **Codegen-level.** Remove bounds checks via iterator restructuring, add
   `#[inline]` on cross-module tiny functions, and hoist invariant loads.
 
+Ideas that have **lost** on this data, so think twice before retrying:
+galloping or "search near the last hit" instead of binary search (twice:
+units of a few hundred entries cost ~8 binary-search steps, and threading a
+cursor costs more); pricing the expensive half of a split first; walking
+every per-unit vector to keep its capacity across resets. See
+`references/known-findings.md`.
+
 Things that are **out of bounds**: changing heuristics, priorities, tie-breaks,
 iteration order that can affect a decision, or anything else that changes the
 output. Check especially **iteration order of hash maps and sets**: swapping
@@ -377,24 +428,64 @@ For each candidate:
    edited mid-session by the user and other agents.
 2. **Implement it.** Keep it minimal and self-contained, one idea per
    attempt. Then `cargo fmt`.
-3. **Correctness gate.** See "Testing" and "Correctness gate" below. A
+3. **Screen it** (about a minute): build, and run `--insts` once over
+   `typical/` and the heavy inputs you bench, against the previous kept
+   binary. An idea that is flat or worse here is not worth an attempt:
+   revert it, and record it with its diff in `misc/` (see "Screening").
+4. **Correctness gate.** See "Testing" and "Correctness gate" below. A
    failure here ends the attempt: it is unsuccessful, whatever its speed.
-4. **Commit** as `WIP: <one line on what it does>` (see "Git").
-5. **Build both binaries and copy them into `bins/`** (see "Build").
-6. **Measure** against the previous kept commit (see "Measuring").
-7. **Decide** using the rule below.
+5. **Commit** as `WIP: <one line on what it does>` (see "Git").
+6. **Build both binaries and copy them into `bins/`** (see "Build").
+7. **Measure** against the previous kept commit (see "Measuring").
+8. **Decide** using the rule below, then **amend the commit message** with
+   the result (see "Git: commit messages"). The binaries in `bins/` are
+   named by the pre-amend short sha; note the new sha beside the old one in
+   the write-up, and copy the binaries under the new name too.
    - **Kept**: write `successful/<slug>.md` and update `report.md`. The next
      attempt's baseline is this commit.
    - **Dropped**: write `unsuccessful/<slug>.md` with the sha, tag it so it
      stays reachable (`git tag regicide-speedup-NNN/<slug> HEAD`), then
      `git reset --hard HEAD^`. Update `report.md`.
-8. Re-profile when the profile has plausibly changed, for example after a
+9. Re-profile when the profile has plausibly changed, for example after a
    kept win of a few percent or more. The next hot spot is often not the
    one you expected.
 
 Every few kept commits, and always at the end, also measure **the original
 base against the current tip** on every set. This gives the cumulative
-number, and catches individually-insignificant regressions that add up.
+number, and catches individually-insignificant regressions that add up. It
+also confirms small wins: on `compile-speedups-004`, four attempts of
+0.35-1.3% each never resolved on wall time alone, but their cumulative
+(n=30) resolved at -6.7% wall on `typical/`.
+
+### Screening
+
+When the user caps the number of attempts, a screen costs no attempt, so
+use it freely: on `compile-speedups-004` it rejected seven ideas (some of
+them large regressions) without spending one. One `--insts` sample per
+build is noisy at the ±0.2% level on heavy inputs, so a screen of a few
+tenths of a percent decides nothing; only commit those if the idea is
+cheap. Record every screen (idea, deltas per set, diff path) in
+`misc/screens.md`, and save the diff with `git diff > $R/misc/screened-<slug>.diff`
+before reverting.
+
+### Overlapping work
+
+Fuzzing (700 s) is the critical path of an attempt. Implementing, counting
+and screening the next idea while the previous one fuzzes keeps things
+moving, with two rules:
+
+- **Never edit `src/` while `cargo fuzz` is still compiling.** Wait until
+  its log shows `INITED`. On `compile-speedups-004` a fuzz build picked up a
+  deliberately broken mutation check of the *next* idea from the working
+  tree and reported a crash that did not exist in the commit. Treat any
+  fuzz crash as suspect until it reproduces on a clean tree at the commit
+  under test.
+- **Do not run the wall-time measurement while anything else runs.** The
+  previous attempt's measurement waits for its fuzz to finish; then the
+  next attempt's gate and fuzz start after the measurement.
+
+Binaries are copied per commit, so a measurement never depends on what is
+in the working tree.
 
 ## Testing
 
@@ -420,7 +511,9 @@ cargo +nightly fuzz run -s none allocate -- -max_total_time=700 \
 grep -E 'INITED|DONE|Done [0-9]+ runs|ERROR|panicked' $R/misc/fuzz-<sha>.log
 ```
 
-Require `INITED` and `Done` before calling it clean.
+Require `INITED` and `Done` before calling it clean. A foreground run of
+700 s outlives the Bash tool's 600 s limit, so start it in the background
+and wait on `exit=` in its log.
 
 ## Correctness gate
 
@@ -454,6 +547,16 @@ a property check first built halves the kernel never creates, and an
 earlier one would have missed out-of-order candidate queries. Run the gate
 even when the tests are thorough, and mutate the new code once (break one
 line, confirm a test fails) to check the test can see it.
+
+Expect the mutation to pass more often than not on a new fast path. On
+`compile-speedups-004`, five of fifteen attempts needed a new test or test
+case before a deliberate bug failed (an interleaved merge where the existing
+test only appended, a run of cuts broken by one whose candidates all fall
+below the floor, a span set long enough to be walked from both ends,
+`btree.rs` with no tests of its own). Add the test. For a pure refactor
+where no reasonable test can see the mutation (an equivalent condition kept
+for safety), say so in the write-up: the gate is then the real check, and
+the write-up should not claim test coverage.
 
 ## Measuring
 
@@ -553,12 +656,44 @@ on a run that was not significant.
   commit in regicide" rule only for the `WIP` commits and tags described
   here.
 
+### Commit messages
+
+The subject says what the change does; the body says what it bought. Write
+the body once the verdict is in, by amending the attempt's commit
+(`git commit --amend -F <file>`, since the attempt is always `HEAD` at that
+point), before tagging or moving on. Keep it short: a sentence or two on
+the idea, then one line per set, then the verdict. Wrap at 72 columns, no
+attribution lines.
+
+```
+WIP: Skip split candidates whose prefix already costs more than the best
+
+A split's prefix only grows with the cut, so a candidate whose prefix
+already exceeds the best score's interference can win no later cut.
+Skips 18.6M of 28.6M prefix pricings on typical.
+
+Measured against previous commit (ff9269d), n=20, 99% CI:
+* typical:  insts -7.60%, wall -5.11%
+* heavy/00: insts -10.30%, wall -6.76%
+* heavy/01: insts -10.52%, wall -6.48%
+```
+
+- Give each set's insts and wall deltas from `compare.py`. Write `(not
+  significant)` for any that is not significant, never a bare number that could
+  be mistaken for a result.
+- Name the baseline commit by its sha.
+- For a dropped attempt, say so in the body's last line and why
+  ("Dropped: no measured effect on any set"), so the tagged commit explains
+  itself.
+- If the user rewrites the branch between sessions, keep the bodies; they
+  are how the next session knows what each commit is worth.
+
 ## 6. Finish
 
 `report.md` must end with:
 
 - the base sha and the final sha, plus the `WIP` commits in order with
-  one-line results;
+  one-line results (the commit bodies hold the full per-set numbers);
 - the **cumulative** base-vs-tip result on every set, both metrics, with the
   `-n` used and the host load at the time;
 - every attempt in a table (kept and dropped), linking to its file;
@@ -601,3 +736,14 @@ Then tell the user where the report is and summarize the cumulative result.
   building on it, check `git log`, and compare patches by content
   (`git show <old> --format=` vs `<new>`) rather than trusting shas in the
   report.
+- **A cheaper-looking variant can cost more.** Recomputing a bound as
+  `best.max(floor)` every iteration pruned more work than a running bound
+  updated on improvement, but retired 3.8% *more* instructions. Screen
+  variants on instructions, not on counts of skipped work.
+- **Scripted edits that half-apply.** A Python edit that asserts on a
+  pattern stops after its first replacement; re-running it on the
+  already-edited file fails the assert and leaves the build broken, and a
+  screen that follows then measures a stale binary. Check that the build
+  printed `Finished` before trusting a screen, and reset the file before
+  retrying an edit.
+- **A fuzz crash from a dirty tree.** See "Overlapping work".
