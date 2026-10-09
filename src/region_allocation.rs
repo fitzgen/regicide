@@ -1607,15 +1607,35 @@ fn order_non_preferred_candidates(
     region_preferences: &RegSet,
     candidates: &mut Vec<Reg>,
 ) {
+    // The tier a stable sort by `(!clobbered, preferred)` would put `r` in.
+    let tier = |r: Reg| {
+        2 * usize::from(!region_clobbers.contains(r)) + usize::from(region_preferences.contains(r))
+    };
+
+    // A counting sort: count each tier, then place each register after the
+    // ones before it in the class's own order.
+    let mut starts = [0; 5];
+    for &r in regs {
+        if !pref.union_contains(r) {
+            starts[tier(r) + 1] += 1;
+        }
+    }
+    for i in 1..starts.len() {
+        starts[i] += starts[i - 1];
+    }
+
     candidates.clear();
-    candidates.extend(regs.iter().copied().filter(|r| !pref.union_contains(*r)));
-    // Stable, so the class's own order breaks ties.
-    candidates.sort_by_key(|r| {
-        (
-            !region_clobbers.contains(*r),
-            region_preferences.contains(*r),
-        )
-    });
+    let Some(&first) = regs.first() else {
+        return;
+    };
+    candidates.resize(starts[4], first);
+    for &r in regs {
+        if !pref.union_contains(r) {
+            let slot = &mut starts[tier(r)];
+            candidates[*slot] = r;
+            *slot += 1;
+        }
+    }
 }
 
 /// Is `bundle` one that splitting cannot help, so that once it fails to get a
