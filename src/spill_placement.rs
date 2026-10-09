@@ -68,7 +68,7 @@ use crate::{
         DefUse, Input, InputBlock as _, InputFunction, InputInst as _, InputValue as _, Position,
         RematCost,
     },
-    live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, Use},
+    live_ranges::{LiveBundle, LivePoint, LiveRanges, LiveSpan, Use, sort_spans},
     liveness::block_first_inst,
     output::OutputInner,
     region_allocation::RegionAllocation,
@@ -238,6 +238,9 @@ where
     /// are contiguous and in program order.
     spans: Vec<LiveSpan<E>>,
 
+    /// Scratch for `sort_spans`.
+    keyed_spans: Vec<(u128, LiveSpan<E>)>,
+
     /// For the value currently being placed, the register span that starts at
     /// the entry of each block that has one.
     ///
@@ -296,6 +299,7 @@ where
             stack_bundles: EntitySet::new(),
             defs: SecondaryMap::new(None),
             spans: Vec::new(),
+            keyed_spans: Vec::new(),
             legal: SecondaryMap::new(None),
             live_out: SecondaryMap::new(None),
             union_find: UnionFind::new(),
@@ -312,6 +316,7 @@ where
             stack_bundles,
             defs,
             spans,
+            keyed_spans,
             legal,
             live_out,
             union_find,
@@ -327,6 +332,7 @@ where
         live_out.reset();
         union_find.reset();
         spans.clear();
+        keyed_spans.clear();
         is_spill_site.reset();
         spill_site_blocks.clear();
         stack_blocks.clear();
@@ -339,6 +345,7 @@ where
             stack_bundles,
             defs,
             spans,
+            keyed_spans,
             legal,
             live_out,
             union_find,
@@ -351,6 +358,7 @@ where
             && stack_bundles.is_reset()
             && defs.is_reset()
             && spans.is_empty()
+            && keyed_spans.is_empty()
             && legal.is_reset()
             && live_out.is_reset()
             && union_find.is_reset()
@@ -465,13 +473,7 @@ where
             self.spans.push(span);
         }
 
-        self.spans.sort_unstable_by_key(|&span| {
-            (
-                span.val(live_ranges),
-                span.start(live_ranges),
-                span.end(live_ranges),
-            )
-        });
+        sort_spans(live_ranges, &mut self.spans, &mut self.keyed_spans);
     }
 
     /// Place the spills for a spilled value, given all of that value's spans.

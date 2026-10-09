@@ -60,7 +60,7 @@ use crate::{
         DefUse, Input, InputBlock, InputFunction, InputInst as _, InputValue as _, Position,
         RematCost,
     },
-    live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation},
+    live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation, sort_spans},
     liveness::{Liveness, block_first_inst, block_last_inst},
     machine::{Interfere, Machine, Reg, RegBank},
     output::{
@@ -462,7 +462,7 @@ where
     /// Scratch for the pass's walk over every value's spans.
     spans: Vec<LiveSpan<E>>,
 
-    /// Scratch for sorting `spans`: each span beside its sort key.
+    /// Scratch for `sort_spans`.
     keyed_spans: Vec<(u128, LiveSpan<E>)>,
 
     /// Scratch, live only while visiting one block, sorted by the instruction
@@ -926,22 +926,8 @@ where
         let mut spans = core::mem::take(&mut self.spans);
         debug_assert!(spans.is_empty());
 
-        // Sort keys packed beside each span, so the sort compares integers
-        // rather than chasing each span's data on every comparison. The span
-        // itself comes last, which makes every key distinct and breaks ties
-        // between spans of one value over one range by span order.
-        let mut keyed = core::mem::take(&mut self.keyed_spans);
-        keyed.extend(live_ranges.spans().map(|span| {
-            let key = (span.val(live_ranges).index() as u128) << 96
-                | (span.start(live_ranges).to_bits() as u128) << 64
-                | (span.end(live_ranges).to_bits() as u128) << 32
-                | span.index() as u128;
-            (key, span)
-        }));
-        keyed.sort_unstable_by_key(|&(key, _)| key);
-        spans.extend(keyed.iter().map(|&(_, span)| span));
-        keyed.clear();
-        self.keyed_spans = keyed;
+        spans.extend(live_ranges.spans());
+        sort_spans(live_ranges, &mut spans, &mut self.keyed_spans);
 
         let result = (|| -> IResult<()> {
             for value_spans in spans.chunk_by(|a, b| a.val(live_ranges) == b.val(live_ranges)) {

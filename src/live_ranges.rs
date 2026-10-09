@@ -818,6 +818,25 @@ where
     region_bundles: SecondaryMap<Region<E>, EntityRange<LiveBundle<E>>>,
 }
 
+/// Sort `spans` by value, then start, then end, so that each value's spans are
+/// contiguous and in program order.
+///
+/// The span itself breaks ties between spans of one value over one range, so
+/// the order is total. `keyed` is scratch, left empty.
+pub(crate) fn sort_spans<E>(
+    live_ranges: &LiveRanges<E>,
+    spans: &mut alloc::vec::Vec<LiveSpan<E>>,
+    keyed: &mut alloc::vec::Vec<(u128, LiveSpan<E>)>,
+) where
+    E: EntityRepr,
+{
+    debug_assert!(keyed.is_empty());
+    keyed.extend(spans.iter().map(|&span| (span.sort_key(live_ranges), span)));
+    keyed.sort_unstable_by_key(|&(key, _)| key);
+    spans.clear();
+    spans.extend(keyed.drain(..).map(|(_, span)| span));
+}
+
 impl<E> LiveRanges<E>
 where
     E: EntityRepr,
@@ -1269,6 +1288,18 @@ where
     #[inline]
     pub(crate) fn val(self, live_ranges: &LiveRanges<E>) -> Val<E> {
         live_ranges.spans[self].val
+    }
+
+    /// `(val, start, end, self)` packed into one integer, ordered the same way,
+    /// so that sorting spans by it compares integers rather than reading each
+    /// span's data on every comparison. See `sort_spans`.
+    #[inline]
+    fn sort_key(self, live_ranges: &LiveRanges<E>) -> u128 {
+        let data = &live_ranges.spans[self];
+        (data.val.index() as u128) << 96
+            | (data.start.to_bits() as u128) << 64
+            | (data.end.to_bits() as u128) << 32
+            | self.index() as u128
     }
 
     /// The hints attached to one end of this span.
