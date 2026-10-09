@@ -560,7 +560,14 @@ where
         // this region's bundles yet, because we haven't allocated registers
         // within this region yet.
         for bundle in region.bundles(live_ranges) {
-            self.push_bundle(input, live_ranges, events, bundle, Phase::default());
+            self.push_bundle(
+                input,
+                region_tree,
+                live_ranges,
+                events,
+                bundle,
+                Phase::default(),
+            );
         }
 
         // Keep processing bundles until they've all been assigned!
@@ -591,26 +598,50 @@ where
                 continue;
             }
 
-            if self.assign_via_eviction(input, live_ranges, events, output, entry)? {
+            if self.assign_via_eviction(input, region_tree, live_ranges, events, output, entry)? {
                 counts.evictions.inc();
                 continue;
             }
 
             if phase <= Phase::SplitBetweenSpans
-                && self.split_between_spans(input, live_ranges, counts, events, output, entry)?
+                && self.split_between_spans(
+                    input,
+                    region_tree,
+                    live_ranges,
+                    counts,
+                    events,
+                    output,
+                    entry,
+                )?
             {
                 counts.split_between_spans.inc();
                 continue;
             }
 
             if phase <= Phase::SplitWithinSpan
-                && self.split_within_span(input, live_ranges, counts, events, output, entry)?
+                && self.split_within_span(
+                    input,
+                    region_tree,
+                    live_ranges,
+                    counts,
+                    events,
+                    output,
+                    entry,
+                )?
             {
                 counts.split_within_span.inc();
                 continue;
             }
 
-            self.split_into_minimal_or_spill(input, live_ranges, counts, events, output, entry)?;
+            self.split_into_minimal_or_spill(
+                input,
+                region_tree,
+                live_ranges,
+                counts,
+                events,
+                output,
+                entry,
+            )?;
             counts.split_into_minimal_or_spill.inc();
         }
 
@@ -627,6 +658,7 @@ where
     fn push_bundle(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         live_ranges: &LiveRanges<E>,
         events: &mut EventsLog<E>,
         bundle: LiveBundle<E>,
@@ -638,7 +670,7 @@ where
         } else {
             self.clobber_bound.remove(bundle);
         }
-        let priority = compute_bundle_priority(input, live_ranges, bundle, &clobbered);
+        let priority = compute_bundle_priority(input, region_tree, live_ranges, bundle, &clobbered);
         self.set_bundle_priority(bundle, priority);
         self.region_preferences
             .union_with(bundle.preference(live_ranges).union());
@@ -839,6 +871,7 @@ where
     fn assign_via_eviction(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         live_ranges: &mut LiveRanges<E>,
         events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
@@ -970,7 +1003,14 @@ where
                         evicted,
                     }
                 );
-                self.push_bundle(input, live_ranges, events, evicted, Phase::AssignEvict);
+                self.push_bundle(
+                    input,
+                    region_tree,
+                    live_ranges,
+                    events,
+                    evicted,
+                    Phase::AssignEvict,
+                );
                 Ok(true)
             }
         }
@@ -1027,6 +1067,7 @@ where
     fn split_between_spans(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
@@ -1161,8 +1202,22 @@ where
 
         // Push again with the same phase: we can afford to keep splitting
         // between spans until we can't split between spans anymore.
-        self.push_bundle(input, live_ranges, events, bundle, entry.phase());
-        self.push_bundle(input, live_ranges, events, suffix, entry.phase());
+        self.push_bundle(
+            input,
+            region_tree,
+            live_ranges,
+            events,
+            bundle,
+            entry.phase(),
+        );
+        self.push_bundle(
+            input,
+            region_tree,
+            live_ranges,
+            events,
+            suffix,
+            entry.phase(),
+        );
 
         Ok(true)
     }
@@ -1175,6 +1230,7 @@ where
     fn split_within_span(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
@@ -1306,8 +1362,8 @@ where
         // after that, then we will split into minimal bundles and/or spill.
         debug_assert!(entry.phase() <= Phase::SplitWithinSpan);
         let phase = Phase::SplitWithinSpan.next();
-        self.push_bundle(input, live_ranges, events, bundle, phase);
-        self.push_bundle(input, live_ranges, events, suffix, phase);
+        self.push_bundle(input, region_tree, live_ranges, events, bundle, phase);
+        self.push_bundle(input, region_tree, live_ranges, events, suffix, phase);
 
         Ok(true)
     }
@@ -1378,6 +1434,7 @@ where
     fn split_into_minimal_or_spill(
         &mut self,
         input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
         live_ranges: &mut LiveRanges<E>,
         counts: &mut Counts,
         events: &mut EventsLog<E>,
@@ -1440,6 +1497,7 @@ where
                         reload.add_hint(live_ranges, events, &pref, None);
                         self.push_bundle(
                             input,
+                            region_tree,
                             live_ranges,
                             events,
                             reload,
@@ -1491,6 +1549,7 @@ where
                 piece.add_hint(live_ranges, events, &pref, None);
                 self.push_bundle(
                     input,
+                    region_tree,
                     live_ranges,
                     events,
                     piece,
@@ -1500,6 +1559,7 @@ where
 
             self.push_bundle(
                 input,
+                region_tree,
                 live_ranges,
                 events,
                 bundle,
@@ -1702,6 +1762,7 @@ where
 /// `clobbered` is `regs_clobbered_across` for `bundle`.
 fn compute_bundle_priority<E>(
     input: &Input<'_, impl InputFunction>,
+    region_tree: &RegionTree<E>,
     live_ranges: &LiveRanges<E>,
     bundle: LiveBundle<E>,
     clobbered: &RegSet,
@@ -1714,9 +1775,32 @@ where
         bundle_group_size(input, live_ranges, bundle),
         // A hint the bundle can never honor earns it no head start over the
         // bundles whose hints it would otherwise take.
-        bundle.num_hinted_spans(live_ranges, clobbered),
+        hint_rank(bundle.hinted_span_weight(input, region_tree, live_ranges, clobbered)),
         bundle.spans(live_ranges).len(),
     )
+}
+
+/// Bucket `weight` into the priority field's tiers, one per factor of ten,
+/// reserving zero for an unhinted bundle.
+///
+/// The point is to saturate: past a bundle's first few hints the count is
+/// noise, and a bundle hinted ten times does not want a register ten times as
+/// much as one hinted once. See `LiveBundle::hinted_span_weight` for why a
+/// tier is ten hinted spans.
+fn hint_rank(weight: f64) -> usize {
+    // A ladder rather than `log10`, which is `std`-only. `!(weight > 0.0)`
+    // also catches a NaN, which would otherwise fall through to the loop.
+    if !(weight > 0.0) {
+        return 0;
+    }
+    let mut tier = 0;
+    let mut bound = 10.0;
+    while weight >= bound && tier < PRIORITY_NUM_HINTS_MAX - 1 {
+        tier += 1;
+        bound *= 10.0;
+    }
+    // A cold block weighs 0.05, so anything under 1 still beats no hint.
+    1 + tier
 }
 
 /// Do the clobbers across `bundle` (`clobbered`) leave it at most half of
@@ -3077,5 +3161,29 @@ mod tests {
         // and unwanted; r0 is clobbered but wanted; r5 survives the clobber
         // and is unwanted; r3 survives it but is wanted.
         assert_eq!(candidates, [1, 2, 0, 5, 3].map(reg));
+    }
+
+    /// Within a region a weight is a hinted-span count times one block weight,
+    /// so these tiers are counts: the rank separates a bundle's first few
+    /// hints and then stops.
+    #[test]
+    fn hint_rank_saturates_past_a_bundles_first_hints() {
+        assert_eq!(hint_rank(0.0), 0);
+
+        // A cold block's 0.05 still outranks no hint.
+        assert!(hint_rank(0.05) > hint_rank(0.0));
+        assert!(hint_rank(1.0) > hint_rank(0.0));
+
+        // A tier is ten hinted spans: one through nine rank alike.
+        assert_eq!(hint_rank(1.0), hint_rank(9.0));
+        assert!(hint_rank(10.0) > hint_rank(9.0));
+        assert!(hint_rank(100.0) > hint_rank(10.0));
+
+        // Saturating rather than overflowing the field.
+        assert_eq!(hint_rank(1e300), MAX_NUM_HINTS);
+        assert_eq!(hint_rank(1e300), hint_rank(1e7));
+
+        assert_eq!(hint_rank(f64::NAN), 0);
+        assert_eq!(hint_rank(f64::INFINITY), MAX_NUM_HINTS);
     }
 }

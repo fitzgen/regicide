@@ -14,6 +14,7 @@ use crate::liveness::{Liveness, block_first_inst, block_last_inst};
 use crate::machine::{Machine, Reg, RegClassMembers};
 use crate::output::{OutputInner, RegAllocation};
 use crate::packed_float::PackedPositiveFloat;
+use crate::region_tree::RegionTree;
 use crate::timing::Timing;
 use crate::{RegClass, RegSet};
 
@@ -2132,19 +2133,43 @@ where
         .as_f32()
     }
 
-    /// How many of this bundle's spans carry a hint, at either end, towards
-    /// some register outside `unusable`.
-    pub(crate) fn num_hinted_spans(self, live_ranges: &LiveRanges<E>, unusable: &RegSet) -> usize {
-        self.spans(live_ranges)
-            .filter(|span| {
-                [HintPos::Start, HintPos::End].iter().any(|&end| {
-                    !span
-                        .preference_at(live_ranges, end)
-                        .union()
-                        .is_subset_of(unusable)
-                })
+    /// How much the blocks of this bundle's hinted spans weigh, all together:
+    /// what honoring the hints saves, since each saves a move in its own block.
+    ///
+    /// Blocks in one region share its loop depth, so within a region this is
+    /// the hinted-span count times one weight, unless the embedder varies
+    /// frequency within a region. Bundles in different regions are never
+    /// compared, so this cannot rank a deep hint above a shallow one.
+    pub(crate) fn hinted_span_weight(
+        self,
+        input: &Input<'_, impl InputFunction>,
+        region_tree: &RegionTree<E>,
+        live_ranges: &LiveRanges<E>,
+        unusable: &RegSet,
+    ) -> f64 {
+        self.hinted_spans(live_ranges, unusable)
+            .map(|span| {
+                span.block(input.func, live_ranges)
+                    .weight(input, region_tree)
             })
-            .count()
+            .sum()
+    }
+
+    /// This bundle's spans that carry a hint, at either end, towards some
+    /// register outside `unusable`.
+    fn hinted_spans<'a>(
+        self,
+        live_ranges: &'a LiveRanges<E>,
+        unusable: &'a RegSet,
+    ) -> impl Iterator<Item = LiveSpan<E>> + 'a {
+        self.spans(live_ranges).filter(move |span| {
+            [HintPos::Start, HintPos::End].iter().any(|&end| {
+                !span
+                    .preference_at(live_ranges, end)
+                    .union()
+                    .is_subset_of(unusable)
+            })
+        })
     }
 
     /// Bias this bundle towards the registers that `constraint` names, on
