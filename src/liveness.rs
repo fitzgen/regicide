@@ -70,7 +70,7 @@ use crate::{
     sorted_vec::SortedVec,
     timing::Timing,
 };
-use alloc::vec::Vec;
+use alloc::{collections::BinaryHeap, vec::Vec};
 
 pub struct Liveness<E>
 where
@@ -92,8 +92,14 @@ where
     /// currently being processed.
     live_across_edge: SortedVec<Val<E>>,
 
-    /// The worklist of blocks that need to be (re)processed.
-    worklist: Vec<Block<E>>,
+    /// The worklist of blocks that need to be (re)processed, keyed by reverse
+    /// post-order index.
+    ///
+    /// This means that the largest, i.e. the latest block in reverse
+    /// post-order, pops first, which is post-order. And this is the order a
+    /// backwards analysis wants: a block's successors are all processed before
+    /// it, so a loop-free graph settles in one visit each.
+    worklist: BinaryHeap<u32>,
 
     /// Whether each block is already on the worklist, so that it is never
     /// enqueued twice.
@@ -139,7 +145,7 @@ where
             live_out: SecondaryMap::new(SortedVec::new()),
             live: SortedVec::new(),
             live_across_edge: SortedVec::new(),
-            worklist: Vec::new(),
+            worklist: BinaryHeap::new(),
             on_worklist: EntitySet::new(),
             span_end: SecondaryMap::new(None),
             pending_head: SecondaryMap::new(NO_PENDING_USE),
@@ -236,17 +242,11 @@ where
 
     /// Initialize the worklist with all of the function's blocks.
     ///
-    /// We arrange the worklist so that blocks will be popped in post-order,
-    /// which minimizes the number of fixed-point iterations we must do: because
-    /// a block is not processed until all of its successors are already
-    /// processed, and we are flowing backwards from successors to predecessors,
-    /// we only need to process each block once (modulo loops).
+    /// They pop in post-order; see the `worklist` field.
     fn seed_worklist(&mut self, rpo: &Rpo<E>) {
-        // The worklist is popped from its end, so pushing in reverse post-order
-        // means we pop in post-order.
-        for block in rpo.iter() {
+        for (i, block) in rpo.iter().enumerate() {
             self.on_worklist.insert(block);
-            self.worklist.push(block);
+            self.worklist.push(u32::try_from(i).unwrap());
         }
     }
 
@@ -271,7 +271,8 @@ where
             finished: _,
         } = self;
 
-        while let Some(block) = worklist.pop() {
+        while let Some(i) = worklist.pop() {
+            let block = rpo.at(i);
             on_worklist.remove(block);
             counts.liveness_iterations.inc();
 
@@ -296,9 +297,8 @@ where
             if live_in[block].union_with(live) {
                 for pred in func.block(block.with_repr32()).predecessors() {
                     let pred = output.with_repr(pred)?;
-                    if rpo.is_reachable(pred) && !on_worklist.contains(pred) {
-                        on_worklist.insert(pred);
-                        worklist.push(pred);
+                    if rpo.is_reachable(pred) && on_worklist.insert(pred) {
+                        worklist.push(rpo.index_of(pred));
                     }
                 }
             }
