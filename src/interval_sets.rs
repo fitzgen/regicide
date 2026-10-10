@@ -315,7 +315,16 @@ where
             Some(true)
         );
 
-        let set = self.union(arena, other, self_first, fuel);
+        let set = match other.first == other.last {
+            true => {
+                let mut visits = 0;
+                let set = self.insert_one(arena, other, &mut visits);
+                fuel.spent += visits;
+                arena.boundaries.clear();
+                set
+            }
+            false => self.union(arena, other, self_first, fuel),
+        };
 
         #[cfg(debug_assertions)]
         set.assert_valid(arena, DEBUG_WALK_LIMIT);
@@ -374,6 +383,87 @@ where
                 Some(next) => x.0 = next,
             }
         }
+    }
+
+    /// Insert the single node `other` into `self`.
+    ///
+    /// Over half of all unions add one interval, where the general merge
+    /// splits the tree apart and joins it back; this descends once and
+    /// splits only the subtree the new node displaces.
+    ///
+    /// Exactly one `boundaries` pair mentions `other`, and the node follows
+    /// that pair's `p` in the `next` chain unless it is `p`, in which case it
+    /// precedes the whole set.
+    fn insert_one<P>(
+        self,
+        arena: &mut IntervalSetArena<K, P>,
+        other: Self,
+        visits: &mut u64,
+    ) -> Self
+    where
+        P: Copy + Ord + Debug,
+    {
+        debug_assert_eq!(other.first, other.last);
+        let node = other.root;
+
+        // Splice into the `next` chain the tree is kept alongside.
+        let first = match arena
+            .boundaries
+            .iter()
+            .find(|&&(p, q)| p == node || q == node)
+        {
+            // `node` precedes the whole set.
+            Some(&(p, q)) if p == node => {
+                arena.node_mut(node).next = Some(q);
+                node
+            }
+            Some(&(p, _)) => {
+                arena.node_mut(node).next = arena.node(p).next;
+                arena.node_mut(p).next = Some(node);
+                self.first
+            }
+            None => unreachable!("a boundary always mentions the inserted node"),
+        };
+
+        // Descend while the nodes outrank `node`, then split the subtree it
+        // displaces around its key.
+        let key = arena.start(node);
+        let pri = priority(node);
+        let mut root = None;
+        let mut hole = Hole::Root;
+        let mut tree = Some(self.root);
+        while let Some(n) = tree {
+            if priority(n) < pri {
+                break;
+            }
+            *visits += 1;
+            let left = key < arena.start(n);
+            arena.fill(&mut root, hole, Some(n));
+            hole = match left {
+                true => Hole::Left(n),
+                false => Hole::Right(n),
+            };
+            tree = match left {
+                true => arena.node(n).left,
+                false => arena.node(n).right,
+            };
+        }
+        let (lo, hi) = arena.split(tree, key, visits);
+        arena.node_mut(node).left = lo;
+        arena.node_mut(node).right = hi;
+        arena.fill(&mut root, hole, Some(node));
+
+        let set = IntervalSet {
+            root: root.expect("the tree is never empty"),
+            first,
+            last: match key > arena.start(self.last) {
+                true => node,
+                false => self.last,
+            },
+        };
+        debug_assert_eq!(arena.self_or_descendant(set.root, |n| n.left), set.first);
+        debug_assert_eq!(arena.self_or_descendant(set.root, |n| n.right), set.last);
+        set
     }
 
     /// Merge `self` and `other` along the run boundaries recorded by
