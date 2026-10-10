@@ -36,7 +36,10 @@ skill in `~/regalloc2`:
 **Before you start, read `references/known-findings.md`**: what the latest
 analysis found, which corpus inputs are its hot functions, and the traps
 earlier sessions fell into. Re-verify anything load-bearing; regicide changes
-quickly, and the user works on it in parallel branches.
+quickly, the user works on it in parallel branches, **and the benchmark suite
+itself has changed under this skill once** — when it has, the previous
+session's corpus totals and ranked backlog describe a corpus that no longer
+exists.
 
 ## The metric: estimated cycles
 
@@ -97,12 +100,32 @@ Breaking any of these invalidates the improvement, however good its numbers.
 
 - **The checker passes on every allocation.** `counts.py` runs `--check` on
   every input by default; a `checker-failed` row fails the gate.
-- **Tests pass.** `cargo test --all-features` green, checking cargo's own exit
-  code (see "Testing").
+- **Tests pass, and the crate still builds without `std`.** `cargo test
+  --all-features` green, checking cargo's own exit code, **plus** `cargo build
+  --no-default-features --features hashbrown` (see "Testing"). The first alone
+  cannot see a `std`-only method, and most of CI builds `no_std`.
 - **No new `unsafe`.**
 - **Measure, don't intuit.** Every claim traces to a count from `counts.py` /
   `diff_counts.py` or a quoted allocation diff. "This should reduce spills"
   is not a finding.
+- **A new measurement script is evidence only after you have tried to break
+  it.** `python3 $S/selftest.py` covers the ones in `scripts/` against cases
+  whose answer is known; run it after touching any of them, and add a case
+  when you add a script. Before a number from a *new* one goes in a write-up,
+  run it on a hand-built case whose answer you know, and check that each
+  bucket it reports can actually fire. All three scripts code-quality-010 added were wrong in ways
+  a five-line synthetic graph would have exposed: a loop finder that pulled
+  the whole dominator chain into a self-loop, a classifier whose `entry`
+  bucket was unreachable (every test required a single-predecessor loop
+  header, and a header always has at least two), and an event reader that
+  ignored a third of the ways a bundle gets a register. **A bucket that is
+  always zero is a bug until proven otherwise** — it is indistinguishable
+  from a finding, and it reads as one.
+- **State the mechanism you measured, not the one you intended.** The two
+  diverge more often than they feel like they do: code-quality-010's kept
+  change won -1.06% and its commit message explained it with a comparison the
+  allocator cannot make. Before writing "this works because X", find the
+  number that would differ if X were false, and look at it.
 - **No pessimization of the guard list.** The analysis's "things we do well
   and must preserve" become guard functions in `targets.tsv`; their estimated
   cycles must not rise.
@@ -147,10 +170,22 @@ found and what it would take, rather than starting it.
   `report.md`, then each `regressions/` and `improvements/` file a finding
   cites.
 - **Corpora.** Every non-empty `corpus*` subdirectory of that report (check
-  `find <dir> -type f | wc -l`; `corpus/` itself has been seen empty), **plus
-  any corpora from earlier reports that its findings were analyzed on**. 003,
-  for example, analyzed tinygo-regex and sqlite3 on 002's corpora. Never
-  write into those directories; they belong to another workflow.
+  `find <dir> -type f | wc -l`), **plus any corpora from earlier reports that
+  its findings were analyzed on**. 003, for example, analyzed tinygo-regex
+  and sqlite3 on 002's corpora. Never write into those directories; they
+  belong to another workflow.
+
+  **The shape varies by report.** Analyses up to 006 have one `corpus-<module>`
+  directory per module and an empty `corpus/`; **analysis 008 has a single
+  `corpus/` holding all 29 modules** (33,038 inputs, 13,926 distinct), and
+  `corpus/` is the only thing to pass. `ls` the report before globbing.
+
+  **Check whether the benchmark suite changed since the last session.** 008
+  swapped `pca.suite` for `default.suite`: three modules gone, 15 added, and
+  the suite's dominant cost went from reloads to deep-loop register moves.
+  When it has changed, no earlier corpus total is a baseline, and the
+  previous session's ranked backlog may be pointing at the wrong thing — say
+  so in `report.md` and re-size the cost yourself.
 - **Which findings** (optional). Without a choice, work down the report's
   "Top N things to fix" in its order, which is already cost × breadth.
 - **Time budget** (optional). Without one, keep going until the backlog has
@@ -208,11 +243,16 @@ write, and the commit sha every measurement was taken at.
 
    ```bash
    python3 $S/counts.py -b $R/bins/run-$sha -o $R/counts/$sha.tsv \
-       $A/corpus-*/ <cited earlier corpora> 2> $R/misc/counts-$sha.log
+       $A/corpus*/ <cited earlier corpora> 2> $R/misc/counts-$sha.log
    ```
 
    Keep the trailing `/`: analysis 006 has `corpus-*.stderr` files beside its
-   corpus directories, and `$A/corpus-*` feeds them in as `failed` inputs.
+   corpus directories, and a glob without it feeds them in as `failed`
+   inputs. `corpus*/` covers both layouts (008's single `corpus/` and the
+   per-module `corpus-<module>/` of 006 and earlier).
+
+   Budget ~25 minutes for 008's corpus at `-j 12`, and expect the last few
+   `tinygo-regex` inputs to take a minute each under `--check`.
 
    Run it in the background and do "From analysis to backlog" meanwhile.
    **Another worktree may already have this TSV** (`git worktree list`, then
@@ -289,8 +329,8 @@ cargo run --release --example visualize -- \
 ```
 
 - **Weighted, not counted.** A printout's plain edit counts mislead: one
-  depth-4 reload outweighs 10,000 at depth 0. `$S/edit_costs.py` (with a
-  `BLOCK_COSTS=1` dump, see step 6 of "The loop") weighs them.
+  depth-4 reload outweighs 10,000 at depth 0. `$S/edit_costs.py PRINTOUT
+  [--latches]` weighs them, by kind and by loop depth.
 - **Find the hot block in the printout** with `$S/loops.py`. It finds the
   back edges and natural loops in a `run` printout and lists each loop's
   blocks with their edit tallies, innermost first. Hot means inside the
@@ -363,9 +403,20 @@ cargo run --release --example visualize -- \
     (`misc/cascade_share.py` there). That split pointed at the fix.
 - **Size a remaining cost before choosing the next attempt.** After a kept
   change, `$S/edit_costs.py` on the heaviest inputs shows edit cost by kind
-  and loop depth, what deep-loop register moves are for (call arguments,
-  parameter registers at jumps, ...), and how much of the reload cost sits
-  on latches. It took minutes to rule ideas in or out in code-quality-009.
+  and loop depth, and how much of the reload cost sits on latches. It took
+  minutes to rule ideas in or out in code-quality-009.
+- **Ask where the cost sits in the CFG before blaming a decision.**
+  `$S/boundary_moves.py PRINTOUT...` splits edit cost into loop-entry,
+  loop-exit and interior blocks, and `$S/exit_stubs.py` ranks the exit
+  stubs. In code-quality-010 this reframed the whole session: 53% of all
+  move cost over the four heaviest inputs sat on a loop boundary, and on the
+  two `dotnet-raytracer` inputs 59-66% of *all* edit cost did.
+- **`$S/hint_misses.py LOG`** classifies, from an event log, why each hinted
+  bundle missed its hint: the register was taken by a bundle that wanted it
+  too (real contention), by one that wanted a *different* register (a
+  tie-break failure), or by an unhinted bundle. That split is what separates
+  "hinting is the lever here" from "it is not": see the hint-rate pitfall
+  below.
 - **Probe before porting a fix to a sibling code path.** After
   code-quality-009 made edge stores weigh loop depth, the push-up step in
   spill placement still compared frequency only. A probe found it never
@@ -434,24 +485,22 @@ For each candidate, highest-ranked first:
    collateral damage?
 
    **For a big function, rank blocks before reading hunks.** A 30,000-line
-   diff is unreadable whole. Build `run` in a scratch tree with
-   `scripts/block-costs.patch`, dump both sides, and compare:
+   diff is unreadable whole. `$S/block_delta.py` reads the two printouts you
+   already have and needs no patched build: block ids are stable between two
+   allocations of one input, so the two sides match directly.
 
    ```bash
-   for rev in $base $sha; do
-       $S/scratch.sh /tmp/bc-$rev $rev
-       patch -p1 -d /tmp/bc-$rev < $S/block-costs.patch
-       cargo build --release --example run --manifest-path /tmp/bc-$rev/Cargo.toml
-       BLOCK_COSTS=1 /tmp/bc-$rev/target/release/examples/run -q <input> \
-           2> $R/logs/<target>-$rev-blocks.txt
-   done
-   python3 $S/block_costs.py $R/logs/<target>-{$base,$sha}-blocks.txt
+   python3 $S/block_delta.py $R/logs/<target>-$base.txt \
+       <($R/bins/run-$sha $A/corpus-X/<target>.postcard)
    ```
 
    It sums the delta by loop depth and lists the blocks that moved most, so
-   the hunks to read, and quote, are the top few of each list. Keep the
-   `/tmp/bc-<sha>` builds for the session: every later attempt needs the
-   last kept commit's dump, and `edit_costs.py` reads the same dumps.
+   the hunks to read, and quote, are the top few of each list. **Read the
+   by-depth summary before the block list**: in code-quality-010 the kept
+   attempt looked like a +0.26% regression on countMatches until the summary
+   showed depth 4 at +40,000 and depth 3 at -18,000, with the whole rise
+   being four blocks that each gained one *remat* (cost 1) while the function
+   shed 263 spills and 236 reloads (cost 5 each).
 
    **A small guard regression is a lead, not noise.** Read it the same way:
    rank its blocks, then find the decision. In code-quality-009 a +50 on the
@@ -570,7 +619,25 @@ grep -E '^test result|FAILED|panicked' $R/misc/test-<sha>.txt
 Check `exit=`, not the grep: when the test build fails to compile there are
 no `test result` lines at all, and an empty grep looks like a pass. regicide
 has `cfg(test)` struct literals only the test build sees. At `cf70ddd` the
-clean baseline was 421 + 8 passed, 10 ignored, about 2 minutes.
+clean baseline was 421 + 8 passed, 10 ignored, about 2 minutes; at `7e8f866`
+it is 428 + 8.
+
+**`--all-features` is not enough: this crate is `#![no_std]`.** Most of the
+CI matrix builds without `std`, and `f64`'s `log10`, `floor`, `sqrt`, `abs`
+and friends are inherent methods on `std`'s float impls, not `core`'s — so
+float math that compiles fine under `--all-features` is a hard `rustc` error
+in 10 of CI's 15 rows. code-quality-010 shipped `weight.log10()` this way and
+review-001 caught it. Before every commit:
+
+```bash
+cargo build --no-default-features --features hashbrown 2>&1 | tail -3
+```
+
+If you need a logarithm, `input.rs`'s `log2_approx` is a `core`-only one
+written for this reason, or write a comparison ladder — a few `>=` tests are
+usually what a tier bucket really wants. Watch out that `f64::max` returns
+the *non-NaN* operand, so `NaN.max(0.0)` is `0.0` and a `weight <= 0.0` guard
+lets `NaN` through: write `!(weight > 0.0)`.
 
 **Property tests can encode the rule you are changing.** In
 code-quality-009, `spill_placement_properties` checked that an edge store
@@ -799,3 +866,54 @@ Then tell the user where the report is and summarize the cumulative result.
   are requeued. 001's attempt 3 changed only the minimal split and moved
   nothing (122 `BundleSplitIntoMinimal` vs 2,418 `BundleSplitBetweenSpans`
   in countMatches). Tally both events before choosing where to intervene.
+- **Ranking by something that is constant across everything the comparison
+  can see.** The allocation queue is **region-local**: `allocate_region`
+  drains it before moving on, and a split copies its bundle's region into
+  both halves, so two bundles in different regions are never compared. And
+  `Block::loop_depth` is the *region's* depth, so every block the queue can
+  compare weighs the same. code-quality-010's kept attempt ranked hints by
+  `Block::weight` believing it would lift a depth-7 hint above a depth-0 one;
+  measured afterwards, `hinted_span_weight == count * K_region` on 27,603 of
+  27,603 bundles, and within a region the new rank reordered **nothing**. The
+  change still won −1.06%, by saturating the count — a different mechanism
+  than the one claimed. **Before building a comparator, ask what varies
+  within the set it actually compares**, and measure it: one `trace!`
+  printing the old key beside the new one would have caught this in minutes.
+- **Working the previous session's backlog without re-sizing the cost.**
+  Analysis 008 replaced the benchmark suite, and the corpus's cost profile
+  inverted: from `countMatches` reloads to **register moves at loop depth
+  5-7**, with one module (`dotnet-raytracer`) holding 6.35G of the suite's
+  7.66G estimated cycles. Every pre-008 corpus total and ranked backlog item
+  refers to a corpus that no longer exists. **Run `edit_costs.py` and
+  `boundary_moves.py` on the heaviest inputs before picking a candidate**,
+  whatever the backlog says.
+- **A high hint hit rate does not mean hinting is the lever.**
+  `dotnet-raytracer-0426-u0-360` honors 242 of its 254 hints and still spends
+  60.5M of 66.7M edit cost on register moves, in single-pred/single-succ
+  stubs at a loop-depth change, rotating values that are not even arguments
+  of that edge's block call. Measure hint *width*, then hit rate, then
+  **where the cost actually sits in the CFG** (`boundary_moves.py`,
+  `hint_misses.py`) before blaming hints.
+- **Assuming a revived idea composes with what landed since.** In
+  code-quality-010 attempt 1 took the heaviest input -2.42% alone, and the
+  same patch on top of attempt 2 took it **+1.66%**: the two were substitutes
+  for one cost, not complements. Re-screen on the current tip.
+- **Treating a 0-or-1 field as an under-specified cost.** It may be a cap.
+  Pricing `EvictionCost::broken_hints` by hint weight cost **+38% compile
+  time** with no codegen gain, because eviction takes only a strictly cheaper
+  victim: raising every hinted victim's price makes it refuse victims and
+  pushes the work into `split_between_spans`. Cutting the tiers from eight to
+  two barely helped, which is how you tell a cap from a granularity problem.
+- **Widening a packed field because a probe says it saturates.** Check that
+  the saturation *decides* something first: `hint_rank`'s ceiling was hit on
+  10.9% of one target's hints, and widening it changed nothing on the 80
+  heaviest inputs — they were ties the other priority fields already broke
+  the same way.
+- **Reusing a TSV after `cmp` says the binary changed.** A rebuild after a
+  test-only edit, or after deleting a now-unused function, differs
+  byte-for-byte while allocating identically. Verify reuse by comparing
+  estimated cycles on the targets, not by `cmp`.
+- **Mistaking cargo's build lock for a stuck replay.** A `counts.py` run
+  blocked behind "Blocking waiting for file lock on build directory" stalls
+  exactly like the stopped-child pitfall above. Check for a concurrent
+  `cargo build` first.

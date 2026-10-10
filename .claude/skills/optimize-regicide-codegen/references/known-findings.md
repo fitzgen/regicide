@@ -10,7 +10,117 @@ in.
 Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 **negative is better**.
 
-## Latest session: `code-quality-009` (2026-10-08, base `cf70ddd`)
+> **Read this first: the benchmark suite changed at analysis 008.** Sightglass
+> replaced `pca.suite` with **`default.suite`** — 29 modules, up from 17.
+> `sqlite3`, `blake3-scalar` and `libsodium-core2` are **gone**; 15 modules are
+> new. So every corpus total, guard number and "open, ranked" item recorded
+> below for sessions **before** `code-quality-010` refers to a corpus that no
+> longer exists, and **none of them is a baseline you can diff against**.
+>
+> The suite's cost profile also inverted. It is now dominated by
+> `dotnet-raytracer` (**6.35G of 7.66G** estimated cycles over 4,153
+> functions), whose cost is **49-91% register-register moves at loop depth
+> 5-7** — where the old corpus was `countMatches` reloads.
+> `starlingmonkey-markdown` is 18,037 of the 33,038 inputs. A session that
+> opens by working the pre-008 backlog will optimize the wrong thing: size the
+> cost yourself with `edit_costs.py` and `boundary_moves.py` on the heaviest
+> inputs before picking a candidate.
+
+## Latest session: `code-quality-010` (2026-10-09, base `7e8f866`)
+
+`reports/code-quality-010/report.md` in the `regicide-compile-time` worktree.
+Against **analysis 008** (`~/regalloc2/reports/codegen-analysis-008/`, which
+measured `7e8f866`, our exact base). Branch `code-quality-010`, tip
+`1ec5260`. Five attempts, the user's budget; one kept.
+
+| # | idea | verdict | result vs `7e8f866` |
+| --- | --- | --- | --- |
+| 1 | count the queued bundles that prefer each register, so a satisfied hint stops reserving it (tag `code-quality-010/stale-region-preferences`, `194a7c3`) | dropped | suite -0.83% but better 873 / worse 3,318, and the whole win is two functions; gate fails on three targets and the siphashx24 guard |
+| 2 | **rank a bundle's hints by the weight of their blocks, not how many there are** (`1ec5260`) | **kept** | suite **-1.06%**; raytracer-0386 **-2.97%**, dotnet-raytracer -1.31%; all six guards byte-identical; 201 better / 253 worse; compile time +0.37% |
+| 3 | attempt 1 replayed on top of attempt 2 | dropped at screen | raytracer-0386 **+1.66%**, where attempt 1 alone was -2.42% |
+| 4 | eviction prices a hint by its blocks' weight too | dropped at screen | no target improved, **compile time +38%** |
+| 5 | give the hint rank a fourth bit | dropped | verified no-op: 0 of the 80 heaviest inputs change |
+
+What the code does now, and what to know before changing it:
+
+- **Hint priority saturates** (`region_allocation.rs`).
+  `compute_bundle_priority` ranks by `hint_rank(bundle.hinted_span_weight(..))`
+  — `Block::weight` summed over the blocks of the spans carrying a usable
+  hint, bucketed one tier per factor of ten. It replaced a plain count of
+  hinted spans. `region_tree` is threaded into `push_bundle` and the four
+  split/evict paths that re-push. Pinned by
+  `hint_rank_saturates_past_a_bundles_first_hints`.
+  - **What it actually does is saturate the count, not weigh depth** (review
+    001, finding 2; the original commit message claimed otherwise and was
+    corrected). **The queue is region-local** — `allocate_region` drains it
+    before the next region, and a split copies its bundle's region into both
+    halves — and `Block::loop_depth` is the *region's* depth, so every block
+    the queue can compare weighs the same. Measured: `hinted_span_weight ==
+    count * K_region` on **27,603 of 27,603 bundles** across three inputs, and
+    within a region the new rank reorders **nothing** (0 pairs reversed, 0
+    distinctions gained or lost over 762 comparable pairs). The win is real
+    and measured; the mechanism is "past the first few hints the count is
+    noise", and ranking a deep hint above a shallow one **cannot happen from
+    this queue**. To actually price a boundary, weigh the block on the far
+    side of the `cross_region_affinities` edge instead.
+  - The weight rather than the count still buys one thing: it stays correct
+    for an embedder whose blocks within one region have different
+    frequencies. Cranelift emits none (0 of 19,473 region observations had
+    mixed frequency), so on this corpus it is exactly the count.
+  - **The sum, not the max.** Variant b (heaviest hinted span) cost the
+    `hashset-0004-u0-3` canary **+7.75%** and +2.66% compile insts.
+  - **`floor`, not `round`.** Variant c cost countMatches +2.02%.
+  - **The field has three bits and that is enough.** Attempt 5 widened it to
+    four (taking one from `size`, which had 23 bits for a few thousand spans)
+    because the rank saturates on 10.9% of `raytracer-0426`'s hints. It
+    changed **nothing** on the 80 heaviest inputs: those were ties the other
+    priority fields already broke the same way.
+- **`region_preferences` saturates, and fixing it does not help.** It is a
+  `RegSet` unioned over every bundle *ever* queued in a region and cleared
+  only when the region finishes, so `order_non_preferred_candidates`' "leave
+  other bundles' hinted registers free" tier reaches **96% of the class** on
+  countMatches and 79% on raytracer-0386 — a no-op under pressure. Counting
+  queued bundles instead (attempts 1 and 3) fixes the saturation (79% -> 22%)
+  and is still a **substitute for attempt 2, not a complement**: alone -2.42%
+  on raytracer-0386, on top of attempt 2 **+1.66%**. Don't revive it without
+  re-screening on the tip.
+- **`EvictionCost::broken_hints` is a boolean, and that boolean is a cap.**
+  Pricing it by hint weight (attempt 4) raised typical compile insts **38%**
+  with no codegen gain, and cutting eight tiers to two barely moved it:
+  `assign_via_eviction` only takes a *strictly cheaper* victim, so a priced
+  hint makes eviction **refuse** victims it used to take, and those bundles
+  go on to `split_between_spans`. The boolean was bounding how often eviction
+  fails.
+
+Open, ranked (measured at `1ec5260`):
+
+1. **The parent region adopts a child's locations for values live through
+   it** (analysis 007/008's own suggested fix). This is where the cost is, and
+   010 narrowed it sharply: `dotnet-raytracer-0426-u0-360` honors **242 of
+   254 hints** (12 misses, all genuine contention) and *still* spends 60.5M of
+   its 66.7M edit cost on register moves — all in single-predecessor,
+   single-successor stubs at a loop-depth change, rotating values that are
+   **not even arguments of that edge's block call**. Attempts 3 and 4
+   exhausted both sides of "who wins the register"; the hint has to bind
+   harder than a hint, or the boundary has to be priced into the parent's
+   assignment. `reports/code-quality-010/todo/03-tiny-loop-regions.md`.
+2. **Price the boundary in the split score** (the seam term earlier sessions
+   kept reaching for), now on a corpus where move cost dominates.
+3. **Why `tinygo-regex` (+0.85%) and `rust-wasmprinter` (+0.87%) lose under
+   attempt 2** while dotnet-raytracer gains 1.31%. Both are reload-dominated
+   rather than move-dominated, so a loop-depth hint rank may be the wrong
+   trade there. `block_delta.py` on `rust-wasmprinter-0028-u0-21` is the
+   cheapest look.
+4. **Permutation cycles at a boundary**: a boundary permutation that closes
+   into a cycle costs one move more than a chain, because nothing is free to
+   start it. Measured, small (0.36% on one input), and probably not fixable
+   greedily — whether the ring closes is a global property of several
+   independent register choices.
+   `reports/code-quality-010/todo/02-permutation-cycles.md`.
+5. **A callee-saved cost model** (008 #5): still needs a `Machine` API
+   decision; ask.
+
+## Previous session: `code-quality-009` (2026-10-08, base `cf70ddd`)
 
 `reports/code-quality-009/report.md` in the `regicide-codegen-improvements`
 worktree. Against **analysis 006** (`~/regalloc2/reports/codegen-analysis-006/`,
@@ -76,7 +186,9 @@ What the code does now, and what to know before changing it:
   same-class mismatched pairs (2.8k weight) and 81 cross-class (1k): not
   worth another attempt.
 
-Open, ranked (measured at `31bda60`):
+Open, ranked (measured at `31bda60`). **Two of these name `sqlite3` inputs,
+which analysis 008's suite dropped**, so their sizes cannot be re-measured;
+treat the mechanisms as live and the numbers as historical:
 
 1. **Latch reloads from a loop-wide cut.** countMatches `v3250`: one use per
    iteration (`block1221`, depth 4), but `split_between_spans` cut its
@@ -94,7 +206,74 @@ Open, ranked (measured at `31bda60`):
    94% in `sqlite3-1504-u0-1159`). Cost 1 each.
 4. **Callee-saved cost model** (006 #3): needs a `Machine` API change; ask.
 
-## Analysis 006 (2026-10-08, regicide `cf70ddd`)
+## Analysis 008 (2026-10-09, regicide `7e8f866`)
+
+`~/regalloc2/reports/codegen-analysis-008/`. The **current** analysis, and the
+one that replaced the benchmark suite (see the note at the top). Regicide was
+unchanged from analysis 007, so 008 measures the same allocator against a
+different, larger benchmark set; the seven carried-over benchmarks reproduce
+to within 0.6 pp, which cross-checks both runs.
+
+Top line on wall time: geomean **-0.64%** over 26 benchmarks, 13
+significantly faster, 6 slower. **Regicide is net faster than ion**, and the
+managed-runtime family carries the win now that `sqlite3` is gone:
+`kotlin-richards` -8.85%, `ocaml-raytrace` -5.11%, `dart-deltablue` -2.52%,
+`java-navier-stokes` -2.21%, `dotnet-raytracer` -1.60%.
+
+Corpus: a single `corpus/` of **33,038 inputs** (13,926 distinct), all 29
+modules. Suite estimated cycles at `7e8f866`: **7,638,047,244**;
+`coalesce-out-of-fuel` 0 everywhere.
+
+| benchmark | cycles | function / input |
+| --- | ---: | --- |
+| `tinygo-regex` | **+10.28%** | `countMatches`, `tinygo-regex-0107-u0-99` |
+| `starlingmonkey-markdown` | ~+3 to +7% (NOISY) | largest module, 18,037 inputs |
+| `shootout-xchacha20` | **+6.28%** | `chacha20_rounds`; identical code, register permutation only |
+| `hashset` | ~+3% (NOISY) | instructions disagree in sign |
+| `hoot-earley-boyer` | +1.46% | better on every static count, measurably slower |
+| `libsodium-siphashx24` | +0.64% | callee-saved pair (fix #5) |
+
+Its five "things to look into", and status after code-quality-010:
+
+1. **The cost model is missing a term** — `hoot-earley-boyer` retires 2.4%
+   fewer instructions, touches 3.8% less stack *and* makes 20.8% fewer moves,
+   and is 1.46% slower; `hashset` is the mirror. The two disagree in sign on
+   moves, so it is not "moves are underpriced". **This is the metric step 3
+   optimizes against**, which makes it the broadest item. Needs a profile
+   under both allocators — the analysis skill's job, not step 3's.
+   **Untouched**; `hoot` moved ±0.00% under every 010 attempt.
+2. **Register choice alone can cost 6%** (`shootout-xchacha20`): 99
+   instructions, identical opcodes in identical order, 0 stack and 0 moves
+   under both allocators, differing only in which registers they name;
+   survives 64-byte alignment. A calibration point for how much wall time can
+   move with allocation quality held constant. **Untouched, and no static
+   metric can see it.**
+3. **Loop-exit stubs** (`tinygo-regex`): the child region wins registers for
+   loop-carried values and the parent picks the join's locations
+   independently, so the exit edge pays the difference. Break-even is 3.1
+   iterations against `block_weight`'s assumed 10. **Partly addressed** by
+   010's attempt 2 (-2.97% on the corpus's heaviest function, its depth-7
+   boundaries 17 moves -> 10 and 11); the general fix is open as 010's #1.
+4. **`starlingmonkey-markdown` is win-shaped but measures as a loss.**
+   **Untouched by design**: the analysis says it is NOISY (CV 12.2/18.7) and
+   that nothing should be built on it without more samples.
+5. **A callee-saved cost model** (`siphashx24`): needs a `Machine` API change
+   — regalloc2 has `non_preferred_regs_by_class`. **Ask first**; two prior
+   probes failed and a hard-coded `index >= 16` rule is aarch64-only. Note
+   the counterweight *grew*: preserve item #1 is built on callee-saved
+   registers held across calls. **Price the pair once per function; do not
+   avoid callee-saved registers.**
+
+Its guards (all byte-identical at 010's tip): `dart-deltablue` <= 1,991
+`[sp]`, `kotlin-richards` <= 3,006, `ocaml-raytrace` <= 2,199; keccak's
+store-then-reload count at 0 and its 336-byte frame; `coalesce-out-of-fuel`
+0 corpus-wide; protobuf <= 1,599 `[sp]` and 5,774 moves; per-iteration stack
+accesses in countMatches' inner loops; tinygo slot-to-slot copies <= 397.
+
+**Compile time vs ion is +249% geomean, 29 of 29 slower** — measurement
+only, not analyzed, and it feeds no ranking.
+
+## Analysis 006 (2026-10-08, regicide `cf70ddd`; superseded by 008 above)
 
 `~/regalloc2/reports/codegen-analysis-006/`. On cycles only **tinygo-regex
 (+21.4%)** and **siphashx24 (+1.25%)** are regressions; sqlite3 (-4%),
@@ -390,6 +569,48 @@ byte-identically (478 inputs re-checked).
   → value mapping is permuted within a block in the text log; the
   visualizer's data is right). Use the visualizer when you need the value.
 
+## Traps from code-quality-010
+
+- **A set that only grows saturates, and a heuristic reading it goes dead.**
+  `region_preferences` unioned every bundle ever queued in a region and was
+  cleared only per region, so the "leave other bundles' hinted registers
+  free" tier saw 96% of the class marked preferred on countMatches. One
+  `trace!` counting `preferred / class` at each call found it in minutes.
+  **Worth checking any "avoid what others want" rule the same way.**
+- **Two changes aimed at one cost can each help and still not compose.**
+  Attempt 1 took the heaviest input -2.42% alone; the identical patch on top
+  of attempt 2 took it **+1.66%**. They were substitutes, not complements.
+  **Always re-screen a revived idea on the current tip** rather than assuming
+  it adds to what landed since.
+- **A field that only ever holds 0 or 1 may be a cap, not an
+  under-specified cost.** Pricing `EvictionCost::broken_hints` by hint weight
+  cost **+38% compile time** with no codegen gain, and cutting eight tiers to
+  two barely moved it: `assign_via_eviction` takes only a strictly cheaper
+  victim, so a priced hint makes it *refuse* victims and pushes the work into
+  `split_between_spans`. This is the "lifting a cap costs compile time" trap
+  in a shape the pitfall list did not name.
+- **"The field saturates" is not "the saturation decides anything."**
+  `hint_rank`'s 3-bit ceiling was hit on 10.9% of one target's hints, so 010
+  widened it. It changed **nothing** on the 80 heaviest inputs: those were
+  ties the other priority fields already broke identically. Screen a
+  widening on the heaviest inputs before writing it up as a candidate.
+- **A 97% hint hit rate can coexist with a huge move cost.**
+  `dotnet-raytracer-0426-u0-360` honors 242 of 254 hints and still spends
+  60.5M of 66.7M edit cost on register moves. The skill already says to
+  measure hint *width*, not just hit rate; this adds that **a high hit rate
+  does not mean hinting is the lever at all**. Classify the heavy blocks by
+  CFG position (`boundary_moves.py`) before attributing cost to hints.
+- **A release rebuild can differ byte-for-byte after a test-only edit.**
+  Twice in 010 an amend that only touched tests, or deleted a now-unused
+  function, produced a different binary that allocated identically. **Verify
+  TSV reuse by comparing estimated cycles on the targets, not by `cmp` on the
+  binary.**
+- **`counts.py` and a concurrent `cargo build` contend on the build lock.**
+  Two full-corpus runs stalled for minutes behind "Blocking waiting for file
+  lock on build directory", which looks exactly like the stuck-replay
+  pitfall. Check for a running cargo before running `ps` on the `run-*`
+  children.
+
 ## Tooling facts
 
 - `run` prints `estimated-cycles` since 2026-10-06. An older `run` binary
@@ -408,30 +629,62 @@ byte-identically (478 inputs re-checked).
 - The baseline `cargo test --all-features` at `36e91a7`: 402 + 8 passed, 10
   ignored, exit 0, about 2 minutes. With 001 #2 it is 403 + 8: the new
   `a_value_unused_in_a_loop_is_not_reloaded_inside_it`. At `cf70ddd`: 421 +
-  8; at `31bda60` (code-quality-009, after review-002): 425 + 8.
+  8; at `31bda60` (code-quality-009, after review-002): 425 + 8. At
+  `7e8f866`: **428 + 8**, and at `1ec5260` (code-quality-010) 429 + 8.
 - **Tests that pinned an allocation shape changed with 001 #2.**
   `a_move_into_a_register_nothing_reads_goes` and the `dead-edits` visualizer
   fixture now use `TestInput::with_a_register_move_overwritten_in_a_later_block`
   (found by a mutatis shrink). `with_a_looping_value_read_only_after_the_loop`
   no longer yields a dead move. Neither the test corpus nor 100,000 mutated
   inputs yielded a dead register move inside a loop under 001 #2.
-- **`$S/block_costs.py` + `$S/block-costs.patch`** rank a function's
-  estimated-cycles delta by block and loop depth. In code-quality-003 this
-  explained every regression in minutes. Both are in `scripts/` since
-  code-quality-009 (the patch regenerated against `31bda60`'s
-  `examples/run.rs`; `patch -p1`). **The patch builds only on top of a tree
-  that builds:** `7d1217e`..`f12e432` fail to compile with the `run`
-  example's features (`split_span_vals`, fixed by `64611a8`).
+- **`$S/block_delta.py BASE.txt CAND.txt`** ranks a function's
+  estimated-cycles delta by block and loop depth, from the two `run`
+  printouts. It replaces the `block_costs.py` + `block-costs.patch` pair the
+  skill used to describe, which **never existed on `main`** — those needed a
+  patched scratch build; this needs none, because block ids are stable
+  between two allocations of one input. In code-quality-003 the older tool
+  explained every regression in minutes; in 010 this one did the same.
+- **The scripts in `scripts/` were out of sync with the skill until
+  2026-10-09.** `SKILL.md` referenced `loops.py`, `edit_costs.py`,
+  `scratch.sh`, `block_costs.py` and `block-costs.patch`; only `counts.py`
+  and `diff_counts.py` were actually committed (`git log --diff-filter=A`
+  confirms). code-quality-009 reported adding them, but that worktree's
+  copies never landed. 010 rewrote and committed working equivalents. **If a
+  script the skill names is missing, check `git log` rather than assuming the
+  worktree is broken** — and write the replacement into `scripts/`, not just
+  the report.
 - **`$S/scratch.sh DIR [REV]`** makes a buildable scratch copy for probes and
   patched builds. A `git archive` of `src examples` alone fails: the crate
   `include_str!`s `README.md` and `visualizer/` files, and the workspace
   needs `fuzz/Cargo.toml`. `cp` is aliased verbose on this host, and the
   fuzz corpus is huge: never copy `fuzz/` whole.
-- **`$S/edit_costs.py PRINTOUT BLOCKS`** weighs one input's edits by kind and
-  loop depth, classifies deep-loop register moves (fixed-register use, jump
-  into a parameter register, jump keeping a live-through register, other),
-  and sums latch reloads. At `31bda60`, countMatches: depth-4 reloads 3.2M of
-  11.0M est. cycles, latch reloads 629k, deep-loop moves 51% call setup.
+- **`$S/edit_costs.py PRINTOUT [--latches]`** weighs one input's edits by
+  kind and loop depth, and sums latch reloads. At `31bda60`, countMatches:
+  depth-4 reloads 3.2M of 11.0M est. cycles, latch reloads 629k.
+- **`$S/boundary_moves.py` and `$S/exit_stubs.py`** split an input's edit
+  cost by CFG position: loop-entry, loop-exit and interior blocks, and the
+  exit stubs ranked. In code-quality-010 this reframed the session —
+  **53% of all move cost over the four heaviest inputs sat on a loop
+  boundary**, and 59-66% of *all* edit cost on the two `dotnet-raytracer`
+  inputs.
+- **`$S/selftest.py`** checks the printout and event scripts against the
+  three bugs review-001 found in them: a self-loop swallowing the dominator
+  chain, an unreachable `entry` bucket, and an event reader blind to
+  eviction. Each case was verified to fail when its bug is reintroduced, and
+  `test_boundary_buckets_can_fire` drives `boundary_moves.classify` on a
+  synthetic printout rather than restating its rule — an earlier draft
+  restated it and passed with the bug back in.
+- **The printout scripts share `loops.py`**, and `python3 -I` drops a
+  script's own directory from `sys.path`, so a bare `import loops` fails
+  under the `-I` the environment asks for when reading untrusted corpora.
+  They each insert their own directory explicitly; keep that shim if you add
+  another. All eight were verified with and without `-I`, from an unrelated
+  cwd, on 2026-10-09.
+- **`$S/hint_misses.py LOG`** classifies, from a
+  `RUST_LOG=regicide::region_allocation=trace` log, why each hinted bundle
+  missed its hint: the holder wanted it too (real contention), wanted a
+  *different* register (a tie-break failure), or was unhinted. Needed to tell
+  "hinting is the lever" from "it is not".
 - **`$S/loops.py`** finds loops, latches and per-block edits in a `run`
   printout. `--latch-reloads N` scans for back-edge seams. At `bf6be7d` it
   found 70 latches with >= 3 reloads in inputs under 5e7 compile insts.
