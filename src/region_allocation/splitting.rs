@@ -377,6 +377,27 @@ where
     })
 }
 
+/// The admissible cut nearest the middle of `spans`, preferring the lower of
+/// two equidistant cuts.
+///
+/// A balanced cut is what matters: the halves are requeued and split again,
+/// so a cut near one end peels one span at a time and takes `O(spans)` splits
+/// where halving takes `O(log spans)`. Where the bundle first ran into
+/// something does not predict a good cut and is not consulted.
+pub fn cut_near_middle<E>(spans: &[Range<LivePoint<E>>], uses: &[SplitUse<E>]) -> Option<usize>
+where
+    E: EntityRepr,
+{
+    let middle = spans.len() / 2;
+    let mut best: Option<usize> = None;
+    for cut in between_span_cuts(spans, uses) {
+        if best.is_none_or(|best| cut.abs_diff(middle) < best.abs_diff(middle)) {
+            best = Some(cut);
+        }
+    }
+    best
+}
+
 /// Find the best boundary between the given `spans` to split at, or return
 /// `None` if there is no valid place to split between spans.
 ///
@@ -395,6 +416,11 @@ where
 /// Ties go to the lower middle of the first run of tied cuts, halving rather
 /// than peeling the bundle, then to the earliest candidate. This avoids
 /// `O(n^2)` complexity in certain edge cases.
+///
+/// The allocator cuts with `cut_near_middle` instead; this is the reference
+/// the splitting property test checks the scoring and tie-break rules
+/// against.
+#[cfg(test)]
 pub fn best_split_between_spans<E, C>(
     spans: &[Range<LivePoint<E>>],
     uses: &[SplitUse<E>],
@@ -586,6 +612,7 @@ where
 }
 
 /// The best candidate for cutting before `spans[k]`.
+#[cfg(test)]
 fn best_candidate_between_spans<E, C>(
     spans: &[Range<LivePoint<E>>],
     k: usize,
@@ -2416,6 +2443,38 @@ mod tests {
         }
 
         Ok(state)
+    }
+
+    /// `cut_near_middle` takes the admissible cut nearest the middle, and
+    /// breaks a tie towards the lower one.
+    ///
+    /// Two equidistant cuts halve the bundle the same way, mirrored, so the
+    /// tie-break is a convention rather than a measured choice. Pin it.
+    #[test]
+    fn cut_near_middle_prefers_the_lower_of_two_equidistant_cuts() {
+        // Four spans, so the middle is 2. Spans touching at an instruction
+        // boundary admit a cut in every gap, so the cuts are 1, 2 and 3.
+        let four = [span(0, 2), span(2, 4), span(4, 6), span(6, 8)];
+        assert_eq!(cut_near_middle(&four, &[]), Some(2), "the middle itself");
+
+        // With the middle gap closed by a use that forbids a cut there, the
+        // candidates are 1 and 3, both one away.
+        let straddling = [span(0, 2), span(2, 5), span(5, 8), span(8, 10)];
+        let use_at_mid = [SplitUse {
+            point: point(5),
+            weight: 1.0,
+            cut_before_allowed: false,
+        }];
+        assert_eq!(
+            between_span_cuts(&straddling, &use_at_mid).collect::<Vec<_>>(),
+            vec![1, 3],
+            "the middle gap is not a legal cut here",
+        );
+        assert_eq!(
+            cut_near_middle(&straddling, &use_at_mid),
+            Some(1),
+            "a tie goes to the lower cut",
+        );
     }
 
     #[test]

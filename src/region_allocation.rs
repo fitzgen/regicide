@@ -1130,63 +1130,15 @@ where
             return Ok(false);
         }
 
-        let pref = *bundle.preference(live_ranges).union();
-
-        let rc = match bundle.constraint(live_ranges) {
-            OperandConstraint::Any => bundle.value_reg_class(live_ranges, input),
-            OperandConstraint::Reg(rc) => rc,
-            OperandConstraint::Stack => unreachable!("already handled"),
-            OperandConstraint::Reuse(_) => unreachable!("already resolved"),
-        };
-
-        self.split_interference
-            .reset(bundle.spans(live_ranges).map(|s| s.query(live_ranges)));
-
-        let best = match rc.members(input.machine) {
-            RegClassMembers::Regs(regs) => splitting::best_split_between_spans(
-                &self.split_spans,
-                &self.split_uses,
-                pref.iter()
-                    .chain(regs.iter().copied().filter(|r| !pref.contains(*r)))
-                    .enumerate(),
-                half_interference(
-                    &mut self.split_interference,
-                    &self.region_assignments,
-                    &mut self.interference_scratch,
-                    live_ranges,
-                    |reg: Reg| core::iter::once(reg.units(input.machine)),
-                ),
-            )
-            .map(|best| (best.cut, Some(best.candidate.1))),
-
-            RegClassMembers::Groups(groups) => {
-                debug_assert!(pref.is_empty());
-                splitting::best_split_between_spans(
-                    &self.split_spans,
-                    &self.split_uses,
-                    groups.iter().copied().enumerate(),
-                    half_interference(
-                        &mut self.split_interference,
-                        &self.region_assignments,
-                        &mut self.interference_scratch,
-                        live_ranges,
-                        |group: RegGroup| {
-                            group
-                                .members(input.machine)
-                                .iter()
-                                .map(|r| r.units(input.machine))
-                        },
-                    ),
-                )
-                .map(|best| (best.cut, None))
-            }
-        };
+        // Cutting in the middle, rather than pricing every admissible cut
+        // against every candidate register, is most of this pass's cost.
+        let best = splitting::cut_near_middle(&self.split_spans, &self.split_uses);
 
         self.split_spans.clear();
         self.split_uses.clear();
         self.split_interference.clear();
 
-        let Some((index, winner)) = best else {
+        let Some(index) = best else {
             counts.split_between_spans_failed.inc();
             event!(
                 events,
@@ -1211,19 +1163,12 @@ where
             }
         );
 
-        if let Some(reg) = winner {
-            let mut winning_reg = RegSet::new();
-            winning_reg.insert(reg);
-
-            suffix.add_hint(live_ranges, events, &winning_reg, None);
-            // Hints attached to neither end stay true of both halves, and the
-            // suffix additionally wants whatever its own spans ask for at the
-            // end it now covers.
+        // Hints attached to neither end stay true of both halves, and the
+        // suffix wants what its own spans ask for at the end it now covers.
+        // `bundle` already carries that hint.
+        let pref = *bundle.preference(live_ranges).union();
+        if !pref.is_empty() {
             suffix.add_hint(live_ranges, events, &pref, None);
-
-            bundle.add_hint(live_ranges, events, &winning_reg, None);
-            // Note: `bundle` already has a hint of `pref`, no need to add it
-            // again.
         }
 
         // Push again with the same phase: we can afford to keep splitting
