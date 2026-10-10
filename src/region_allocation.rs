@@ -248,6 +248,14 @@ where
     /// Each bundle's current allocation priority.
     bundle_priority: SecondaryMap<LiveBundle<E>, Priority>,
 
+    /// Each bundle's clobbered-register set, once `push_bundle` has computed
+    /// it, and `None` once a split has changed the bundle's spans.
+    ///
+    /// Most pushes re-queue a bundle an eviction displaced, and an eviction
+    /// changes neither the bundle's spans nor the function's reservations,
+    /// which is all the set depends on.
+    bundle_clobbered: SecondaryMap<LiveBundle<E>, Option<RegSet>>,
+
     /// The set of bundles that must be allocated to stack slots.
     ///
     /// We just remember the set for now, and actually allocate the stack slots
@@ -307,6 +315,7 @@ where
             region_assignments: Assignments::new(),
             queue: BinaryHeap::new(),
             bundle_priority: SecondaryMap::new(Priority::ZERO),
+            bundle_clobbered: SecondaryMap::new(None),
             stack_bundles: Vec::new(),
             spilled: EntitySet::new(),
             split_spans: Vec::new(),
@@ -328,6 +337,7 @@ where
             region_assignments,
             queue,
             bundle_priority,
+            bundle_clobbered,
             stack_bundles,
             spilled,
             split_spans,
@@ -345,6 +355,7 @@ where
         region_assignments.reset();
         queue.clear();
         bundle_priority.reset();
+        bundle_clobbered.reset();
         stack_bundles.clear();
         spilled.reset();
         split_spans.clear();
@@ -365,6 +376,7 @@ where
             region_assignments,
             queue,
             bundle_priority,
+            bundle_clobbered,
             stack_bundles,
             spilled,
             split_spans,
@@ -382,6 +394,7 @@ where
             && region_assignments.is_reset()
             && queue.is_empty()
             && bundle_priority.is_reset()
+            && bundle_clobbered.is_reset()
             && stack_bundles.is_empty()
             && spilled.is_reset()
             && split_spans.is_empty()
@@ -664,7 +677,14 @@ where
         bundle: LiveBundle<E>,
         phase: Phase,
     ) {
-        let clobbered = regs_clobbered_across(input, live_ranges, bundle);
+        let clobbered = match self.bundle_clobbered[bundle] {
+            Some(clobbered) => clobbered,
+            None => {
+                let clobbered = regs_clobbered_across(input, live_ranges, bundle);
+                self.bundle_clobbered[bundle] = Some(clobbered);
+                clobbered
+            }
+        };
         if is_clobber_bound(input, live_ranges, bundle, &clobbered) {
             self.clobber_bound.insert(bundle);
         } else {
@@ -684,6 +704,11 @@ where
                 phase,
             }
         );
+    }
+
+    /// Forget `bundle`'s cached clobber set, after a split took spans from it.
+    fn forget_clobbered(&mut self, bundle: LiveBundle<E>) {
+        self.bundle_clobbered[bundle] = None;
     }
 
     fn set_bundle_priority(&mut self, bundle: LiveBundle<E>, priority: Priority) {
@@ -1174,6 +1199,7 @@ where
         };
 
         let suffix = bundle.split_at_span(live_ranges, input, events, output, index)?;
+        self.forget_clobbered(bundle);
 
         event!(
             events,
@@ -1331,6 +1357,7 @@ where
 
         let suffix =
             bundle.split_at_point(live_ranges, input, events, output, cut.index, cut.at)?;
+        self.forget_clobbered(bundle);
 
         event!(
             events,
@@ -1546,6 +1573,7 @@ where
                         bundle.split_at_point(live_ranges, input, events, output, index, at)?
                     }
                 };
+                self.forget_clobbered(bundle);
                 piece.add_hint(live_ranges, events, &pref, None);
                 self.push_bundle(
                     input,
@@ -2323,6 +2351,44 @@ mod tests {
         }
 
         Ok(Some(context))
+    }
+
+    /// Every cached clobber set that survives allocation must still be the
+    /// one `regs_clobbered_across` would compute now.
+    ///
+    /// A missed `forget_clobbered` leaves a stale set behind, which only
+    /// sometimes changes a visible decision but is always detectably stale.
+    #[test]
+    fn cached_clobbers_match_a_fresh_walk() -> CheckResult<TestInput> {
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = allocate(test_input)? else {
+                        return Ok(());
+                    };
+                    let inner = &context.context32;
+                    test_input
+                        .with_input(|input| -> IResult<()> {
+                            let live_ranges = &inner.live_ranges;
+                            for bundle in live_ranges.bundles() {
+                                let Some(cached) = inner.region_allocation.bundle_clobbered[bundle]
+                                else {
+                                    continue;
+                                };
+                                let fresh = regs_clobbered_across(input, live_ranges, bundle);
+                                assert_eq!(cached, fresh, "{bundle:?}'s clobber set is stale");
+                            }
+                            Ok(())
+                        })
+                        .map_err(|e| format!("{e:?}"))?;
+
+                    Ok(())
+                },
+            )
     }
 
     /// Every bundle and every span that exists at the end of allocation can be
