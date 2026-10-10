@@ -833,9 +833,65 @@ pub(crate) fn sort_spans<E>(
 {
     debug_assert!(keyed.is_empty());
     keyed.extend(spans.iter().map(|&span| (span.sort_key(live_ranges), span)));
-    keyed.sort_unstable_by_key(|&(key, _)| key);
+
+    // Bucketing by value first hands the comparison sort many short runs
+    // instead of one long one, which only pays on a long list.
+    if keyed.len() >= RADIX_SORT_SPANS_MIN {
+        sort_keyed_by_val(keyed);
+    } else {
+        keyed.sort_unstable_by_key(|&(key, _)| key);
+    }
+
     spans.clear();
     spans.extend(keyed.drain(..).map(|(_, span)| span));
+}
+
+/// How many spans make `sort_spans`'s bucketing pass worth its extra scan.
+const RADIX_SORT_SPANS_MIN: usize = 64;
+
+/// Sort `keyed` by key, bucketing on the value index the key's top bits hold.
+fn sort_keyed_by_val<E>(keyed: &mut alloc::vec::Vec<(u128, LiveSpan<E>)>)
+where
+    E: EntityRepr,
+{
+    // Size the histogram by the values present, not by what `Val` can index.
+    let val_of = |key: u128| (key >> 96) as usize;
+    let (lo, hi) = keyed.iter().fold((usize::MAX, 0), |(lo, hi), &(key, _)| {
+        (lo.min(val_of(key)), hi.max(val_of(key)))
+    });
+    let width = hi - lo + 1;
+
+    // A histogram wider than the input is not worth filling.
+    if width > keyed.len() {
+        keyed.sort_unstable_by_key(|&(key, _)| key);
+        return;
+    }
+
+    let mut starts = alloc::vec![0usize; width + 1];
+    for &(key, _) in keyed.iter() {
+        starts[val_of(key) - lo + 1] += 1;
+    }
+    for i in 1..starts.len() {
+        starts[i] += starts[i - 1];
+    }
+
+    let mut out = alloc::vec::Vec::with_capacity(keyed.len());
+    out.resize(keyed.len(), keyed[0]);
+    let mut at = starts.clone();
+    for &entry in keyed.iter() {
+        let b = val_of(entry.0) - lo;
+        out[at[b]] = entry;
+        at[b] += 1;
+    }
+
+    // Each bucket is one value's spans, still unordered among themselves.
+    for w in starts.windows(2) {
+        out[w[0]..w[1]].sort_unstable_by_key(|&(key, _)| key);
+    }
+
+    keyed.clear();
+    keyed.extend_from_slice(&out);
+    debug_assert!(keyed.windows(2).all(|w| w[0].0 < w[1].0));
 }
 
 impl<E> LiveRanges<E>
