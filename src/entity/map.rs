@@ -451,6 +451,7 @@ where
     ///
     /// Entries that are still implicitly the default value are not visited, as
     /// there is nothing yet to mutate.
+    #[allow(dead_code, reason = "will probably need it")]
     pub fn iter_mut(&mut self) -> PrimaryMapIterMut<'_, K, V> {
         self.inner.iter_mut()
     }

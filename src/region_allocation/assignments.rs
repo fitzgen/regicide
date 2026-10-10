@@ -955,15 +955,24 @@ where
         debug_assert!(never.is_none());
     }
 
-    /// Remove all of `bundle`'s assignments.
+    /// Remove `bundle`'s assignments from `reg_units`.
     ///
     /// `spans` must be exactly the spans that `bundle` was assigned with.
+    ///
+    /// `reg_units` must be the units of `bundle`'s own allocation, not of
+    /// whatever is taking its place: a victim and the candidate evicting it
+    /// need only overlap in one unit, and a narrower set leaves a stale
+    /// assignment behind for a bundle that no longer holds a register.
+    /// Scanning those units rather than all of them skips dozens of
+    /// unrelated maps.
     fn remove_assignment(
         &mut self,
         bundle: LiveBundle<E>,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
         spans: impl ExactSizeIterator<Item = QuerySpan<E>> + Clone,
     ) {
-        for (_unit, unit_assignments) in self.assignments.iter_mut() {
+        for unit in iter_reg_units(reg_units) {
+            let unit_assignments = &mut self.assignments[unit];
             for span in spans.clone() {
                 let key = AssignmentKey::new(span.range().start);
                 if unit_assignments
@@ -974,6 +983,17 @@ where
                 }
             }
         }
+        debug_assert!(
+            !self
+                .assignments
+                .iter()
+                .any(|(_, m)| m.into_iter().any(|(_, a)| a.bundle == bundle)),
+            "{bundle:?} still holds an assignment in some unit outside the ones given: {:?}",
+            self.assignments
+                .iter()
+                .filter_map(|(u, m)| m.into_iter().any(|(_, a)| a.bundle == bundle).then_some(u))
+                .collect::<Vec<_>>(),
+        );
     }
 
     /// Insert a new assignment.
@@ -1123,7 +1143,7 @@ where
         None
     }
 
-    fn try_evict_and_assign<C, Units, Spans>(
+    fn try_evict_and_assign<C, Units, Spans, BundleUnits>(
         &mut self,
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = C>,
@@ -1131,11 +1151,13 @@ where
         max_cost: EvictionCost,
         eviction_cost: impl Fn(LiveBundle<E>, C) -> EvictionCost,
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
+        bundle_units: impl Fn(LiveBundle<E>) -> BundleUnits,
     ) -> Option<(C, LiveBundle<E>)>
     where
         C: Copy,
         Units: Iterator<Item = Range<RegUnit>> + Clone,
         Spans: ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        BundleUnits: Iterator<Item = Range<RegUnit>>,
     {
         let spans = bundle_spans(bundle);
         debug_assert!(spans.len() > 0);
@@ -1196,7 +1218,11 @@ where
             return None;
         };
 
-        self.remove_assignment(other_bundle, bundle_spans(other_bundle));
+        self.remove_assignment(
+            other_bundle,
+            bundle_units(other_bundle),
+            bundle_spans(other_bundle),
+        );
         self.insert_assignment(bundle, candidate_units(candidate), spans);
         Some((candidate, other_bundle))
     }
@@ -1207,7 +1233,7 @@ where
     /// If `bundle` was assigned, then returns the candidate it was assigned to
     /// along with the other `LiveBundle` that was evicted to make room for it.
     /// Otherwise, returns `None` and `self` is unmodified.
-    pub fn try_evict_reg_and_assign<Spans>(
+    pub fn try_evict_reg_and_assign<Spans, BundleUnits>(
         &mut self,
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = Reg>,
@@ -1215,9 +1241,11 @@ where
         max_cost: EvictionCost,
         eviction_cost: impl Fn(LiveBundle<E>, Reg) -> EvictionCost,
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
+        bundle_units: impl Fn(LiveBundle<E>) -> BundleUnits,
     ) -> Option<(Reg, LiveBundle<E>)>
     where
         Spans: ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        BundleUnits: Iterator<Item = Range<RegUnit>>,
     {
         self.try_evict_and_assign(
             bundle,
@@ -1226,11 +1254,12 @@ where
             max_cost,
             eviction_cost,
             bundle_spans,
+            bundle_units,
         )
     }
 
     /// Like `try_evict_reg_and_assign` but for `RegGroup`s.
-    pub fn try_evict_reg_group_and_assign<GroupUnits, Spans>(
+    pub fn try_evict_reg_group_and_assign<GroupUnits, Spans, BundleUnits>(
         &mut self,
         bundle: LiveBundle<E>,
         candidates: impl IntoIterator<Item = RegGroup>,
@@ -1238,10 +1267,12 @@ where
         max_cost: EvictionCost,
         eviction_cost: impl Fn(LiveBundle<E>, RegGroup) -> EvictionCost,
         bundle_spans: impl Fn(LiveBundle<E>) -> Spans,
+        bundle_units: impl Fn(LiveBundle<E>) -> BundleUnits,
     ) -> Option<(RegGroup, LiveBundle<E>)>
     where
         GroupUnits: Iterator<Item = Range<RegUnit>> + Clone,
         Spans: ExactSizeIterator<Item = QuerySpan<E>> + Clone,
+        BundleUnits: Iterator<Item = Range<RegUnit>>,
     {
         self.try_evict_and_assign(
             bundle,
@@ -1250,6 +1281,7 @@ where
             max_cost,
             eviction_cost,
             bundle_spans,
+            bundle_units,
         )
     }
 
@@ -1635,6 +1667,31 @@ mod tests {
             .position(|units| !oracle_conflicts(oracle, units, spans))?;
         oracle_insert(oracle, bundle, &candidates[index], spans);
         Some(index)
+    }
+
+    /// Every register unit the oracle says `bundle` is assigned in, standing
+    /// in for the `RegAllocation::units` the real caller passes.
+    fn units_by_bundle(oracle: &Oracle) -> Vec<Vec<Range<RegUnit>>> {
+        (0..usize::from(NUM_BUNDLES))
+            .map(|index| {
+                let b = bundle(index);
+                let mut units: Vec<RegUnit> = oracle
+                    .assignments
+                    .iter()
+                    .filter(|existing| existing.bundle == b)
+                    .map(|existing| existing.unit)
+                    .collect();
+                units.sort_unstable();
+                units.dedup();
+                units
+                    .into_iter()
+                    .map(|unit| {
+                        let next = RegUnit::try_new(unit.index() + 1).unwrap();
+                        unit..next
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// The spans that each bundle is currently assigned with, as
@@ -2956,6 +3013,9 @@ mod tests {
                                 SpillWeight::new(f32::from(weights[b.index()])),
                             );
 
+                            // Snapshot before the oracle evicts, as the real
+                            // caller sees it.
+                            let units_of_bundle = units_by_bundle(&oracle);
                             let expected = oracle_try_evict_and_assign(
                                 &mut oracle,
                                 b,
@@ -2964,6 +3024,8 @@ mod tests {
                                 max_cost,
                                 |victim, index| cost(victim, candidates[index]),
                             );
+                            let units_of =
+                                |bb: LiveBundle<u32>| units_of_bundle[bb.index()].iter().cloned();
                             let actual = assignments
                                 .try_evict_reg_and_assign(
                                     b,
@@ -2972,6 +3034,7 @@ mod tests {
                                     max_cost,
                                     cost,
                                     bundle_spans,
+                                    units_of,
                                 )
                                 .map(|(r, victim)| (victim, candidate_index(&candidates, r)));
                             check_try_evict(
@@ -3032,6 +3095,9 @@ mod tests {
                                 SpillWeight::new(f32::from(weights[b.index()])),
                             );
 
+                            // Snapshot before the oracle evicts, as the real
+                            // caller sees it.
+                            let units_of_bundle = units_by_bundle(&oracle);
                             let expected = oracle_try_evict_and_assign(
                                 &mut oracle,
                                 b,
@@ -3040,6 +3106,8 @@ mod tests {
                                 max_cost,
                                 |victim, index| cost(victim, candidates[index]),
                             );
+                            let units_of =
+                                |bb: LiveBundle<u32>| units_of_bundle[bb.index()].iter().cloned();
                             let actual = assignments
                                 .try_evict_reg_group_and_assign(
                                     b,
@@ -3048,6 +3116,7 @@ mod tests {
                                     max_cost,
                                     cost,
                                     bundle_spans,
+                                    units_of,
                                 )
                                 .map(|(g, victim)| (victim, candidate_index(&candidates, g)));
                             check_try_evict(

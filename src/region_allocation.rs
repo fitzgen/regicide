@@ -963,6 +963,12 @@ where
         };
 
         let bundle_spans = |b: LiveBundle<E>| b.spans(live_ranges).map(|s| s.query(live_ranges));
+        // The victim's own units; see `Assignments::remove_assignment`.
+        let bundle_units = |b: LiveBundle<E>| {
+            b.reg_allocation(live_ranges)
+                .expect("a bundle being evicted holds a register")
+                .units(machine)
+        };
 
         let evicted = match rc.members(machine) {
             RegClassMembers::Regs(regs) => self
@@ -978,6 +984,7 @@ where
                         eviction_cost(victim, victim.preference(live_ranges).union_contains(reg))
                     },
                     bundle_spans,
+                    bundle_units,
                 )
                 .map(|(reg, evicted)| {
                     output
@@ -1002,6 +1009,7 @@ where
                             eviction_cost(victim, hinted)
                         },
                         bundle_spans,
+                        bundle_units,
                     )
                     .map(|(group, evicted)| (RegAllocation::RegGroup(group), evicted))
             }
