@@ -7,8 +7,8 @@ description: >
   cost, find what is slow or superlinear in regicide, or recover a regicide
   compile-time regression -- driving the work empirically by replaying
   captured corpora with `examples/run.rs` (`--insts`), the `timing` feature,
-  `samply-text`, and disassembly of the hot functions. Produces a series of
-  `WIP` commits, one per kept optimization, and a report directory.
+  a sampling profiler, and disassembly of the hot functions. Produces a
+  series of `WIP` commits, one per kept optimization, and a report directory.
 ---
 
 # Optimize regicide's compile time
@@ -36,6 +36,12 @@ Breaking any of these makes the optimization invalid, however fast it is.
   permission to change it *in this session*. `scripts/check_identical.sh` over
   every input set proves it. Different-but-also-valid output is still a
   failure: the user's codegen-quality work is measured against this output.
+  Permission is often **scoped** -- "for this attempt only" -- so re-read
+  what was granted before each attempt rather than treating it as a new
+  default, and say in the commit message that the change was permitted.
+  When it is granted, the gate becomes validity (`run --check`, exit 0 per
+  set) **plus** a codegen-quality comparison on estimated cycles; see
+  "When output changes are allowed".
 - **No new `unsafe`**, unless the user explicitly allows it in this session.
 - **Statistically significant.** Every kept change has a significant
   improvement on at least one input set and no significant regression on any.
@@ -81,7 +87,7 @@ Not `sets`: `make_sets.py` creates it and refuses one that already exists.
 | `report.md` | Status, baseline, table of every attempt, cumulative result. Created first, updated after every step. Template in `references/report-templates.md`. |
 | `successful/<slug>.md` | One per kept optimization: commit sha, what and why, measurements, links into `profiles/` and `bench/`. |
 | `unsuccessful/<slug>.md` | One per dropped attempt: commit sha (it stays reachable from the tag, see "Git"), what, why it failed, measurements. |
-| `profiles/` | Raw `samply` profiles (`.json.gz`), the `samply-text` reports made from them, timing logs, disassembly. |
+| `profiles/` | Raw profiles (`samply`'s `.json.gz`, or `sample`'s text), the reports made from them, timing logs, disassembly. |
 | `misc/` | Environment and host load, the census, counters, screens (`misc/screens.md` plus `screened-<slug>.diff`), tool gotchas, and **suggested additions to this skill** (`misc/skill-learnings.md`). |
 | `bins/` | A copy of the `run` binary for each commit measured, named `run-<sha>` (and `run-<sha>-prof` for profiling builds). Comparisons need two binaries side by side. |
 | `bench/` | Raw per-sample CSVs from `scripts/compare.py`, so any verdict can be re-checked. |
@@ -93,16 +99,22 @@ write, and the commit sha every measurement was taken at.
 ## 0. Setup
 
 1. Create `$R` and a skeleton `report.md` (status: "setting up").
-2. **Record the environment** into `$R/misc/environment.md`: `date`,
+2. **Check the tools exist** and note what is missing in
+   `$R/misc/environment.md`: `which samply samply-text rustfilt;
+   cargo +nightly fuzz --version`. Several are absent on this host (see
+   `references/known-findings.md`, "Tooling facts"), and the fallbacks are
+   in "Which functions" below. Finding out now costs a minute; finding out
+   mid-attempt costs the attempt's momentum.
+3. **Record the environment** into `$R/misc/environment.md`: `date`,
    `git rev-parse HEAD`, `git status --short`, `rustc -V`, `sysctl -n
    machdep.cpu.brand_string hw.ncpu`, `uptime`, and the top of
    `ps -Ao %cpu,etime,comm -r | head -15`. **Load matters.** This host
    normally runs CrashPlan, Defender, and other agents that use whole cores,
    and other Claude sessions may be fuzzing or benchmarking. Write down what
    was running. Re-check before every benchmark and record it with the result.
-3. **Branch.** Work on a fresh branch off the current `HEAD`, e.g.
+4. **Branch.** Work on a fresh branch off the current `HEAD`, e.g.
    `git switch -c compile-speedups-NNN`. Note the base sha in `report.md`.
-4. **Baseline tests.** Run the test suite on the untouched tree (see
+5. **Baseline tests.** Run the test suite on the untouched tree (see
    "Testing") and record the result. Then a red test later is yours. For
    pre-existing failures, also check the user's memory notes.
 
@@ -246,7 +258,38 @@ repeats the inputs and logs every pass of every repeat, so to average out
 noise on one small input, sum over a `--profile` run and divide by the
 `profiled N pass(es)` count printed in the totals.
 
-### Which functions: `samply-text`
+### Which functions: `samply-text`, or `sample`
+
+**Check the tools exist before planning around them.** On this host, as of
+2026-10-09, `samply`, `samply-text` and `rustfilt` are **not installed**,
+which breaks the recipe below and `scripts/disasm.sh` with it. `cargo fuzz`
+was missing too until the user installed it mid-session. A minute of
+`which samply samply-text rustfilt; cargo fuzz --version` during setup saves
+discovering each one at the moment you need it.
+
+The fallback, which carried a whole session:
+
+```bash
+# /usr/bin/sample is always present on macOS.
+($R/bins/run-$sha-prof -q --profile 30 <set> >/dev/null 2>&1 &)
+sleep 8
+sample $(pgrep -n -f "run-$sha-prof") 16 -f $R/profiles/<name>.sample.txt
+```
+
+Read `Sort by top of stack` for flat self time and the `Call graph` above
+it for the tree. It shows source lines when the binary has line tables.
+Symbols come out mangled (v0), so `grep` for the mangled substring --
+`10coalescing8coalesce`, say -- rather than the pretty name. There is no
+equivalent of `-c`, so deep recursion is harder to read.
+
+For disassembly without `rustfilt`:
+
+```bash
+sym=$(nm $R/bins/run-$sha-prof | grep '<mangled substring>' | head -1 | awk '{print $3}')
+objdump -d --disassemble-symbols="$sym" $R/bins/run-$sha-prof
+```
+
+When `samply` *is* available, prefer it:
 
 ```bash
 samply record -s -o $R/profiles/<name>.json.gz -- \
@@ -338,6 +381,30 @@ Counters chase the cheapest thing to count, so also count the *other*
 shortcuts a change would disturb. A reordering that skips 5.7M of one kind
 of work can lose more by disabling an existing prune that fired more often.
 
+#### Three counters worth running unprompted
+
+Each of these found a kept win on `compile-speedups-005`, and each is a
+handful of lines:
+
+1. **Visits per block, for every dataflow fixpoint** -- not just the one a
+   previous session fixed. Liveness was at **4.54 visits per block** on an
+   input whose switch dispatch has 4,097 successors, re-visiting that one
+   block ~16,400 times, years after the same pathology was fixed in RME.
+   `-92% insts` on that input. Check liveness, RME, and anything else with
+   a worklist.
+2. **The log-log slope of `insts` against input bytes, per benchmark
+   family**, computed straight from the census TSV after `make_sets.py`.
+   Every family came out at **1.5 to 2.2**. That one number reframed the
+   session: the gap to ion is an exponent, not a constant factor, so the
+   search was for superlinear structure rather than for hot lines.
+3. **What fraction of a repeated computation is a re-run of unchanged
+   input.** `regs_clobbered_across` was recomputed on every queue push, and
+   **99.8% of the spans it walked belonged to re-pushes of bundles whose
+   spans had not changed** (an eviction changes neither the bundle's spans
+   nor the function's reservations). Caching it was `-8.3%` on the input
+   where eviction dominates. Ask it of any function called from a loop that
+   re-queues work.
+
 ## 4. Choose what to try
 
 Rank candidates by **estimated saving × breadth**. A 30% speedup of a pass
@@ -345,18 +412,71 @@ that is 2% of `typical/` is worth less than 5% of a pass that is 40% of it.
 Record each candidate, its estimate, and the profile evidence in `report.md`'s
 backlog before starting on it.
 
+**Probe the ceiling before building anything.** A deliberately-wrong fast
+version, run once and thrown away, tells you what the real fix could be
+worth. On `compile-speedups-005`, replacing the split-point *search* with
+"cut at the midpoint, price nothing" -- wrong output, reverted immediately
+-- showed the search was **22% of `typical/` and 51% of the heaviest
+input**. That single number justified the session's largest attempt and
+would have killed it just as cheaply had it come back at 2%.
+
+### Borrowing a design from ion or regalloc3
+
+`~/regalloc2/src/ion/` and `~/regalloc3` solve the same problems and are
+worth reading when regicide looks structurally slow. But:
+
+**The comparison establishes the cost worth attacking, not the fix.** On
+`-005` a reading of ion correctly identified that regicide *searches* for a
+split point where ion derives one for free from its interference walk. The
+recommendation that followed -- copy ion's conflict-derived cut -- was
+**wrong, and measurably so: +216% on `typical/`**. Ion's first conflict is
+nearly always in the bundle's first span, so the cut peels one span at a
+time; ion's bundles leave circulation fast enough not to care, while
+regicide requeues the prefix and keeps splitting.
+
+Worse, the borrowed part turned out to be **inert**. Clamping the conflict
+towards the middle fixed the blow-up, and sweeping the clamp showed the
+tighter it got the better the result on *both* compile time and codegen
+quality -- until at the limit the clamp pinned the cut to the middle and
+the conflict contributed nothing at all. What shipped ignores the conflict
+entirely.
+
+So: probe the cost, then try the borrowed design as **one candidate among
+others**, and **sweep its parameters**. A parameter sweep is what revealed
+the borrowed part was doing no work. Reading another implementation tells
+you what it does, not what it buys here.
+
 Kinds of optimization, roughly in order of how often they pay off here:
 
 - **Better big-O.** Superlinear inputs exist (see "Census and input sets").
   Find the loop nest that grows with function size, with a counter, and
   break it: an index instead of a scan, an interval structure instead of
   repeated range searches, incremental update instead of recomputation.
+- **Stop searching for something you can derive, or balance.** The most
+  expensive kind of work here is a search whose answer barely matters.
+  `split_between_spans` priced every admissible cut against every candidate
+  register -- **22% of `typical/` and 51% of the heaviest input** -- and
+  cutting at the middle instead was **-22.6%** *and* slightly better
+  codegen. Before optimizing a search, ask whether its result is worth what
+  it costs, and probe the ceiling with a throwaway wrong-but-fast version.
 - **Fixpoint visit order.** Count analysis visits against reachable blocks
-  for every dataflow fixpoint. A LIFO worklist on a forward analysis made
-  RME visit each block 4.8 times (15 on one heavy input); visiting in
-  reverse post-order cut the pass by 79% and `typical/` by 17.5%, with
-  identical output, since a monotone fixpoint does not depend on visit
-  order. Backward analyses want post-order.
+  for **every** dataflow fixpoint, not just the one a previous session
+  fixed. A LIFO worklist on a forward analysis made RME visit each block 4.8
+  times (15 on one heavy input); visiting in reverse post-order cut the pass
+  by 79% and `typical/` by 17.5%. **Liveness had the same bug two sessions
+  later**: 4.54 visits per block on a CFG whose switch dispatch has 4,097
+  successors, fixed with a post-order heap for **-92% on that input**.
+  Identical output either way, since a monotone fixpoint does not depend on
+  visit order. Backward analyses want post-order, forward ones RPO.
+- **One pass per (collection, query set), not one query per element.** When
+  a caller asks a sorted structure about many keys that ascend, the general
+  "search per key" shape is `O(keys x log n)` where one merge is
+  `O(keys + entries touched)`. This is ion's design (`try_to_allocate_bundle_to_reg`
+  carries a comment stating exactly that trade), and the single biggest
+  constant-factor family here: the split row fill went from 156 binary
+  searches over a ~4,300-entry map to one search plus a sweep (**-2.6%
+  typical, -5.2% on the heaviest input**). Note the shape has to *replace*
+  the per-key loop -- adding a cursor to it loses (see "The null test").
 - **Prune against the best so far, and generalize a prune that works.**
   When a nested search keeps a running best, pass it down as a floor
   (`compile-speedups-004` attempt 2), and look for monotonicity: a split's
@@ -407,11 +527,24 @@ Kinds of optimization, roughly in order of how often they pay off here:
   `#[inline]` on cross-module tiny functions, and hoist invariant loads.
 
 Ideas that have **lost** on this data, so think twice before retrying:
-galloping or "search near the last hit" instead of binary search (twice:
-units of a few hundred entries cost ~8 binary-search steps, and threading a
-cursor costs more); pricing the expensive half of a split first; walking
-every per-unit vector to keep its capacity across resets. See
-`references/known-findings.md`.
+galloping or "search near the last hit" instead of binary search (three
+times: units of a few hundred entries cost ~8 binary-search steps, and
+threading a cursor through the existing per-span call chain costs more than
+it saves -- but see the null test under "Screening", which showed the
+cursor itself was a win buried under its scaffolding, and led to the bulk
+fill that replaced the loop outright); pricing the expensive half of a
+split first; walking every per-unit vector to keep its capacity across
+resets; a maintained side index over the unit maps (five variants, all
+regressions -- the per-insert write costs more than the searches saved).
+See `references/known-findings.md`.
+
+**A large "falls back to the slow path" share can be the opposite of
+opportunity.** `-005`'s bulk row fill covered 38% of rows and bailed out on
+the other 62%, which looked like the obvious next win. Extending it lost
+3-6%: the per-span path **stops at the first reserved span**, so it was
+already cheap on exactly those rows, and a sweep has no such exit. The rows
+falling back were the ones never paying full price. Measure what the
+fallback *costs on those cases* before chasing its share.
 
 Things that are **out of bounds**: changing heuristics, priorities, tie-breaks,
 iteration order that can affect a decision, or anything else that changes the
@@ -460,13 +593,40 @@ also confirms small wins: on `compile-speedups-004`, four attempts of
 ### Screening
 
 When the user caps the number of attempts, a screen costs no attempt, so
-use it freely: on `compile-speedups-004` it rejected seven ideas (some of
-them large regressions) without spending one. One `--insts` sample per
-build is noisy at the ±0.2% level on heavy inputs, so a screen of a few
-tenths of a percent decides nothing; only commit those if the idea is
-cheap. Record every screen (idea, deltas per set, diff path) in
+use it freely: `compile-speedups-004` rejected seven ideas this way and
+`-005` ten, several of them large regressions (+6.3%, +5.0%, +29%). One
+`--insts` sample per build is noisy at the ±0.2% level on heavy inputs, so
+a screen of a few tenths of a percent decides nothing; only commit those if
+the idea is cheap. Record every screen (idea, deltas per set, diff path) in
 `misc/screens.md`, and save the diff with `git diff > $R/misc/screened-<slug>.diff`
 before reverting.
+
+**Screen on the whole `typical/` set, not a sample.** A sample of every
+40th input (825 of 13,922) disagreed with the full set repeatedly on
+`-005`, and in both directions: one idea looked like a win on the sample
+and a loss on the set, another -2.07% on the sample and -2.67% on the set.
+A full `--insts` pass costs ~20 s. The per-family sets in `misc/` are for
+diagnosis, not for verdicts.
+
+**A failed screen is evidence, not just a rejection.** Two of `-005`'s kept
+attempts came out of what a failed screen taught, so write down *why* it
+failed, not only that it did.
+
+#### The null test
+
+When a change regresses, **disable its new logic but keep its code shape**,
+and measure again. The difference separates "the idea is wrong" from "the
+scaffolding costs more than the idea saves".
+
+On `-005` a cursor threaded through the interference query regressed 1-5%.
+Raising its threshold so the cursor **never fired** still cost +0.55% to
++0.92% -- so the whole regression was the extra parameter, the
+`mem::take`/put-back, and the second routine competing for inlining, and
+the cursor itself was worth about -3.1% underneath it. That reading is what
+led to the attempt that *did* work: replace the per-span call loop entirely
+rather than speed up its iterations. Without the null test the obvious
+conclusion -- "cursors lose here", which two earlier sessions had already
+recorded -- would have been wrong for the third time.
 
 ### Overlapping work
 
@@ -499,6 +659,21 @@ no `test result` lines at all, and an empty grep looks like a pass. regicide
 has `cfg(test)` struct literals that only the test build sees, so adding a
 field to a struct can break tests while `cargo build` stays happy. At
 `e53b573` the clean baseline was 389 + 8 passed, 10 ignored, about 2 minutes.
+At `7e8f866` it is 428 + 8; `compile-speedups-005` left it at 430 + 8.
+
+**`cargo test --all-features --no-run` is the cheap version of that check**
+(a few seconds, no test execution). Run it immediately after any change to
+a function's signature. Adding one out-parameter to `try_assign_to_reg` on
+`-005` left `cargo build` green and broke eight `#[cfg(test)]` call sites.
+
+**When a test fails, re-run on a known-clean tree before explaining it.**
+`-005` made this mistake in both directions on the same day: once blaming a
+race for six genuine failures (a real aliasing bug), and once nearly
+accepting eight failures that really were a race with a mutation check in
+the tree. A failure list spanning unrelated modules is **not** evidence of
+a race -- it is what a broken invariant deep in the allocator looks like.
+Restore the tree, confirm the release binary matches the one you screened
+(`cmp`), and only then form a theory.
 
 If the change touches anything the fuzzer exercises (most of the allocator),
 also run the `allocate` fuzz target. The user's notes require `-s none`,
@@ -557,6 +732,50 @@ below the floor, a span set long enough to be walked from both ends,
 where no reasonable test can see the mutation (an equivalent condition kept
 for safety), say so in the write-up: the gate is then the real check, and
 the write-up should not claim test coverage.
+
+### Making the mutation check mean something
+
+- **Confirm the edit landed.** A mutation that "passes" may never have been
+  applied: on `-005` `cargo fmt` reflowed an expression after the patch was
+  written, so its match string no longer existed, and the suite ran against
+  unmutated code. It looked like a real coverage gap. `grep` for the
+  mutation, or have the patch script assert, before believing a pass.
+- **If you cannot make a mutation fail, check the new code runs at all.**
+  An `eprintln!` in the new branch, counted over a test run, answers it in a
+  minute. On `-005` an eviction shortcut's precondition **never fired once**
+  in a 2,000-iteration property run; three added seeds and a hand-written
+  unit test all failed to reach it. The tests were not weak -- the generator
+  could not reach that state. That is worth knowing before writing a fourth
+  test.
+- **Prefer a `debug_assert` to a new test case.** Asserting the invariant
+  at the point it must hold lets the *existing* generator find the bug,
+  because it usually already produces the shapes; it just has no way to
+  notice. On `-005` a one-line `debug_assert` that no assignment survived
+  outside the units given caught the real bug **and** two bugs in the test
+  harness written to catch it. Measure the assert's cost if it is in a hot
+  path -- that one was free.
+- **A mutation that produces identical output may be correct.** Bucketing a
+  sort on `key >> 97` instead of `>> 96` merges two values per bucket and
+  changes nothing, because each bucket is still sorted within itself.
+  Record it as a mutation that *should* pass rather than as a gap.
+
+### When output changes are allowed
+
+Identity is not the gate; validity and codegen quality are. Run
+`run --check -q` per set and require exit 0 from each. Also compare
+**estimated cycles**, which is the metric the user's codegen-quality work
+is measured against -- `run -q <set>` prints it in the totals. A
+compile-time win that costs cycles is a trade the user has to approve; one
+that improves them is not a trade at all.
+
+`compare.py` prints `ALLOCATION COUNTS DIFFER` instead of its usual
+agreeing line, so any loop waiting on the agreeing phrase will hang. Also
+re-check which tests assert that a *case is still reachable*: on `-005` one
+variant of an output-changing attempt silently stopped producing the
+allocation shape that reaches a guard in `hoist_demanded_moves`, leaving it
+untested across the whole corpus. The test failure was evidence about the
+change, not a stale test, and it discriminated between two variants that
+looked identical on every aggregate number.
 
 ## Measuring
 
@@ -747,3 +966,27 @@ Then tell the user where the report is and summarize the cumulative result.
   printed `Finished` before trusting a screen, and reset the file before
   retrying an edit.
 - **A fuzz crash from a dirty tree.** See "Overlapping work".
+- **Inserting an item above an existing one steals its attributes.** A new
+  function or test written directly after an existing item's doc comment
+  takes that doc -- and any `#[cfg(...)]` with it -- because Rust attaches
+  outer attributes to the *next* item. A review of `compile-speedups-005`
+  found this three times in eight commits, once silently un-gating a test
+  that cannot compile without the `visualizer` feature. **Nothing catches
+  the `cfg` half**: `cargo doc --all-features` sees the orphaned doc, and
+  the dev-dependency feature unification hides the `cfg` from every CI row
+  that builds tests. It is a hazard of patching files by string insertion.
+  After inserting an item, read what sits immediately above the insertion
+  point and confirm the item *below* still owns its docs and attributes.
+- **`pgrep -f <pattern>` matches your own waiting loop.** `until ! pgrep -f
+  'check_identical.sh'; do sleep 10; done` never exits, because the loop's
+  own command line contains that string. This looked twice like a gate
+  running long after it had finished. Wait on the log's contents instead:
+  `until [ "$(grep -c 'identical\|DIFFERENT' $R/misc/ident-a2.log)" -ge 4 ]`.
+- **Waiting on a phrase only one code path prints.** `compare.py` ends with
+  `allocation counts identical: ...` when the builds agree and
+  `ALLOCATION COUNTS DIFFER ...` when they do not. A monitor watching for
+  the first sat through a full 30-minute timeout on a run that had finished
+  25 minutes earlier. Match something both paths print (`=>`, or `COUNTS`),
+  or wait for the process to exit.
+- **A sample of `typical/` is not `typical/`.** See "Screening"; they
+  disagreed in both directions on `-005`.

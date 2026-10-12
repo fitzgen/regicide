@@ -160,10 +160,23 @@ allocation. A separate superlinearity from the splitting ones. It is
 `heavy/01` in `compilation-speedup-002`'s sets, and is now the
 second-heaviest input.
 
-**Status:** open, not profiled. Probably affected by `compile-speedups-004`,
-which replaced liveness's `BTreeSet`s with sorted vectors (liveness pass
--75% on `typical/`), but that input is not in `codegen-analysis-006` and was
-not re-measured.
+**Status:** **fixed** by `compile-speedups-005` (`a9dc9c1`), which found the
+cause and closed it: **the worklist was a LIFO `Vec`**. It was *seeded* in
+post-order, which is right for a backwards analysis, but the first
+re-enqueue broke that order, and this input's switch dispatch has **4,097
+successors**, so it was re-enqueued and re-popped after nearly every arm --
+**4.54 visits per block, ~16,400 visits of that one block**, each
+re-running `transfer_edges` over all 4,097 successors and almost always
+learning nothing (134M `SortedVec` unions).
+
+A `BinaryHeap` keyed by reverse post-order index keeps the order after a
+re-enqueue too. A monotone fixpoint does not depend on visit order, so the
+output is unchanged. **-92.3% insts and -83.3% wall on this input**, ~0% on
+ordinary functions.
+
+This is the same pathology `compile-speedups-004` fixed in redundant-move
+elimination, which had been left in place here. **Check every fixpoint's
+visits-per-block, not just the one a previous session fixed.**
 
 ## Tooling facts (2026-10-05)
 
@@ -190,6 +203,17 @@ not re-measured.
 - Disassembly: on macOS, `objdump --source` only finds line info through a
   dSYM. `scripts/disasm.sh` runs `dsymutil` for you. Building with
   `split-debuginfo="packed"` fails here and leaves stray `.rcgu.o` files.
+- **Missing tools (2026-10-09):** `samply`, `samply-text` and `rustfilt`
+  are **not installed** on this host, so the SKILL's profiling recipe and
+  `scripts/disasm.sh` both fail. `cargo fuzz` was missing too until the
+  user installed it mid-session. `/usr/bin/sample` and `objdump
+  --disassemble-symbols` are the fallbacks; see SKILL.md, "Which
+  functions". Check with `which samply samply-text rustfilt` during setup
+  rather than discovering each one when you need it.
+- `insts-retired` CV on `codegen-analysis-008`'s `typical/` (13,922 inputs,
+  ~2e11 insts per sample) is **0.01-0.04%**, and wall CV is 1-4% on a quiet
+  host. Both resolve easily at n=12; the host's load is what decides
+  whether wall resolves, not the sample count.
 - The baseline `cargo test --all-features` at `e53b573`: 389 + 8 passed,
   10 ignored, exit 0, about 2 minutes. At `645db2b`: 402 + 8 passed, 10
   ignored.
@@ -249,3 +273,116 @@ reservation) could use attempt 9's "blocked at" shortcut too.
 
 The baseline `cargo test --all-features` at `cf70ddd`: 421 + 8 passed, 10
 ignored. At `2bac3d3`: 424 + 8 passed, 10 ignored.
+
+## Session `compile-speedups-005` (2026-10-09, base `7e8f866`, tip `757d59f`)
+
+Corpora `codegen-analysis-008` (33,038 inputs across 29 benchmark families,
+13,922 distinct under 1e10 insts; 8x broader than 006). Ten attempts, eight
+kept, ten more ideas screened out at no attempt cost. Report:
+`reports/compilation-speedup-005/`.
+
+Cumulative, n=12/10, 99% CI, significant on both metrics:
+
+| set | insts | wall |
+| --- | ---: | ---: |
+| `typical/` (13,922) | **-28.43%** | **-19.69%** |
+| heavy/00 `starlingmonkey-markdown-15922` | **-56.65%** | **-47.23%** |
+| heavy/01 `shootout-switch-0004` | -92.35% | |
+| heavy/02 `starlingmonkey-markdown-14982` | -25.14% | |
+| heavy/03 `hashset-0004` | -15.35% | |
+
+**Codegen quality improved**: estimated cycles over `typical/` -0.39%,
+weighted moves -5.5%.
+
+### The central finding: the cost is an exponent, not a constant
+
+Log-log slope of `insts` against input bytes, per family, over the census:
+**every family is 1.5 to 2.2**, none linear. Pooled, median insts/byte rises
+70x from the smallest inputs to the largest. Ion is near-linear, so the
+compile-time gap widens with function size and is dominated by the largest
+functions. Compute this straight from the census TSV; it decides what kind
+of change to look for.
+
+### What worked, largest first (typical insts)
+
+| change | typical | where |
+| --- | ---: | --- |
+| **Cut a between-spans split in the middle instead of searching for it** | **-22.56%** | `region_allocation.rs`, `splitting.rs` (`cut_near_middle`) |
+| Fill a split candidate's row in one sweep of the unit's assignments | -2.64% | `assignments.rs` (`fill_row_from_one_unit`) |
+| Remove an evicted bundle's assignments from its own units only | -2.26% | `assignments.rs` (`remove_assignment`) |
+| Bucket a long span sort by value before sorting | -1.24% | `live_ranges.rs` (`sort_keyed_by_val`) |
+| Insert a single interval into a set with a treap insert | -0.59% | `interval_sets.rs` (`insert_one`) |
+| Walk to the end of a location's facts instead of searching | -0.43% | `redundant_move_elimination.rs` (`range_of`) |
+| Pop liveness's worklist in post-order instead of LIFO | -0.38% | `liveness.rs` -- but **-92% on `shootout-switch-0004`** |
+| Remember a bundle's clobbered registers across eviction re-pushes | -0.26% | `region_allocation.rs` -- **-8.3% on `hashset`** |
+
+**The split search was 22% of `typical/` and 51% of the heaviest input.** A
+throwaway probe (cut at the midpoint, price nothing) established that before
+any real work. The replacement is **not** ion's conflict-derived cut, which
+measured **+216%**: the first conflict is nearly always in the bundle's
+first span, so cutting there peels one span per split and a long bundle
+takes O(spans) splits. Clamping towards the middle fixed it, and sweeping
+the clamp showed the conflict contributed nothing -- the shipped version
+ignores it. **This one changes the allocation output** (permitted for that
+commit only) and improved estimated cycles by 0.39%.
+
+Liveness's LIFO worklist was the same pathology session 004 fixed in RME,
+still present: 4.54 visits per block on an input whose switch dispatch has
+4,097 successors, re-visiting that block ~16,400 times. Check **every**
+fixpoint, not just the one a previous session fixed.
+
+### What lost (screened, no attempt spent)
+
+- Per-unit occupancy bitmap over live points (+6.3%): the per-insert write
+  costs more than the 21% of searches it skips.
+- Cursor threaded through the general interference query (+5.0%), and
+  through a dedicated row-fill query (typical +1.09%). A **null test**
+  (cursor present but never firing, still +0.9%) showed the cost was the
+  per-span call chain, not the search -- which is what led to the bulk fill
+  that replaced the loop outright.
+- Extending the bulk fill to reservation-holding units (+3 to +6%): those
+  rows are cheap *because* the per-span path exits at the first reserved
+  span. A big fallback share is not automatically opportunity.
+- `u32` instead of `usize` for `SpanInterference::prefix` rows: flat.
+- Hoisting the "is this unit reserved at all" test out of the span loop:
+  flat; the optimizer already did it.
+- Skipping `sort_spans` when the list is already sorted: a wash (the
+  pre-sorted third are the tiny lists; the big calls are never pre-sorted).
+- Scanning instead of binary-searching for the *start* of a location's facts
+  in RME: flat on `typical/`, -0.38% on `hashset`. Attempt 3 took the win
+  that was there.
+- Caching `compute_bundle_priority` like the clobber set: **unsound** --
+  priority reads hints, which allocation mutates; it differs on 77% of
+  re-pushes.
+
+### Where the time goes at `757d59f` (`typical/`)
+
+region allocate 24%, generate moves 17%, coalesce 17%, live ranges 14%,
+RME 11%, everything else 17%. **The profile is flat**: no pass above a
+quarter and no function above a few percent. Region allocation was 40% at
+the session's start.
+
+**Status:** open, but the easy structural wins are gone -- the last three
+attempts were worth ~1% each against 22% and 6% for the first two. Leading
+candidates, in order:
+
+1. **Measure where this left regicide against ion.** `codegen-analysis-008`
+   had regicide at **+249% geomean**; per-family arithmetic implies roughly
+   **+150%** now, with `shootout-switch` (worst at +1,255%) near **+23%**.
+   That is arithmetic on two measured columns, **not a measurement** --
+   confirm it with the `analyze-regicide-codegen` skill before building on
+   it. Regicide does **not** beat ion on compile time yet.
+2. Generalize "one merge per (bundle, register)" -- ion's design, and the
+   shape of the bulk fill -- to `try_assign` and `try_evict_and_assign`,
+   which still query span-by-span. Copy ion's **bounded skip**: step
+   forward, and re-seek the tree after 16 steps. All three cursor attempts
+   in this repo lacked that, and `for_each_overlapping` is still top-10.
+3. Coalescing's multi-run merges: `insert_one` took the 55% of unions that
+   add one interval; the rest are genuine merges at ~26 node visits each,
+   and coalescing is 17% of `typical/`.
+4. RME's `clobber`: 555k calls on a mixed sample, 75% finding nothing, each
+   searching a 14-entry vector. An occupied-location bitmap answers those in
+   O(1). Ceiling ~2.6% of `typical/`.
+
+The baseline `cargo test --all-features` at `7e8f866`: 428 + 8 passed, 10
+ignored. At `757d59f`: 430 + 8.
