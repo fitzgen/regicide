@@ -75,10 +75,31 @@ Things to know about it:
   compare it across different inputs or corpora.
 - **It is not the analysis skill's "virtual cycles"**, which uses 10x for
   the stack and no weights. Do not mix the two numbers.
-- **Plain counts are secondary.** A plain-count rise with lower estimated
-  cycles is often the intended trade (moves pushed into cold blocks, a reload
-  hoisted out of a loop). Say so in the write-up; do not treat it as a
-  regression.
+- **Plain counts are secondary, in both directions.** A plain-count rise with
+  lower estimated cycles is often the intended trade (moves pushed into cold
+  blocks, a reload hoisted out of a loop). Say so in the write-up; do not
+  treat it as a regression. The mirror is the dangerous one, because a
+  session that screens on counts would ship it: code-quality-011's attempt 6
+  gave countMatches **432 fewer spills, 407 fewer reloads and 199 fewer
+  moves** and cost it **+4.60%**, because the registers it freed went to
+  shallower blocks. Judge on the estimate either way.
+- **Know the ceiling before chasing a cost class.** Nine tenths of this
+  metric is instructions no allocation decision can remove. One `awk` over
+  the baseline TSV gives every class's share in seconds, and it should come
+  before picking a candidate:
+
+  ```sh
+  awk -F'\t' 'NR>1{m+=$7;rm+=$8;sp+=$9;rl+=$10;ro+=$5} END{t=m+rm+sp+rl+ro;
+    printf "reg_operands %.1f%%  moves %.1f%%  remats %.1f%%  spills %.1f%%  reloads %.1f%%\n",
+    ro/t*100,m/t*100,rm/t*100,sp/t*100,rl/t*100}' $R/counts/$sha.tsv
+  ```
+
+  On analysis 009's corpus at `1902b8a` that prints **reg_operands 90.9%,
+  moves 6.2%, reloads 1.9%, remats 0.6%, spills 0.4%**. Those are shares of
+  the summed components; against the corpus's own estimated-cycles total
+  they are moves 5.71%, reloads **1.70%**, remats 0.55% — so eliminating
+  *every* reload in the corpus is worth 1.70%, and every remat 0.55%. In
+  code-quality-011 that one line ruled out three candidate ideas.
 - **Spill slots** are not in the estimate. Watch `slots` separately: all else
   equal, smaller frames are better (a thing to preserve, see known-findings).
 - **Cold edits barely register.** At 0.05x, cutting cold moves by half in
@@ -331,6 +352,14 @@ cargo run --release --example visualize -- \
 - **Weighted, not counted.** A printout's plain edit counts mislead: one
   depth-4 reload outweighs 10,000 at depth 0. `$S/edit_costs.py PRINTOUT
   [--latches]` weighs them, by kind and by loop depth.
+- **Read the instructions around an edit before calling it redundant.**
+  Every script here summarizes the edit list, and that summary is where this
+  trap lives. In code-quality-011, 148 repeated `(from, to)` moves inside
+  single blocks looked like a clean redundancy worth 19.5M on one input;
+  interleaving the `inst` lines showed the calls between them **clobber
+  r0-r15**, so each repeat re-establishes arguments the previous call
+  destroyed. A `sed -n '/^  blockN:/,/^$/p'` of the whole block, instructions
+  and `clobbers` lines included, settles it in one look.
 - **Find the hot block in the printout** with `$S/loops.py`. It finds the
   back edges and natural loops in a `run` printout and lists each loop's
   blocks with their edit tallies, innermost first. Hot means inside the
@@ -365,6 +394,22 @@ cargo run --release --example visualize -- \
   block (code-quality-003's `misc/operand_changes.py`). If none moved, rerun
   both sides with `-r none`: if the ranking holds there, the cost is real;
   either way, it is not a hot-loop decision your change made.
+
+  Normalizing the register *names* out of both sides answers the first half
+  in one line — an empty diff means every value is in a register on both
+  sides and only the names differ:
+
+  ```sh
+  diff <(grep -E '(early|late) (use|def)' base | sed 's/Reg(Reg(r[0-9]*))/REG/') \
+       <(grep -E '(early|late) (use|def)' cand | sed 's/Reg(Reg(r[0-9]*))/REG/')
+  ```
+
+  **If the `-r none` ranking *inverts*, that is stronger than "not yours".**
+  In code-quality-011 a guard read +0.46% with no operand moved, and under
+  `-r none` the candidate was *ahead* with identical reload counts — so the
+  regression was redundant-move elimination removing a different set after
+  the renaming, not a cost. That evidence is what justified keeping a change
+  whose gate failed on that guard; write it out in full when you rely on it.
 - **Re-derive the mechanism from the event counts.** The analysis's
   mechanism is a hypothesis about the code as it was. 001's explanation of
   the switch regression was wrong, and 002 found the real one from event
@@ -416,12 +461,42 @@ cargo run --release --example visualize -- \
   too (real contention), by one that wanted a *different* register (a
   tie-break failure), or by an unhinted bundle. That split is what separates
   "hinting is the lever here" from "it is not": see the hint-rate pitfall
-  below.
+  below. It also tells the two kinds of heavy input apart at a glance —
+  100% "holder took it as its own hint" is a pure-boundary input, a
+  three-way split is one under real register pressure.
+- **`$S/hint_votes.py LOG`** tallies, per bundle, how many region borders
+  asked for each register against what the bundle was assigned, so a
+  preference broken by arrival order rather than by weight of evidence shows
+  up as "assigned a less-asked-for register". It found code-quality-011's
+  kept change. It reads `BundleHint`, which is logged from
+  `regicide::live_ranges`, so it needs **`RUST_LOG=regicide=trace`** rather
+  than the `region_allocation` target the other event scripts use. Read its
+  output with the settled/speculative distinction in mind (see the pitfall
+  on hint kinds): a "minority" may be a settled hint correctly displacing
+  guesses.
 - **Probe before porting a fix to a sibling code path.** After
   code-quality-009 made edge stores weigh loop depth, the push-up step in
   spill placement still compared frequency only. A probe found it never
   climbs into a deeper block on the 40 heaviest inputs, so changing it
   would be a no-op.
+- **Revive a past idea by cherry-picking its tag, not by rewriting it.**
+  Every dropped attempt is committed and tagged (see "Git"), so it is
+  reachable and usually still applies:
+
+  ```bash
+  git cherry-pick --no-commit code-quality-NNN/<slug>   # then screen it
+  ```
+
+  In code-quality-011 that turned a half-session's reimplementation into two
+  minutes and a decisive answer: code-quality-010's dropped
+  `stale-region-preferences` moved both targets **+0.00%** on the new tip,
+  because the kept attempt 1 had already captured what it was reaching for.
+  **`--no-commit` leaves the changes staged**, so backing one out takes both
+  steps — `git checkout --` alone leaves them in the index:
+
+  ```bash
+  git reset -q HEAD src/ && git checkout -- src/   # verify with git status
+  ```
 
 ## 4. The loop: one attempt
 
@@ -879,6 +954,23 @@ Then tell the user where the report is and summarize the cumulative result.
   than the one claimed. **Before building a comparator, ask what varies
   within the set it actually compares**, and measure it: one `trace!`
   printing the old key beside the new one would have caught this in minutes.
+- **A "how many decisions change" count does not rescue a near-constant
+  key.** code-quality-011 ran the variance check above *before* implementing
+  and found the far-side block weight varies for only **21 of 176**
+  conflicting bundles — then built it anyway on the strength of a second
+  number, that **61 of 176** decisions would differ from the status quo.
+  Both numbers were right and the first was the one that mattered: those 61
+  decisions changed to whatever the cheap rule already picked, the targets
+  moved by *exactly* the amounts the cheap rule moved them, and it cost
+  +3.18% compile time to learn nothing. When the variance probe says
+  near-constant, stop there.
+- **A passing gate is not a reason to keep a flat change.** code-quality-011's
+  attempt 5 did everything it promised — every guard byte-identical, corpus
+  spills *falling* where the ungated version raised them, `diff_counts.py`
+  exiting 0 — and the corpus moved **+0.01%**, because the rule's gain and
+  loss relocated between depth 5 and depth 6 of the same two inputs. The
+  decision rule's "flat or rose → drop" row is what applies; a clean gate
+  says the change is *safe*, not that it is *worth the churn*.
 - **Working the previous session's backlog without re-sizing the cost.**
   Analysis 008 replaced the benchmark suite, and the corpus's cost profile
   inverted: from `countMatches` reloads to **register moves at loop depth
@@ -893,7 +985,22 @@ Then tell the user where the report is and summarize the cumulative result.
   stubs at a loop-depth change, rotating values that are not even arguments
   of that edge's block call. Measure hint *width*, then hit rate, then
   **where the cost actually sits in the CFG** (`boundary_moves.py`,
-  `hint_misses.py`) before blaming hints.
+  `hint_misses.py`) before blaming hints. What paid on that input was not
+  the hit rate at all but the *kind* of hint — see the next item.
+- **Among hints, look for a difference in kind, not a better tie-break.**
+  `hint_across_regions` emits two: a **settled** hint names the register the
+  far side of a border already holds, a **speculative** one relays what
+  another neighbor of a still-unassigned far side chose. Teaching
+  `RegPreference` that a fact displaces a guess was worth **-3.69%**
+  suite-wide in one commit (code-quality-011 attempt 1). Re-ranking hints
+  *within* one kind then failed three times, each within **±0.01% of flat**:
+  by vote count (attempt 2), by the far-side border's `Block::weight`
+  (attempt 3, and +3.18% compile time), and by count gated to bundles no
+  clobber crosses (attempt 5, which passed the gate and still did not pay).
+  Counting cannot tell a depth-6 border from a depth-4 one, and weighing
+  cannot tell most of them apart at all — the far-side weight varies for
+  only 21 of 176 conflicting bundles. **Treat that family as closed** unless
+  you have a new difference in kind.
 - **Assuming a revived idea composes with what landed since.** In
   code-quality-010 attempt 1 took the heaviest input -2.42% alone, and the
   same patch on top of attempt 2 took it **+1.66%**: the two were substitutes

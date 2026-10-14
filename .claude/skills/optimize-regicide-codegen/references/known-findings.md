@@ -25,8 +25,162 @@ Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 > opens by working the pre-008 backlog will optimize the wrong thing: size the
 > cost yourself with `edit_costs.py` and `boundary_moves.py` on the heaviest
 > inputs before picking a candidate.
+>
+> **Analysis 009 keeps that suite**, so its corpus is comparable with 008's
+> and the warning above still stands for anything older. Its 33,038 captures
+> are **13,928 distinct**, and `counts.py -j 12` over them takes about **6
+> minutes**, not the ~25 the main skill budgets.
 
-## Latest session: `code-quality-010` (2026-10-09, base `7e8f866`)
+## Latest session: `code-quality-011` (2026-10-13, base `4fa422a`)
+
+`reports/code-quality-011/report.md` in the `regicide-code-quality` worktree.
+Against **analysis 009** (`~/regalloc2/reports/codegen-analysis-009/`, which
+measured **`4fa422a`** — that session's exact base). Branch
+`code-quality-011`, tip **`1902b8a`**. Eight attempts across two budgets
+(five implemented, three rejected by probes); **one kept**.
+
+**Suite estimated cycles -3.69%** (7,497,918,888 -> 7,220,977,036 over the
+13,928 distinct inputs), better 1,633 / worse 347, compile time +0.90%.
+Total *edit* cost fell **29.5%**.
+
+| # | idea | verdict | result |
+| --- | --- | --- | --- |
+| 1 | **a settled hint outranks a speculative one** (`1902b8a`) | **kept** | suite **-3.69%**; raytracer-0426 -2.44%, -0386 -5.80%, -0385 -5.31%; countMatches -1.33% |
+| 2 | among settled hints, follow the majority (tag `code-quality-011/hint-majority`) | dropped | suite **+0.01%**: moves -1.43% bought with spills +0.27%, reloads +0.45% |
+| 3 | weigh a settled hint by its border's `Block::weight` (tag `.../hint-weight`) | dropped at screen | targets move *exactly* as in 2; countMatches +1.10%, compile **+3.18%** |
+| 4 | revive 010's `stale-region-preferences` by cherry-pick | dropped at screen | **both targets +0.00%**, five guards fail |
+| 5 | majority gated to clobber-free bundles (tag `.../clobber-free-majority`) | dropped | **gate passes**, every guard byte-identical, suite still **+0.01%** |
+| 6 | reserve a bundle's hint intersection, not its union (tag `.../reserve-intersection`) | dropped at screen | **both targets +0.00%**; countMatches **+4.60%** with every plain count better |
+| 7 | the register-pressure case, surveyed | not implemented | five probes, no in-scope lever |
+| 8 | repeated argument moves | not implemented | the calls between them clobber `r0-r15`; necessary |
+
+What the code does now, and what to know before changing it:
+
+- **`RegPreference` distinguishes two kinds of hint** (`live_ranges.rs`),
+  passed as a `HintStrength`. The *settled* one is the direct branch of
+  `hint_across_regions`, where the far side of a border is already assigned.
+  The *speculative* ones are the relayed branch, which passes on what another
+  neighbor of a still-unassigned far side chose, and the post-split top-ups,
+  which hand a piece the parent's whole union.
+  - **"Settled" is about reach, not certainty.** `hint_reserved_registers`
+    names a register just as committed as a border's, and promoting it was
+    measured: **worse on 1,533 inputs against better on 366**, moves +1.50%,
+    reloads +0.46%, for +0.009% estimated cycles. A reservation binds a
+    register at *one instruction*; a border hint binds one across an edge
+    that usually runs many times, so the border is worth more per hint even
+    though both name a register that is really there. It stays speculative,
+    and a strength named for certainty alone would get this wrong. A settled hint **displaces** speculative
+  ones outright; among hints of the same kind, first arrival still wins.
+  Pinned by `a_settled_hint_displaces_speculative_ones`. The three existing
+  `the_first_hint_*` / `a_later_hint_*` / `a_conflicting_hint_*` tests
+  describe the speculative path.
+  - **The preference keeps the settled hints' own intersection**, not a
+    `bool`, so the rule is a set containment rather than a flag: the
+    intersection is always kept within what settled hints allow, and a guess
+    may only choose among the registers they leave open. A flag would let a
+    guess that merely *narrowed* a wide settled hint mark the preference
+    settled, after which a genuinely settled hint naming another register
+    would be dropped.
+  - **Settledness survives a split.** A span records a bare `RegSet`
+    (`hinted_at_start` / `hinted_at_end`) rather than a whole preference,
+    because only the direct branch hints a span at all; the relayed branch
+    deliberately skips it. `LiveBundle::new` re-folds those as settled, so
+    the half it rebuilds ranks hints the way the half rewritten in place
+    does. Pinned by `a_rebuilt_preference_keeps_its_hints_settled`. That
+    also made `LiveSpanData<u32>` **152 bytes, down from 280**, since a span
+    had been carrying two 128-byte preferences whose intersections nothing
+    read.
+  - The mechanism in one line of allocation diff on the target: the join's
+    parameters went from `(r0, r21, r6, r5, r4, r3)` to
+    `(r0, r5, r4, r3, r2, r1)`, matching the child loop's
+    `(r0, r6, r5, r4, r3, r2, r1)`, so the rotation chains vanished. Three
+    depth-6 exit stubs that each emitted the same 8-move rotation became
+    **empty**.
+  - **Re-ranking hints within one kind is a closed family.** Attempts 2, 3
+    and 5 are three independent tries and all land within ±0.01% of flat.
+    See the pitfall "Among hints, look for a difference in kind" in
+    `SKILL.md`.
+- **The `region_preferences` critique is closed from two of its three ends.**
+  The set is saturated (79% of the class on `-0385`), stale, *and* ~60% wider
+  than needed (mean union 2.26 registers against intersection 1.42). Attempt
+  4 fixed the lifetime, attempt 6 the width, and **both left both targets at
+  exactly +0.00%**. Displacement is a third source of the staleness that
+  neither attempt covered: `push_bundle` folds in a bundle's `union()`, and
+  displacing a guess never shrinks that union, so a register that lost a
+  displacement contest still deprioritizes itself region-wide for every other
+  bundle. Untested, and the two measured ends both came back flat. The saturation was a *symptom* of hints pointing at the
+  wrong registers, not an independent defect. Attempt 6 is also the
+  session's sharpest counts-vs-estimate case: it gave countMatches 432 fewer
+  spills, 407 fewer reloads and 199 fewer moves **and cost it +4.60%**,
+  because the freed registers went to shallower blocks.
+- **The corpus's cost ceiling.** At `1902b8a`, as a share of the corpus's
+  estimated-cycles total: **reg-operands 90.9%**, moves 5.71%, reloads
+  1.70%, remats 0.55%, spills 0.39%. (The `awk` one-liner in `SKILL.md`
+  divides by the summed components instead, so it prints moves 6.2% and
+  reloads 1.9% for the same data — same ranking, slightly different
+  denominator.) Nine tenths of the metric is instructions no allocation
+  decision removes. So eliminating *every* reload
+  in the corpus is worth 1.70% and every remat 0.55% — three candidate ideas
+  died on that arithmetic. Of the edit cost alone: moves 68.4%, reloads
+  20.3%, remats 6.6%, spills 4.6%.
+- **The three heaviest inputs are two different problems**, and the same
+  change moves them in opposite directions. Together they are ~77% of the
+  suite total.
+  - `dotnet-raytracer-0426-u0-360` (1.85G) is a **pure boundary** input: 0
+    spills, 0 evictions, 0 splits, 89% moves, and `hint_misses.py` reports
+    100% "holder took it as its own hint". It responds to hint work.
+  - `-0385-u0-321` and `-0386-u0-322` (1.86G each) are **register
+    pressure**: 586 of 2,490 bundles spilled, 1,222 split failures, 50%
+    reloads, 77% of cost at depth 6. They regressed slightly under every
+    attempt that helped `-0426`.
+- **`-0385`'s cost is 91% single-instruction edge stubs**, mirrored around
+  every deep loop: entry shifts `r17..r22` down by one, exit shifts them
+  back up. Five probes ruled out the obvious culprits, and the detail is in
+  `reports/code-quality-011/unsuccessful/07-pressure-case-survey.md`:
+  - **578 of its 586 spills are zero-use bundles with spill weight exactly
+    0.0 and constraint `Any`** going to the stack whole. That is
+    `has_nothing_to_split_for` (code-quality-001 #2) working as designed —
+    *the spilling is not the problem*. Only 8 spills involve a bundle with
+    any use weight.
+  - 600 of 877 bundles reaching the eviction step have spill weight exactly
+    0.0, so `EvictionCost`'s weight tie-break has nothing to rank with —
+    but those are the same zero-use bundles.
+  - Coalescing is healthy: 14,240 spans coalesced, **77 refusals, all
+    `Overlap`**.
+  - 24 identical edit-lists are shared by more than one block, worth 3.36G
+    in the estimate — but `block169` and `block172` are on **mutually
+    exclusive paths**, so each execution runs one. Code size, not cycles.
+    **Do not quote that 3.36G as an opportunity.**
+- **Call-argument setup is the biggest remaining move class with a known
+  fix.** 15-30% of move cost on the two most move-heavy inputs is moves into
+  registers that the next instruction clobbers. `rust-wasmprinter` spends
+  **16.9%** of its estimated cycles on moves (the most in the corpus) and is
+  **74% interior**, unlike the raytracer's boundary shape. Reducing these
+  needs analysis 009's **fix #5**, a callee-saved `Machine` API — ask first,
+  and price the save/restore pair rather than avoiding callee-saved
+  registers.
+
+Open, ranked (measured at `1902b8a`). **Everything here is out of scope or
+needs an API decision**; nothing in scope was left that the session had a
+credible, unmeasured idea for:
+
+1. **A callee-saved cost model** (009 fix #5) — **needs the user's API
+   decision**, and is now the best-evidenced item (see above).
+2. **The parent region adopts a child loop's locations** (009 fix #1's
+   remainder) — **out of scope** (a new pass). Everything reachable by
+   hinting is done.
+3. **Is `-0385`/`-0386` worth optimizing at all?** They are ~50% of the
+   suite's static cost, but **`dotnet-raytracer` is already -1.06% faster
+   than ion on wall time** (robust, 60 samples). 009's fix #5 warns against
+   exactly this. Re-justify against wall time first.
+4. **Why attempt 5's re-aimed hints help at depth 5 and hurt at depth 6**
+   (-1.3M against +6.0M on `-0385`). A localized answer might reopen the
+   hint family.
+5. **`tinygo-regex-0156-u0-145`** regressed +0.85% under the kept change
+   while *every* plain count improved. One spill in one depth-4 block
+   (+50,000) against -10,000 each in three depth-3 blocks.
+
+## Previous session: `code-quality-010` (2026-10-09, base `7e8f866`)
 
 `reports/code-quality-010/report.md` in the `regicide-compile-time` worktree.
 Against **analysis 008** (`~/regalloc2/reports/codegen-analysis-008/`, which
@@ -120,7 +274,7 @@ Open, ranked (measured at `1ec5260`):
 5. **A callee-saved cost model** (008 #5): still needs a `Machine` API
    decision; ask.
 
-## Previous session: `code-quality-009` (2026-10-08, base `cf70ddd`)
+## Earlier session: `code-quality-009` (2026-10-08, base `cf70ddd`)
 
 `reports/code-quality-009/report.md` in the `regicide-codegen-improvements`
 worktree. Against **analysis 006** (`~/regalloc2/reports/codegen-analysis-006/`,
@@ -206,7 +360,61 @@ treat the mechanisms as live and the numbers as historical:
    94% in `sqlite3-1504-u0-1159`). Cost 1 each.
 4. **Callee-saved cost model** (006 #3): needs a `Machine` API change; ask.
 
-## Analysis 008 (2026-10-09, regicide `7e8f866`)
+## Analysis 009 (2026-10-13, regicide `4fa422a`)
+
+`~/regalloc2/reports/codegen-analysis-009/`. The **current** analysis, and
+the one `code-quality-011` worked against. Same `default.suite` as 008, so
+their corpora are comparable; it measured the tip that 010 and
+`compile-speedups-005` had landed.
+
+Top line on wall time: geomean **-0.31%** over 26 benchmarks, **12
+significantly faster against 2 slower** — regicide wins six times as many
+benchmarks as it loses, and 12 of 26 are outright parity.
+
+| benchmark | cycles | note |
+| --- | --- | --- |
+| `shootout-xchacha20` | **+7.61%** | the largest regression, and **not regicide's**: `chacha20_rounds` is byte-identical across the 11 commits |
+| `tinygo-regex` | **+2.67%** | down from +10.28%, and **attributable to regicide** (124 of 265 functions changed) |
+| `shootout-keccak` | **-5.09%** | the largest win, on **+8.42% instructions** |
+| `ocaml-raytrace` | -4.50% | |
+| `rust-protobuf` | -4.32% | |
+| `rust-wasmprinter` | -3.34% | predicted **+0.87%** by the previous step-3 session — an inverted sign |
+
+Its **five "things to fix"**, and status after code-quality-011:
+
+1. **The parent region does not adopt a child loop's locations.** **Partly
+   addressed**: the hint-reachable part is fixed (the clean target -2.44%,
+   its siblings -5.80% and -5.31%, exit-stub cost 39.4M -> 7.0M). The
+   remainder is out of scope; see 011's open #2.
+2. **Nothing else in the suite is a significant regression** — it bounds the
+   work rather than naming one. "Further codegen work on this suite needs a
+   new benchmark set to find anything, or has to accept that it is
+   optimizing static metrics with no wall-time signal."
+3. **Judge `starlingmonkey-markdown` statically** (+10.04% insts against
+   +1.82% cycles, `NOISY` even at 300 samples). **Followed**; it is -0.46%
+   at 011's tip and no wall-time claim rests on it.
+4. **`hashset` is unmeasurable on this host — stop citing it.** Its CV
+   *rises* as n doubles, and its sign is not reproducible across five
+   analyses. With `hoot-earley-boyer` now explained as host-bound, "the cost
+   model is missing a term" is **open and unevidenced, not established**.
+5. **The static cost model is concentrated on two benchmarks**:
+   `dotnet-raytracer` 82.6% and `starlingmonkey-markdown` 16.1% =
+   **98.7%**. Gate on per-module numbers plus the wall-time guards, never
+   the suite total alone. Note `shootout-keccak` is **0.0005%** of static
+   cost and the run's largest wall-time win.
+
+Its "things we do well" (all byte-identical at 011's tip): keccak's remat
+and 336-byte frame — and **ion emits 23 store-then-reload pairs within 4
+instructions where regicide emits 0**; whole-function coalescing
+(`encode_varint` 53 -> 18 moves); loop-carried values in registers
+(`rust-wasmprinter` stack accesses **-45.4%**, `dart-deltablue` -38.7%);
+managed runtimes as regicide's strongest family; and slot-to-slot copies
+now **better than ion** (579 against 608).
+
+**Compile time vs ion is +173% geomean, 29 of 29 slower** — measurement
+only, feeding no ranking.
+
+## Analysis 008 (2026-10-09, regicide `7e8f866`; superseded by 009 above)
 
 `~/regalloc2/reports/codegen-analysis-008/`. The **current** analysis, and the
 one that replaced the benchmark suite (see the note at the top). Regicide was
@@ -569,6 +777,36 @@ byte-identically (478 inputs re-checked).
   → value mapping is permuted within a block in the text log; the
   visualizer's data is right). Use the visualizer when you need the value.
 
+## Traps from code-quality-011
+
+- **Both halves of a critique can be right and both fixes worthless.**
+  `region_preferences` is saturated, stale and ~60% too wide. Attempt 4
+  fixed its lifetime, attempt 6 its width, and **both left both targets at
+  exactly +0.00%** — because the saturation was a symptom of hints pointing
+  at the wrong registers, which attempt 1 had already fixed. **Before
+  fixing a data structure that measures badly, check that anything still
+  depends on the measurement.**
+- **Plain counts can improve on every axis while the estimate rises 4.6%.**
+  The skill's standing example of counts-vs-estimate disagreement runs the
+  other way (a count *rise* that is the intended trade). This is the mirror,
+  and the more dangerous direction: a session screening on counts would
+  have shipped attempt 6's 432 fewer spills and 407 fewer reloads as a win.
+- **A "how many decisions change" count does not rescue a near-constant
+  ranking key.** Attempt 3's variance probe said the far-side block weight
+  varies for only 21 of 176 conflicts; a second probe said 61 of 176
+  decisions would change, and that second number is what talked me into
+  building it. The 61 changed to whatever the cheap rule already picked.
+  **Stop at the variance probe.**
+- **Read the instructions around an edit before calling it redundant.** 148
+  repeated `(from, to)` moves inside single blocks, worth 19.5M on one
+  input, looked like a clean redundancy in the edit list. The calls between
+  them clobber `r0-r15`; every repeat is necessary. Every script here
+  summarizes edits by design, which is where this trap lives.
+- **Revive a dropped idea by cherry-picking its tag.** `git cherry-pick
+  --no-commit code-quality-NNN/<slug>` still applies cleanly across
+  sessions, and turned a half-session's reimplementation into two minutes
+  and a decisive answer.
+
 ## Traps from code-quality-010
 
 - **A set that only grows saturates, and a heuristic reading it goes dead.**
@@ -577,6 +815,8 @@ byte-identically (478 inputs re-checked).
   free" tier saw 96% of the class marked preferred on countMatches. One
   `trace!` counting `preferred / class` at each call found it in minutes.
   **Worth checking any "avoid what others want" rule the same way.**
+  **But see the qualification below: code-quality-011 fixed both the
+  staleness and the width, and neither was worth anything.**
 - **Two changes aimed at one cost can each help and still not compose.**
   Attempt 1 took the heaviest input -2.42% alone; the identical patch on top
   of attempt 2 took it **+1.66%**. They were substitutes, not complements.
@@ -613,6 +853,10 @@ byte-identically (478 inputs re-checked).
 
 ## Tooling facts
 
+- **`counts.py -j 12` over analysis 009's corpus takes about 6 minutes**
+  (13,928 distinct of 33,038 captures), not the ~25 `SKILL.md` budgets for
+  008's. All 13,928 come back `ok`; the slowest are the two `tinygo-regex`
+  inputs at ~42 s each.
 - `run` prints `estimated-cycles` since 2026-10-06. An older `run` binary
   gives `counts.py` rows with status `no-estimate`; rebuild old revisions
   with the current `examples/run.rs`, `Output::loop_depth`, and the public
@@ -630,7 +874,11 @@ byte-identically (478 inputs re-checked).
   ignored, exit 0, about 2 minutes. With 001 #2 it is 403 + 8: the new
   `a_value_unused_in_a_loop_is_not_reloaded_inside_it`. At `cf70ddd`: 421 +
   8; at `31bda60` (code-quality-009, after review-002): 425 + 8. At
-  `7e8f866`: **428 + 8**, and at `1ec5260` (code-quality-010) 429 + 8.
+  `7e8f866`: **428 + 8**, and at `1ec5260` (code-quality-010) 429 + 8. At
+  `4fa422a` (analysis 009's revision): **431 + 8**, ~100 s; at `1902b8a`
+  (code-quality-011) **432 + 8**, the extra being
+  `a_settled_hint_displaces_speculative_ones`. No fixture needed re-blessing
+  for that change.
 - **Tests that pinned an allocation shape changed with 001 #2.**
   `a_move_into_a_register_nothing_reads_goes` and the `dead-edits` visualizer
   fixture now use `TestInput::with_a_register_move_overwritten_in_a_later_block`
@@ -667,6 +915,20 @@ byte-identically (478 inputs re-checked).
   **53% of all move cost over the four heaviest inputs sat on a loop
   boundary**, and 59-66% of *all* edit cost on the two `dotnet-raytracer`
   inputs.
+- **`$S/hint_votes.py LOG`** (added by code-quality-011) tallies, per
+  bundle, how many region borders asked for each register against what the
+  bundle was assigned. It found that session's kept change: 25 of 254
+  hinted bundles on `raytracer-0426` took a register fewer borders asked
+  for. It reads `BundleHint`, logged from `regicide::live_ranges`, so it
+  needs **`RUST_LOG=regicide=trace`**, not the `region_allocation` target
+  the other event scripts use. Only single-register hints vote — a
+  whole-class hint names a class rather than a place, and counting it
+  drowns the ones that name a register.
+- **`$S/hint_misses.py` also classifies the input, not just the hint.**
+  100% "holder took it as its own hint" means a pure-boundary input
+  (`raytracer-0426`); a three-way split means real register pressure
+  (`-0385`: 111 contention, 83 a different hint, 24 unhinted). That is the
+  fastest way to tell which of the two problems you are looking at.
 - **`$S/selftest.py`** checks the printout and event scripts against the
   three bugs review-001 found in them: a self-loop swallowing the dominator
   chain, an unreachable `entry` bucket, and an event reader blind to

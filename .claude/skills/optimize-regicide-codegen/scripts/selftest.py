@@ -132,6 +132,77 @@ def test_hint_misses_reads_evictions():
         check("eviction names evictor, reg, victim", m.groups(), ("12", "r3", "9"))
 
 
+def test_hint_votes_counts_borders(tmp):
+    """Drives `hint_votes` on a log whose answer is countable by hand, rather
+    than restating its rule. Three bundles: one unanimous, one that took the
+    register fewer borders asked for, one that took the majority's."""
+    import hint_votes
+
+    log = os.path.join(tmp, "hints.log")
+    with open(log, "w") as f:
+        # bundle1: three borders all want r4, and it gets r4. Not a conflict.
+        for _ in range(3):
+            f.write("event: BundleHint { bundle: bundle1, "
+                    "hint: FixedEntitySet {r4}, from: None }\n")
+        f.write("event: BundleAssignedPreferred { bundle: bundle1, "
+                "alloc: Reg(r4) }\n")
+        # bundle2: r6 asked for 3 times, r9 once, and it took r9. Margin 2.
+        for _ in range(3):
+            f.write("event: BundleHint { bundle: bundle2, "
+                    "hint: FixedEntitySet {r6}, from: None }\n")
+        f.write("event: BundleHint { bundle: bundle2, "
+                "hint: FixedEntitySet {r9}, from: None }\n")
+        f.write("event: BundleAssignedNonPreferred { bundle: bundle2, "
+                "alloc: Reg(r9), preference: FixedEntitySet {r9} }\n")
+        # bundle3: borders disagree but it took the one more of them wanted.
+        f.write("event: BundleHint { bundle: bundle3, "
+                "hint: FixedEntitySet {r7}, from: None }\n")
+        f.write("event: BundleHint { bundle: bundle3, "
+                "hint: FixedEntitySet {r8}, from: None }\n")
+        f.write("event: BundleHint { bundle: bundle3, "
+                "hint: FixedEntitySet {r8}, from: None }\n")
+        f.write("event: BundleAssignedPreferred { bundle: bundle3, "
+                "alloc: Reg(r8) }\n")
+        # A whole-class hint must not vote, or it drowns the ones that name
+        # a place. Placed on the *unanimous* bundle and naming registers it
+        # did not get, so a reader that counts it turns bundle1 into both a
+        # conflict and a minority -- every count below moves.
+        f.write("event: BundleHint { bundle: bundle1, "
+                "hint: FixedEntitySet {r20, r21}, from: None }\n")
+        # bundle4 took the minority register by *eviction*. A reader that
+        # knows only the two "Preferred" variants leaves it unassigned, which
+        # counts it as a conflict and then skips it as a minority: the
+        # denominator rises and the headline does not.
+        for _ in range(2):
+            f.write("event: BundleHint { bundle: bundle4, "
+                    "hint: FixedEntitySet {r2}, from: None }\n")
+        f.write("event: BundleHint { bundle: bundle4, "
+                "hint: FixedEntitySet {r3}, from: None }\n")
+        f.write("event: BundleAssignedViaEviction { bundle: bundle4, "
+                "alloc: Reg(r3), evicted: bundle9 }\n")
+
+    out = []
+    argv, write = sys.argv, sys.stdout.write
+    try:
+        sys.argv = ["hint_votes", log]
+        sys.stdout.write = out.append
+        hint_votes.main()
+    finally:
+        sys.argv, sys.stdout.write = argv, write
+    text = "".join(out)
+
+    check("counts every single-register-hinted bundle",
+          "single-register hints: 4" in text, True)
+    check("only disagreeing borders count as a conflict",
+          "borders disagree:    3" in text, True)
+    check("only the bundle that took the minority is reported",
+          "less-asked-for register: 2" in text, True)
+    check("the margin is majority minus taken", "{1: 1, 2: 1}" in text, True)
+    check("the minority bundle is named", "bundle2: took r9" in text, True)
+    check("a register taken by eviction is still an assignment",
+          "bundle4: took r3" in text, True)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="regicide-selftest-")
     for test in (
@@ -139,9 +210,10 @@ def main():
         test_block_header_regex,
         test_boundary_buckets_can_fire,
         test_hint_misses_reads_evictions,
+        test_hint_votes_counts_borders,
     ):
         print(f"{test.__name__}:")
-        if test is test_boundary_buckets_can_fire:
+        if test in (test_boundary_buckets_can_fire, test_hint_votes_counts_borders):
             test(tmp)
         else:
             test()
