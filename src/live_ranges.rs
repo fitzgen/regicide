@@ -504,14 +504,19 @@ where
     /// The value that this span is associated with.
     val: Val<E>,
 
-    /// The hints attached to this span's start, and to its end.
+    /// The registers hinted at this span's start, and at its end.
     ///
     /// A cross-region affinity is about one edge, so it wants a register only
     /// where the span meets that edge. Splitting would otherwise give a hint
     /// about the entry to the half covering the exit, where it competes with
     /// that half's own hint.
-    preference_at_start: RegPreference,
-    preference_at_end: RegPreference,
+    ///
+    /// Only settled hints reach a span: a relayed register is what another
+    /// region chose rather than what this edge needs, so a piece split away
+    /// from here must not inherit it. That is what lets `LiveBundle::new`
+    /// re-fold these at their original strength.
+    hinted_at_start: RegSet,
+    hinted_at_end: RegSet,
 }
 
 /// Which end of a span a hint is about.
@@ -539,8 +544,8 @@ where
             end,
             uses,
             val,
-            preference_at_start: RegPreference::new(),
-            preference_at_end: RegPreference::new(),
+            hinted_at_start: RegSet::new(),
+            hinted_at_end: RegSet::new(),
         }
     }
 }
@@ -592,15 +597,35 @@ const BUNDLE_SPILL_WEIGHT_BITS: u32 = 31;
 const BUNDLE_SPILL_WEIGHT_MASK: u32 = PackedPositiveFloat::<u32, BUNDLE_SPILL_WEIGHT_BITS>::MASK;
 const BUNDLE_MINIMAL: u32 = 1 << 31;
 
-/// The registers hints have asked for, kept two ways.
+/// How far a hint's register reaches, which is what decides whose claim
+/// wins when two hints disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HintStrength {
+    /// Names the register the far side of a region border already holds, so
+    /// honoring it elides a move across an edge.
+    Settled,
+
+    /// Names a register honoring it might not elide anything: a relay of
+    /// what some other neighbor of a still-unassigned far side chose, or the
+    /// union a split hands down to its pieces.
+    Speculative,
+}
+
+/// The registers hints have asked for, kept three ways.
 ///
 /// `intersection` holds the registers satisfying every hint, and empties as
 /// soon as two disagree, which is common once hints name single registers.
 /// `union` is the fallback: satisfying one hint still elides one move.
+///
+/// `settled` is what the settled hints alone allow, and the intersection is
+/// always kept within it: a guess may choose among the registers settled hints
+/// leave open, but never outside them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RegPreference {
     intersection: RegSet,
     union: RegSet,
+    /// The registers every settled hint accepts, empty until one arrives.
+    settled: RegSet,
 }
 
 impl RegPreference {
@@ -609,26 +634,45 @@ impl RegPreference {
         RegPreference {
             intersection: RegSet::new(),
             union: RegSet::new(),
+            settled: RegSet::new(),
         }
     }
 
     /// Fold `hint` in.
-    pub(crate) fn add_hint(&mut self, hint: RegSet) {
+    pub(crate) fn add_hint(&mut self, hint: RegSet, strength: HintStrength) {
         debug_assert!(!hint.is_empty());
 
         self.union.union_with(&hint);
 
-        if self.intersection.is_empty() {
-            // Take the first hint whole rather than intersect an empty set.
-            self.intersection = hint;
-            return;
+        if let HintStrength::Settled = strength {
+            let narrowed = self.settled.intersection(&hint);
+            self.settled = match (self.settled.is_empty(), narrowed.is_empty()) {
+                (true, _) => hint,
+                // Two settled hints naming different registers is the
+                // arbitrary case: both are really there and the bundle can
+                // only be one place, so first arrival keeps it.
+                (false, true) => self.settled,
+                (false, false) => narrowed,
+            };
         }
 
         let narrowed = self.intersection.intersection(&hint);
-
-        // Keep the existing hint over an equally arbitrary alternative.
-        if !narrowed.is_empty() {
+        if self.intersection.is_empty() {
+            // Take the first hint whole rather than intersect an empty set.
+            self.intersection = hint;
+        } else if !narrowed.is_empty() {
+            // Keep the existing hint over an equally arbitrary alternative.
             self.intersection = narrowed;
+        }
+
+        // Guesses rank below what is really there, however many of them
+        // agreed and however early they arrived.
+        if !self.settled.is_empty() {
+            let within = self.intersection.intersection(&self.settled);
+            self.intersection = match within.is_empty() {
+                true => self.settled,
+                false => within,
+            };
         }
     }
 
@@ -663,8 +707,8 @@ where
     E: EntityRepr,
 {
     /// Fold `hint` into this bundle's preference.
-    fn add_hint(&mut self, hint: RegSet) {
-        self.preference.add_hint(hint);
+    fn add_hint(&mut self, hint: RegSet, strength: HintStrength) {
+        self.preference.add_hint(hint, strength);
     }
 }
 
@@ -1359,24 +1403,25 @@ where
             | self.index() as u128
     }
 
-    /// The hints attached to one end of this span.
+    /// The registers hinted at one end of this span.
     #[inline]
-    pub(crate) fn preference_at(self, live_ranges: &LiveRanges<E>, pos: HintPos) -> &RegPreference {
+    pub(crate) fn hinted_at(self, live_ranges: &LiveRanges<E>, pos: HintPos) -> &RegSet {
         let data = &live_ranges.spans[self];
         match pos {
-            HintPos::Start => &data.preference_at_start,
-            HintPos::End => &data.preference_at_end,
+            HintPos::Start => &data.hinted_at_start,
+            HintPos::End => &data.hinted_at_end,
         }
     }
 
-    /// Record that `hint` is wanted at one end of this span.
+    /// Record that a settled hint wants `hint` at one end of this span.
     #[inline]
     pub(crate) fn add_hint_at(self, live_ranges: &mut LiveRanges<E>, pos: HintPos, hint: RegSet) {
         let data = &mut live_ranges.spans[self];
-        match pos {
-            HintPos::Start => data.preference_at_start.add_hint(hint),
-            HintPos::End => data.preference_at_end.add_hint(hint),
-        }
+        let hinted = match pos {
+            HintPos::Start => &mut data.hinted_at_start,
+            HintPos::End => &mut data.hinted_at_end,
+        };
+        hinted.union_with(&hint);
     }
 
     /// The block this span lies within; spans never cross a block boundary.
@@ -1512,9 +1557,9 @@ where
             live_ranges.span_bundle[span] = Some(bundle);
 
             for end in [HintPos::Start, HintPos::End] {
-                let hinted = *span.preference_at(live_ranges, end).union();
+                let hinted = *span.hinted_at(live_ranges, end);
                 if !hinted.is_empty() {
-                    preference.add_hint(hinted);
+                    preference.add_hint(hinted, HintStrength::Settled);
                 }
             }
         }
@@ -1808,8 +1853,8 @@ where
             end,
             uses,
             val,
-            preference_at_start,
-            preference_at_end,
+            hinted_at_start,
+            hinted_at_end,
         } = live_ranges.spans[old];
         debug_assert!(start < at);
         debug_assert!(at < end);
@@ -1838,12 +1883,12 @@ where
         // Each half keeps only the hints about the end it still covers; the
         // cut itself is hinted by neither.
         let mut lo = LiveSpanData::new(start, at, val, lo_uses);
-        lo.preference_at_start = preference_at_start;
+        lo.hinted_at_start = hinted_at_start;
         live_ranges.spans[old] = lo;
 
         // The new span takes second piece.
         let mut hi = LiveSpanData::new(at, end, val, hi_uses);
-        hi.preference_at_end = preference_at_end;
+        hi.hinted_at_end = hinted_at_end;
         let new_span = live_ranges.spans.push(output, hi)?;
 
         // And the new span's uses need to be reassociated with it.
@@ -2008,8 +2053,8 @@ where
             end,
             uses,
             val,
-            preference_at_start,
-            preference_at_end,
+            hinted_at_start,
+            hinted_at_end,
         } = live_ranges.spans[span];
 
         debug_assert_eq!(start.pos(), Position::Early);
@@ -2046,9 +2091,9 @@ where
             block,
         )?;
         // The reload covers the early reads, so the start's hints go with it.
-        live_ranges.spans[reload].preference_at_start = preference_at_start;
-        live_ranges.spans[span].preference_at_start = RegPreference::new();
-        let _ = preference_at_end;
+        live_ranges.spans[reload].hinted_at_start = hinted_at_start;
+        live_ranges.spans[span].hinted_at_start = RegSet::new();
+        let _ = hinted_at_end;
         live_ranges.spans[span].uses = EntityRange {
             start: uses.start,
             end: uses.start,
@@ -2219,12 +2264,9 @@ where
         unusable: &'a RegSet,
     ) -> impl Iterator<Item = LiveSpan<E>> + 'a {
         self.spans(live_ranges).filter(move |span| {
-            [HintPos::Start, HintPos::End].iter().any(|&end| {
-                !span
-                    .preference_at(live_ranges, end)
-                    .union()
-                    .is_subset_of(unusable)
-            })
+            [HintPos::Start, HintPos::End]
+                .iter()
+                .any(|&end| !span.hinted_at(live_ranges, end).is_subset_of(unusable))
         })
     }
 
@@ -2274,7 +2316,13 @@ where
         debug_assert!(!class.member_set(machine).is_empty());
 
         // Via `add_hint`, so that every hint is logged in one place.
-        self.add_hint(live_ranges, events, class.member_set(machine), from);
+        self.add_hint(
+            live_ranges,
+            events,
+            class.member_set(machine),
+            from,
+            HintStrength::Speculative,
+        );
     }
 
     /// Bias this bundle towards `regs`, on behalf of `from`.
@@ -2284,11 +2332,12 @@ where
         events: &mut EventsLog<E>,
         regs: &RegSet,
         from: Option<LiveBundle<E>>,
+        strength: HintStrength,
     ) {
         if regs.is_empty() {
             return;
         }
-        live_ranges.bundles[self].add_hint(*regs);
+        live_ranges.bundles[self].add_hint(*regs, strength);
         event!(
             events,
             BundleHint {
@@ -3674,7 +3723,7 @@ mod tests {
         let mut bundle = bundle(0);
         assert!(bundle.preference.is_empty());
 
-        bundle.add_hint(regs(&[0, 2]));
+        bundle.add_hint(regs(&[0, 2]), HintStrength::Speculative);
         assert_eq!(*bundle.preference.intersection(), regs(&[0, 2]));
         assert_eq!(*bundle.preference.union(), regs(&[0, 2]));
     }
@@ -3683,15 +3732,15 @@ mod tests {
     #[test]
     fn a_later_hint_narrows_the_preference() {
         let mut bundle = bundle(0);
-        bundle.add_hint(regs(&[0, 2]));
+        bundle.add_hint(regs(&[0, 2]), HintStrength::Speculative);
 
-        bundle.add_hint(regs(&[2, 3]));
+        bundle.add_hint(regs(&[2, 3]), HintStrength::Speculative);
         assert_eq!(*bundle.preference.intersection(), regs(&[2]));
         assert_eq!(*bundle.preference.union(), regs(&[0, 2, 3]));
 
         // And narrowing again keeps narrowing, rather than starting over from
         // the newest hint.
-        bundle.add_hint(regs(&[1, 2]));
+        bundle.add_hint(regs(&[1, 2]), HintStrength::Speculative);
         assert_eq!(*bundle.preference.intersection(), regs(&[2]));
         assert_eq!(*bundle.preference.union(), regs(&[0, 1, 2, 3]));
     }
@@ -3701,9 +3750,9 @@ mod tests {
     #[test]
     fn a_conflicting_hint_leaves_the_preference_alone() {
         let mut bundle = bundle(0);
-        bundle.add_hint(regs(&[0, 2]));
+        bundle.add_hint(regs(&[0, 2]), HintStrength::Speculative);
 
-        bundle.add_hint(regs(&[1, 3]));
+        bundle.add_hint(regs(&[1, 3]), HintStrength::Speculative);
         assert_eq!(*bundle.preference.intersection(), regs(&[0, 2]));
         // The union still records what the dropped hint wanted.
         assert_eq!(*bundle.preference.union(), regs(&[0, 1, 2, 3]));
@@ -6730,5 +6779,151 @@ mod tests {
         }
 
         result
+    }
+
+    /// A hint naming where the far side already sits displaces the guesses
+    /// that got in first, however many of them there were.
+    #[test]
+    fn a_settled_hint_displaces_speculative_ones() {
+        let reg = |i: usize| Reg::try_new(i).unwrap();
+        let set = |i: usize| {
+            let mut set = RegSet::new();
+            set.insert(reg(i));
+            set
+        };
+
+        let settled = |pref: &mut RegPreference, regs| pref.add_hint(regs, HintStrength::Settled);
+        let guess = |pref: &mut RegPreference, regs| pref.add_hint(regs, HintStrength::Speculative);
+
+        // Three guesses agree on r6; the register the far side really holds
+        // is r4, and it arrives last.
+        let mut pref = RegPreference::new();
+        guess(&mut pref, set(6));
+        guess(&mut pref, set(6));
+        guess(&mut pref, set(6));
+        settled(&mut pref, set(4));
+        assert_eq!(*pref.intersection(), set(4));
+
+        // A later guess does not take it back.
+        guess(&mut pref, set(6));
+        assert_eq!(*pref.intersection(), set(4));
+
+        // Two settled hints disagreeing is the arbitrary case the first-one-
+        // wins rule was written for, and still is.
+        let mut pref = RegPreference::new();
+        settled(&mut pref, set(4));
+        settled(&mut pref, set(6));
+        assert_eq!(*pref.intersection(), set(4));
+
+        // So is two guesses disagreeing.
+        let mut pref = RegPreference::new();
+        guess(&mut pref, set(4));
+        guess(&mut pref, set(6));
+        assert_eq!(*pref.intersection(), set(4));
+
+        // A hint that agrees still narrows rather than replaces, and the
+        // union keeps every register anything asked for.
+        let mut pref = RegPreference::new();
+        let mut both = set(4);
+        both.insert(reg(6));
+        guess(&mut pref, both);
+        settled(&mut pref, set(4));
+        assert_eq!(*pref.intersection(), set(4));
+        assert!(pref.union_contains(reg(6)));
+
+        // A guess narrowing a wide settled hint does not make its choice
+        // settled: a later settled hint still outranks it.
+        let mut pref = RegPreference::new();
+        let mut both = set(4);
+        both.insert(reg(6));
+        settled(&mut pref, both);
+        guess(&mut pref, set(4));
+        assert_eq!(*pref.intersection(), set(4));
+        settled(&mut pref, set(6));
+        assert_eq!(*pref.intersection(), set(6));
+
+        // A guess may still choose among the registers a wide settled hint
+        // left open, which is the whole of its remaining say.
+        let mut pref = RegPreference::new();
+        settled(&mut pref, both);
+        guess(&mut pref, set(6));
+        assert_eq!(*pref.intersection(), set(6));
+    }
+
+    /// Settledness survives a split. The suffix half of a split is rebuilt
+    /// from its spans rather than inherited, so a hint recorded on a span has
+    /// to come back at the strength it went in at; otherwise a later guess
+    /// displaces a register the far side of a border really holds, which is
+    /// the very thing hint strength exists to prevent.
+    #[test]
+    fn a_split_suffix_keeps_its_hints_settled() {
+        // Alternating conflicting classes, as in
+        // `split_bundle_keeps_storage_tiled`: that is what cuts the value
+        // into one span per use, leaving a multi-span bundle to split.
+        let rc = |i: u8| OperandConstraint::Reg(RegClass::try_new(i.into()).unwrap());
+        let (first, second) = (
+            rc(TestMachine::FIRST_PAIR_CLASS),
+            rc(TestMachine::SECOND_PAIR_CLASS),
+        );
+        let test_input = TestInput::with_use_constraints_in(
+            TestMachine::four_registers(),
+            TestMachine::ALL_FOUR_REGS_CLASS,
+            OperandConstraint::Any,
+            &[first, second, first, second, first],
+        );
+        let region = Region::try_new(0).unwrap();
+        let reg = |i: usize| Reg::try_new(i).unwrap();
+        let set = |i: usize| {
+            let mut set = RegSet::new();
+            set.insert(reg(i));
+            set
+        };
+
+        let (_liveness, mut live_ranges) = analyze_spans(&test_input).unwrap();
+        let spans = live_ranges.spans().step_by(2).collect::<Vec<_>>();
+        assert!(spans.len() >= 2, "need a span on each side of the cut");
+        let mut events = EventsLog::<u32>::new();
+        let mut output = OutputInner::<u32>::new();
+
+        // A border hint on the last span, which the suffix will carry: the
+        // far side of that border really holds r1.
+        let last = *spans.last().unwrap();
+        last.add_hint_at(&mut live_ranges, HintPos::End, set(1));
+
+        let bundle = test_input.with_input(|input| {
+            live_ranges
+                .push_bundle(
+                    input,
+                    &mut output,
+                    region,
+                    OperandConstraint::Any,
+                    spans.iter().copied(),
+                )
+                .unwrap()
+        });
+        let cut = spans.len() - 1;
+        let suffix = test_input
+            .with_input(|input| {
+                bundle.split_at_span(&mut live_ranges, input, &mut events, &mut output, cut)
+            })
+            .unwrap();
+        assert_eq!(*suffix.preference(&live_ranges).intersection(), set(1));
+
+        // A second settled hint naming a different register is the arbitrary
+        // case, so first arrival keeps it. Were the rebuilt half holding the
+        // border's register as a mere guess, this would displace it, and the
+        // two halves of one bundle would rank the same hint differently.
+        suffix.add_hint(
+            &mut live_ranges,
+            &mut events,
+            &set(2),
+            None,
+            HintStrength::Settled,
+        );
+        assert_eq!(
+            *suffix.preference(&live_ranges).intersection(),
+            set(1),
+            "the rebuilt half demoted its border hint to a guess",
+        );
     }
 }

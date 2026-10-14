@@ -15,7 +15,8 @@ use crate::{
     events::{EventsLog, SplitKind},
     input::{DefUse, InputInst, InputValue},
     live_ranges::{
-        HintPos, LiveBundle, LivePoint, LiveRanges, LiveSpan, RegPreference, SpillWeight,
+        HintPos, HintStrength, LiveBundle, LivePoint, LiveRanges, LiveSpan, RegPreference,
+        SpillWeight,
     },
     machine::{Machine, Reg, RegClassMembers, RegGroup, RegUnit},
     output::{OutputInner, RegAllocation},
@@ -182,7 +183,13 @@ fn hint_across_regions<E>(
                     hint.insert(reg.with_repr32());
                 }
             }
-            ours.add_hint(live_ranges, events, &hint, Some(theirs));
+            ours.add_hint(
+                live_ranges,
+                events,
+                &hint,
+                Some(theirs),
+                HintStrength::Speculative,
+            );
             continue;
         };
         if !members.contains(&reg.with_repr32()) {
@@ -200,7 +207,15 @@ fn hint_across_regions<E>(
             false => HintPos::End,
         };
         our_span.add_hint_at(live_ranges, pos, hint);
-        ours.add_hint(live_ranges, events, &hint, Some(theirs));
+        // `theirs` is assigned, so this names a register that is really
+        // there, not a guess about where an unassigned side will land.
+        ours.add_hint(
+            live_ranges,
+            events,
+            &hint,
+            Some(theirs),
+            HintStrength::Settled,
+        );
     }
 
     relayed_regs.clear();
@@ -1176,7 +1191,7 @@ where
         // `bundle` already carries that hint.
         let pref = *bundle.preference(live_ranges).union();
         if !pref.is_empty() {
-            suffix.add_hint(live_ranges, events, &pref, None);
+            suffix.add_hint(live_ranges, events, &pref, None, HintStrength::Speculative);
         }
 
         // Push again with the same phase: we can afford to keep splitting
@@ -1326,13 +1341,25 @@ where
             let mut winning_reg = RegSet::new();
             winning_reg.insert(reg);
 
-            suffix.add_hint(live_ranges, events, &winning_reg, None);
+            suffix.add_hint(
+                live_ranges,
+                events,
+                &winning_reg,
+                None,
+                HintStrength::Speculative,
+            );
             // Hints attached to neither end stay true of both halves, and the
             // suffix additionally wants whatever its own spans ask for at the
             // end it now covers.
-            suffix.add_hint(live_ranges, events, &pref, None);
+            suffix.add_hint(live_ranges, events, &pref, None, HintStrength::Speculative);
 
-            bundle.add_hint(live_ranges, events, &winning_reg, None);
+            bundle.add_hint(
+                live_ranges,
+                events,
+                &winning_reg,
+                None,
+                HintStrength::Speculative,
+            );
             // Note: `bundle` already has a hint of `pref`.
         }
 
@@ -1474,7 +1501,13 @@ where
                         let pref = *bundle.preference(live_ranges).union();
                         let reload =
                             bundle.narrow_to_early_half(live_ranges, input, events, output)?;
-                        reload.add_hint(live_ranges, events, &pref, None);
+                        reload.add_hint(
+                            live_ranges,
+                            events,
+                            &pref,
+                            None,
+                            HintStrength::Speculative,
+                        );
                         self.push_bundle(
                             input,
                             region_tree,
@@ -1527,7 +1560,7 @@ where
                     }
                 };
                 self.forget_clobbered(bundle);
-                piece.add_hint(live_ranges, events, &pref, None);
+                piece.add_hint(live_ranges, events, &pref, None, HintStrength::Speculative);
                 self.push_bundle(
                     input,
                     region_tree,
@@ -3169,7 +3202,7 @@ mod tests {
         let class: Vec<Reg> = (0..6).map(reg).collect();
 
         let mut pref = RegPreference::new();
-        pref.add_hint(set(&[4]));
+        pref.add_hint(set(&[4]), HintStrength::Settled);
         let clobbered = set(&[0, 1, 2]);
         let preferred = set(&[0, 3, 4]);
 

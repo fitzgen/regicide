@@ -85,7 +85,7 @@ use crate::input::{
     Input, InputBlock, InputFunction, InputInst, InputValue, OperandConstraint, Position,
 };
 use crate::interval_sets::{Fuel, IntervalSet, IntervalSetArena, Refused};
-use crate::live_ranges::{LivePoint, LiveRanges, LiveSpan, Reservation};
+use crate::live_ranges::{HintStrength, LivePoint, LiveRanges, LiveSpan, Reservation};
 use crate::liveness::{block_first_inst, block_last_inst};
 use crate::machine::{Machine, RegClassMembers};
 use crate::output::{OutputInner, RegAllocation};
@@ -1050,7 +1050,11 @@ fn hint_reserved_registers<E>(
 
             let mut hint = RegSet::new();
             hint.insert(reg.with_repr32());
-            bundle.add_hint(live_ranges, events, &hint, None);
+            // Speculative, although the reservation is committed: it binds
+            // a register at this one instruction, while a settled hint binds
+            // one across a region edge that usually runs many times, so the
+            // edge outranks it when the two disagree.
+            bundle.add_hint(live_ranges, events, &hint, None, HintStrength::Speculative);
         }
     }
 
