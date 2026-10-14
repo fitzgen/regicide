@@ -943,7 +943,9 @@ impl State {
     ///
     /// A definition does this: the input is in SSA form, so anything claiming
     /// to hold `val` beforehand was left over from an earlier trip around a
-    /// loop.
+    /// loop. The checker cleans up rather than asserting, as
+    /// `redundant_move_elimination::State::assert_nothing_holds` does, because
+    /// the input it checks may be the one that broke SSA.
     fn kill(&mut self, val: Val) {
         self.locs.retain(|_, parts| {
             parts.retain(|part| part.val != val);

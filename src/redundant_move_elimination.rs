@@ -282,9 +282,16 @@ where
             .splice(range, parts.iter().map(|&part| (loc, part)));
     }
 
-    /// Forget every part of `val`, wherever it is.
-    fn kill(&mut self, val: Val<E>) {
-        self.facts.retain(|&(_, part)| part.val != val);
+    /// Check that nothing still claims to hold a part of `val`.
+    ///
+    /// The definition's own locations are clobbered just before this, and by
+    /// SSA nothing else can hold a value that is only now being produced.
+    /// `checker::State::kill` relies on the same invariant.
+    fn assert_nothing_holds(&self, val: Val<E>) {
+        debug_assert!(
+            !self.facts.iter().any(|&(_, part)| part.val == val),
+            "{val:?} is still held somewhere when its definition is applied",
+        );
     }
 
     /// Copy what `from` holds into `to`, as a move that really happens does.
@@ -1244,7 +1251,7 @@ where
                 for &loc in &scalars {
                     state.clobber(machine, loc);
                 }
-                state.kill(val);
+                state.assert_nothing_holds(val);
                 for (index, &loc) in scalars.iter().enumerate() {
                     state.insert(
                         loc,
