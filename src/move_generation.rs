@@ -458,6 +458,11 @@ where
     /// The edges that enter each block.
     incoming_edges: SecondaryMap<Block<E>, EntityRange<Edge<E>>>,
 
+    /// Where each edge's moves go, in the same order as `edges`.
+    ///
+    /// A pure function of the edge, asked for once per span crossing it.
+    edge_positions: Vec<PackedMovePosition<E>>,
+
     /// For a block parameter, the block it belongs to and its index in that
     /// block's parameter list.
     param_of: SecondaryMap<Val<E>, Option<(Block<E>, usize)>>,
@@ -551,6 +556,7 @@ where
             dests: Vec::new(),
             edges: PrimaryMap::new(),
             incoming_edges: SecondaryMap::new(EntityRange::empty()),
+            edge_positions: Vec::new(),
             param_of: SecondaryMap::new(None),
             spans: Vec::new(),
             keyed_spans: Vec::new(),
@@ -576,6 +582,7 @@ where
             dests,
             edges,
             incoming_edges,
+            edge_positions,
             param_of,
             spans,
             keyed_spans,
@@ -597,6 +604,7 @@ where
         dests.clear();
         edges.reset();
         incoming_edges.reset();
+        edge_positions.clear();
         param_of.reset();
         spans.clear();
         keyed_spans.clear();
@@ -621,6 +629,7 @@ where
             dests,
             edges,
             incoming_edges,
+            edge_positions,
             param_of,
             spans,
             keyed_spans,
@@ -642,6 +651,7 @@ where
             && dests.is_empty()
             && edges.is_reset()
             && incoming_edges.is_reset()
+            && edge_positions.is_empty()
             && param_of.is_reset()
             && spans.is_empty()
             && keyed_spans.is_empty()
@@ -915,7 +925,17 @@ where
             };
         }
 
+        self.edge_positions.reserve(edges.len());
+        for &edge in edges {
+            self.edge_positions.push(edge_position(input, edge)?);
+        }
+
         Ok(())
+    }
+
+    /// Where `edge`'s moves go, from the table `index_function` filled.
+    fn edge_position_of(&self, edge: Edge<E>) -> PackedMovePosition<E> {
+        self.edge_positions[edge.index()]
     }
 
     /// Get the `k`th block-call argument from the given `edge`'s predecessor.
@@ -1085,7 +1105,7 @@ where
 
                 for e in self.incoming_edges[block] {
                     let edge = self.edges[e];
-                    let pos = edge_position(input, edge)?;
+                    let pos = self.edge_position_of(e);
 
                     let incoming_val = match param {
                         // `val` is not a block param, so its value across the
@@ -1550,7 +1570,7 @@ where
 
         for e in self.incoming_edges[block] {
             let edge = self.edges[e];
-            if edge_position(input, edge)? == pos {
+            if self.edge_position_of(e) == pos {
                 return self.block_call_arg(input, output, edge, k);
             }
         }
