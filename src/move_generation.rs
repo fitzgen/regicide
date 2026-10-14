@@ -455,6 +455,9 @@ where
     /// contiguous.
     edges: PrimaryMap<Edge<E>, EdgeData<E>>,
 
+    /// The edges that enter each block.
+    incoming_edges: SecondaryMap<Block<E>, EntityRange<Edge<E>>>,
+
     /// For a block parameter, the block it belongs to and its index in that
     /// block's parameter list.
     param_of: SecondaryMap<Val<E>, Option<(Block<E>, usize)>>,
@@ -547,6 +550,7 @@ where
             sources: FxHashMap::with_hasher(rustc_hash::FxBuildHasher),
             dests: Vec::new(),
             edges: PrimaryMap::new(),
+            incoming_edges: SecondaryMap::new(EntityRange::empty()),
             param_of: SecondaryMap::new(None),
             spans: Vec::new(),
             keyed_spans: Vec::new(),
@@ -571,6 +575,7 @@ where
             sources,
             dests,
             edges,
+            incoming_edges,
             param_of,
             spans,
             keyed_spans,
@@ -591,6 +596,7 @@ where
         sources.clear();
         dests.clear();
         edges.reset();
+        incoming_edges.reset();
         param_of.reset();
         spans.clear();
         keyed_spans.clear();
@@ -614,6 +620,7 @@ where
             sources,
             dests,
             edges,
+            incoming_edges,
             param_of,
             spans,
             keyed_spans,
@@ -634,6 +641,7 @@ where
         sources.is_empty()
             && dests.is_empty()
             && edges.is_reset()
+            && incoming_edges.is_reset()
             && param_of.is_reset()
             && spans.is_empty()
             && keyed_spans.is_empty()
@@ -878,23 +886,36 @@ where
             }
         }
 
-        // `incoming_edges` hands out half-open ranges of edge keys, so the key
-        // just after the last edge has to be representable as well.
-        self.edges.next_key(output)?;
-
         self.edges.as_mut_slice().sort_unstable();
-        Ok(())
-    }
+        debug_assert!(
+            self.edges
+                .as_slice()
+                .windows(2)
+                .all(|w| w[0].succ <= w[1].succ),
+            "the fill below walks one run per block, so edges must be grouped \
+             by successor",
+        );
 
-    /// The edges that enter `block`.
-    fn incoming_edges(&self, block: Block<E>) -> EntityRange<Edge<E>> {
         let edges = self.edges.as_slice();
-        let start = edges.partition_point(|e| e.succ < block);
-        let end = edges.partition_point(|e| e.succ <= block);
-        EntityRange {
-            start: Edge::try_new(start).unwrap(),
-            end: Edge::try_new(end).unwrap(),
+
+        // One pass over the sorted edges records each block's run, so that
+        // reading a block's edges need not search for it: it is asked once per
+        // live-in span, which is many times per block.
+        self.incoming_edges.reserve(func.len_blocks());
+        let mut e = 0;
+        while e < edges.len() {
+            let succ = edges[e].succ;
+            let start = e;
+            while e < edges.len() && edges[e].succ == succ {
+                e += 1;
+            }
+            self.incoming_edges[succ] = EntityRange {
+                start: output.entity::<Edge<E>>(start)?,
+                end: output.entity::<Edge<E>>(e)?,
+            };
         }
+
+        Ok(())
     }
 
     /// Get the `k`th block-call argument from the given `edge`'s predecessor.
@@ -1062,7 +1083,7 @@ where
                 // Check whether the value is a parameter of this block.
                 let param = self.param_of[val].filter(|&(b, _)| b == block);
 
-                for e in self.incoming_edges(block) {
+                for e in self.incoming_edges[block] {
                     let edge = self.edges[e];
                     let pos = edge_position(input, edge)?;
 
@@ -1527,7 +1548,7 @@ where
             return Ok(val);
         };
 
-        for e in self.incoming_edges(block) {
+        for e in self.incoming_edges[block] {
             let edge = self.edges[e];
             if edge_position(input, edge)? == pos {
                 return self.block_call_arg(input, output, edge, k);
