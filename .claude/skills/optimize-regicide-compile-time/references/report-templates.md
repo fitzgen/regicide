@@ -42,9 +42,27 @@ heaviest input. Link to profiles/.>
 | 1 | [btree-to-vec](successful/btree-to-vec.md) | `abc1234` | kept | -3.1% | -2.5% | -40% on 00 | |
 | 2 | [inline-x](unsuccessful/inline-x.md) | `def5678` (tag) | dropped | +0.0% | n.s. | n.s. | no effect |
 
+## Screened out (no attempt spent)
+
+| # | idea | typical | why |
+| --- | --- | ---: | --- |
+| 1 | ... | +x.x% | ... (and the null test's reading, if one was run) |
+
+Full write-ups and counters in `misc/screens.md`; diffs beside it.
+
+## Probes
+
+Ceiling probes (delete the work, wrong output) and marginal-cost probes
+(do it twice, output unchanged), with what each bounds.
+
+| probe | typical | reading |
+| --- | ---: | --- |
+| ... | -x.x% | ... |
+
 ## Backlog
 
-Ranked, with estimated saving and the profile evidence for each.
+Ranked, with a measured ceiling where there is one and the profile
+evidence for each.
 
 1. ...
 

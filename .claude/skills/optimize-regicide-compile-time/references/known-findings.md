@@ -380,9 +380,152 @@ candidates, in order:
 3. Coalescing's multi-run merges: `insert_one` took the 55% of unions that
    add one interval; the rest are genuine merges at ~26 node visits each,
    and coalescing is 17% of `typical/`.
+   **-- Still open, and now measured** (`-006`): `check_disjoint` alone is
+   **1.7% of `typical/`**, and 62% of its expensive walks are these real
+   merges. A singleton fast path was tried and bought nothing (-0.07%).
 4. RME's `clobber`: 555k calls on a mixed sample, 75% finding nothing, each
    searching a 14-entry vector. An occupied-location bitmap answers those in
    O(1). Ceiling ~2.6% of `typical/`.
+   **-- Tried in `-006` and it lost (+1.9%).** The bitmap's maintenance is
+   affordable (+0.33%); the *branch it adds* costs the rest. See that
+   session's entry. `clobber` itself is real (~1% of `typical/` by a
+   marginal-cost probe), so the cost stands; just not this fix.
 
 The baseline `cargo test --all-features` at `7e8f866`: 428 + 8 passed, 10
 ignored. At `757d59f`: 430 + 8.
+
+## Session `compile-speedups-006` (2026-10-13, base `4fa422a`, tip `1489df3`)
+
+Corpora `codegen-analysis-009` (33,038 inputs; **same file names as 008 but
+different contents**, regenerated after block frequencies, remats and lazy
+critical-edge splitting, so an older census does not transfer). 13,925
+distinct inputs under 1e10 insts, and **only three heavy inputs**, each
+about a second. Report: `reports/compilation-speedup-006/`.
+
+Three attempts, three kept; **ten further ideas screened out at no attempt
+cost**. Cumulative, n=12/10, 99% CI, all significant, **no regression on any
+set**, allocation output **byte-identical** everywhere (the session's
+permission to change output was never needed):
+
+| set | insts | wall |
+| --- | ---: | ---: |
+| `typical/` (13,925) | **-2.09%** | **-2.32%** |
+| heavy/00 `starlingmonkey-markdown-15922` | -1.97% | -1.56% |
+| heavy/01 `starlingmonkey-markdown-14982` | -1.25% | (n.s.) |
+| heavy/02 `hashset-0004` | -0.23% | (n.s.) |
+
+### What worked
+
+| change | typical | where |
+| --- | ---: | --- |
+| Index each block's incoming edges instead of two binary searches per live-in span (208k calls for 1.35 edges each) | -0.91% | `move_generation.rs` |
+| Compute each edge's move position once (recomputed 10.7x per edge) | -0.69% | `move_generation.rs` |
+| **Delete RME's `State::kill`**, a `retain` that removed **0 facts in 120,197 calls** | -0.53% | `redundant_move_elimination.rs` |
+
+The third is the one to copy the *method* from: `kill` scanned every fact
+to forget the value being defined, but the preceding `clobber` already took
+that definition's own locations and **by SSA nothing else can hold a value
+only now being produced**. It became a `debug_assert`, which 593k fuzz runs
+and the full suite then checked. Output byte-identical.
+
+### What lost (ten screens, none costing an attempt)
+
+Three were sizable regressions, caught before any attempt was spent:
+
+- **Occupancy bitmap in front of RME's `clobber`** (+1.9%): 73% of calls
+  find nothing, but the null test put maintenance at only +0.33%, so **the
+  fast path itself cost ~1.5%**: a 27/73 data-dependent branch in front of
+  a `partition_point` over 13.5 cached entries. (`hashset`, whose lists are
+  far longer, went -0.6%; everything else regressed.) This is `-005`'s
+  occupancy-bitmap finding in a second pass.
+- **Merging a bundle's whole span run into a unit at once** (+2.6% typical,
+  **+14.7% on `hashset`**): 16.6M element shifts would have become ~4M, but
+  the null test put the scaffolding at +0.15%, so the merge itself was the
+  regression. One `memmove` of 57 elements beats 57 individual swaps.
+- **Packed `u128` sort key for `resolve`'s `dests`** (+0.24%): `-004`'s
+  "packing loses when the key is already inline" in a new place.
+
+Flat or too small: bucketing DME's operands by `(position, kind)` (-0.10%,
+though 75% of its 1.5M operand visits are "wasted"); raising coalescing's
+fuel x4/x8/x16 (~0%, the budget never binds); hoisting the edge load out of
+the live-in loop (the optimizer already did it); skipping
+`sequentialize_batch`'s sort when presorted (batches average 7.4 moves); a
+singleton fast path through `check_disjoint` (-0.07%, see below).
+
+**Deliberately not attempted:** `sequentialize_batch`'s `dedup_by_key`
+removes **0 of 9.26M** expanded moves over the whole corpus, but unlike
+`kill` nothing *guarantees* it cannot fire, since two group moves in one
+batch
+can legitimately expand to the same `(src, dst)` pair. The corpora simply
+lack that shape.
+
+### Scaling: the exponent is spread across every pass
+
+Pooled log-log slope of insts against bytes over the new census: **1.72**
+(per family 1.45 to 3.24). Bucketing `dotnet-raytracer` geometrically by
+size and timing each pass per bucket gives each pass its own exponent:
+
+| pass | slope | share of the largest bucket |
+| --- | ---: | ---: |
+| coalesce | **1.85** | 22.6% |
+| generate moves | 1.79 | 20.5% |
+| region allocate | 1.68 | 33.1% |
+| eliminate redundant moves | 1.66 | 13.1% |
+| live ranges | 1.47 | 10.7% |
+
+**No pass carries the superlinearity alone**, which correctly predicted that
+no single structural fix was available this session.
+
+- **Coalescing's superlinearity is intrinsic**: affinities are
+  `edges x live-in set per edge`, and **95.6% of the live-in spans scanned
+  produce an affinity**. Live-in set per edge grew 10.9x while bytes grew
+  32x. Not waste.
+- **Coalescing pays for itself many times over**: refusing every merge
+  (ceiling probe) made the rest of compilation **+51% on `typical/` and
+  +212% on `hashset`**. Do not look for ways to do less of it.
+- **All three dataflow fixpoints are correctly ordered now** (liveness
+  post-order, RME and DME reverse post-order). Visits per block still rise
+  with input size, 1.01 at the smallest bucket to 2.0-2.7 at the largest,
+  but that is **genuine convergence, not the LIFO bug** of `-004` and
+  `-005`, which showed as a flat ~4.8 at every size.
+
+### Where the time goes at `1489df3`
+
+The profile is **flat**: the largest self-time row in the whole process is
+4.1%, and `generate_moves` (13%) is the only item above 10%. On a sample:
+`generate_moves` 12.2%, RME `analyze` 7.6%, `coalesce_affinity` 6.4%,
+`assign_via_eviction` 5.3%, `assign_to_non_preferred` 5.3%,
+`allocate_region` 5.2%, RME `rewrite` 3.8%, `split_between_spans` 2.9%.
+
+Move generation's sub-passes (instrument `enter_pass`): **`EmitHalfMoves`
+58%**, `Sequentialize` 18%, `Resolve` 17%, `EmitReservationHalfMoves` 6%.
+
+**Status:** open. Leading candidates, with measured ceilings:
+
+1. **Coalescing's genuine multi-interval merges.** A marginal-cost probe
+   puts `IntervalSet::check_disjoint` at **1.7% of `typical/`, 2.2% of
+   heavy/00**, the largest single target found. 59% of its calls fall
+   into the interleaving walk, and **62% of those are real multi-interval
+   merges**, so a singleton fast path does not help (measured: -0.07%).
+   Needs a better merge over the treaps. This is `-005`'s item 3, now with
+   a number.
+2. **The ~8% around `emit_dest`.** Ceiling probes: deleting the live-in
+   edge loop is -10.2%, and `black_box`-ing only its `emit_dest` calls is
+   -8.3%, so ~2% is walking edges and ~8% is recording destinations and
+   what `resolve`/`sequentialize` do with them. Emitting one dest per span
+   instead of per edge bounds the fan-out at -2.05%, but each edge
+   genuinely needs its own move. `resolve`'s sort is 0.88%; its hash lookup
+   is only 0.14%. The `sources` map is read *during* `emit_half_moves`
+   (`arrives_in_the_gap`), so it cannot simply become a merge join;
+   splitting its mid-pass role from its post-pass role is the way in.
+3. `MoveGeneration::spans_range` still has the two-binary-search shape
+   attempt 1 removed from `incoming_edges`, over `self.spans` keyed by
+   value.
+4. `UnitMap::merge` uses the swap-based merge that lost badly to
+   `Vec::insert`'s `memmove` above; check whether it should change.
+
+`-005`'s item 1 (measure regicide against ion) and item 2 (bounded-skip
+cursors in `try_assign`) were **not** attempted here and remain open.
+
+The baseline `cargo test --all-features` at `4fa422a`: **431 + 8 passed, 10
+ignored**, exit 0, ~100 s. Unchanged at `1489df3`.

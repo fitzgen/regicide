@@ -155,6 +155,15 @@ What the `run` example builds. This matters when interpreting numbers:
   ~0.3% of instructions, so it is small but not zero. **An optimization that
   only speeds up event construction is not a production win**: say so in its
   write-up, and do not count it as one.
+
+  **In a sampling profile it looks much bigger than 0.3%**, because it
+  stores and drops wide structs rather than retiring many instructions.
+  On `-006`, `PrimaryMap<EventIndex, Event<u16>>::push_unwrap` was **1.9%
+  self time, the third-largest row in the whole profile**, with ~0.6%
+  more in `drop_glue` and the `u8` variant, and `remap_block_span_events`
+  (1.4% of the tree) is `#[cfg(feature = "visualizer")]` outright. Grep a
+  new profile for `viz_enabled|events::Event<|EventIndex|remap_` once,
+  note the total in `misc/`, and subtract it when reading any share.
 - `std` swaps `hashbrown::HashMap` for `std::collections::HashMap` (both with
   `FxBuildHasher`, and the same SwissTable underneath). Close enough, but do
   not tune hashing details off the back of it.
@@ -260,14 +269,17 @@ noise on one small input, sum over a `--profile` run and divide by the
 
 ### Which functions: `samply-text`, or `sample`
 
-**Check the tools exist before planning around them.** On this host, as of
-2026-10-09, `samply`, `samply-text` and `rustfilt` are **not installed**,
-which breaks the recipe below and `scripts/disasm.sh` with it. `cargo fuzz`
-was missing too until the user installed it mid-session. A minute of
-`which samply samply-text rustfilt; cargo fuzz --version` during setup saves
-discovering each one at the moment you need it.
+**Check the tools exist before planning around them**, every session: what
+is installed changes. As of **2026-10-13**, `samply` and `samply-text`
+**are** present and the preferred recipe below works; `rustfilt` is still
+**missing**, so `scripts/disasm.sh` needs the `nm`/`objdump` fallback.
+(On 2026-10-09 all three were absent and `cargo fuzz` was missing until the
+user installed it mid-session.) A minute of
+`which samply samply-text rustfilt; cargo fuzz --version` during setup
+saves discovering each one at the moment you need it.
 
-The fallback, which carried a whole session:
+The fallback, for when `samply` is missing again, as it did for a whole
+session:
 
 ```bash
 # /usr/bin/sample is always present on macOS.
@@ -381,23 +393,65 @@ Counters chase the cheapest thing to count, so also count the *other*
 shortcuts a change would disturb. A reordering that skips 5.7M of one kind
 of work can lose more by disabling an existing prune that fired more often.
 
-#### Three counters worth running unprompted
+**Count what the work *achieves*, not how often it runs.** A counter
+measures operations; what decides an attempt is cycles, and the two differ
+by an order of magnitude between a `memmove` and an interpreted loop.
+`compile-speedups-006` lost two screens to this, from opposite directions:
+**75% of DME's 1.5M operand visits were "wasted"**, and removing them was
+worth **0.1%**, because a visit is two field reads on cached data; and
+replacing **16.6M element shifts with ~4M** was a **+2.6% to +14.7%
+regression**, because one `memmove` of 57 elements beats 57 individual
+swaps. In the same session the counter that *found* a win counted an
+outcome instead: RME's `kill` removed **0 facts in 120,197 calls**. Zero.
 
-Each of these found a kept win on `compile-speedups-005`, and each is a
-handful of lines:
+So prefer "how often does this find anything?" to "how often does this
+run?", and when a count of operations does look large, convert it to time
+with a probe (below) before building anything.
+
+#### Four counters worth running unprompted
+
+Each of these found a kept win, or killed a whole line of enquiry, and each
+is a handful of lines:
 
 1. **Visits per block, for every dataflow fixpoint** -- not just the one a
    previous session fixed. Liveness was at **4.54 visits per block** on an
    input whose switch dispatch has 4,097 successors, re-visiting that one
    block ~16,400 times, years after the same pathology was fixed in RME.
-   `-92% insts` on that input. Check liveness, RME, and anything else with
-   a worklist.
+   `-92% insts` on that input (`-005`). Check liveness, RME, and anything
+   else with a worklist.
+
+   **Measure it across input sizes, and know what a bug looks like.** By
+   `-006` all three fixpoints were correctly ordered, yet visits per block
+   still *rose* with input size: 1.01 at the smallest inputs to 2.0-2.7 at
+   the largest. **That growth is genuine loop convergence, not a bug.** A
+   broken worklist order shows as a flat ~4.8 at *every* size. Check the
+   pop order by reading the code too: a backwards analysis wants
+   post-order (a max-heap on RPO index), a forwards one RPO.
 2. **The log-log slope of `insts` against input bytes, per benchmark
    family**, computed straight from the census TSV after `make_sets.py`.
-   Every family came out at **1.5 to 2.2**. That one number reframed the
-   session: the gap to ion is an exponent, not a constant factor, so the
-   search was for superlinear structure rather than for hot lines.
-3. **What fraction of a repeated computation is a re-run of unchanged
+   Every family came out at **1.5 to 2.2** on `-005`; **1.45 to 3.24,
+   pooled 1.72**, on `-006`'s corpora. That one number reframed `-005`:
+   the gap to ion is an exponent, not a constant factor, so the search was
+   for superlinear structure rather than for hot lines.
+3. **The same slope per *pass*, not just per family** (`-006`). Bucket one
+   big family's inputs geometrically by size, symlink each bucket into its
+   own directory, and run the `timing` feature per bucket; a few minutes
+   of work gives every pass its own exponent and its share of the largest
+   inputs:
+
+   | pass | slope | share of the largest bucket |
+   | --- | ---: | ---: |
+   | coalesce | 1.85 | 22.6% |
+   | generate moves | 1.79 | 20.5% |
+   | region allocate | 1.68 | 33.1% |
+   | eliminate redundant moves | 1.66 | 13.1% |
+   | live ranges | 1.47 | 10.7% |
+
+   This says *which* pass to attack, and whether the exponent is
+   concentrated or spread. On `-006` it was **spread across every pass**,
+   which correctly predicted that no single structural fix was available
+   and that the session would be won in fractions of a percent.
+4. **What fraction of a repeated computation is a re-run of unchanged
    input.** `regs_clobbered_across` was recomputed on every queue push, and
    **99.8% of the spans it walked belonged to re-pushes of bundles whose
    spans had not changed** (an eviction changes neither the bundle's spans
@@ -412,13 +466,42 @@ that is 2% of `typical/` is worth less than 5% of a pass that is 40% of it.
 Record each candidate, its estimate, and the profile evidence in `report.md`'s
 backlog before starting on it.
 
-**Probe the ceiling before building anything.** A deliberately-wrong fast
-version, run once and thrown away, tells you what the real fix could be
-worth. On `compile-speedups-005`, replacing the split-point *search* with
-"cut at the midpoint, price nothing" -- wrong output, reverted immediately
--- showed the search was **22% of `typical/` and 51% of the heaviest
-input**. That single number justified the session's largest attempt and
-would have killed it just as cheaply had it come back at 2%.
+**Probe before building anything.** A throwaway build, measured once with
+`--insts` and reverted, converts a guess into a number in two minutes.
+There are two kinds, and they fail in different places, so they are worth
+treating as separate tools.
+
+**A ceiling probe deletes the work.** The output is wrong; the number is
+what a perfect fix could be worth. On `compile-speedups-005`, replacing the
+split-point *search* with "cut at the midpoint, price nothing" showed the
+search was **22% of `typical/` and 51% of the heaviest input**. That single
+number justified the session's largest attempt and would have killed it
+just as cheaply had it come back at 2%.
+
+**A marginal-cost probe does the work twice**, and reads the delta as the
+cost of doing it once. The output stays correct, and it needs no reasoning
+about what breaks, so it works where deleting the work would crash or
+short-circuit the pass. On `compile-speedups-006` it was the better tool
+three times out of three: RME's `kill` came out at **+0.51%**, and removing
+it later measured **-0.526%**; agreement that close is also a check that
+the probe measured what it claimed. The same session used it to *reject* a
+target: `resolve`'s per-destination hash lookup was only **+0.14%**, though
+the 8% around it had looked promising.
+
+**Sanity-check a probe against the structure it claims to bound.** A
+ceiling probe whose wrong output changes control flow measures something
+else entirely: making `block_call_arg` return the first argument read
+**-75.8% on `typical/`**, not because the scan was expensive but because
+the bad values made the allocator bail out early. If a probe's number is
+implausibly large, it broke something rather than skipped it: re-read
+what the wrong value does downstream, or switch to a marginal-cost probe.
+
+**Probe a pass wholesale once, to learn whether it is worth having.**
+Disabling coalescing entirely (refuse every merge) made the rest of
+compilation **51% to 212% slower**. That reframed the pass: the question
+was never "can coalescing be cheaper" but "is it doing enough", and it
+killed a whole branch of the session's backlog in one measurement. Worth
+doing for any pass over ~15% that exists to make later passes cheaper.
 
 ### Borrowing a design from ion or regalloc3
 
@@ -448,10 +531,40 @@ you what it does, not what it buys here.
 
 Kinds of optimization, roughly in order of how often they pay off here:
 
+- **Delete work that provably achieves nothing.** The cheapest win there
+  is. RME's `State::kill` was a `retain` over every fact, run once per
+  definition, that removed **0 facts in 120,197 calls**. The preceding
+  `clobber` had already taken the definition's own locations, and by SSA
+  nothing else can hold a value that is only now being produced. Replacing
+  it with a `debug_assert` was **-0.53% insts and -1.81% wall** on
+  `typical/`, output byte-identical, and the fuzzer then checked the
+  invariant 593k times.
+
+  **The bar is a proof, not a measurement.** In the same session,
+  `sequentialize_batch`'s `dedup_by_key` removed **0 of 9.26M** expanded
+  moves over the whole corpus, and was deliberately left alone, because
+  two group moves in one batch *can* legitimately expand to the same
+  `(src, dst)` pair. The corpora merely never contain that shape. Ask what
+  guarantees the zero: an invariant of the IR, or the inputs you happen to
+  have.
+- **Replace a search with an index when the caller asks per something
+  denser than the thing searched.** Two of `-006`'s three wins were this.
+  `incoming_edges` ran two binary searches over every edge in the function,
+  once per live-in span: **208k calls for 1.35 edges of work each**.
+  `edge_position` was a pure function of the edge recomputed **10.7 times
+  per edge**. Both are now filled in one pass where the data is already
+  being sorted. Look for "a sorted array of per-X records, asked about one
+  X at a time from a loop over something denser than X".
 - **Better big-O.** Superlinear inputs exist (see "Census and input sets").
   Find the loop nest that grows with function size, with a counter, and
   break it: an index instead of a scan, an interval structure instead of
   repeated range searches, incremental update instead of recomputation.
+
+  But **check the superlinearity is not intrinsic** before attacking it.
+  Coalescing is the worst-scaling pass (slope 1.85), and its cost is the
+  affinity count, which is `edges x live-in set per edge`, and **95.6% of
+  the live-in spans it scans produce an affinity**. There is no waste to
+  remove; the input really is that big.
 - **Stop searching for something you can derive, or balance.** The most
   expensive kind of work here is a search whose answer barely matters.
   `split_between_spans` priced every admissible cut against every candidate
@@ -535,8 +648,22 @@ cursor itself was a win buried under its scaffolding, and led to the bulk
 fill that replaced the loop outright); pricing the expensive half of a
 split first; walking every per-unit vector to keep its capacity across
 resets; a maintained side index over the unit maps (five variants, all
-regressions -- the per-insert write costs more than the searches saved).
+regressions, because the per-insert write costs more than the searches
+saved);
+an occupancy bitmap in front of a short search (twice now: `-005`'s over
+live points at +6.3%, `-006`'s over RME's fact list at +1.9%, where the
+null test showed the *branch*, not the maintenance, was the cost);
+packing a sort key that is already stored inline in the sorted elements
+(twice: `-004`'s `resolve` keys at +0.4%, `-006`'s `dests` at +0.24%);
+and skipping a sort when the data is already sorted, where the lists are
+short (twice, both flat).
 See `references/known-findings.md`.
+
+**Two of those are now three-time losers, and both have the same shape:**
+paying a per-element maintenance or staging cost to avoid a search over a
+few dozen cached entries. Such a search is ~8 well-predicted steps on data
+already in L1. Before retrying anything in that family, use a
+marginal-cost probe to show the search is actually expensive.
 
 **A large "falls back to the slow path" share can be the opposite of
 opportunity.** `-005`'s bulk row fill covered 38% of rows and bailed out on
@@ -545,6 +672,16 @@ the other 62%, which looked like the obvious next win. Extending it lost
 already cheap on exactly those rows, and a sweep has no such exit. The rows
 falling back were the ones never paying full price. Measure what the
 fallback *costs on those cases* before chasing its share.
+
+**Count the slow path by the *shape* your special case would catch, not
+by how many take it.** `-006` found 59% of `IntervalSet::check_disjoint`
+calls falling past its two end-to-end tests into the interleaving walk,
+which a marginal-cost probe valued at **1.7% of `typical/`**, the
+largest single target of that session. A fast path for the singleton case
+bought only -0.07%, because splitting those walks by argument shape showed
+**62% are genuine multi-interval merges** and the singleton walks (the
+only ones the fast path touched) terminate in one or two steps anyway. One
+extra counter, taken before implementing, would have said so.
 
 Things that are **out of bounds**: changing heuristics, priorities, tie-breaks,
 iteration order that can affect a decision, or anything else that changes the
@@ -627,6 +764,26 @@ led to the attempt that *did* work: replace the per-span call loop entirely
 rather than speed up its iterations. Without the null test the obvious
 conclusion -- "cursors lose here", which two earlier sessions had already
 recorded -- would have been wrong for the third time.
+
+**When the null test says the scaffolding is cheap, ask whether the cost is
+in the new algorithm or in the branch that selects it.** On
+`compile-speedups-006` it answered both ways within an hour:
+
+- Merging a bundle's span run into a unit regressed +2.6% to +14.7%, and
+  the null test cost only **+0.15%**: the algorithm itself was wrong here
+  (one `memmove` beats 57 swaps).
+- An occupancy bitmap for RME's `clobber` regressed +1.9%, and keeping all
+  its maintenance but never letting the fast path fire cost **+0.33%**,
+  so the *fast path itself* cost the remaining ~1.5%. It put a 27/73
+  data-dependent branch in front of a `partition_point` over 13.5 cached
+  entries.
+
+That second shape is worth naming: **a fast path needs the work it skips to
+be long, not merely often skippable.** Replacing a short, well-predicted
+search with an unpredictable branch loses even when the branch "saves" the
+search three times in four. (Note the exception in the same measurement:
+on `hashset`, where the fact lists are far longer, the identical change was
+**-0.6%**.)
 
 ### Overlapping work
 
@@ -916,8 +1073,12 @@ Measured against previous commit (ff9269d), n=20, 99% CI:
 - the **cumulative** base-vs-tip result on every set, both metrics, with the
   `-n` used and the host load at the time;
 - every attempt in a table (kept and dropped), linking to its file;
+- **every screen in a table too**, with its deltas and why it failed, and
+  **every probe** with what it bounds. On a flat profile these outnumber
+  the attempts several to one and are most of what the next session can
+  use: `-006` kept 3 and screened 10.
 - what is still hot and the ideas not yet tried, ranked, for the next
-  session;
+  session, **with a measured ceiling wherever a probe gave one**;
 - anything learned that should go into this skill, also in
   `misc/skill-learnings.md`.
 
@@ -990,3 +1151,20 @@ Then tell the user where the report is and summarize the cumulative result.
   or wait for the process to exit.
 - **A sample of `typical/` is not `typical/`.** See "Screening"; they
   disagreed in both directions on `-005`.
+- **Reading a count of operations as a count of time.** The two differ by
+  an order of magnitude between a `memmove` and an interpreted loop. See
+  "How often: counters"; it cost `-006` two screens.
+- **A ceiling probe whose wrong output changes control flow.** It then
+  measures the allocator taking a shortcut, not the work you skipped.
+  `-006` saw -75.8% from a probe that was really making the allocator bail
+  out early. Sanity-check the number against the structure it claims to
+  bound, and prefer a marginal-cost probe when deleting the work would
+  break an invariant.
+- **Interleaved stdout and stderr when dumping counters.** `run` writes
+  results through a `BufWriter` on stdout while counters go to stderr, so
+  `run ... 2>&1 | grep CTR` splices the two mid-line and mangles both.
+  Redirect separately: `run -q <set> >/dev/null 2>/tmp/ctr.txt`.
+- **Leaving a fuzz worker running into a measurement.** `cargo fuzz`'s
+  child survives the parent's exit and sits at 100% of a core. Check
+  `ps`/`uptime` and `pkill -f 'release/allocate'` before any wall-time
+  run; `-006` caught one only because the load average looked wrong.
