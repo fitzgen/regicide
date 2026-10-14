@@ -31,6 +31,45 @@ Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 > are **13,928 distinct**, and `counts.py -j 12` over them takes about **6
 > minutes**, not the ~25 the main skill budgets.
 
+---
+
+> **Correction (2026-10-14): there is no missing callee-saved `Machine`
+> API.** Sessions 003, 006, 008/009 and 011 all deferred the callee-saved
+> cost model as "needs an API decision — regalloc2 has
+> `non_preferred_regs_by_class`, regicide's `Machine` only has an order".
+> **The order *is* the answer, and it is strictly more expressive than two
+> buckets.** `machine.rs:783-792` documents it ("a class is both the set of
+> registers an operand may be assigned to and the order to prefer them in,
+> so the caller-saved registers come first"), the captured corpus populates
+> it (GPR class: `r0`-`r15` clobbered by ~every call, `r16`-`r25` by none),
+> and `order_non_preferred_candidates` already consumes it. 003's
+> hard-coded `index >= 16` probe was reading the real convention, not
+> guessing — its flaw was hard-coding one class's shape instead of keying
+> off the order.
+>
+> The item persisted because **"callee-saved" was used in two senses**:
+> *the callees preserve it* (answered per call site by
+> `InputInst::clobbers()`, and genuinely variable — `r2` is clobbered by
+> 301 of 533 calls in `rust-wasmprinter-0028`) versus *this function saves
+> it* (answered by class order). The backlog item's reasoning ran through
+> the first sense while reaching for a mechanism belonging to the second.
+>
+> What is actually missing is a **cost model term**, internal to
+> `region_allocation.rs` and fully in scope: the prologue/epilogue pair is
+> unmodeled (`src/` mentions it only in doc comments) and is a *step
+> function* in the count of distinct tail registers used (~4.8 per function
+> over the 226 corpus functions using >= 8 registers). Add a 5th tier to
+> `order_non_preferred_candidates`' counting sort so an already-committed
+> tail register outranks a fresh one — biasing toward **reuse**, which is
+> what preserve item #4 wants. **Judge it on the register set used, not the
+> estimate**; the estimator cannot see a prologue. Two caveats: key the
+> model off class order, not observed clobbers (734 corpus functions >= 50
+> insts have *no* clobbering instruction yet use a mean of 13.5 registers),
+> and prefer `rust-wasmprinter` over `dotnet-raytracer` as the target,
+> which is already -1.06% ahead of ion on wall time. Full write-up:
+> `reports/code-quality-011/misc/callee-saved-api.md` in the
+> `regicide-code-quality` worktree.
+
 ## Latest session: `code-quality-011` (2026-10-13, base `4fa422a`)
 
 `reports/code-quality-011/report.md` in the `regicide-code-quality` worktree.
@@ -155,17 +194,16 @@ What the code does now, and what to know before changing it:
   fix.** 15-30% of move cost on the two most move-heavy inputs is moves into
   registers that the next instruction clobbers. `rust-wasmprinter` spends
   **16.9%** of its estimated cycles on moves (the most in the corpus) and is
-  **74% interior**, unlike the raytracer's boundary shape. Reducing these
-  needs analysis 009's **fix #5**, a callee-saved `Machine` API — ask first,
-  and price the save/restore pair rather than avoiding callee-saved
-  registers.
+  **74% interior**, unlike the raytracer's boundary shape. Reducing these is
+  analysis 009's **fix #5** — **in scope, no API decision needed**; see the
+  correction below.
 
-Open, ranked (measured at `1902b8a`). **Everything here is out of scope or
-needs an API decision**; nothing in scope was left that the session had a
-credible, unmeasured idea for:
+Open, ranked (measured at `1902b8a`). The session recorded everything here
+as out of scope or needing an API decision; **the 2026-10-14 correction
+above moved item 1 back into scope**, and it is the best-evidenced one:
 
-1. **A callee-saved cost model** (009 fix #5) — **needs the user's API
-   decision**, and is now the best-evidenced item (see above).
+1. **A callee-saved cost model** (009 fix #5) — **in scope, needs no API
+   decision**, and is the best-evidenced item (see the correction below).
 2. **The parent region adopts a child loop's locations** (009 fix #1's
    remainder) — **out of scope** (a new pass). Everything reachable by
    hinting is done.
@@ -271,8 +309,8 @@ Open, ranked (measured at `1ec5260`):
    greedily — whether the ring closes is a global property of several
    independent register choices.
    `reports/code-quality-010/todo/02-permutation-cycles.md`.
-5. **A callee-saved cost model** (008 #5): still needs a `Machine` API
-   decision; ask.
+5. **A callee-saved cost model** (008 #5): **superseded** — no API
+   decision is needed. See the correction at the top.
 
 ## Earlier session: `code-quality-009` (2026-10-08, base `cf70ddd`)
 
@@ -358,7 +396,8 @@ treat the mechanisms as live and the numbers as historical:
 3. **Fixed-register moves** (call arguments) are the largest deep-loop move
    class in 7 of the 14 heaviest functions (78% in `sqlite3-2492-u0-1910`,
    94% in `sqlite3-1504-u0-1159`). Cost 1 each.
-4. **Callee-saved cost model** (006 #3): needs a `Machine` API change; ask.
+4. **Callee-saved cost model** (006 #3): **superseded** — no API change is
+   needed. See the correction at the top.
 
 ## Analysis 009 (2026-10-13, regicide `4fa422a`)
 
@@ -465,10 +504,11 @@ Its five "things to look into", and status after code-quality-010:
 4. **`starlingmonkey-markdown` is win-shaped but measures as a loss.**
    **Untouched by design**: the analysis says it is NOISY (CV 12.2/18.7) and
    that nothing should be built on it without more samples.
-5. **A callee-saved cost model** (`siphashx24`): needs a `Machine` API change
-   — regalloc2 has `non_preferred_regs_by_class`. **Ask first**; two prior
-   probes failed and a hard-coded `index >= 16` rule is aarch64-only. Note
-   the counterweight *grew*: preserve item #1 is built on callee-saved
+5. **A callee-saved cost model** (`siphashx24`): **the API half of this is
+   superseded** — see the correction at the top. `Machine`'s class order
+   already names the convention, and the `index >= 16` rule was reading it
+   correctly, just hard-coded to one class shape. The counterweight still
+   stands and still grew: preserve item #1 is built on callee-saved
    registers held across calls. **Price the pair once per function; do not
    avoid callee-saved registers.**
 
@@ -538,10 +578,10 @@ before working on them. What 001 left open, ranked:
 2. **`hashset-0004-u0-3` regressed +3.3% under #2**: in one 7,442-instruction
    block, v126 (3,419 uses) lost callee-saved r17 and is reloaded 3,368
    times. Why does a bundle that heavy lose its register?
-3. **Callee-saved as a `Machine` property** (fix #3). regicide's `Machine`
-   has only an order, so "is callee-saved" can only be guessed (003's probe
-   hard-coded index >= 16). regalloc2 knows it (`non_preferred_regs_by_class`).
-   Adding it is an **API change: ask the user first.**
+3. **Callee-saved as a `Machine` property** (fix #3). **Superseded** — see
+   the correction at the top. The order *is* the property, and is more
+   expressive than `non_preferred_regs_by_class`; 003's `index >= 16` probe
+   was reading the real convention. No API change, no need to ask.
 4. **Depth-0 reload-for-move trades** (most of #2's 58 regressions are
    small): a zero-use bundle that could ride in a free register between two
    uses in straight-line code now reloads. Try restricting #2 to bundles in a
@@ -657,13 +697,19 @@ tinygo-regex and sqlite3 corpora to dominate `counts.py`'s wall time.
    siphashx24's hottest function (`stp/ldp x19, x20` that ion does not need).
    **003 probed a fix**: keep the class's callee-saved tail behind the
    `region_preferences` key. That kept `4aa7bd5`'s move win (19 → 9), dropped
-   the save/restore, passed `--check`, and left corpus totals neutral. But
-   the probe hard-coded the tail as class index >= 16 (or 24). regicide's
-   `Machine` does not know which registers are callee-saved. 001's in-scope
-   proxy (rank registers past the furthest one in use last) regressed keccak
-   and blake3 and was dropped. The estimate cannot see the prologue
-   save/restore, so judge any fix on the register set used, not the estimate
-   alone. Status: open, needs an API decision.
+   the save/restore, passed `--check`, and left corpus totals neutral. The
+   probe hard-coded the tail as class index >= 16 (or 24), and that is why
+   it was shelved. **2026-10-14: that hard-coding was reading the real
+   convention** — class member order is caller-saved-first by construction
+   (`machine.rs:783`), so the probe generalizes by keying off *position in
+   the class order* instead of a literal index. No API change is needed; see
+   the correction at the top. 001's in-scope proxy (rank registers past the
+   furthest one in use last) regressed keccak and blake3 and was dropped —
+   note it is a different and weaker idea than keying off class order. The
+   estimate cannot see the prologue save/restore, so judge any fix on the
+   register set used, not the estimate alone. **Status: open and in scope —
+   this is the most concrete form of the callee-saved item, and it already
+   has a probed fix.**
 4. **`br_table` arms end in register rotations** (9–15 moves per arm to the
    join's assignment). tinygo `machine.add` had 1,013 moves vs ion's 55, and
    sqlite3 VDBE 6,655 vs 640. Caused by between-span split pieces landing in
