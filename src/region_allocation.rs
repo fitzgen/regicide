@@ -18,7 +18,7 @@ use crate::{
         HintPos, HintStrength, LiveBundle, LivePoint, LiveRanges, LiveSpan, RegPreference,
         SpillWeight,
     },
-    machine::{Machine, Reg, RegClassMembers, RegGroup, RegUnit},
+    machine::{Machine, Reg, RegClass, RegClassMembers, RegGroup, RegUnit},
     output::{OutputInner, RegAllocation},
     region_tree::RegionTree,
     timing::Timing,
@@ -316,6 +316,17 @@ where
     /// order.
     non_preferred_candidates: Vec<Reg>,
 
+    /// `order_class_by_tier`'s output, valid while the class and the region's
+    /// two sets are still the ones recorded beside it.
+    tier_order: Vec<Reg>,
+    tier_order_class: Option<RegClass>,
+    tier_order_clobbers: RegSet,
+    tier_order_preferences: RegSet,
+
+    /// Scratch for the debug cross-check that the cache above is current.
+    #[cfg(debug_assertions)]
+    tier_order_check: Vec<Reg>,
+
     /// Scratch space for `hint_across_regions`: the registers that bundles
     /// outside the region being hinted have affinity with, by bundle.
     relayed_regs: Vec<(LiveBundle<E>, Reg<E>)>,
@@ -345,6 +356,12 @@ where
             clobber_bound: EntitySet::new(),
             region_preferences: RegSet::new(),
             non_preferred_candidates: Vec::new(),
+            tier_order: Vec::new(),
+            tier_order_class: None,
+            tier_order_clobbers: RegSet::new(),
+            tier_order_preferences: RegSet::new(),
+            #[cfg(debug_assertions)]
+            tier_order_check: Vec::new(),
             relayed_regs: Vec::new(),
             split_interference: SpanInterference::new(),
         }
@@ -367,6 +384,12 @@ where
             clobber_bound,
             region_preferences,
             non_preferred_candidates,
+            tier_order,
+            tier_order_class,
+            tier_order_clobbers,
+            tier_order_preferences,
+            #[cfg(debug_assertions)]
+            tier_order_check,
             relayed_regs,
             split_interference,
         } = self;
@@ -385,6 +408,12 @@ where
         clobber_bound.reset();
         region_preferences.reset();
         non_preferred_candidates.clear();
+        tier_order.clear();
+        *tier_order_class = None;
+        tier_order_clobbers.reset();
+        tier_order_preferences.reset();
+        #[cfg(debug_assertions)]
+        tier_order_check.clear();
         relayed_regs.clear();
         split_interference.clear();
     }
@@ -406,9 +435,19 @@ where
             clobber_bound,
             region_preferences,
             non_preferred_candidates,
+            tier_order,
+            tier_order_class,
+            tier_order_clobbers,
+            tier_order_preferences,
+            #[cfg(debug_assertions)]
+            tier_order_check,
             relayed_regs,
             split_interference,
         } = self;
+        #[cfg(debug_assertions)]
+        let tier_order_check_is_reset = tier_order_check.is_empty();
+        #[cfg(not(debug_assertions))]
+        let tier_order_check_is_reset = true;
         assignments.is_reset()
             && region_assignments.is_reset()
             && queue.is_empty()
@@ -424,6 +463,11 @@ where
             && clobber_bound.is_reset()
             && region_preferences.is_reset()
             && non_preferred_candidates.is_empty()
+            && tier_order.is_empty()
+            && tier_order_class.is_none()
+            && tier_order_clobbers.is_reset()
+            && tier_order_preferences.is_reset()
+            && tier_order_check_is_reset
             && relayed_regs.is_empty()
             && split_interference.is_empty()
     }
@@ -683,6 +727,10 @@ where
         self.region_clobbers.reset();
         self.clobber_bound.reset();
         self.region_preferences.reset();
+        self.tier_order.clear();
+        self.tier_order_class = None;
+        self.tier_order_clobbers.reset();
+        self.tier_order_preferences.reset();
 
         Ok(())
     }
@@ -837,14 +885,41 @@ where
 
         let assigned = match rc.members(input.machine) {
             RegClassMembers::Regs(regs) => {
+                if self.tier_order_class != Some(rc)
+                    || self.tier_order_clobbers != self.region_clobbers
+                    || self.tier_order_preferences != self.region_preferences
+                {
+                    order_class_by_tier(
+                        regs,
+                        &self.region_clobbers,
+                        &self.region_preferences,
+                        &mut self.tier_order,
+                    );
+                    self.tier_order_class = Some(rc);
+                    self.tier_order_clobbers = self.region_clobbers;
+                    self.tier_order_preferences = self.region_preferences;
+                }
+                // Rebuilding from the region's *live* sets and comparing
+                // against the order cached from its recorded ones is what
+                // catches a missed invalidation: dropping the preference term
+                // above fails this immediately, where the whole suite passes
+                // and 600 inputs stay byte-identical without it.
+                #[cfg(debug_assertions)]
+                {
+                    let mut fresh = core::mem::take(&mut self.tier_order_check);
+                    order_class_by_tier(
+                        regs,
+                        &self.region_clobbers,
+                        &self.region_preferences,
+                        &mut fresh,
+                    );
+                    debug_assert_eq!(self.tier_order, fresh, "the cached tier order went stale",);
+                    fresh.clear();
+                    self.tier_order_check = fresh;
+                }
+
                 let candidates = &mut self.non_preferred_candidates;
-                order_non_preferred_candidates(
-                    regs,
-                    pref,
-                    &self.region_clobbers,
-                    &self.region_preferences,
-                    candidates,
-                );
+                order_non_preferred_candidates(&self.tier_order, pref, candidates);
                 let assigned = self.region_assignments.try_assign_to_reg(
                     bundle,
                     candidates.iter().copied(),
@@ -1670,20 +1745,21 @@ where
 /// before the victim's hint may stop protecting it from eviction.
 const HINT_YIELDS_TO_HEAVIER_FACTOR: f32 = 8.0;
 
-/// Fill `candidates` with the registers of `regs` that `pref` does not name, in
-/// the order a bundle with no usable hint should try them.
+/// Order `regs` by the tier a bundle with no usable hint should try them in.
 ///
 /// Registers clobbered in the region come first: a bundle that fits in one
 /// crosses no clobber, and leaves the registers that survive one to bundles
 /// that do. Within each of those, registers no bundle in the region prefers
 /// come before ones some bundle does, so that a bundle still in the queue
 /// finds the register it was hinted towards free.
-fn order_non_preferred_candidates(
+///
+/// Nothing here depends on the bundle being assigned, so the result is
+/// cached per class and region state; see `RegionAllocation::tier_order`.
+fn order_class_by_tier(
     regs: &[Reg],
-    pref: &RegPreference,
     region_clobbers: &RegSet,
     region_preferences: &RegSet,
-    candidates: &mut Vec<Reg>,
+    ordered: &mut Vec<Reg>,
 ) {
     // The tier a stable sort by `(!clobbered, preferred)` would put `r` in.
     let tier = |r: Reg| {
@@ -1694,26 +1770,35 @@ fn order_non_preferred_candidates(
     // ones before it in the class's own order.
     let mut starts = [0; 5];
     for &r in regs {
-        if !pref.union_contains(r) {
-            starts[tier(r) + 1] += 1;
-        }
+        starts[tier(r) + 1] += 1;
     }
     for i in 1..starts.len() {
         starts[i] += starts[i - 1];
     }
 
-    candidates.clear();
+    ordered.clear();
     let Some(&first) = regs.first() else {
         return;
     };
-    candidates.resize(starts[4], first);
+    ordered.resize(regs.len(), first);
     for &r in regs {
-        if !pref.union_contains(r) {
-            let slot = &mut starts[tier(r)];
-            candidates[*slot] = r;
-            *slot += 1;
-        }
+        let slot = &mut starts[tier(r)];
+        ordered[*slot] = r;
+        *slot += 1;
     }
+}
+
+/// Fill `candidates` with the registers of `ordered` that `pref` does not name.
+///
+/// `ordered` is `order_class_by_tier`'s output, and dropping entries cannot
+/// reorder the rest, so the tier order survives.
+fn order_non_preferred_candidates(
+    ordered: &[Reg],
+    pref: &RegPreference,
+    candidates: &mut Vec<Reg>,
+) {
+    candidates.clear();
+    candidates.extend(ordered.iter().copied().filter(|&r| !pref.union_contains(r)));
 }
 
 /// Is `bundle` one that splitting cannot help, so that once it fails to get a
@@ -3282,13 +3367,25 @@ mod tests {
         let clobbered = set(&[0, 1, 2]);
         let preferred = set(&[0, 3, 4]);
 
-        let mut candidates = Vec::new();
-        order_non_preferred_candidates(&class, &pref, &clobbered, &preferred, &mut candidates);
+        let mut ordered = Vec::new();
+        order_class_by_tier(&class, &clobbered, &preferred, &mut ordered);
 
-        // r4 is the bundle's own hint, already tried; r1 and r2 are clobbered
-        // and unwanted; r0 is clobbered but wanted; r5 survives the clobber
-        // and is unwanted; r3 survives it but is wanted.
+        // r1 and r2 are clobbered and unwanted; r0 is clobbered but wanted;
+        // r5 survives the clobber and is unwanted; r3 and r4 survive it but
+        // are wanted.
+        assert_eq!(ordered, [1, 2, 0, 5, 3, 4].map(reg));
+
+        let mut candidates = Vec::new();
+        order_non_preferred_candidates(&ordered, &pref, &mut candidates);
+
+        // r4 drops out: the bundle's own hint has already tried it.
         assert_eq!(candidates, [1, 2, 0, 5, 3].map(reg));
+
+        // Dropping entries cannot reorder the rest, whatever the bundle wants.
+        let mut other = RegPreference::new();
+        other.add_hint(set(&[1, 3]), HintStrength::Settled);
+        order_non_preferred_candidates(&ordered, &other, &mut candidates);
+        assert_eq!(candidates, [2, 0, 5, 4].map(reg));
     }
 
     /// Within a region a weight is a hinted-span count times one block weight,
