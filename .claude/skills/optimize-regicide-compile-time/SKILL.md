@@ -603,9 +603,27 @@ Kinds of optimization, roughly in order of how often they pay off here:
   neighbor (87% of failed assignment tries). Checking that span first is
   exact and cheap (attempts 8 and 9, -1.3% of `typical/` each). Keep the
   span itself, not its index into an iterator.
+- **Read the shared containers, not just the passes.** When a flat profile's
+  largest self-time rows are container internals -- `push`, `capacity`,
+  `grow_one`, `memmove`, `drop_glue` -- the fix is in `entity/`, not in the
+  caller the row sits under. `compile-speedups-007`'s largest win by far was
+  one line there: `SecondaryMap::index_mut` materialized the defaults between
+  its length and the key with a `while ... push` loop, re-checking the
+  capacity per element; one `Vec::resize` was **-8.7% of `typical/` and -28%
+  on the heaviest input**. Six sessions had walked past it because the
+  profile names `push_mut<Option<LiveSpan<u32>>>` and `capacity`, never a
+  pass. These containers serve every pass, so a line there outweighs any
+  single pass.
 - **Don't recompute.** Does a later pass rebuild something an earlier pass
   already had (liveness, RPO, block-to-region maps, use lists)? Could it be
   kept in the `Context` and reused?
+- **Computed per X, but all its inputs are per Y.** Look for a computation
+  the code does once per fine-grained thing whose arguments are all
+  properties of some coarser thing. `order_non_preferred_candidates` ran a
+  counting sort over a register class **per bundle**, but the sort key is a
+  function of **the region's** clobber and preference sets alone; caching it
+  per (class, region state) hit **97.4%** and was -0.89% of `typical/`. This
+  is the general form of `-006`'s `incoming_edges` and `edge_position` wins.
 - **Fast path for the common case.** Measure the distribution. If most calls
   see one element, one region, or no conflicts, handle that inline and leave
   the general case to a cold path (`#[cold]`, `#[inline(never)]`).
@@ -627,6 +645,24 @@ Kinds of optimization, roughly in order of how often they pay off here:
   (the `EntityRepr` machinery exists for this), use `Option<NonZero…>`, and
   reorder fields. Check sizes with a temporary
   `const _: () = assert!(size_of::<T>() == N);`.
+
+  **Probe the width before shrinking it, and rank the candidates by what the
+  probe says.** Add *dead* padding of the size you hope to remove and measure
+  the delta; that is what a byte of this map is worth. On
+  `compile-speedups-007`, +128 B of padding on `LiveSpanData` cost **+1.36%
+  of `typical/`** while +192 B on `LiveBundleData` cost **+0.13%** -- a 10:1
+  ratio, found in four minutes, and the *larger* struct was the worse
+  candidate. The payoff scales with the map's entry **count** and with how
+  much of each entry the hot passes stride over without reading, not with the
+  struct's size.
+
+  **`RegSet` is 64 bytes on every machine** (`FixedEntitySet<Reg,
+  words_for(Reg::MAX)>` with `Reg::MAX = 512`, against the 128 registers the
+  corpora's machines actually define), so grep hot structs for it first.
+  Moving `LiveSpanData`'s two `RegSet` hint fields into a side arena -- ~6%
+  of spans are ever hinted -- took it from **144 bytes to 16** and was
+  **-2.91% wall on `typical/`, -16.12% on heavy/00**, against only -0.60%
+  insts.
 - **Split or group by access pattern.** Which fields of a `PrimaryMap<K, V>`
   are read together in the hot loop? Keep those together in `V` and move
   the cold ones into a `SecondaryMap<K, V2>`. Fields always read together
@@ -664,6 +700,36 @@ paying a per-element maintenance or staging cost to avoid a search over a
 few dozen cached entries. Such a search is ~8 well-predicted steps on data
 already in L1. Before retrying anything in that family, use a
 marginal-cost probe to show the search is actually expensive.
+
+**A linear fast path in front of a search is now a four-time loser**, and
+it is worth stating as a rule rather than a list: *chasing a `next` or
+cursor chain is a dependent load per step, where a binary search or treap
+descent is predictable, and the steps such a fast path saves are the short
+searches that were already cheap.* `compile-speedups-007` found the fourth
+instance already in the tree: `last_ending_by` walked up to four `next`
+links before descending, averaged **2.03 steps, and still fell through to
+the descent 24.2% of the time**, paying for both. Cutting the walk to a
+single step was -0.22% of `typical/` and -0.47% on heavy/00.
+
+**Sweep such a bound rather than tuning it.** Sweeping that one over
+0,1,2,3,4,6,8,12,16 put 0 and 1 within 0.00% of each other and was
+monotone against the rest -- the shipped value of 4 was not merely
+suboptimal, it was well past the knee, which one or two spot measurements
+around it would not have shown.
+
+**But a sweep ranks only what it measures.** That one measured instructions
+retired, and the bound also sets how much *fuel* a check spends:
+`last_ending_by` is charged per node visited, so a descent costs
+`O(log n)` burns per boundary where a `next` step costs one. Going to 0
+rather than 1 was free on insts and made a finely interleaved refusal cost
+**~8x more fuel**, which at `RegionFuel::FLOOR` decides whether a merge
+happens at all -- a lost merge is a register-register move, in a region
+under enough pressure to have spent its budget. Review 003 caught it after
+the fact. **When a constant also bounds a budget that decides output, the
+sweep's winner is a candidate, not an answer: measure the budget too, and
+pin the headroom with a test** (`a_modest_interleaving_still_merges_at_the_floor`).
+"Allocation output is byte-identical on the corpus" does not show headroom
+is unchanged; it shows no current input reaches the limit.
 
 **A large "falls back to the slow path" share can be the opposite of
 opportunity.** `-005`'s bulk row fill covered 38% of rows and bailed out on
@@ -791,12 +857,22 @@ Fuzzing (700 s) is the critical path of an attempt. Implementing, counting
 and screening the next idea while the previous one fuzzes keeps things
 moving, with two rules:
 
-- **Never edit `src/` while `cargo fuzz` is still compiling.** Wait until
-  its log shows `INITED`. On `compile-speedups-004` a fuzz build picked up a
-  deliberately broken mutation check of the *next* idea from the working
-  tree and reported a crash that did not exist in the commit. Treat any
-  fuzz crash as suspect until it reproduces on a clean tree at the commit
-  under test.
+- **Never edit `src/` while `cargo fuzz` is still compiling.** On
+  `compile-speedups-004` a fuzz build picked up a deliberately broken
+  mutation check of the *next* idea from the working tree and reported a
+  crash that did not exist in the commit. **`-007` hit it again** -- a
+  screen written into `src/interval_sets.rs` produced a
+  `refused as overlapping, but the sets are disjoint` panic at 1,024
+  execs that did not reproduce at the commit, nor with the finished
+  screen applied, and a clean re-run then did 424k runs green.
+
+  The window is the whole build, which is ~2 minutes, while `INITED` can
+  be ten minutes later on this corpus -- so "wait for `INITED`" is a long
+  wait and easy to talk yourself out of. **The reliable discipline is to
+  not touch `src/` at all until the fuzz run has printed `Done`**, and to
+  do the next idea's reading, counting and design in that window instead.
+  Treat any fuzz crash as suspect until it reproduces on a clean tree at
+  the commit under test.
 - **Do not run the wall-time measurement while anything else runs.** The
   previous attempt's measurement waits for its fuzz to finish; then the
   next attempt's gate and fuzz start after the measurement.
@@ -911,10 +987,32 @@ the write-up should not claim test coverage.
   outside the units given caught the real bug **and** two bugs in the test
   harness written to catch it. Measure the assert's cost if it is in a hot
   path -- that one was free.
+
+  **For a cache, it is usually not a preference but the only option.**
+  `compile-speedups-007` cached a per-region ordering; dropping the
+  invalidation test for the one input that can change under it **passed the
+  whole suite and left the output byte-identical on 600 `typical/` inputs
+  and two heavy ones**, because a counter put that case at **27 of 66,885
+  asks (0.04%)**. No corpus of this size will catch that by differing
+  output. A `#[cfg(debug_assertions)]` block that recomputes the cached
+  value and compares made the same mutation fail *immediately and across
+  many unrelated tests*. **Any cache whose staleness window is rarer than
+  about 1% should carry one**, and the fuzz target builds with debug
+  assertions, so it then gets checked hundreds of thousands of times.
 - **A mutation that produces identical output may be correct.** Bucketing a
   sort on `key >> 97` instead of `>> 96` merges two values per bucket and
   changes nothing, because each bucket is still sorted within itself.
   Record it as a mutation that *should* pass rather than as a gap.
+- **But identical output is never proof that an invariant holds.** It says
+  the corpus did not notice. `-007`'s one failed attempt guarded an
+  all-operands scan with `kind() == DefUse::Def`, screened at **-0.92% of
+  `typical/`** with **byte-identical output on 600 inputs** -- and the
+  guard was logically inverted: `validation.rs`'s `InvalidReuse` rules
+  require a `Reuse`'s target to be an early *use*. The speedup was the
+  guard skipping work it should have done. Corrected, it was worth 0.08%.
+  **When a change rests on an invariant about the IR, check it against
+  `validation.rs`, which states these rules explicitly**, before believing
+  a clean gate.
 
 ### When output changes are allowed
 
@@ -949,6 +1047,13 @@ change whose whole point is locality (shrinking a type, splitting hot from
 cold fields, `Vec` instead of `BTreeMap`), a flat instruction count means
 "no information", not "no effect". Such changes must be judged on wall time,
 with enough samples to resolve it.
+
+**A wall delta several times the insts delta is the signature of a locality
+change, not an error.** `-007`'s span-shrinking attempt measured -0.60%
+insts and **-2.91% wall on `typical/`, -16.12% on heavy/00**: the same
+instructions retiring against a working set that now fits. So do not skip
+the wall run because the insts figure looks too small to bother with -- on
+a layout change that figure is the one carrying no information.
 
 ```bash
 python3 $S/compare.py -n 20 --csv $R/bench/<slug>-typical.csv \
@@ -1167,4 +1272,20 @@ Then tell the user where the report is and summarize the cumulative result.
 - **Leaving a fuzz worker running into a measurement.** `cargo fuzz`'s
   child survives the parent's exit and sits at 100% of a core. Check
   `ps`/`uptime` and `pkill -f 'release/allocate'` before any wall-time
-  run; `-006` caught one only because the load average looked wrong.
+  run; `-006` caught one only because the load average looked wrong, and
+  `-007` hit it twice (`pkill -9` is what finally cleared it).
+- **A screen is not a verdict about correctness.** It only says the
+  candidate is faster, and the fastest way to be faster is to do less than
+  you should. `-007` screened an idea at -0.92% whose guard was logically
+  backwards; the gate was clean too, because the corpus never exercises
+  the difference. Check the invariant, not just the numbers.
+- **A hanging test is a detection, not a timeout.** `-007`'s mutation of
+  the treap descent made `unions_match_a_model` loop forever instead of
+  failing an assertion. Under plain `cargo test` that just looks stuck.
+  Note that **`timeout` is not installed on this host**: to bound a run,
+  `cargo test --no-run` and execute the test binary in the background,
+  polling its log.
+- **Parsing `--insts` with a bare `grep`.** `run` prints `insts-retired`
+  once per input *and* again under `=== totals`, so a single-input set
+  gets double-counted. Use
+  `awk '/=== totals/{t=1} t&&/insts-retired/{print $2; exit}'`.

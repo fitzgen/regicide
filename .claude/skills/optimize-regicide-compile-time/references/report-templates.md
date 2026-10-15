@@ -69,6 +69,26 @@ evidence for each.
 ## Not yet understood / follow-ups
 
 - ...
+
+## Where the time goes at the tip
+
+The timing-log breakdown over `typical/` at the final sha, so the next
+session starts from where this one left the profile rather than re-deriving
+it. Take it with the recipe in SKILL.md, "Which pass: the `timing` feature",
+and give each pass its share as well as its milliseconds.
+
+| pass | ms | share | vs base |
+| --- | ---: | ---: | ---: |
+| region allocate | 0000.0 | 00.0% | -0.0pp |
+| coalesce | 0000.0 | 00.0% | +0.0pp |
+| generate moves | ... | ... | ... |
+| live ranges | ... | ... | ... |
+| eliminate redundant moves | ... | ... | ... |
+| ... | ... | ... | ... |
+
+Note which passes moved and which did not: a pass whose *share* grew while
+its milliseconds fell is one the session did not touch, and is usually the
+next session's starting point.
 ```
 
 ## `successful/<slug>.md` and `unsuccessful/<slug>.md`

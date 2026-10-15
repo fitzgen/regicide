@@ -529,3 +529,136 @@ cursors in `try_assign`) were **not** attempted here and remain open.
 
 The baseline `cargo test --all-features` at `4fa422a`: **431 + 8 passed, 10
 ignored**, exit 0, ~100 s. Unchanged at `1489df3`.
+
+## Session `compile-speedups-007` (2026-10-15, base `da7b1da`, tip `157ff2d`)
+
+Corpora `codegen-analysis-010` -- **byte-identical to `009`'s** (same
+33,038 files; 41 sampled files all `cmp`-equal, the only difference a new
+`README.md`), so that session's structural findings carry over, but the
+tree was 2% faster so the census was re-run. Same shape as before: 13,925
+distinct inputs under 1e10 insts and three heavy inputs of about a second.
+
+Five attempts, **four kept**; three further ideas screened out and six
+probes run. Cumulative, n=12, 99% CI, **all significant on both metrics**,
+no regression on any set, allocation output **byte-identical everywhere**
+(the session had no permission to change it and never needed any):
+
+| set | insts | wall |
+| --- | ---: | ---: |
+| `typical/` (13,925) | **-10.24%** | **-7.96%** |
+| heavy/00 `starlingmonkey-markdown-15922` | **-29.12%** | **-24.52%** |
+| heavy/01 `starlingmonkey-markdown-14982` | -9.84% | -12.22% |
+| heavy/02 `hashset-0004` | -1.59% | -2.43% |
+
+### What worked
+
+| change | typical | where |
+| --- | ---: | --- |
+| **`SecondaryMap::index_mut` grows with `resize`, not a `push` loop** | **-8.68%** (heavy/00 **-28.10%**) | `entity/map.rs` |
+| Order a register class by tier once per region, not per bundle (97.4% hit) | -0.89% | `region_allocation.rs` |
+| Span hints held out of line: `LiveSpanData` 144 B -> **16 B** | -0.60% insts, **-2.91% wall** (heavy/00 **-16.12% wall**) | `live_ranges.rs` |
+| Delete `last_ending_by`'s `next` pre-walk; descend the treap directly | -0.22% | `interval_sets.rs` |
+
+**The first is the headline and the lesson.** It is one line in a shared
+container, not in any pass: `index_mut` materialized the defaults between
+its length and the key one `push` at a time. Six sessions walked past it
+because the profile names `push_mut<Option<LiveSpan<u32>>>` and `capacity`,
+never a pass. **When a flat profile's biggest self-time rows are container
+internals, read `entity/`.**
+
+### Probes, and what they ranked
+
+Every attempt this session was chosen by a marginal-cost probe first:
+
+| probe | typical | outcome |
+| --- | ---: | --- |
+| `reuse_aware_constraint` called twice | **+3.53%** | largest target found; **still open** |
+| `check_disjoint` called twice | +1.71% (heavy/00 +2.97%) | drove the treap attempt |
+| `order_non_preferred_candidates`' two scans | +1.53% | drove the tier-order attempt |
+| +128 B dead padding on `LiveSpanData` | +1.36% | drove the span-shrinking attempt |
+| +192 B dead padding on `LiveBundleData` | +0.13% | **rejected**: 10x less, despite being the larger struct |
+| `is_live_in` called twice | +0.12% | rejected: 99.998% true but no invariant makes it so |
+| `spans_range` searched twice | -0.18% (noise) | rejected: `-006`'s open item 3 is **not** worth doing -- 5,459 calls, not 208k like `incoming_edges` |
+
+**Padding probes rank shrink candidates in minutes**, and ranked these two
+10:1 the opposite way round from how they look. `RegSet` is **64 bytes on
+every machine** (`Reg::MAX = 512`, while the corpora's machines define 128),
+so grep hot structs for it.
+
+### What lost
+
+- **A linear fast path in front of a search, for the fourth time.**
+  `last_ending_by`'s `next` walk averaged 2.03 steps and *still* descended
+  24.2% of the time. A sweep over 0,1,2,3,4,6,8,12,16 was **monotone in
+  favor of 0**. Joins `-005`'s and `-006`'s bitmaps and the three cursors.
+- **Guarding `is_reuse_target`'s scan by operand kind** screened at -0.92%
+  with **byte-identical output on 600 inputs** -- and was wrong:
+  `validation.rs` requires a `Reuse`'s target to be an early *use*, so
+  `kind() == Def` skipped exactly the operands that should enter. Corrected
+  to `Use && Early`, worth 0.08%. **Identical output means the corpus did
+  not notice, not that the invariant holds.**
+- Narrowing `param_of`'s index to `u16` (7.4% of values are parameters, max
+  index 11): flat at -0.01%. One entry per value is too small a map.
+- One node lookup per interval-set loop iteration: -0.10%, and the
+  `last_ending_by` half added nothing, so the optimizer already had it.
+
+### Verification findings
+
+**Two of four kept attempts had mutations that passed everything.** Both
+needed more than the default recipe:
+
+- The tier-order cache: dropping the `region_preferences` invalidation
+  passed the full suite *and* left output byte-identical on 600 typical
+  inputs and two heavy ones, because that case is **27 of 66,885 asks
+  (0.04%)**. Fixed with a `#[cfg(debug_assertions)]` block that rebuilds
+  the order and compares; the same mutation then fails immediately across
+  many tests. **Any cache whose staleness window is rarer than ~1% should
+  carry one.**
+- The split-hint handoff: reversing which half keeps which hint also passed
+  everything with identical output (the hint only biases a preference later
+  allocation usually overrides). Fixed by extending the existing
+  `split_bundle_within_span` property test.
+
+A **false fuzz crash** recurred exactly as SKILL.md warns: a screen written
+into `src/interval_sets.rs` during the fuzz *build* produced a panic at
+1,024 execs that did not reproduce at the commit; a clean re-run did 424k
+runs green.
+
+### Fixpoints: all three still correctly ordered
+
+Visits per block -- liveness 1.49 (small sample) to **5.18** (heavy/01),
+RME 1.17-2.28, DME 1.24-3.27. Liveness near 5 looks like `-004`/`-005`'s
+LIFO signature but is **not**: the pop order is a max-heap on RPO index
+(post-order, right for a backwards analysis) and the figure **rises with
+input size**, which is genuine convergence. The bug shows as a *flat* ~4.8.
+
+### Where the time goes at `157ff2d` (`typical/`, timing log)
+
+region allocate 26.7%, coalesce 16.8%, generate moves 16.5%, live ranges
+11.8%, RME 10.1%, DME 4.3%, liveness 3.3%, everything else 10.5%. Almost
+unchanged in *share* from `-006`, because the two largest wins were spread
+across every pass rather than concentrated in one.
+
+**Status:** open. Ranked candidates:
+
+1. **`reuse_aware_constraint`, +3.53% by probe** -- the best-measured
+   target left. 1.06M calls at **5.38 per distinct `(inst, operand)`**, so
+   82% are recomputation across passes. Only 3.1% find a reuse tie, and the
+   sibling scan is 0.06 operand visits per call, so the cost is
+   `is_reuse_target` scanning every operand on every call. Cannot be
+   skipped by operand kind (see above). A memo keyed by `(inst, operand)`,
+   or folding the constraint into `UseData` where the callers go through
+   `Use`, is the way; note `Use::is_fixed`'s doc explicitly says it uses
+   "nothing cached", so check why before changing that path.
+2. `resolve`'s `dests` sort: **1.2%** by probe (sort, reverse, re-sort --
+   no clone). `dedup` removes only 0.1% of 309k entries but cannot go,
+   since two group moves can legitimately expand to one pair.
+3. `check_disjoint`'s remaining ~1.5%: 2.22 loop iterations per walk, and
+   `-006` showed 62% are genuine multi-interval merges, so this needs a
+   better merge, not a fast path.
+4. `-005`'s item 2 (bounded-skip cursors in `try_assign`) and item 1
+   (measure against ion) remain untried across three sessions now.
+
+The baseline `cargo test --all-features` at `da7b1da`: **433 + 8 passed, 10
+ignored**, exit 0, ~100 s. At `157ff2d`: **433 + 8** (two tests extended,
+none added).
