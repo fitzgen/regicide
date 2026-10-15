@@ -83,23 +83,39 @@ Things to know about it:
   gave countMatches **432 fewer spills, 407 fewer reloads and 199 fewer
   moves** and cost it **+4.60%**, because the registers it freed went to
   shallower blocks. Judge on the estimate either way.
-- **Know the ceiling before chasing a cost class.** Nine tenths of this
+- **Know the ceiling before chasing a cost class.** Five sixths of this
   metric is instructions no allocation decision can remove. One `awk` over
   the baseline TSV gives every class's share in seconds, and it should come
   before picking a candidate:
 
   ```sh
-  awk -F'\t' 'NR>1{m+=$7;rm+=$8;sp+=$9;rl+=$10;ro+=$5} END{t=m+rm+sp+rl+ro;
-    printf "reg_operands %.1f%%  moves %.1f%%  remats %.1f%%  spills %.1f%%  reloads %.1f%%\n",
-    ro/t*100,m/t*100,rm/t*100,sp/t*100,rl/t*100}' $R/counts/$sha.tsv
+  awk -F'\t' 'NR>1{ro+=$5;so+=5*$6;m+=$7;rm+=$8;sp+=5*$9;rl+=5*$10} END{t=ro+so+m+rm+sp+rl;
+    printf "reg_operands %.2f%%  stack_operands %.2f%%  moves %.2f%%  remats %.2f%%  spills %.2f%%  reloads %.2f%%  sum %.0f\n",
+    ro/t*100,so/t*100,m/t*100,rm/t*100,sp/t*100,rl/t*100,t}' $R/counts/$sha.tsv
   ```
 
-  On analysis 009's corpus at `1902b8a` that prints **reg_operands 90.9%,
-  moves 6.2%, reloads 1.9%, remats 0.6%, spills 0.4%**. Those are shares of
-  the summed components; against the corpus's own estimated-cycles total
-  they are moves 5.71%, reloads **1.70%**, remats 0.55% — so eliminating
-  *every* reload in the corpus is worth 1.70%, and every remat 0.55%. In
-  code-quality-011 that one line ruled out three candidate ideas.
+  **The `5*` on `$6`, `$9` and `$10` is load-bearing.** `run` prints every
+  component *before* `EstimatedCycles::total` multiplies the three stack
+  classes by `STACK_COST = 5`, so summing the printed fields raw understates
+  spills and reloads fivefold and inflates the rest. The check that it is
+  right: **`sum` must reproduce the corpus's own `est_cycles` column**
+  (`awk -F'\t' 'NR>1{t+=$4} END{printf "%.0f\n", t}'`; without the
+  `printf` awk prints it in scientific notation and you cannot compare it).
+  The raw sum misses it by 8%.
+
+  On analysis 010's corpus at `da7b1da` the corrected line prints
+  **reg_operands 83.32%, reloads 8.48%, moves 5.71%, spills 1.93%, remats
+  0.55%** (stack_operands 0.00%). So eliminating *every* reload in the
+  corpus is worth **8.48%**, every move 5.71%, every remat 0.55%. Of the
+  **edit cost** alone — the part allocation decides — **reloads are 50.9%
+  and moves 34.2%**, spills 11.6%, remats 3.3%.
+
+  **Reloads are the biggest editable class, not moves.** Sessions through
+  012 worked from an uncorrected figure that reversed this (moves ~3:1 over
+  reloads; truly reloads ~1.5:1 over moves) and sized candidates against it.
+  A move-count win that costs reloads is usually a loss: code-quality-012's
+  attempt 1 cut moves 2.56% and still regressed, because the seam moves it
+  removed are ~7x cheaper than the reloads it created.
 - **Spill slots** are not in the estimate. Watch `slots` separately: all else
   equal, smaller frames are better (a thing to preserve, see known-findings).
 - **Cold edits barely register.** At 0.05x, cutting cold moves by half in
@@ -142,6 +158,17 @@ Breaking any of these invalidates the improvement, however good its numbers.
   ignored a third of the ways a bundle gets a register. **A bucket that is
   always zero is a bug until proven otherwise** — it is indistinguishable
   from a finding, and it reads as one.
+  - **The printout's block header has two optional parenthesised groups, and
+    a greedy regex merges them.** `block368(v1085, v1086) -> (Reg(Reg(r7)),
+    Stack(SpillSlot(stack24))):` matched against
+    `block(\d+)(\(.*\))? ?(?:-> \((.*)\))?:` swallows the arrow into group
+    2, so every block parses as parameterless and three buckets report zero.
+    Use `^  (?:entry )?block(\d+)(?:\([^)]*\))? -> \((.*)\):$`, and check it
+    does *not* match a plain `  block366:`.
+  - **Make "nothing to report" say so.** `hint_votes.py` prints nothing at
+    all for an input whose borders never disagree, which is
+    indistinguishable from a crash or a bad log. A script of your own should
+    print `0 conflicting bundles` rather than exit silently.
 - **State the mechanism you measured, not the one you intended.** The two
   diverge more often than they feel like they do: code-quality-010's kept
   change won -1.06% and its commit message explained it with a comparison the
@@ -450,6 +477,17 @@ cargo run --release --example visualize -- \
   change, `$S/edit_costs.py` on the heaviest inputs shows edit cost by kind
   and loop depth, and how much of the reload cost sits on latches. It took
   minutes to rule ideas in or out in code-quality-009.
+- **Size the feasible subset, not the cost class.** A bound over every
+  occurrence of a pattern, computed without the pattern's enabling
+  condition, measures the question rather than the opportunity — and the
+  enabling condition is often the very thing the allocator already decided
+  against. In code-quality-012, loop-invariant reloads on
+  `dotnet-raytracer-0385-u0-321` bounded at **119.7M**, 6.4% of that input's
+  cycles and the largest number any probe in the session found; asking ten
+  minutes later whether the hoist was *legal* (is the destination register
+  free across the loop?) returned **0 of 183**. The register the hoist needs
+  is busy precisely because that is why the value was spilled. Put the
+  enabling condition in the same probe, or expect the number to collapse.
 - **Ask where the cost sits in the CFG before blaming a decision.**
   `$S/boundary_moves.py PRINTOUT...` splits edit cost into loop-entry,
   loop-exit and interior blocks, and `$S/exit_stubs.py` ranks the exit
@@ -474,6 +512,19 @@ cargo run --release --example visualize -- \
   output with the settled/speculative distinction in mind (see the pitfall
   on hint kinds): a "minority" may be a settled hint correctly displacing
   guesses.
+- **`$S/split_depth.py LOG`** follows the `BundleSplit { parent, child }`
+  lineage and reports how many cuts each bundle had spent when it reached an
+  outcome, with the outcome mix at each depth. It needs
+  **`RUST_LOG=regicide=trace`**. Use it before touching the split ladder: it
+  sizes "how deep does splitting actually go" in one run. Read it
+  **marginally**, not cumulatively. On `rust-wasmprinter-0028-u0-21`, unsplit
+  bundles spill 69% of the time and bundles 6-9 cuts deep only ~30%, which
+  looks like "deep splitting is a symptom of trouble" and is the opposite:
+  each cut is buying a register for a piece that would otherwise be on the
+  stack. The question that decides is what the *next* cut buys, and a
+  cumulative distribution does not show it. Lineages run 11 and 18 cuts deep
+  here, and no finite cap pays (code-quality-012 attempt 1: monotone in the
+  cap, +0.09% at 3, exact no-op at 14).
 - **Probe before porting a fix to a sibling code path.** After
   code-quality-009 made edge stores weigh loop depth, the push-up step in
   spill placement still compared frequency only. A probe found it never
@@ -526,6 +577,14 @@ For each candidate, highest-ranked first:
 
    If the targets do not move, or move the wrong way, rethink before going
    further. Iterating here is cheap.
+
+   **A screen is a go/no-go, never an estimate.** The 15 inputs are chosen
+   because they are sensitive to allocation changes, so a win concentrated
+   in them is the *expected* false positive, not a surprise. Read it as
+   "do the targets move and do the guards hold", and let the full corpus
+   decide the size and the sign. Three attempts in code-quality-012 had the
+   two disagree in sign: attempt 6 screened **-2.52% on reloads** and
+   measured **+0.01%** over all 13,928 inputs.
 
    **Screen variants of one idea against each other** before committing to
    one. In code-quality-009 the first variant of the kept attempt 1 cost the
@@ -730,11 +789,17 @@ attempt's write-up. Never bless blind. The visualizer's node tests read the
 same fixtures, so run them too:
 
 ```bash
-(cd visualizer && node --test test/) 2>&1 | grep -E '^ℹ (pass|fail)|^✖'
+(cd visualizer && node --test test/*.test.js) 2>&1 | grep -E '^ℹ (pass|fail)|^✖'
 ```
 
-The clean baseline is 125 pass, 1 fail ("an event summary names its entities
-as clickable parts", a missing `slot=`).
+The glob is required: `node --test test/` fails with `MODULE_NOT_FOUND` and
+reports one failing "test" and zero passing, which reads exactly like a
+regression from the change under test.
+
+The clean baseline is **124 pass, 2 fail** ("an event summary names its
+entities as clickable parts" and "a block is prefixed by what the embedder
+called it"). Both fail on an untouched tree; confirm against one before
+blaming a change.
 
 **Some tests pin an allocation shape, not a rendering.** A test that needs a
 dead move, a spill in a loop, and so on stops testing anything when a better
@@ -964,6 +1029,16 @@ Then tell the user where the report is and summarize the cumulative result.
   moved by *exactly* the amounts the cheap rule moved them, and it cost
   +3.18% compile time to learn nothing. When the variance probe says
   near-constant, stop there.
+- **The variance probe predicts the outcome in both directions.** It is ten
+  lines in `allocate_region` printing the old key beside the candidate, and
+  code-quality-012 ran it on two keys with opposite results: use weight x
+  loop depth reordered **0%** of comparable pairs (every region spans one
+  depth) and measured -0.00%; spill weight vs span count reordered
+  **79-80%** and measured **-4.80%**, the largest single win any session has
+  landed. Run it before implementing, and read a near-zero answer as fatal.
+  A premise can be true and still irrelevant: the depth key's premise
+  (frequency carries no loop information) was correct, but the queue cannot
+  compare across regions anyway.
 - **A passing gate is not a reason to keep a flat change.** code-quality-011's
   attempt 5 did everything it promised — every guard byte-identical, corpus
   spills *falling* where the ungated version raised them, `diff_counts.py`
@@ -993,14 +1068,19 @@ Then tell the user where the report is and summarize the cumulative result.
   another neighbor of a still-unassigned far side chose. Teaching
   `RegPreference` that a fact displaces a guess was worth **-3.69%**
   suite-wide in one commit (code-quality-011 attempt 1). Re-ranking hints
-  *within* one kind then failed three times, each within **±0.01% of flat**:
-  by vote count (attempt 2), by the far-side border's `Block::weight`
-  (attempt 3, and +3.18% compile time), and by count gated to bundles no
-  clobber crosses (attempt 5, which passed the gate and still did not pay).
-  Counting cannot tell a depth-6 border from a depth-4 one, and weighing
-  cannot tell most of them apart at all — the far-side weight varies for
-  only 21 of 176 conflicting bundles. **Treat that family as closed** unless
-  you have a new difference in kind.
+  *within* one kind then failed **four** times: by vote count (011 attempt
+  2), by the far-side border's `Block::weight` (011 attempt 3, and +3.18%
+  compile time), by count gated to bundles no clobber crosses (011 attempt
+  5, which passed the gate and still did not pay), and by a true per-register
+  tally (012 attempt 3, -0.05% with the gate failing). The first three shared
+  one approximation — incumbent-and-one-challenger — which is lossy for the
+  18-45% of conflicting bundles where three or more registers compete; 012
+  attempt 3 removed it and the answer did not change. Counting cannot tell a
+  depth-6 border from a depth-5 one: on `-0385` a true tally bought -1.7M at
+  depth 5 and paid **+6.0M at depth 6**, six blocks each gaining one move.
+  **Treat that family as closed** unless you have a new difference in kind.
+  What GCC has here and a count does not is per-border *frequency* weighting
+  (`color_pass`, `ira-color.cc:3721`).
 - **Assuming a revived idea composes with what landed since.** In
   code-quality-010 attempt 1 took the heaviest input -2.42% alone, and the
   same patch on top of attempt 2 took it **+1.66%**: the two were substitutes

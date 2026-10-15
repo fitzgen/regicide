@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import boundary_moves
 import loops
+import split_depth
 
 FAILURES = []
 
@@ -203,6 +204,45 @@ def test_hint_votes_counts_borders(tmp):
           "bundle4: took r3" in text, True)
 
 
+def test_split_depth_follows_lineage(tmp):
+    """`split_at_span` mutates the parent in place, so a prefix keeps its id
+    and its lineage depth must keep rising across further cuts. Counting
+    splits per bundle id instead would report every prefix at depth 1."""
+    log = os.path.join(tmp, "trace.txt")
+    with open(log, "w") as f:
+        # bundle0 is cut twice, so its prefix ends three deep after a third
+        # cut; each child inherits the depth spent so far.
+        f.write(
+            "  TRACE event: BundleSplit { parent: bundle0, child: bundle1, region: region0 }\n"
+            "  TRACE event: BundleSplit { parent: bundle0, child: bundle2, region: region0 }\n"
+            "  TRACE event: BundleSplit { parent: bundle2, child: bundle3, region: region0 }\n"
+            "  TRACE event: BundleSpilledToStack { bundle: bundle0, region: region0 }\n"
+            "  TRACE event: BundleAssignedPreferred { bundle: bundle3, alloc: Reg(r0) }\n"
+            "  TRACE event: BundleAssignedViaEviction { bundle: bundle1, alloc: Reg(r1) }\n"
+        )
+    text = run_capture(split_depth.main, log)
+    check("every outcome is counted", "3 bundles reached an outcome" in text, True)
+    # bundle0 was cut twice, so its own outcome sits at depth 2, not 1.
+    check("a twice-cut parent reaches its outcome two deep",
+          "    2 splits:      1" in text, True)
+    # bundle3 inherits bundle2's one spent split, plus the cut that made it.
+    check("a child inherits the splits already spent",
+          "    3 splits:      1" in text, True)
+    check("the outcome kind is reported", "spilled 1" in text, True)
+    check("a cap stops the splits past it", "3 splits" in text, True)
+
+
+def run_capture(fn, *args):
+    """Run `fn`, returning what it printed."""
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        fn(*args)
+    return buf.getvalue()
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="regicide-selftest-")
     for test in (
@@ -211,9 +251,11 @@ def main():
         test_boundary_buckets_can_fire,
         test_hint_misses_reads_evictions,
         test_hint_votes_counts_borders,
+        test_split_depth_follows_lineage,
     ):
         print(f"{test.__name__}:")
-        if test in (test_boundary_buckets_can_fire, test_hint_votes_counts_borders):
+        if test in (test_boundary_buckets_can_fire, test_hint_votes_counts_borders,
+                    test_split_depth_follows_lineage):
             test(tmp)
         else:
             test()

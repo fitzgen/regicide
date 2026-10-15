@@ -54,23 +54,115 @@ Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 > it* (answered by class order). The backlog item's reasoning ran through
 > the first sense while reaching for a mechanism belonging to the second.
 >
-> What is actually missing is a **cost model term**, internal to
-> `region_allocation.rs` and fully in scope: the prologue/epilogue pair is
-> unmodeled (`src/` mentions it only in doc comments) and is a *step
-> function* in the count of distinct tail registers used (~4.8 per function
-> over the 226 corpus functions using >= 8 registers). Add a 5th tier to
-> `order_non_preferred_candidates`' counting sort so an already-committed
-> tail register outranks a fresh one — biasing toward **reuse**, which is
-> what preserve item #4 wants. **Judge it on the register set used, not the
-> estimate**; the estimator cannot see a prologue. Two caveats: key the
-> model off class order, not observed clobbers (734 corpus functions >= 50
-> insts have *no* clobbering instruction yet use a mean of 13.5 registers),
-> and prefer `rust-wasmprinter` over `dotnet-raytracer` as the target,
-> which is already -1.06% ahead of ion on wall time. Full write-up:
-> `reports/code-quality-011/misc/callee-saved-api.md` in the
-> `regicide-code-quality` worktree.
+> **Measured and closed (2026-10-15, code-quality-012 attempt 5, base
+> `da7b1da`).** The reuse half of the prescription below was implemented
+> exactly as written — a `function_registers: RegSet` outliving the region,
+> a 5th tier in `order_non_preferred_candidates` — and judged on the
+> register set, as instructed. Over 400 inputs sampled across the corpus:
+> **9 functions better, 3 worse, 388 unchanged**, a net of six registers,
+> bought with **+0.43% compile time** and +0.64% moves; estimated cycles
+> +0.00% with the gate failing on `markdown-16779`. This corroborates
+> analysis 010's `callee-saved-survey.md` from the inside: regicide's
+> allocation is already near-minimal in registers used, so there is almost
+> no headroom. **Do not re-open the reuse bias.** Tag
+> `code-quality-012/reuse-registers`.
+>
+> What that did *not* test, and what remains open, is a **prologue cost
+> term** that prices the push/pop pair against the spill it would avoid —
+> GCC's `targetm.frame_allocation_cost` (`ira-color.cc:2046`), charged into
+> the spill decision and gated on `existing_spills_p`. That is a larger and
+> different change: it makes spilling *more* attractive for a function that
+> has not spilled yet. Nothing has measured it.
+>
+> The cost such a term would price: the prologue/epilogue pair is unmodeled
+> (`src/` mentions it only in doc comments) and is a *step function* in the
+> count of distinct tail registers used (~4.8 per function over the 226
+> corpus functions using >= 8 registers). Two constraints any attempt
+> inherits: key the model off class order, not observed clobbers (734 corpus
+> functions >= 50 insts have *no* clobbering instruction yet use a mean of
+> 13.5 registers), and prefer `rust-wasmprinter` over `dotnet-raytracer` as
+> the target, which is already -1.06% ahead of ion on wall time. Judge it on
+> the register set used, not the estimate; the estimator cannot see a
+> prologue. Full write-ups:
+> `reports/code-quality-011/misc/callee-saved-api.md` (the correction) and
+> `reports/code-quality-012/unsuccessful/05-reuse-committed-registers.md`
+> (the measurement) in the `regicide-code-quality` worktree.
 
-## Latest session: `code-quality-011` (2026-10-13, base `4fa422a`)
+## Latest session: `code-quality-012` (2026-10-15, base `da7b1da`)
+
+`reports/code-quality-012/report.md` in the `regicide-code-quality` worktree.
+Against **analysis 010** (`~/regalloc2/reports/codegen-analysis-010/`, which
+measured **`da7b1da`** — that session's exact base). Branch
+`code-quality-012`. Nineteen attempts across two budgets (eleven implemented
+and dropped, six rejected by probes); **two kept**.
+
+**Suite estimated cycles -4.82%** (7,220,977,036 -> 6,873,024,304), spills
+-2.62%, reloads -2.07%, better 1,405 / worse 1,141, **compile time -0.41%**.
+The two kept commits are one change in two halves, both in `Priority`.
+
+| # | idea | verdict | result |
+| --- | --- | --- | --- |
+| 12 | **a bundle that wants a register queues before one that does not** | **kept** | suite **-4.80%**; raytracer-0385 **-8.73%**, -0386 -8.42%, markdown-16779 -3.72%; compile **-0.43%** |
+| 19 | **among bundles a register buys nothing, the small ones first** | **kept** | -0.02%, gate clean; recovers 85% of 12's countMatches cost (+2.02% -> +0.30%) |
+| 1 | cap how many times a bundle may be split (`split_fuel`) | dropped | **monotone in the cap**: +0.09% at 3, +0.00% at 10, no-op at 14 |
+| 3 | count hints per register, most-asked-for wins | dropped | -0.05%, gate fails; **a count cannot tell a depth-6 border from a depth-5 one** |
+| 5 | prefer a register the function already uses | dropped | +0.00%; 9 better / 3 worse over 400 functions (closes open item 1 above) |
+| 6 | prefer a cut at a liveness hole | dropped | +0.11% suite, but **xchacha20 -2.44%** — the first in-scope move on it |
+| 14 | only a weighted bundle reserves a register | dropped at screen | **+5.78%**, the session's worst: a zero-weight bundle's hint is load-bearing |
+| 2, 4, 7, 16, 17, 18 | see the report | rejected or no-op | each closes a line of attack; details there |
+
+What the code does now, and what to know before changing it:
+
+- **`Priority` has a `weight` bit above `size`.** The field order is
+  `(is_minimal, group_size, num_hints, weight, size)`, and `weight` is one
+  bit: does the bundle have any spill weight at all? One bit rather than
+  tiers because the weights do not spread — every nonzero spill weight on
+  `dotnet-raytracer-0385` is below 0.5, since `normalize_spill_weight`
+  divides a use cost by a length plus 25, and tier bases of 1.5, 2, 4 and 10
+  all screen byte-identically.
+  - **The size order below it is inverted for zero-weight bundles.** Among
+    bundles a register buys nothing, short ones queue first: a long carrier
+    holds a register across a wide range, gains nothing by it, and blocks
+    every bundle it overlaps. `size` is 22 bits now, down from 23, and a
+    bundle over 4,194,303 spans saturates.
+  - **Zero spill weight is a superset of `has_nothing_to_split_for`.** It
+    also catches a bundle whose uses all price to zero: a non-minimal
+    `AlwaysRemat` carrier (`REMAT_ALWAYS_SCALE` is 0.0), and a bundle whose
+    uses are all reuse-tied `Any` defs (`use_spill_cost` subtracts
+    `MOVE_COST` and floors at zero). Both have uses and something to split
+    for, and both are demoted.
+- **The queue was the lever, not the boundary.** Four sessions worked hints
+  and boundaries on this corpus for tenths of a percent; one bit in the
+  queue's sort key was worth -4.80%. Attempt 12's write-up has the probe to
+  run before proposing another key: for a candidate, how many comparable
+  pairs does it order differently from the status quo? 79-80% there,
+  **0%** for attempt 10's (use weight x loop depth), which measured -0.00%.
+- **Hint re-ranking within one kind is closed on four independent tries**
+  (011's attempts 2, 3, 5 and this session's 3), with the structural
+  objection to the first three removed. A fifth attempt needs a difference
+  in *kind*. What a count cannot do, and GCC's hard-register cost vector
+  can, is weight each border by its frequency (`color_pass`,
+  `ira-color.cc:3721`, writing `ALLOCNO_UPDATED_HARD_REG_COSTS`): on
+  `-0385` a pure tally traded a real -1.7M at depth 5 for **+6.0M at depth
+  6**.
+- **`region_preferences` is closed as a decision input** on a fifth and
+  sixth try (attempts 14 and 18). Attempt 18 is the sharpest: **0 of 444**
+  bundles have an uncontested extra register in their hint union, so there
+  is nothing for a preference to pick between.
+- **Splitting is not shredding.** Lineages run 11 and 18 cuts deep, and the
+  outcome mix *improves* with depth: on `rust-wasmprinter-0028-u0-21`
+  unsplit bundles spill 69% of the time while bundles 6-9 cuts deep spill
+  ~30%. No finite cap pays. See `$S/split_depth.py`.
+- **Open, and the clearest lead: xchacha20's -2.44%.** Attempt 6 is the
+  first in-scope change any session has moved the suite's one robust
+  wall-time loss with, by trading its depth-2 reloads for register moves. It
+  costs the deep-loop targets, and attempt 9 showed a **bundle-depth** gate
+  cannot separate them — the cost lands on other bundles at other depths,
+  mediated by the register file. Untried: gating on the *function's* shape
+  (xchacha20 is depth 1-2 with 93% of its edit cost in stack traffic;
+  `-0385` is depth 5-7).
+
+## Previous session: `code-quality-011` (2026-10-13, base `4fa422a`)
 
 `reports/code-quality-011/report.md` in the `regicide-code-quality` worktree.
 Against **analysis 009** (`~/regalloc2/reports/codegen-analysis-009/`, which
@@ -152,16 +244,22 @@ What the code does now, and what to know before changing it:
   session's sharpest counts-vs-estimate case: it gave countMatches 432 fewer
   spills, 407 fewer reloads and 199 fewer moves **and cost it +4.60%**,
   because the freed registers went to shallower blocks.
-- **The corpus's cost ceiling.** At `1902b8a`, as a share of the corpus's
-  estimated-cycles total: **reg-operands 90.9%**, moves 5.71%, reloads
-  1.70%, remats 0.55%, spills 0.39%. (The `awk` one-liner in `SKILL.md`
-  divides by the summed components instead, so it prints moves 6.2% and
-  reloads 1.9% for the same data — same ranking, slightly different
-  denominator.) Nine tenths of the metric is instructions no allocation
-  decision removes. So eliminating *every* reload
-  in the corpus is worth 1.70% and every remat 0.55% — three candidate ideas
-  died on that arithmetic. Of the edit cost alone: moves 68.4%, reloads
-  20.3%, remats 6.6%, spills 4.6%.
+- **The corpus's cost ceiling.** At `da7b1da`, as a share of the corpus's
+  estimated-cycles total: **reg-operands 83.32%**, **reloads 8.48%**, moves
+  5.71%, spills 1.93%, remats 0.55%. Five sixths of the metric is
+  instructions no allocation decision removes. So eliminating *every* reload
+  in the corpus is worth **8.48%**, every move 5.71% and every remat 0.55%.
+  Of the **edit cost** alone: **reloads 50.9%, moves 34.2%**, spills 11.6%,
+  remats 3.3%.
+
+  **Reloads are the biggest editable class, by ~1.5:1 over moves.** Through
+  code-quality-012 this entry and `SKILL.md` both said the reverse (moves
+  ~3:1 over reloads, every reload worth 1.70%), because the one-liner that
+  produced those numbers summed the printed components raw and `run` prints
+  the three stack classes *before* `EstimatedCycles::total` scales them by
+  `STACK_COST = 5`. Candidates were sized against the wrong ranking; see
+  `SKILL.md`'s cost-ceiling bullet for the corrected command and its
+  self-check.
 - **The three heaviest inputs are two different problems**, and the same
   change moves them in opposite directions. Together they are ~77% of the
   suite total.
@@ -218,7 +316,7 @@ above moved item 1 back into scope**, and it is the best-evidenced one:
    while *every* plain count improved. One spill in one depth-4 block
    (+50,000) against -10,000 each in three depth-3 blocks.
 
-## Previous session: `code-quality-010` (2026-10-09, base `7e8f866`)
+## Earlier session: `code-quality-010` (2026-10-09, base `7e8f866`)
 
 `reports/code-quality-010/report.md` in the `regicide-compile-time` worktree.
 Against **analysis 008** (`~/regalloc2/reports/codegen-analysis-008/`, which
