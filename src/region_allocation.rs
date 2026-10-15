@@ -60,9 +60,10 @@ where
             &mut context.region_allocation.relayed_regs,
             &mut context.live_ranges,
             &mut context.events,
+            &mut context.output,
             input,
             region,
-        );
+        )?;
 
         context.region_allocation.allocate_region(
             input,
@@ -106,9 +107,11 @@ fn hint_across_regions<E>(
     relayed_regs: &mut Vec<(LiveBundle<E>, Reg<E>)>,
     live_ranges: &mut LiveRanges<E>,
     events: &mut EventsLog<E>,
+    output: &mut OutputInner<E>,
     input: &Input<'_, impl InputFunction>,
     region: Region<E>,
-) where
+) -> IResult<()>
+where
     E: EntityRepr,
 {
     // The registers each unassigned bundle outside this region has affinity
@@ -206,7 +209,7 @@ fn hint_across_regions<E>(
             true => HintPos::Start,
             false => HintPos::End,
         };
-        our_span.add_hint_at(live_ranges, pos, hint);
+        our_span.add_hint_at(live_ranges, output, pos, hint)?;
         // `theirs` is assigned, so this names a register that is really
         // there, not a guess about where an unassigned side will land.
         ours.add_hint(
@@ -219,6 +222,7 @@ fn hint_across_regions<E>(
     }
 
     relayed_regs.clear();
+    Ok(())
 }
 
 /// What making room for a split half costs in the `c`th of a split's

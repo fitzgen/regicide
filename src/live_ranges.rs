@@ -39,6 +39,10 @@ define_entities! {
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct BundleSpansStorageIndex = "bundle_spans_storage_index";
 
+    /// One span's pair of hint sets, in `LiveRanges::hints`.
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub struct SpanHints = "span_hints";
+
     /// A register held for one fixed operand, outside of any value's live
     /// range.
     #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -504,7 +508,7 @@ where
     /// The value that this span is associated with.
     val: Val<E>,
 
-    /// The registers hinted at this span's start, and at its end.
+    /// Where this span's hints live, or `None` while it has none.
     ///
     /// A cross-region affinity is about one edge, so it wants a register only
     /// where the span meets that edge. Splitting would otherwise give a hint
@@ -515,8 +519,45 @@ where
     /// region chose rather than what this edge needs, so a piece split away
     /// from here must not inherit it. That is what lets `LiveBundle::new`
     /// re-fold these at their original strength.
-    hinted_at_start: RegSet,
-    hinted_at_end: RegSet,
+    ///
+    /// Out of line because a `RegSet` pair is 128 bytes against the 16 this
+    /// span is otherwise, and few spans are ever hinted.
+    hints: Option<SpanHints<E>>,
+}
+
+/// What `hinted_at` hands back for a span with no hints.
+static EMPTY_REG_SET: RegSet = RegSet::new();
+
+/// The registers a span wants where it starts, and where it ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HintSets {
+    at_start: RegSet,
+    at_end: RegSet,
+}
+
+impl HintSets {
+    const fn empty() -> Self {
+        HintSets {
+            at_start: RegSet::new(),
+            at_end: RegSet::new(),
+        }
+    }
+
+    #[inline]
+    fn at(&self, pos: HintPos) -> &RegSet {
+        match pos {
+            HintPos::Start => &self.at_start,
+            HintPos::End => &self.at_end,
+        }
+    }
+
+    #[inline]
+    fn at_mut(&mut self, pos: HintPos) -> &mut RegSet {
+        match pos {
+            HintPos::Start => &mut self.at_start,
+            HintPos::End => &mut self.at_end,
+        }
+    }
 }
 
 /// Which end of a span a hint is about.
@@ -544,8 +585,7 @@ where
             end,
             uses,
             val,
-            hinted_at_start: RegSet::new(),
-            hinted_at_end: RegSet::new(),
+            hints: None,
         }
     }
 }
@@ -856,6 +896,9 @@ where
     /// to that region alone.
     block_reservations: SecondaryMap<Block<E>, EntityRange<Reservation<E>>>,
 
+    /// Storage for the spans that have hints; see `LiveSpanData::hints`.
+    hints: PrimaryMap<SpanHints<E>, HintSets>,
+
     /// Map from a region to the bundles that coalescing created for it.
     ///
     /// Does not include bundles created after coalescing, e.g. by splitting
@@ -957,6 +1000,7 @@ where
             block_reservations: SecondaryMap::new(EntityRange::empty()),
             region_bundles: SecondaryMap::new(EntityRange::empty()),
             use_span: SecondaryMap::new(LiveSpan::MAX_REPRESENTABLE),
+            hints: PrimaryMap::new(),
         }
     }
 
@@ -975,6 +1019,7 @@ where
             block_reservations,
             use_span,
             region_bundles,
+            hints,
         } = self;
         uses.reset();
         spans.reset();
@@ -989,6 +1034,7 @@ where
         block_reservations.reset();
         use_span.reset();
         region_bundles.reset();
+        hints.reset();
     }
 
     pub fn is_reset(&self) -> bool {
@@ -1006,6 +1052,7 @@ where
             block_reservations,
             use_span,
             region_bundles,
+            hints,
         } = self;
         uses.is_reset()
             && spans.is_reset()
@@ -1020,6 +1067,7 @@ where
             && block_reservations.is_reset()
             && use_span.is_reset()
             && region_bundles.is_reset()
+            && hints.is_reset()
     }
 
     /// Iterate over every reservation in the function, in program order.
@@ -1406,22 +1454,63 @@ where
     /// The registers hinted at one end of this span.
     #[inline]
     pub(crate) fn hinted_at(self, live_ranges: &LiveRanges<E>, pos: HintPos) -> &RegSet {
-        let data = &live_ranges.spans[self];
-        match pos {
-            HintPos::Start => &data.hinted_at_start,
-            HintPos::End => &data.hinted_at_end,
+        match live_ranges.spans[self].hints {
+            Some(hints) => live_ranges.hints[hints].at(pos),
+            None => &EMPTY_REG_SET,
         }
+    }
+
+    #[inline]
+    fn hint_sets(self, live_ranges: &LiveRanges<E>) -> HintSets {
+        match live_ranges.spans[self].hints {
+            Some(hints) => live_ranges.hints[hints],
+            None => HintSets::empty(),
+        }
+    }
+
+    /// Give `hints` to this span, replacing whatever it had.
+    ///
+    /// A span that already owns a slot keeps it, even for an empty pair:
+    /// nothing reclaims a slot, so clearing the pointer would strand it.
+    /// Only an unhinted span given nothing stays out of the arena.
+    fn set_hint_sets(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        output: &mut OutputInner<E>,
+        hints: HintSets,
+    ) -> IResult<()> {
+        match live_ranges.spans[self].hints {
+            Some(slot) => live_ranges.hints[slot] = hints,
+            None => {
+                if hints == HintSets::empty() {
+                    return Ok(());
+                }
+                let slot = live_ranges.hints.push(output, hints)?;
+                live_ranges.spans[self].hints = Some(slot);
+            }
+        }
+        Ok(())
     }
 
     /// Record that a settled hint wants `hint` at one end of this span.
     #[inline]
-    pub(crate) fn add_hint_at(self, live_ranges: &mut LiveRanges<E>, pos: HintPos, hint: RegSet) {
-        let data = &mut live_ranges.spans[self];
-        let hinted = match pos {
-            HintPos::Start => &mut data.hinted_at_start,
-            HintPos::End => &mut data.hinted_at_end,
+    pub(crate) fn add_hint_at(
+        self,
+        live_ranges: &mut LiveRanges<E>,
+        output: &mut OutputInner<E>,
+        pos: HintPos,
+        hint: RegSet,
+    ) -> IResult<()> {
+        let slot = match live_ranges.spans[self].hints {
+            Some(slot) => slot,
+            None => {
+                let slot = live_ranges.hints.push(output, HintSets::empty())?;
+                live_ranges.spans[self].hints = Some(slot);
+                slot
+            }
         };
-        hinted.union_with(&hint);
+        live_ranges.hints[slot].at_mut(pos).union_with(&hint);
+        Ok(())
     }
 
     /// The block this span lies within; spans never cross a block boundary.
@@ -1853,9 +1942,12 @@ where
             end,
             uses,
             val,
-            hinted_at_start,
-            hinted_at_end,
+            hints,
         } = live_ranges.spans[old];
+        let HintSets {
+            at_start: hinted_at_start,
+            at_end: hinted_at_end,
+        } = old.hint_sets(live_ranges);
         debug_assert!(start < at);
         debug_assert!(at < end);
 
@@ -1883,13 +1975,30 @@ where
         // Each half keeps only the hints about the end it still covers; the
         // cut itself is hinted by neither.
         let mut lo = LiveSpanData::new(start, at, val, lo_uses);
-        lo.hinted_at_start = hinted_at_start;
+        // Carry the slot across the rewrite: `new` leaves it `None`, and a
+        // slot the span no longer points at is one nothing can reuse.
+        lo.hints = hints;
         live_ranges.spans[old] = lo;
+        old.set_hint_sets(
+            live_ranges,
+            output,
+            HintSets {
+                at_start: hinted_at_start,
+                at_end: RegSet::new(),
+            },
+        )?;
 
         // The new span takes second piece.
-        let mut hi = LiveSpanData::new(at, end, val, hi_uses);
-        hi.hinted_at_end = hinted_at_end;
+        let hi = LiveSpanData::new(at, end, val, hi_uses);
         let new_span = live_ranges.spans.push(output, hi)?;
+        new_span.set_hint_sets(
+            live_ranges,
+            output,
+            HintSets {
+                at_start: RegSet::new(),
+                at_end: hinted_at_end,
+            },
+        )?;
 
         // And the new span's uses need to be reassociated with it.
         for u in hi_uses {
@@ -2053,9 +2162,12 @@ where
             end,
             uses,
             val,
-            hinted_at_start,
-            hinted_at_end,
+            hints: _,
         } = live_ranges.spans[span];
+        let HintSets {
+            at_start: hinted_at_start,
+            at_end: hinted_at_end,
+        } = span.hint_sets(live_ranges);
 
         debug_assert_eq!(start.pos(), Position::Early);
         debug_assert_eq!(span.len_insts(live_ranges), 1);
@@ -2091,9 +2203,22 @@ where
             block,
         )?;
         // The reload covers the early reads, so the start's hints go with it.
-        live_ranges.spans[reload].hinted_at_start = hinted_at_start;
-        live_ranges.spans[span].hinted_at_start = RegSet::new();
-        let _ = hinted_at_end;
+        reload.set_hint_sets(
+            live_ranges,
+            output,
+            HintSets {
+                at_start: hinted_at_start,
+                at_end: RegSet::new(),
+            },
+        )?;
+        span.set_hint_sets(
+            live_ranges,
+            output,
+            HintSets {
+                at_start: RegSet::new(),
+                at_end: hinted_at_end,
+            },
+        )?;
         live_ranges.spans[span].uses = EntityRange {
             start: uses.start,
             end: uses.start,
@@ -5452,6 +5577,21 @@ mod tests {
                     let mut output = OutputInner::<u32>::new();
                     let leftovers = odds(&live_ranges.spans().collect::<Vec<_>>());
 
+                    // A different register at each end, so the assertions
+                    // below can tell which end a half kept.
+                    let reg_set = |i: usize| {
+                        let mut set = RegSet::new();
+                        set.insert(Reg::try_new(i).unwrap());
+                        set
+                    };
+                    let (start_hint, end_hint) = (reg_set(0), reg_set(1));
+                    spans[i]
+                        .add_hint_at(&mut live_ranges, &mut output, HintPos::Start, start_hint)
+                        .unwrap();
+                    spans[i]
+                        .add_hint_at(&mut live_ranges, &mut output, HintPos::End, end_hint)
+                        .unwrap();
+
                     let (bundle, followers) = test_input.with_input(|input| {
                         let bundle = live_ranges
                             .push_bundle(
@@ -5502,6 +5642,7 @@ mod tests {
                         .collect::<Vec<_>>();
 
                     let context = format!("cutting {divided:?} at {at:?}, of {num_owned} spans");
+                    let hint_slots_before = live_ranges.hints.len();
 
                     let suffix = test_input
                         .with_input(|input| {
@@ -5525,6 +5666,33 @@ mod tests {
                     assert_eq!(divided.end(&live_ranges), at, "{context}");
                     assert_eq!(new_span.start(&live_ranges), at, "{context}");
                     assert_eq!(new_span.end(&live_ranges), end, "{context}");
+
+                    for (half, kept, dropped) in [
+                        (divided, HintPos::Start, HintPos::End),
+                        (new_span, HintPos::End, HintPos::Start),
+                    ] {
+                        let want = match kept {
+                            HintPos::Start => &start_hint,
+                            HintPos::End => &end_hint,
+                        };
+                        assert_eq!(
+                            half.hinted_at(&live_ranges, kept),
+                            want,
+                            "{context}: {half:?} lost the hint about the end it covers",
+                        );
+                        assert!(
+                            half.hinted_at(&live_ranges, dropped).is_empty(),
+                            "{context}: {half:?} kept a hint about the cut",
+                        );
+                    }
+                    // The divided span keeps its slot and only the new half
+                    // takes one: nothing reclaims a slot, so a split that
+                    // abandoned one would leak it for the whole allocation.
+                    assert_eq!(
+                        live_ranges.hints.len(),
+                        hint_slots_before + 1,
+                        "{context}: the split orphaned or double-allocated a hint slot",
+                    );
                     assert_eq!(
                         divided.len_insts(&live_ranges) + new_span.len_insts(&live_ranges),
                         end.prev_point().inst().index() - start.inst().index() + 1,
@@ -6888,7 +7056,8 @@ mod tests {
         // A border hint on the last span, which the suffix will carry: the
         // far side of that border really holds r1.
         let last = *spans.last().unwrap();
-        last.add_hint_at(&mut live_ranges, HintPos::End, set(1));
+        last.add_hint_at(&mut live_ranges, &mut output, HintPos::End, set(1))
+            .unwrap();
 
         let bundle = test_input.with_input(|input| {
             live_ranges
@@ -6925,5 +7094,50 @@ mod tests {
             set(1),
             "the rebuilt half demoted its border hint to a guess",
         );
+    }
+
+    /// Handing a hinted span an empty pair keeps its arena slot. Nothing
+    /// reclaims a slot, so clearing the pointer instead would strand one on
+    /// every narrow of a span hinted at one end only, which is the shape
+    /// `hint_across_regions` usually produces.
+    #[test]
+    fn clearing_a_span_s_hints_keeps_its_slot() {
+        let test_input = TestInput::with_two_uses_of_different_values();
+        let mut output = OutputInner::<u32>::new();
+        let (_liveness, mut live_ranges) = analyze_spans(&test_input).unwrap();
+        let span = live_ranges.spans().next().unwrap();
+        let reg = Reg::try_new(0).unwrap();
+        let mut hint = RegSet::new();
+        hint.insert(reg);
+
+        span.add_hint_at(&mut live_ranges, &mut output, HintPos::Start, hint)
+            .unwrap();
+        let slots = live_ranges.hints.len();
+        assert_eq!(slots, 1, "the hint should have taken a slot");
+
+        span.set_hint_sets(&mut live_ranges, &mut output, HintSets::empty())
+            .unwrap();
+        assert!(span.hinted_at(&live_ranges, HintPos::Start).is_empty());
+        assert_eq!(
+            live_ranges.hints.len(),
+            slots,
+            "clearing the hints should not have allocated",
+        );
+
+        // The slot is still the span's, so re-hinting reuses it.
+        span.add_hint_at(&mut live_ranges, &mut output, HintPos::End, hint)
+            .unwrap();
+        assert_eq!(
+            live_ranges.hints.len(),
+            slots,
+            "re-hinting a span that owns a slot should reuse it",
+        );
+
+        // An unhinted span given nothing stays out of the arena entirely.
+        let other = live_ranges.spans().nth(1).unwrap();
+        other
+            .set_hint_sets(&mut live_ranges, &mut output, HintSets::empty())
+            .unwrap();
+        assert_eq!(live_ranges.hints.len(), slots);
     }
 }
