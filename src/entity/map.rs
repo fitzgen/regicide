@@ -496,6 +496,23 @@ where
     }
 }
 
+impl<K, V> SecondaryMap<K, V>
+where
+    K: Entity,
+    V: Clone,
+{
+    /// Materialize defaults up to and including `index`.
+    ///
+    /// Out of line because growing is the rare half of `index_mut`.
+    #[cold]
+    #[inline(never)]
+    fn grow_to(&mut self, index: usize) {
+        self.inner
+            .elems
+            .resize(index + 1, self.default_value.clone());
+    }
+}
+
 impl<K, V> IndexMut<K> for SecondaryMap<K, V>
 where
     K: Entity,
@@ -503,8 +520,8 @@ where
 {
     fn index_mut(&mut self, key: K) -> &mut Self::Output {
         let index = key.index();
-        while self.inner.elems.len() <= index {
-            self.inner.elems.push(self.default_value.clone());
+        if self.inner.elems.len() <= index {
+            self.grow_to(index);
         }
         &mut self.inner[key]
     }
