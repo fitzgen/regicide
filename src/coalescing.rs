@@ -2302,6 +2302,50 @@ mod tests {
         }
     }
 
+    /// A merge at `FLOOR` fuel still affords a modestly interleaved pair.
+    ///
+    /// `last_ending_by`'s one `next` step is what keeps a boundary O(1) in
+    /// fuel here: descending from the root instead costs `O(log n)` per
+    /// boundary, which at `FLOOR` refuses pairs this test merges. A region
+    /// whose budget is spent is one under pressure, so these are exactly the
+    /// merges whose loss shows up as a register-register move.
+    #[test]
+    fn a_modest_interleaving_still_merges_at_the_floor() {
+        use crate::interval_sets::Fuel;
+
+        // Interleaved at stride 4: `a` at 0, 4, 8, ..., `b` at 2, 6, 10, ...,
+        // so the two cross at every element and `check_disjoint` walks a
+        // boundary for each.
+        for n in [2usize, 4, 8, 16] {
+            let mut sets = IntervalSetArena::<LiveSpan, u32>::new();
+            let build = |sets: &mut IntervalSetArena<LiveSpan, u32>, base: usize, first: u32| {
+                let mut set: Option<IntervalSet<LiveSpan>> = None;
+                for i in 0..n {
+                    let k = LiveSpan::try_new(base + i).unwrap();
+                    let start = first + 4 * u32::try_from(i).unwrap();
+                    let one = IntervalSet::singleton(&mut *sets, k, start, start + 1);
+                    set = Some(match set {
+                        None => one,
+                        Some(set) => set
+                            .try_union(&mut *sets, one, &mut Fuel::new(u64::MAX))
+                            .unwrap(),
+                    });
+                }
+                set.unwrap()
+            };
+            let a = build(&mut sets, 0, 0);
+            let b = build(&mut sets, n, 2);
+
+            let mut check = Fuel::new(RegionFuel::FLOOR);
+            assert!(
+                a.try_union(&mut sets, b, &mut check).is_ok(),
+                "{n} interleaved elements per set ran out of fuel at FLOOR, \
+                 spending {}",
+                check.spent(),
+            );
+        }
+    }
+
     /// Two finely interleaved sets cost far more than `FLOOR` to refuse, so
     /// once a region's budget is gone, repeated refusals stop at `FLOOR`.
     #[test]

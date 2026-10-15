@@ -7,7 +7,14 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 
 /// Steps along `next` before searching from the root.
-const MAX_STEPS: u32 = 4;
+///
+/// One step, not none: the descent costs `O(log n)` fuel per boundary where a
+/// step costs 1, and `check_disjoint` pays that per boundary, so dropping the
+/// walk entirely made a finely interleaved refusal cost ~8x more fuel. That is
+/// what a region's budget is charged, and at `RegionFuel::FLOOR` it decides
+/// whether a merge happens at all. Beyond one step the walk stops paying for
+/// itself; see the sweep in `reports/compilation-speedup-007/`.
+const MAX_STEPS: u32 = 1;
 
 /// Keeps debug cross-checks from going quadratic.
 const DEBUG_WALK_LIMIT: usize = 256;
@@ -158,7 +165,7 @@ where
     fn last_ending_by(&self, from: K, root: K, key: P, fuel: &mut Fuel) -> Result<K, Refused> {
         debug_assert!(self.end(from) <= key);
 
-        // Close interleavings need only a step or two.
+        // A close interleaving needs only the one step.
         let mut p = from;
         for _ in 0..MAX_STEPS {
             fuel.burn()?;
