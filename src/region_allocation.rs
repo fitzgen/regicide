@@ -1784,14 +1784,26 @@ fn compute_bundle_priority<E>(
 where
     E: EntityRepr,
 {
+    let wants_a_register = wants_a_register(bundle.spill_weight(live_ranges));
     Priority::new(
         bundle.is_minimal(live_ranges),
         bundle_group_size(input, live_ranges, bundle),
         // A hint the bundle can never honor earns it no head start over the
         // bundles whose hints it would otherwise take.
         hint_rank(bundle.hinted_span_weight(input, region_tree, live_ranges, clobbered)),
+        usize::from(wants_a_register),
         bundle.spans(live_ranges).len(),
     )
+}
+
+/// Does a register buy this bundle anything at all?
+///
+/// The size field below ranks by span count, which alone lets a long bundle
+/// nothing reads take a register ahead of a short one read every iteration.
+/// A flag rather than tiers because the nonzero weights do not spread.
+fn wants_a_register(weight: f32) -> bool {
+    // A NaN is false here, so it counts as wanting nothing.
+    weight > 0.0
 }
 
 /// Bucket `weight` into the priority field's tiers, one per factor of ten,
@@ -1943,10 +1955,10 @@ impl Phase {
 /// A bundle's allocation priority.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Priority {
-    ///    Bit:   31   ...  30   29             28  ...   26   25  ...  0
-    ///         +--------------+--------------+--------------+------------+
-    /// Fields: | (reserved):2 | is_minimal:1 | group_size:3 |   size:26  |
-    ///         +--------------+--------------+--------------+------------+
+    ///    Bit:      31..30           29           28..26        25..23         22       21..0
+    ///         +--------------+--------------+--------------+-------------+----------+---------+
+    /// Fields: | (reserved):2 | is_minimal:1 | group_size:3 | num_hints:3 | weight:1 | size:22 |
+    ///         +--------------+--------------+--------------+-------------+----------+---------+
     ///
     /// Packed so that we sort/prioritize bundles by:
     ///
@@ -1957,7 +1969,15 @@ pub struct Priority {
     ///    register groups assigns N registers at once, not just 1, so they are
     ///    harder to place and have more constraints than regular bundles).
     ///
-    /// 3. Finally, by the bundle's size (number of spans) because if we assign
+    /// 3. How many of its spans are hinted, bucketed by `hint_rank`, since a
+    ///    bundle that can honor a hint saves a move by taking its register
+    ///    before the bundle that would otherwise claim it.
+    ///
+    /// 4. Whether a register buys the bundle anything at all, as
+    ///    `wants_a_register` decides, so that a bundle no instruction reads
+    ///    does not take a register ahead of one that is read.
+    ///
+    /// 5. Finally, by the bundle's size (number of spans) because if we assign
     ///    a larger bundle, then we get fewer moves and better codegen (and if
     ///    assigning it fails, we can always split it and try again).
     ///
@@ -1966,12 +1986,17 @@ pub struct Priority {
     bits: u32,
 }
 
-const PRIORITY_SIZE_BITS: u32 = 23;
+const PRIORITY_SIZE_BITS: u32 = 22;
 const PRIORITY_SIZE_SHIFT: u32 = 0;
 const PRIORITY_SIZE_MASK: u32 = ((1 << PRIORITY_SIZE_BITS) - 1) << PRIORITY_SIZE_SHIFT;
 
+const PRIORITY_WEIGHT_BITS: u32 = 1;
+const PRIORITY_WEIGHT_SHIFT: u32 = PRIORITY_SIZE_SHIFT + PRIORITY_SIZE_BITS;
+const PRIORITY_WEIGHT_MASK: u32 = ((1 << PRIORITY_WEIGHT_BITS) - 1) << PRIORITY_WEIGHT_SHIFT;
+const PRIORITY_WEIGHT_MAX: usize = (1 << PRIORITY_WEIGHT_BITS) - 1;
+
 const PRIORITY_NUM_HINTS_BITS: u32 = 3;
-const PRIORITY_NUM_HINTS_SHIFT: u32 = PRIORITY_SIZE_SHIFT + PRIORITY_SIZE_BITS;
+const PRIORITY_NUM_HINTS_SHIFT: u32 = PRIORITY_WEIGHT_SHIFT + PRIORITY_WEIGHT_BITS;
 const PRIORITY_NUM_HINTS_MASK: u32 =
     ((1 << PRIORITY_NUM_HINTS_BITS) - 1) << PRIORITY_NUM_HINTS_SHIFT;
 const PRIORITY_NUM_HINTS_MAX: usize = (1 << PRIORITY_NUM_HINTS_BITS) - 1;
@@ -2020,6 +2045,7 @@ impl fmt::Debug for Priority {
             .field("is_minimal", &self.is_minimal())
             .field("group_size", &self.group_size())
             .field("num_hints", &self.num_hints())
+            .field("weight", &self.weight())
             .field("size", &self.size())
             .finish()
     }
@@ -2052,7 +2078,13 @@ impl Priority {
     /// The lowest possible priority.
     const ZERO: Priority = Priority { bits: 0 };
 
-    fn new(is_minimal: bool, group_size: usize, num_hints: usize, size: usize) -> Self {
+    fn new(
+        is_minimal: bool,
+        group_size: usize,
+        num_hints: usize,
+        weight: usize,
+        size: usize,
+    ) -> Self {
         let is_minimal = u32::from(is_minimal) << PRIORITY_IS_MINIMAL_SHIFT;
         debug_assert_eq!(is_minimal & PRIORITY_IS_MINIMAL_MASK, is_minimal);
 
@@ -2064,20 +2096,33 @@ impl Priority {
         let num_hints = num_hints << PRIORITY_NUM_HINTS_SHIFT;
         debug_assert_eq!(num_hints & PRIORITY_NUM_HINTS_MASK, num_hints);
 
+        let weight = u32::try_from(weight.min(PRIORITY_WEIGHT_MAX)).unwrap();
+        let weight = weight << PRIORITY_WEIGHT_SHIFT;
+        debug_assert_eq!(weight & PRIORITY_WEIGHT_MASK, weight);
+
         let max_size = (1 << PRIORITY_SIZE_BITS) - 1;
-        debug_assert!(size <= max_size);
-        let size = u32::try_from(size).unwrap();
+        debug_assert!(
+            size <= max_size,
+            "a bundle with more than {max_size} spans saturates the priority's size field",
+        );
+        let size = u32::try_from(size.min(max_size)).unwrap();
         let size = size << PRIORITY_SIZE_SHIFT;
         debug_assert_eq!(size & PRIORITY_SIZE_MASK, size);
 
         Priority {
-            bits: is_minimal | group_size | num_hints | size,
+            bits: is_minimal | group_size | num_hints | weight | size,
         }
     }
 
     #[inline]
     fn is_minimal(&self) -> bool {
         self.bits & PRIORITY_IS_MINIMAL_MASK != 0
+    }
+
+    #[inline]
+    fn weight(&self) -> usize {
+        let weight = (self.bits & PRIORITY_WEIGHT_MASK) >> PRIORITY_WEIGHT_SHIFT;
+        usize::try_from(weight).unwrap()
     }
 
     #[inline]
@@ -2766,6 +2811,8 @@ mod tests {
     const MAX_SIZE: usize = (1 << PRIORITY_SIZE_BITS) - 1;
     const MAX_GROUP_SIZE: usize = PRIORITY_GROUP_SIZE_MAX;
     const MAX_NUM_HINTS: usize = PRIORITY_NUM_HINTS_MAX;
+
+    const MAX_WEIGHT: usize = PRIORITY_WEIGHT_MAX;
     const MAX_BROKEN_HINTS: usize = EVICTION_COST_BROKEN_HINTS_MAX;
     const MAX_STICKINESS: usize = EVICTION_COST_STICKINESS_MAX;
 
@@ -2865,12 +2912,15 @@ mod tests {
         for is_minimal in [false, true] {
             for group_size in [0, 1, 2, MAX_GROUP_SIZE, RegGroup::MAX_SIZE] {
                 for num_hints in [0, 1, MAX_NUM_HINTS, MAX_NUM_HINTS + 9] {
-                    for size in [0, 1, 1000, MAX_SIZE] {
-                        let p = Priority::new(is_minimal, group_size, num_hints, size);
-                        assert_eq!(p.is_minimal(), is_minimal, "{p:?}");
-                        assert_eq!(p.group_size(), group_size.min(MAX_GROUP_SIZE), "{p:?}");
-                        assert_eq!(p.num_hints(), num_hints.min(MAX_NUM_HINTS), "{p:?}");
-                        assert_eq!(p.size(), size.min(MAX_SIZE), "{p:?}");
+                    for weight in [0, 1, MAX_WEIGHT + 9] {
+                        for size in [0, 1, 1000, MAX_SIZE] {
+                            let p = Priority::new(is_minimal, group_size, num_hints, weight, size);
+                            assert_eq!(p.is_minimal(), is_minimal, "{p:?}");
+                            assert_eq!(p.group_size(), group_size.min(MAX_GROUP_SIZE), "{p:?}");
+                            assert_eq!(p.num_hints(), num_hints.min(MAX_NUM_HINTS), "{p:?}");
+                            assert_eq!(p.weight(), weight.min(MAX_WEIGHT), "{p:?}");
+                            assert_eq!(p.size(), size.min(MAX_SIZE), "{p:?}");
+                        }
                     }
                 }
             }
@@ -2878,21 +2928,26 @@ mod tests {
     }
 
     /// Priorities compare by minimality first, then register group size, then
-    /// how many of the bundle's spans are hinted, and only then by its size.
+    /// how many of the bundle's spans are hinted, then whether a register buys
+    /// the bundle anything, and only then by its size.
     #[test]
     fn priority_compares_by_tier() {
         let ascending = [
-            Priority::new(false, 0, 0, 0),
-            Priority::new(false, 0, 0, 1),
-            Priority::new(false, 0, 0, MAX_SIZE),
-            // One hinted span outranks every unhinted bundle, however large.
-            Priority::new(false, 0, 1, 0),
-            Priority::new(false, 0, MAX_NUM_HINTS, MAX_SIZE),
+            Priority::new(false, 0, 0, 0, 0),
+            Priority::new(false, 0, 0, 0, 1),
+            Priority::new(false, 0, 0, 0, MAX_SIZE),
+            // Any use weight at all outranks the largest bundle without one.
+            Priority::new(false, 0, 0, MAX_WEIGHT, 0),
+            Priority::new(false, 0, 0, MAX_WEIGHT, MAX_SIZE),
+            // One hinted span outranks every unhinted bundle, however large
+            // and however weighted.
+            Priority::new(false, 0, 1, 0, 0),
+            Priority::new(false, 0, MAX_NUM_HINTS, MAX_WEIGHT, MAX_SIZE),
             // ... and group size still outranks any number of hints.
-            Priority::new(false, 1, 0, 0),
-            Priority::new(false, MAX_GROUP_SIZE, MAX_NUM_HINTS, MAX_SIZE),
-            Priority::new(true, 0, 0, 0),
-            Priority::new(true, MAX_GROUP_SIZE, MAX_NUM_HINTS, MAX_SIZE),
+            Priority::new(false, 1, 0, 0, 0),
+            Priority::new(false, MAX_GROUP_SIZE, MAX_NUM_HINTS, MAX_WEIGHT, MAX_SIZE),
+            Priority::new(true, 0, 0, 0, 0),
+            Priority::new(true, MAX_GROUP_SIZE, MAX_NUM_HINTS, MAX_WEIGHT, MAX_SIZE),
         ];
         for w in ascending.windows(2) {
             assert!(w[0] < w[1], "{:?} should sort below {:?}", w[0], w[1]);
@@ -2904,9 +2959,9 @@ mod tests {
     #[test]
     fn pq_entry_round_trips_its_fields() {
         let priorities = [
-            Priority::new(false, 0, 0, 0),
-            Priority::new(true, MAX_GROUP_SIZE, MAX_NUM_HINTS, MAX_SIZE),
-            Priority::new(true, 2, 1, 1000),
+            Priority::new(false, 0, 0, 0, 0),
+            Priority::new(true, MAX_GROUP_SIZE, MAX_NUM_HINTS, 0, MAX_SIZE),
+            Priority::new(true, 2, 1, 0, 1000),
         ];
         for phase in PHASES {
             for priority in priorities {
@@ -2924,8 +2979,8 @@ mod tests {
     /// remaining ties with the bundle index.
     #[test]
     fn pq_entry_compares_by_phase_then_priority_then_bundle() {
-        let low = Priority::new(false, 0, 0, 0);
-        let high = Priority::new(true, MAX_GROUP_SIZE, MAX_NUM_HINTS, MAX_SIZE);
+        let low = Priority::new(false, 0, 0, 0, 0);
+        let high = Priority::new(true, MAX_GROUP_SIZE, MAX_NUM_HINTS, 0, MAX_SIZE);
         let max_index = LiveBundle::<u32>::MAX_REPRESENTABLE.index();
 
         let mut ascending = vec![
