@@ -159,14 +159,14 @@
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 536870913,
+      "priority": 541065214,
       "region": 0
     },
     {
       "bundle": 1,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 536870913,
+      "priority": 541065214,
       "region": 0
     },
     {

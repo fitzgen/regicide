@@ -172,7 +172,7 @@
       "bundle": 0,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 1,
+      "priority": 4194302,
       "region": 0
     },
     {
@@ -223,7 +223,7 @@
       "bundle": 0,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 1,
+      "priority": 4194302,
       "region": 0
     },
     {

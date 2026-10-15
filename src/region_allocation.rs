@@ -1785,6 +1785,7 @@ where
     E: EntityRepr,
 {
     let wants_a_register = wants_a_register(bundle.spill_weight(live_ranges));
+    let num_spans = bundle.spans(live_ranges).len();
     Priority::new(
         bundle.is_minimal(live_ranges),
         bundle_group_size(input, live_ranges, bundle),
@@ -1792,7 +1793,14 @@ where
         // bundles whose hints it would otherwise take.
         hint_rank(bundle.hinted_span_weight(input, region_tree, live_ranges, clobbered)),
         usize::from(wants_a_register),
-        bundle.spans(live_ranges).len(),
+        if wants_a_register {
+            num_spans
+        } else {
+            // A bundle a register buys nothing is better off small: a long
+            // carrier holds a register across a wide range and gains nothing
+            // by it, where a short one blocks less.
+            PRIORITY_SIZE_MAX.saturating_sub(num_spans)
+        },
     )
 }
 
@@ -1801,6 +1809,10 @@ where
 /// The size field below ranks by span count, which alone lets a long bundle
 /// nothing reads take a register ahead of a short one read every iteration.
 /// A flag rather than tiers because the nonzero weights do not spread.
+///
+/// The bundles this rejects are a superset of `has_nothing_to_split_for`'s:
+/// they also include a bundle whose uses all price to zero, such as a
+/// non-minimal `AlwaysRemat` carrier.
 fn wants_a_register(weight: f32) -> bool {
     // A NaN is false here, so it counts as wanting nothing.
     weight > 0.0
@@ -1979,7 +1991,10 @@ pub struct Priority {
     ///
     /// 5. Finally, by the bundle's size (number of spans) because if we assign
     ///    a larger bundle, then we get fewer moves and better codegen (and if
-    ///    assigning it fails, we can always split it and try again).
+    ///    assigning it fails, we can always split it and try again). Below
+    ///    tier 4 that order flips: among the bundles a register buys nothing,
+    ///    the short ones go first, since a long one blocks more and gains
+    ///    nothing by the register.
     ///
     /// NB: the upper bits are reserved for encoding a `Phase` when this is
     /// packed inside a `PqEntry`.
@@ -1994,6 +2009,8 @@ const PRIORITY_WEIGHT_BITS: u32 = 1;
 const PRIORITY_WEIGHT_SHIFT: u32 = PRIORITY_SIZE_SHIFT + PRIORITY_SIZE_BITS;
 const PRIORITY_WEIGHT_MASK: u32 = ((1 << PRIORITY_WEIGHT_BITS) - 1) << PRIORITY_WEIGHT_SHIFT;
 const PRIORITY_WEIGHT_MAX: usize = (1 << PRIORITY_WEIGHT_BITS) - 1;
+
+const PRIORITY_SIZE_MAX: usize = (1 << PRIORITY_SIZE_BITS) - 1;
 
 const PRIORITY_NUM_HINTS_BITS: u32 = 3;
 const PRIORITY_NUM_HINTS_SHIFT: u32 = PRIORITY_WEIGHT_SHIFT + PRIORITY_WEIGHT_BITS;

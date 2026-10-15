@@ -171,14 +171,14 @@
       "bundle": 1,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 536870913,
+      "priority": 541065214,
       "region": 0
     },
     {
       "bundle": 1,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 536870913,
+      "priority": 541065214,
       "region": 0
     },
     {
@@ -222,14 +222,14 @@
       "bundle": 2,
       "kind": "BundleQueued",
       "phase": "assignEvict",
-      "priority": 545259521,
+      "priority": 549453822,
       "region": 1
     },
     {
       "bundle": 2,
       "kind": "BundleQueuePopped",
       "phase": "assignEvict",
-      "priority": 545259521,
+      "priority": 549453822,
       "region": 1
     },
     {
