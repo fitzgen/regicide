@@ -9064,6 +9064,101 @@ impl TestInput {
         input
     }
 
+    /// A value defined in a loop and read off the stack past it, where the
+    /// block the walk leaves the loop into is itself a legal store site.
+    ///
+    /// `block0` branches into the loop `block1 -> block1`, which defines the
+    /// value, and on to `block2`, which reads it in a register and then off
+    /// the stack. `block2` is the loop exit and the value is live in a
+    /// register at its top, so the walk out of the loop stops there for an
+    /// edge store, and a store placed inside `block2` instead would sit
+    /// outside the defining loop; see
+    /// `first_legal_placement_up_dom_tree`.
+    pub fn with_a_value_defined_in_a_loop_and_read_past_its_exit() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = Val::try_new(0).unwrap();
+        let block = |i| Block::try_new(i).unwrap();
+        let class = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+
+        func.values = PrimaryMap::new();
+        func.values
+            .push(
+                &mut output,
+                ValData {
+                    reg_class: TestMachine::BOTH_REGS_CLASS,
+                    def: ValDef::InstResult {
+                        inst: Inst::try_new(1).unwrap(),
+                        i: 0,
+                    },
+                    remat: 0,
+                },
+            )
+            .unwrap();
+
+        let op = |pos, kind, constraint| InstData::Op {
+            operands: vec![Operand::new(pos, kind, constraint, Some(val))],
+            clobbers: vec![],
+            side_effects: true,
+        };
+        let branch = |targets: &[usize]| InstData::Branch {
+            operands: vec![],
+            clobbers: vec![],
+            targets: targets
+                .iter()
+                .map(|&t| BlockCall {
+                    target: block(t),
+                    args: vec![],
+                })
+                .collect(),
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            // block0: enter the loop.
+            branch(&[1]),
+            // block1, the loop: define the value and either go around again or
+            // leave. The back edge is what makes this a region of its own.
+            op(Position::Late, DefUse::Def, OperandConstraint::Any),
+            branch(&[1, 2]),
+            // block2, the exit: read the value in a register, which makes this
+            // a legal store site, then read it off the stack, which is what
+            // asks for a store at all.
+            op(Position::Early, DefUse::Use, OperandConstraint::Reg(class)),
+            op(Position::Early, DefUse::Use, OperandConstraint::Stack),
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        for insts in [
+            vec![inst(0)],
+            vec![inst(1), inst(2)],
+            vec![inst(3), inst(4)],
+        ] {
+            func.blocks
+                .push(
+                    &mut output,
+                    BlockData {
+                        params: vec![],
+                        insts,
+                        frequency: 0,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A value defined outside a loop that spends part of its live range on
     /// the stack inside it: `block0` defines the value and conditionally
     /// enters the loop `block1 <-> block2`, which reads the value in a
@@ -11413,6 +11508,9 @@ pub fn corpus() -> Vec<TestInput> {
         // the stack inside it, which is where a spill has a region to be
         // hoisted out of.
         TestInput::with_a_value_spilled_inside_a_loop(),
+        // A value defined in a loop and read past its exit, where the exit is
+        // itself a legal store site: the store belongs on the edge into it.
+        TestInput::with_a_value_defined_in_a_loop_and_read_past_its_exit(),
         // A loop nest, whose two loops must be separate regions so that an
         // outer-loop value's spill stays out of the inner loop.
         TestInput::with_a_nested_loop(),

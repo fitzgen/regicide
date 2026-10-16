@@ -266,6 +266,14 @@ where
     /// The same blocks as `is_spill_site`, in the order we found them.
     spill_site_blocks: Vec<Block<E>>,
 
+    /// The sites the walk stopped at to put the store on the edge into them,
+    /// rather than in a predecessor that runs more often.
+    ///
+    /// Such a block may also be a legal one to store in, but storing there
+    /// would run the store inside a loop the walk was on its way out of, which
+    /// is what it stopped to avoid.
+    edge_spill_sites: EntitySet<Block<E>>,
+
     /// Scratch space: the blocks the value currently being placed is on the
     /// stack in, most frequent first.
     stack_blocks: Vec<Block<E>>,
@@ -305,6 +313,7 @@ where
             union_find: UnionFind::new(),
             is_spill_site: EntitySet::new(),
             spill_site_blocks: Vec::new(),
+            edge_spill_sites: EntitySet::new(),
             stack_blocks: Vec::new(),
             arrives_from_nowhere: EntitySet::new(),
         }
@@ -322,6 +331,7 @@ where
             union_find,
             is_spill_site,
             spill_site_blocks,
+            edge_spill_sites,
             stack_blocks,
             arrives_from_nowhere,
         } = self;
@@ -335,6 +345,7 @@ where
         keyed_spans.clear();
         is_spill_site.reset();
         spill_site_blocks.clear();
+        edge_spill_sites.reset();
         stack_blocks.clear();
         arrives_from_nowhere.reset();
     }
@@ -351,6 +362,7 @@ where
             union_find,
             is_spill_site,
             spill_site_blocks,
+            edge_spill_sites,
             stack_blocks,
             arrives_from_nowhere,
         } = self;
@@ -364,6 +376,7 @@ where
             && union_find.is_reset()
             && is_spill_site.is_empty()
             && spill_site_blocks.is_empty()
+            && edge_spill_sites.is_empty()
             && stack_blocks.is_empty()
             && arrives_from_nowhere.is_empty()
     }
@@ -408,6 +421,7 @@ where
         debug_assert!(
             self.is_spill_site.is_empty()
                 && self.spill_site_blocks.is_empty()
+                && self.edge_spill_sites.is_empty()
                 && self.arrives_from_nowhere.is_empty(),
             "a completed placement leaves no scratch behind",
         );
@@ -541,9 +555,14 @@ where
         // Gather the deduplicated spill blocks and construct our `SpillSite`s
         // for them.
         for block in self.spill_site_blocks.drain(..) {
+            // The walk returns the defining block as a legal placement in its
+            // own region before it ever weighs an edge store there.
+            let on_edge = self.edge_spill_sites.contains(block);
+            debug_assert!(!(on_edge && block == def_block));
+
             let (point, span) = if block == def_block {
                 (def.spill_point(), def_span)
-            } else if let Some(span) = self.legal[block] {
+            } else if let Some(span) = self.legal[block].filter(|_| !on_edge) {
                 (span.start(live_ranges), span)
             } else {
                 let pred = idom(input, block).unwrap();
@@ -568,6 +587,7 @@ where
         self.legal.reset();
         self.live_out.reset();
         self.is_spill_site.reset();
+        self.edge_spill_sites.reset();
         self.union_find.reset();
         self.arrives_from_nowhere.reset();
     }
@@ -772,6 +792,10 @@ where
                 if above.runs_more(input, region_tree, spill_block)
                     && !self.covers_another_site(input, above)
                 {
+                    // On the edge even when this block is a legal one to store
+                    // in: a store inside it runs in the loop the walk is
+                    // leaving, which is what stopping here avoids.
+                    self.edge_spill_sites.insert(spill_block);
                     return spill_block;
                 }
             }
