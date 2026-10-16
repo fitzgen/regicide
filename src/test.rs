@@ -9159,6 +9159,112 @@ impl TestInput {
         input
     }
 
+    /// A recomputable value whose one read is pinned to a register, beside two
+    /// defs that take both of the machine's registers at that same point.
+    ///
+    /// Nothing is left for the read, so the bundle narrows to its early half
+    /// and the carrier it leaves behind loses the use that wanted a register.
+    /// That carrier is recomputable, and placing it decides between the stack
+    /// and recomputing it; see `split_into_minimal_or_spill`.
+    pub fn with_a_recomputable_value_read_under_full_pressure() -> Self {
+        let mut output = OutputInner::<u32>::new();
+        let mut func = TestFunction::default();
+
+        let val = |i| Val::try_new(i).unwrap();
+        let both = RegClass::try_new(TestMachine::BOTH_REGS_CLASS.into()).unwrap();
+        let first = RegClass::try_new(TestMachine::FIRST_REG_CLASS.into()).unwrap();
+        let second = RegClass::try_new(TestMachine::SECOND_REG_CLASS.into()).unwrap();
+
+        // `v0` is the recomputable one, defined first and read twice; `v1` and
+        // `v2` are each pinned to one of the two registers.
+        func.values = PrimaryMap::new();
+        for (inst, i, remat) in [(0usize, 0usize, 2u8), (1, 1, 0), (1, 2, 0)] {
+            func.values
+                .push(
+                    &mut output,
+                    ValData {
+                        reg_class: TestMachine::BOTH_REGS_CLASS,
+                        def: ValDef::InstResult {
+                            inst: Inst::try_new(inst).unwrap(),
+                            i,
+                        },
+                        remat,
+                    },
+                )
+                .unwrap();
+        }
+
+        let op = |operands: Vec<Operand>| InstData::Op {
+            operands,
+            clobbers: vec![],
+            side_effects: true,
+        };
+
+        func.insts = PrimaryMap::new();
+        for inst in [
+            op(vec![Operand::new(
+                Position::Late,
+                DefUse::Def,
+                OperandConstraint::Any,
+                Some(val(0)),
+            )]),
+            // The early read of `v0` wants a register at the same point as the
+            // two defs that take every register the machine has.
+            op(vec![
+                Operand::new(
+                    Position::Early,
+                    DefUse::Use,
+                    OperandConstraint::Reg(both),
+                    Some(val(0)),
+                ),
+                Operand::new(
+                    Position::Late,
+                    DefUse::Def,
+                    OperandConstraint::Reg(first),
+                    Some(val(1)),
+                ),
+                Operand::new(
+                    Position::Early,
+                    DefUse::Def,
+                    OperandConstraint::Reg(second),
+                    Some(val(2)),
+                ),
+            ]),
+            // A later read, so `v0` stays live past the crowded point and has
+            // a carrier span to place.
+            op(vec![Operand::new(
+                Position::Late,
+                DefUse::Use,
+                OperandConstraint::Any,
+                Some(val(0)),
+            )]),
+            op(vec![]),
+        ] {
+            func.insts.push(&mut output, inst).unwrap();
+        }
+
+        let inst = |i| Inst::try_new(i).unwrap();
+        func.blocks = PrimaryMap::new();
+        func.blocks
+            .push(
+                &mut output,
+                BlockData {
+                    params: vec![],
+                    insts: vec![inst(0), inst(1), inst(2), inst(3)],
+                    frequency: 0,
+                },
+            )
+            .unwrap();
+
+        let mut input = TestInput {
+            options: InputOptions::default(),
+            machine: TestMachine::two_registers(),
+            func,
+        };
+        input.fixup();
+        input
+    }
+
     /// A value defined outside a loop that spends part of its live range on
     /// the stack inside it: `block0` defines the value and conditionally
     /// enters the loop `block1 <-> block2`, which reads the value in a
@@ -11517,6 +11623,9 @@ pub fn corpus() -> Vec<TestInput> {
         // A cycle entered at two different blocks, so no natural loop.
         TestInput::with_an_irreducible_loop(),
         TestInput::with_a_def_only_value_under_pressure(),
+        // A recomputable value whose register-pinned read narrows to its early
+        // half, leaving a carrier that is recomputable only after narrowing.
+        TestInput::with_a_recomputable_value_read_under_full_pressure(),
         TestInput::with_a_stack_constrained_value_under_pressure(),
         TestInput::with_three_values_needing_two_register_groups(),
         TestInput::with_a_value_reloaded_past_a_diamond(),

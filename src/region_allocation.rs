@@ -1550,22 +1550,8 @@ where
                 match bundle.constraint(live_ranges) {
                     // Free to live on the stack, or nowhere at all when
                     // recomputing its values is cheaper than keeping them.
-                    OperandConstraint::Any => {
-                        if bundle.is_cheaper_to_recompute_than_to_spill(input, live_ranges) {
-                            bundle.set_rematerialized(live_ranges);
-                            counts.rematerialized_bundles.inc();
-                            event!(
-                                events,
-                                BundleRematerialized {
-                                    bundle,
-                                    region: bundle.region(live_ranges),
-                                }
-                            );
-                            return Ok(());
-                        }
-
-                        // Fall through to the spill code below...
-                    }
+                    // Both are decided below, once narrowing has had its say.
+                    OperandConstraint::Any => {}
 
                     // It wants a register and there was none for it. One thing
                     // is left to try: split off a early-half-instruction span
@@ -1597,11 +1583,28 @@ where
                         );
                         counts.early_half_reloads.inc();
 
-                        // And fall through to spill the carrier bundle below...
+                        // And fall through to place the carrier bundle below...
                     }
 
                     OperandConstraint::Reuse(_) => unreachable!("already resolved"),
                     OperandConstraint::Stack => unreachable!("already handled"),
+                }
+
+                // Asked here rather than per arm: narrowing sheds the uses that
+                // made a bundle want a register, so the carrier it leaves
+                // behind may be recomputable even though the bundle that
+                // entered this call was not.
+                if bundle.is_cheaper_to_recompute_than_to_spill(input, live_ranges) {
+                    bundle.set_rematerialized(live_ranges);
+                    counts.rematerialized_bundles.inc();
+                    event!(
+                        events,
+                        BundleRematerialized {
+                            bundle,
+                            region: bundle.region(live_ranges),
+                        }
+                    );
+                    return Ok(());
                 }
 
                 self.stack_bundles.push(bundle);
