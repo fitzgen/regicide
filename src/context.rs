@@ -84,7 +84,10 @@ impl Context {
 pub(crate) enum WhichContext {
     #[cfg(feature = "entity-repr-8")]
     Context8,
+    // `run_dispatch` no longer selects this one, for the reasons given there,
+    // but `Output` still knows how to read a context that holds it.
     #[cfg(feature = "entity-repr-16")]
+    #[expect(dead_code, reason = "`run_dispatch` does not select the `u16` tier")]
     Context16,
     Context32,
 }

@@ -123,6 +123,14 @@ pub fn run<'a>(context: &'a mut Context, input: &Input<impl InputFunction>) -> R
 }
 
 /// Solve `input` under the narrowest entity representation it fits in.
+///
+/// `u16` is deliberately not among the representations tried, though it still
+/// exists and `Output` still reads a context that holds one. A `LivePoint`
+/// packs into `EntityRepr::Wide`, which maxes out at `u32`, so
+/// `LivePoint<u16>` is the same four bytes as `LivePoint<u32>`, and `UseData`
+/// and `LiveBundleData` barely shrink either. The tier paid for narrowing
+/// conversions at every boundary and got almost no smaller working set back.
+/// `u8`, which really does halve a point, stays.
 fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Result<()> {
     assert!(context.is_reset());
 
@@ -132,18 +140,6 @@ fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Res
         match run_inner(&mut context.context8, input) {
             Ok(()) => return Ok(()),
             Err(()) => match context.context8.output.take_error() {
-                InternalError::EntityReprTooSmall => {}
-                InternalError::Error(e) => return Err(e),
-            },
-        }
-    }
-
-    #[cfg(feature = "entity-repr-16")]
-    if entity_repr_can_likely_fit::<u16>(input) {
-        context.which = Some(WhichContext::Context16);
-        match run_inner(&mut context.context16, input) {
-            Ok(()) => return Ok(()),
-            Err(()) => match context.context16.output.take_error() {
                 InternalError::EntityReprTooSmall => {}
                 InternalError::Error(e) => return Err(e),
             },
