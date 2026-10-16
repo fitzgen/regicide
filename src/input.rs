@@ -129,7 +129,9 @@ pub struct InputOptions {
     ///
     /// This option is enabled by default, and has no effect unless
     /// [`InputOptions::redundant_move_elimination_level`] is
-    /// [`MoveEliminationLevel::Global`].
+    /// [`MoveEliminationLevel::Global`] or
+    /// [`MoveEliminationLevel::SinglePass`], the levels that leave behind the
+    /// states this reads.
     ///
     /// Defaulted to `false` on deserialization, so an input captured before
     /// this option existed still reads back as the allocation it recorded.
@@ -165,13 +167,13 @@ impl InputOptions {
 #[cfg_attr(feature = "deserialize", derive(serde::Deserialize))]
 #[cfg_attr(
     any(feature = "serialize", feature = "deserialize"),
-    serde(rename_all = "lowercase")
+    serde(rename_all = "kebab-case")
 )]
 pub enum MoveEliminationLevel {
     /// Do not spend time identifying and eliminating these moves at all.
     None,
 
-    /// Perform a single pass, which can only remove the moves provably
+    /// Walk each block on its own, which can only remove the moves provably
     /// removable from within one basic block.
     Local,
 
@@ -179,6 +181,20 @@ pub enum MoveEliminationLevel {
     /// only an analysis spanning several blocks can prove removable.
     #[default]
     Global,
+
+    /// Make one pass over the blocks, finding most of what [`Self::Global`]
+    /// does for a little more than [`Self::Local`] costs.
+    ///
+    /// Each block joins only the neighbours already visited, which for a block
+    /// with no back edge into it is every one the fixed point would have used.
+    /// A back edge contributes the unknown state instead, so loops cost
+    /// precision rather than correctness.
+    SinglePass,
+}
+
+impl MoveEliminationLevel {
+    /// Every level, in declaration order.
+    pub const ALL: [Self; 4] = [Self::None, Self::Local, Self::Global, Self::SinglePass];
 }
 
 /// The constraints describing where an operand may be located.
@@ -1865,11 +1881,7 @@ mod tests {
         ] {
             round_trip(remat);
         }
-        for level in [
-            MoveEliminationLevel::None,
-            MoveEliminationLevel::Local,
-            MoveEliminationLevel::Global,
-        ] {
+        for level in MoveEliminationLevel::ALL {
             round_trip(level);
         }
         for constraint in [
@@ -1908,6 +1920,10 @@ mod tests {
             "\"none\"",
         );
         assert_eq!(
+            serde_json::to_string(&MoveEliminationLevel::SinglePass).unwrap(),
+            "\"single-pass\"",
+        );
+        assert_eq!(
             serde_json::to_string(&OperandConstraint::Stack).unwrap(),
             "\"stack\"",
         );
@@ -1933,6 +1949,25 @@ mod tests {
             .unwrap(),
             r#"{"pos":"early","kind":"use","constraint":{"reg":1},"val":null}"#,
         );
+    }
+
+    /// `MoveEliminationLevel::ALL` names every level: the exhaustive match
+    /// stops compiling when a new variant is left out of it.
+    #[test]
+    fn all_names_every_level() {
+        for level in MoveEliminationLevel::ALL {
+            match level {
+                MoveEliminationLevel::None
+                | MoveEliminationLevel::Local
+                | MoveEliminationLevel::Global
+                | MoveEliminationLevel::SinglePass => {}
+            }
+        }
+
+        let mut seen = MoveEliminationLevel::ALL.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), MoveEliminationLevel::ALL.len());
     }
 
     /// `InputOptions` is a handful of public scalars; round-trip it separately

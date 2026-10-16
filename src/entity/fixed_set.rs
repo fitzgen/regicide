@@ -58,6 +58,13 @@ impl<K, const WORDS: usize> FixedEntitySet<K, WORDS> {
         words.fill(0);
     }
 
+    /// Put every entity this set can hold into it, up to `CAPACITY` rather
+    /// than to any smaller number its element type uses.
+    #[inline]
+    pub fn fill(&mut self) {
+        self.words.fill(Word::MAX);
+    }
+
     /// Is this set empty?
     #[inline]
     pub fn is_reset(&self) -> bool {

@@ -84,6 +84,10 @@
 //! * The writes replaced survived dead-move elimination, so the insertion is
 //!   not dead. Its source must also survive it, so a source has to be live out
 //!   of the root as far as that pass knows.
+//!
+//! Both read what those passes recorded as they decided, so this runs only at
+//! the levels that keep those recordings: see `wants_recording` and
+//! `Hoister::source_survives`.
 
 use crate::{
     Entity as _, Input,
@@ -166,7 +170,10 @@ where
 /// Should redundant-move elimination record what this pass needs?
 pub(crate) fn wants_recording(input: &Input<'_, impl InputFunction>) -> bool {
     input.options.hoist_demanded_moves
-        && input.options.redundant_move_elimination_level == MoveEliminationLevel::Global
+        && matches!(
+            input.options.redundant_move_elimination_level,
+            MoveEliminationLevel::Global | MoveEliminationLevel::SinglePass,
+        )
 }
 
 /// Is `block` the root of an extended block with something to hoist into: does
@@ -925,8 +932,11 @@ where
             return true;
         }
 
-        // Only the `Global` fixpoint keeps live-out sets to ask.
-        if options.dead_move_elimination_level != MoveEliminationLevel::Global {
+        // A `Local` run keeps no live-out sets to ask.
+        if !matches!(
+            options.dead_move_elimination_level,
+            MoveEliminationLevel::Global | MoveEliminationLevel::SinglePass,
+        ) {
             return false;
         }
 
@@ -1273,6 +1283,46 @@ mod tests {
                 on.edits,
             );
         }
+    }
+
+    /// The pass runs at `SinglePass` too, and hoists there.
+    ///
+    /// Both recordings it reads come from a deciding walk, and a single pass
+    /// makes one. The arms have no back edge, so the answer matches
+    /// `Global`'s.
+    #[test]
+    fn a_single_pass_still_hoists() {
+        let mut test_input = TestInput::with_a_value_reloaded_on_every_arm(2);
+        test_input.options.redundant_move_elimination_level = MoveEliminationLevel::SinglePass;
+        test_input.options.dead_move_elimination_level = MoveEliminationLevel::SinglePass;
+
+        // `run_with` checks the allocation, so a hoist that broke it fails
+        // here rather than being counted.
+        let off = run_with(&test_input, false).unwrap().unwrap();
+        let on = run_with(&test_input, true).unwrap().unwrap();
+
+        let reloads = |run: &Run| {
+            run.edits
+                .iter()
+                .filter(|(_, edit)| matches!(edit, Edit::Move(Move::Reload { .. })))
+                .count()
+        };
+        assert_eq!(reloads(&off), 2, "{:?}", off.edits);
+        assert_eq!(reloads(&on), 1, "{:?}", on.edits);
+        assert_eq!(on.stats.hoisted_reloads, 1);
+        assert_eq!(on.stats.eliminated, 2);
+        assert!(on.estimate < off.estimate);
+    }
+
+    /// `Local` keeps nothing for the pass to read, so it never runs there.
+    #[test]
+    fn a_local_run_hoists_nothing() {
+        let mut test_input = TestInput::with_a_value_reloaded_on_every_arm(2);
+        test_input.options.redundant_move_elimination_level = MoveEliminationLevel::Local;
+        test_input.options.dead_move_elimination_level = MoveEliminationLevel::Local;
+
+        let on = run_with(&test_input, true).unwrap().unwrap();
+        assert_eq!(on.stats, TestStats::new(), "the pass returned early");
     }
 
     /// Arms at different, non-canonical frequencies: the hoist is taken only

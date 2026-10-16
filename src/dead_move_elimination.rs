@@ -24,6 +24,9 @@
 //! and, at its top, is unioned into each predecessor's live-out, enqueueing
 //! those that grew. A final backwards pass then drops the edits writing to a
 //! location that nothing ever reads.
+//!
+//! `MoveEliminationLevel::SinglePass` folds those two walks into one; see
+//! `Eliminator::single_pass`.
 
 use crate::{
     Entity as _, Input,
@@ -128,7 +131,8 @@ where
 /// block is seeded, and only `Eliminator::is_live_unit`, `is_live_slot`,
 /// `mark_live` and `mark_dead` read it, so the transfer function above them is
 /// written once. A saturated set is never propagated, and so never has to be
-/// turned into bits for a meet.
+/// turned into bits for a meet. `DeadMoveElimination::everything` says the
+/// same thing in bits, for the walk that does propagate it.
 struct LiveSet<E>
 where
     E: EntityRepr,
@@ -191,7 +195,7 @@ enum Seed {
     LiveOut,
 }
 
-/// Which of the pass's two walks over the control-flow graph is running.
+/// Which walk over the control-flow graph is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// Computing the fixpoint over block live-out sets.
@@ -199,6 +203,21 @@ enum Mode {
 
     /// Deciding which edits to drop, against the settled sets.
     Rewrite,
+
+    /// Both at once, in one pass: see `Eliminator::single_pass`.
+    SinglePass,
+}
+
+impl Mode {
+    /// Does this walk decide which edits to drop?
+    fn records(self) -> bool {
+        matches!(self, Self::Rewrite | Self::SinglePass)
+    }
+
+    /// Does this walk hand each block's result to its predecessors?
+    fn propagates(self) -> bool {
+        matches!(self, Self::Analyze | Self::SinglePass)
+    }
 }
 
 /// Reusable storage for the pass.
@@ -218,6 +237,11 @@ where
 
     /// Whether `live` is saturated; see `LiveSet`.
     saturated: bool,
+
+    /// Every location, as bits rather than as the `saturated` flag, which is
+    /// never propagated. The live-out a single pass gives a block with a back
+    /// edge.
+    everything: LiveSet<E>,
 
     /// One incoming edge's worth of `live`, so that an edge's edits are seen
     /// only on that edge.
@@ -266,6 +290,7 @@ where
             live_out: Vec::new(),
             live: LiveSet::new(),
             saturated: false,
+            everything: LiveSet::new(),
             edge: LiveSet::new(),
             worklist: BinaryHeap::new(),
             on_worklist: EntitySet::new(),
@@ -285,6 +310,7 @@ where
             live_out,
             live,
             saturated,
+            everything,
             edge,
             worklist,
             on_worklist,
@@ -300,6 +326,7 @@ where
         live_out.clear();
         live.clear();
         *saturated = false;
+        everything.clear();
         edge.clear();
         worklist.clear();
         on_worklist.reset();
@@ -320,6 +347,7 @@ where
             live_out,
             live,
             saturated,
+            everything,
             edge,
             worklist,
             on_worklist,
@@ -335,6 +363,7 @@ where
         live_out.is_empty()
             && live.is_empty()
             && !*saturated
+            && everything.is_empty()
             && edge.is_empty()
             && worklist.is_empty()
             && on_worklist.is_reset()
@@ -351,12 +380,13 @@ impl<E> DeadMoveElimination<E>
 where
     E: EntityRepr,
 {
-    /// Is any unit of `reg` possibly read after `block`'s bottom, per the
-    /// fixpoint?
+    /// Is any unit of `reg` possibly read after `block`'s bottom, as the run
+    /// that just finished decided it?
     ///
-    /// Only meaningful after a `Global` run that tracked registers. `None` for a
-    /// block the pass never numbered: an unreachable one, or any after a run
-    /// that kept no live-out sets.
+    /// Only meaningful after a run that kept live-out sets and tracked
+    /// registers, so not after a `Local` one. `None` for a block the pass
+    /// never numbered: an unreachable one, or any after a run that kept no
+    /// live-out sets.
     pub(crate) fn reg_may_be_live_out(
         &self,
         machine: &crate::machine::Machine,
@@ -371,10 +401,12 @@ where
         )
     }
 
-    /// Is `slot` possibly read after `block`'s bottom, per the fixpoint?
+    /// Is `slot` possibly read after `block`'s bottom, as the run that just
+    /// finished decided it?
     ///
-    /// Only meaningful after a `Global` run. `None` for a block the pass never
-    /// numbered; see `reg_may_be_live_out`.
+    /// Only meaningful after a run that kept live-out sets, so not after a
+    /// `Local` one. `None` for a block the pass never numbered; see
+    /// `reg_may_be_live_out`.
     pub(crate) fn slot_may_be_live_out(
         &self,
         rpo: &Rpo<E>,
@@ -432,10 +464,15 @@ where
 
         self.index_blocks();
 
-        if level == MoveEliminationLevel::Global {
-            self.analyze();
+        match level {
+            MoveEliminationLevel::Global => {
+                self.analyze();
+                self.rewrite(level);
+            }
+            MoveEliminationLevel::SinglePass => self.single_pass(),
+            MoveEliminationLevel::Local => self.rewrite(level),
+            MoveEliminationLevel::None => unreachable!("the pass returned early"),
         }
-        self.rewrite(level);
     }
 
     /// Give each reachable block an empty cached live-out, at its
@@ -476,12 +513,68 @@ where
             MoveEliminationLevel::Global => Seed::LiveOut,
             // A local walk has no live-out sets to start from.
             MoveEliminationLevel::Local => Seed::All,
-            MoveEliminationLevel::None => unreachable!("the pass returned early"),
+            MoveEliminationLevel::None | MoveEliminationLevel::SinglePass => {
+                unreachable!("the pass returned early, or decided as it walked")
+            }
         };
 
         for block in self.rpo.iter().rev() {
             self.visit_block(block, seed, Mode::Rewrite);
         }
+    }
+
+    /// Walk the blocks once in post-order, propagating and deciding together.
+    ///
+    /// Post-order reaches a block after every successor but those on a back
+    /// edge, so without one its live-out already holds what the fixpoint would
+    /// settle on. A block with one starts from every location, the top of the
+    /// lattice, which is what `Local` assumes everywhere.
+    ///
+    /// By the same argument a predecessor already decided must not be unioned
+    /// into: growing its set now would leave `live_out_of` reporting one no
+    /// walk used, which `crate::demanded_moves` reads and trusts.
+    fn single_pass(&mut self) {
+        self.fill_everything();
+
+        for block in self.rpo.iter().rev() {
+            if self.has_back_edge(block) {
+                let i = self.rpo.index_of(block);
+                let everything = core::mem::take(&mut self.me.everything);
+                self.me.live_out[i as usize].copy_from(&everything);
+                self.me.everything = everything;
+                test_stat!(self.me, blocks_seeded_everything);
+            }
+            self.visit_block(block, Seed::LiveOut, Mode::SinglePass);
+        }
+    }
+
+    /// Fill in the set holding every location.
+    ///
+    /// Units the machine never defined go in too: only a real register's unit
+    /// is ever asked about, so trimming them would buy nothing.
+    fn fill_everything(&mut self) {
+        let everything = &mut self.me.everything;
+        everything.clear();
+        everything.units.fill();
+        for i in 0..self.spill_slots.len_slots() {
+            everything
+                .slots
+                .insert(SpillSlot::<E>::try_new(i).expect("a slot the allocator made"));
+        }
+    }
+
+    /// Does an edge out of `block` go to one the walk has not reached yet?
+    fn has_back_edge(&self, block: Block<E>) -> bool {
+        let i = self.rpo.index_of(block);
+        self.input
+            .func
+            .block(block.with_repr32())
+            .successors()
+            // Unwrapped, not skipped: a dropped successor is a missed back
+            // edge, the unsound direction.
+            .map(|succ| Block::<E>::try_new(succ.index()).unwrap())
+            .filter(|&succ| self.rpo.is_reachable(succ))
+            .any(|succ| self.rpo.index_of(succ) <= i)
     }
 
     /// Queue `block` for another analysis visit, if it is not queued already.
@@ -722,8 +815,11 @@ where
                 }
             }
 
-            // The rewrite must not disturb the sets it decides against.
-            if mode == Mode::Analyze {
+            // The rewrite must not disturb the sets it decides against, and a
+            // single pass must leave alone a predecessor it already decided.
+            let settled =
+                mode == Mode::SinglePass && self.rpo.index_of(pred) >= self.rpo.index_of(block);
+            if mode.propagates() && !settled {
                 debug_assert!(
                     !self.me.saturated,
                     "a saturated set is never propagated, so it never has to be \
@@ -733,7 +829,8 @@ where
                 let mut live_out = core::mem::take(&mut self.me.live_out[i as usize]);
                 let grew = live_out.union_with(&self.me.live);
                 self.me.live_out[i as usize] = live_out;
-                if grew {
+                // A single pass takes its order from the traversal instead.
+                if grew && mode == Mode::Analyze {
                     self.enqueue(pred);
                 }
             }
@@ -808,7 +905,7 @@ where
             // A dead edit does not happen, so it must not keep its source
             // alive. Leaving the live set untouched is what lets a chain of dead
             // spills collapse in one pass, and it is still monotone.
-            if mode == Mode::Rewrite {
+            if mode.records() {
                 self.eliminate(edit, index);
             }
             return;
@@ -906,6 +1003,9 @@ struct TestStats {
     /// How many blocks were walked from a saturated seed.
     saturated_blocks: usize,
 
+    /// How many blocks were walked from a live-out holding every location.
+    blocks_seeded_everything: usize,
+
     /// The largest live set the walk held, sampled at each block's top.
     peak_live: usize,
 }
@@ -921,6 +1021,7 @@ impl TestStats {
             eliminated_on_critical_edge: 0,
             block_visits: 0,
             saturated_blocks: 0,
+            blocks_seeded_everything: 0,
             peak_live: 0,
         }
     }
@@ -935,6 +1036,7 @@ impl TestStats {
             eliminated_on_critical_edge,
             block_visits: _,
             saturated_blocks: _,
+            blocks_seeded_everything: _,
             peak_live: _,
         } = self;
         *eliminated_spills == 0
@@ -1200,12 +1302,14 @@ mod tests {
         )
     }
 
-    /// Every level only deletes from the list move generation produced, and
-    /// `Global` deletes everything `Local` does.
+    /// Every level only deletes from the list move generation produced, and a
+    /// level deletes everything a weaker one does: `Local` within
+    /// `SinglePass` within `Global`.
     ///
-    /// Unlike redundant-move elimination, that containment holds here: `Local`
-    /// seeds every block at the top of the lattice, above whatever the fixpoint
-    /// settles on, and the transfer is monotone.
+    /// Unlike redundant-move elimination, that containment holds here: the
+    /// transfer is monotone, and each level seeds no lower than the next.
+    /// `Local` seeds every block at the top of the lattice, `SinglePass` only
+    /// the ones with a back edge.
     #[test]
     fn the_levels_are_ordered() -> CheckResult<TestInput> {
         Check::new().iters(20_000).run_with(
@@ -1224,7 +1328,15 @@ mod tests {
                 };
                 let local = level_ran(MoveEliminationLevel::Local)?;
                 let global = level_ran(MoveEliminationLevel::Global)?;
+                let single = level_ran(MoveEliminationLevel::SinglePass)?;
 
+                if !is_subsequence(&single.edits, &none.edits) {
+                    return Err(format!(
+                        "`SinglePass` did not merely delete from `None`:\n\
+                         none   = {:?}\nsingle = {:?}",
+                        none.edits, single.edits,
+                    ));
+                }
                 if !is_subsequence(&local.edits, &none.edits) {
                     return Err(format!(
                         "`Local` did not merely delete from `None`:\n\
@@ -1242,11 +1354,19 @@ mod tests {
 
                 let expect = |edits| deleted(edits, &none.edits).expect("just checked");
                 let by_global = expect(&global.edits);
-                if let Some(i) = expect(&local.edits).iter().find(|i| !by_global.contains(i)) {
+                let by_single = expect(&single.edits);
+                if let Some(i) = expect(&local.edits).iter().find(|i| !by_single.contains(i)) {
                     return Err(format!(
-                        "`Local` eliminated edit {i}, which `Global` kept:\n\
-                         none   = {:?}\nlocal  = {:?}\nglobal = {:?}",
-                        none.edits, local.edits, global.edits,
+                        "`Local` eliminated edit {i}, which `SinglePass` kept:\n\
+                         none   = {:?}\nlocal  = {:?}\nsingle = {:?}",
+                        none.edits, local.edits, single.edits,
+                    ));
+                }
+                if let Some(i) = by_single.iter().find(|i| !by_global.contains(i)) {
+                    return Err(format!(
+                        "`SinglePass` eliminated edit {i}, which `Global` kept:\n\
+                         none   = {:?}\nsingle = {:?}\nglobal = {:?}",
+                        none.edits, single.edits, global.edits,
                     ));
                 }
                 Ok(())
@@ -1499,9 +1619,12 @@ mod tests {
         assert_eq!(count(&global.edits, is_remat), 1);
     }
 
-    /// `Local` reaches every block from a saturated seed, and `Global` reaches
-    /// none of them from one. Nothing else here would notice a level reaching
-    /// for the wrong seed.
+    /// Each level reaches for the seed it is meant to; nothing else here would
+    /// notice one reaching for another's.
+    ///
+    /// `Local` saturates every block, `Global` saturates none and runs the
+    /// fixpoint, and `SinglePass` does neither: it propagates, so its top of
+    /// the lattice has to be bits.
     #[test]
     fn only_local_saturates() -> CheckResult<TestInput> {
         Check::new().iters(2_000).run_with(
@@ -1512,6 +1635,9 @@ mod tests {
                     return Ok(());
                 };
                 let Some(global) = run_at(test_input, MoveEliminationLevel::Global)? else {
+                    return Ok(());
+                };
+                let Some(single) = run_at(test_input, MoveEliminationLevel::SinglePass)? else {
                     return Ok(());
                 };
                 if local.stats.saturated_blocks == 0 {
@@ -1527,9 +1653,43 @@ mod tests {
                         "`Global` walked a block from a saturated seed",
                     ));
                 }
+                if single.stats.saturated_blocks != 0 {
+                    return Err(String::from(
+                        "`SinglePass` walked a block from a saturated seed",
+                    ));
+                }
+                if single.stats.block_visits != 0 {
+                    return Err(String::from("`SinglePass` ran the fixpoint"));
+                }
+                if global.stats.blocks_seeded_everything != 0
+                    || local.stats.blocks_seeded_everything != 0
+                {
+                    return Err(String::from(
+                        "only a single pass seeds a block with every location",
+                    ));
+                }
                 Ok(())
             },
         )
+    }
+
+    /// A single pass seeds from every location exactly the blocks with a back
+    /// edge out of them, and the rest from what their successors settled.
+    #[test]
+    fn a_single_pass_seeds_only_a_back_edge_from_everything() {
+        let looping = TestInput::with_a_value_spilled_inside_a_loop();
+        let single = allocated(&looping, MoveEliminationLevel::SinglePass);
+        assert!(
+            single.stats.blocks_seeded_everything > 0,
+            "a loop has a back edge to seed from",
+        );
+
+        let acyclic = TestInput::with_a_value_reloaded_past_a_diamond();
+        let single = allocated(&acyclic, MoveEliminationLevel::SinglePass);
+        assert_eq!(
+            single.stats.blocks_seeded_everything, 0,
+            "a diamond has no back edge, so every block takes a settled live-out",
+        );
     }
 
     /// The arithmetic `Event::MoveEmitted`'s doc describes takes a move's event

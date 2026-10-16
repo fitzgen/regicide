@@ -39,9 +39,10 @@ is either a directory, in which case every `*.postcard` and `*.json` file
 directly in it is an input, or a single input file. Either encoding is read,
 whichever a file turns out to be in.
 
-  -r, --redundant-moves LEVEL  redundant-move elimination: none, local or
-                               global
-  -d, --dead-moves LEVEL       dead-move elimination: none, local or global
+  -r, --redundant-moves LEVEL  redundant-move elimination: none, local,
+                               single-pass or global
+  -d, --dead-moves LEVEL       dead-move elimination: none, local, single-pass
+                               or global
       --dead-reg-moves         let dead-move elimination consider registers
       --no-dead-reg-moves      restrict it to spill slots
       --narrow-slots           reserve each spill slot only where its value is
@@ -542,6 +543,7 @@ fn describe_options(options: &InputOptions) -> String {
         MoveEliminationLevel::None => "none",
         MoveEliminationLevel::Local => "local",
         MoveEliminationLevel::Global => "global",
+        MoveEliminationLevel::SinglePass => "single-pass",
     };
     format!(
         "options: validate {}, redundant-moves {}, dead-moves {}, dead-reg-moves {}, \
@@ -684,8 +686,11 @@ fn parse_level(flag: &str, value: &str) -> Result<MoveEliminationLevel, String> 
     match value {
         "none" => Ok(MoveEliminationLevel::None),
         "local" => Ok(MoveEliminationLevel::Local),
+        "single-pass" => Ok(MoveEliminationLevel::SinglePass),
         "global" => Ok(MoveEliminationLevel::Global),
-        _ => Err(format!("{flag} wants none, local or global, not `{value}`")),
+        _ => Err(format!(
+            "{flag} wants none, local, single-pass or global, not `{value}`"
+        )),
     }
 }
 

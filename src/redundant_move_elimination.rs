@@ -368,7 +368,7 @@ enum Place {
     OnEdge,
 }
 
-/// Which of the pass's two walks over the control-flow graph is running.
+/// Which walk over the control-flow graph is running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     /// Computing the fixpoint over block entry states.
@@ -376,6 +376,21 @@ enum Mode {
 
     /// Deciding which edits to drop, against the settled states.
     Rewrite,
+
+    /// Both at once, in one pass: see `Eliminator::single_pass`.
+    SinglePass,
+}
+
+impl Mode {
+    /// Does this walk decide which edits to drop?
+    fn records(self) -> bool {
+        matches!(self, Self::Rewrite | Self::SinglePass)
+    }
+
+    /// Does this walk hand each block's result to its successors?
+    fn propagates(self) -> bool {
+        matches!(self, Self::Analyze | Self::SinglePass)
+    }
 }
 
 /// Reusable storage for the pass.
@@ -722,11 +737,19 @@ where
     fn run(&mut self, level: MoveEliminationLevel) {
         debug_assert_ne!(level, MoveEliminationLevel::None);
 
-        if level == MoveEliminationLevel::Global {
-            self.seed_entry();
-            self.analyze();
+        match level {
+            MoveEliminationLevel::Global => {
+                self.seed_entry();
+                self.analyze();
+                self.rewrite(level);
+            }
+            MoveEliminationLevel::SinglePass => {
+                self.seed_entry();
+                self.single_pass();
+            }
+            MoveEliminationLevel::Local => self.rewrite(level),
+            MoveEliminationLevel::None => unreachable!("the pass returned early"),
         }
-        self.rewrite(level);
     }
 
     /// Work out the state on entry to the function: where its parameters arrive.
@@ -783,10 +806,7 @@ where
     /// `Local` never ran the fixpoint, so every block starts from the empty
     /// state: the bottom of the lattice, and so sound.
     fn rewrite(&mut self, level: MoveEliminationLevel) {
-        if self.me.recorded.enabled {
-            let len = self.move_generation.edits().len();
-            self.me.recorded.written.resize(len, None);
-        }
+        self.size_recorded();
 
         for block in self.rpo.iter() {
             // Unreachable, and so with no edits to drop.
@@ -795,6 +815,74 @@ where
             }
 
             self.visit_block(block, Mode::Rewrite);
+        }
+    }
+
+    /// Walk the blocks once in reverse post-order, propagating and deciding
+    /// together.
+    ///
+    /// Reverse post-order reaches a block after every predecessor but those on
+    /// a back edge, so without one its entry state already holds what the
+    /// fixpoint would settle on. A block with one is bottomed first, which is
+    /// what `Local` gives every block.
+    ///
+    /// By the same argument a successor already decided must not be meet into:
+    /// shrinking its state now would leave the facts recorded for it
+    /// describing a state no walk used.
+    fn single_pass(&mut self) {
+        self.size_recorded();
+
+        let entry = Block::<E>::try_new(self.input.func.entry_block().index()).unwrap();
+        let seed = core::mem::take(&mut self.me.seed);
+        self.meet_into(entry, &seed);
+        self.me.seed = seed;
+
+        for block in self.rpo.iter() {
+            debug_assert!(
+                self.me.entry_state[block].is_some(),
+                "every reachable block is entered from a predecessor earlier in \
+                 reverse post-order, or is the seeded entry block",
+            );
+            if self.has_back_edge(block) {
+                self.bottom_entry_state(block);
+            }
+            self.visit_block(block, Mode::SinglePass);
+        }
+
+        // `meet_into` enqueues, but the order here comes from the traversal.
+        self.me.worklist.clear();
+        self.me.on_worklist.reset();
+    }
+
+    /// Make room for what the deciding walk records, if anything wants it.
+    fn size_recorded(&mut self) {
+        if self.me.recorded.enabled {
+            let len = self.move_generation.edits().len();
+            self.me.recorded.written.resize(len, None);
+        }
+    }
+
+    /// Does an edge into `block` come from one the walk has not reached yet?
+    fn has_back_edge(&self, block: Block<E>) -> bool {
+        let i = self.rpo.index_of(block);
+        self.input
+            .func
+            .block(block.with_repr32())
+            .predecessors()
+            // Unwrapped, not skipped: a dropped predecessor is a missed back
+            // edge, the unsound direction.
+            .map(|pred| Block::<E>::try_new(pred.index()).unwrap())
+            .filter(|&pred| self.rpo.is_reachable(pred))
+            .any(|pred| self.rpo.index_of(pred) >= i)
+    }
+
+    /// Drop `block`'s entry state to the bottom of the lattice.
+    fn bottom_entry_state(&mut self, block: Block<E>) {
+        if let Some(facts) = self.me.entry_state[block] {
+            self.me.entry_state[block] = Some(Facts {
+                start: facts.start,
+                end: facts.start,
+            });
         }
     }
 
@@ -869,8 +957,8 @@ where
     ///
     /// `checker::visit_block` with every check deleted and one decision added.
     /// The order the pieces run in is the contract move generation placed the
-    /// edits under; getting it wrong is invisible at `Local` and wrong at
-    /// `Global`.
+    /// edits under; getting it wrong is invisible at `Local` and wrong at the
+    /// levels that look across blocks.
     fn visit_block(&mut self, block: Block<E>, mode: Mode) {
         let func = self.input.func;
         let machine = self.input.machine;
@@ -911,7 +999,7 @@ where
             let edit = match item {
                 InstOrEdit::Inst(inst) => {
                     self.rename_arriving_edge(&mut state, block, &mut renamed);
-                    if inst == terminator && mode == Mode::Rewrite && self.me.recorded.enabled {
+                    if inst == terminator && mode.records() && self.me.recorded.enabled {
                         self.record_before_terminator(&state, block);
                     }
                     self.apply_inst(&mut state, inst);
@@ -962,9 +1050,11 @@ where
                 self.rename_params(&mut out, block, i, succ);
             }
 
-            // Only the analysis propagates; the rewrite must not disturb the
-            // states it is deciding against.
-            if mode == Mode::Analyze {
+            // The rewrite must not disturb the states it decides against, and
+            // a single pass must leave alone a successor it already decided.
+            let settled =
+                mode == Mode::SinglePass && self.rpo.index_of(succ) <= self.rpo.index_of(block);
+            if mode.propagates() && !settled {
                 self.meet_into(succ, &out);
             }
         }
@@ -1123,7 +1213,7 @@ where
                 } else {
                     state.clobber(machine, dest);
                     state.insert(dest, part);
-                    if mode == Mode::Rewrite && self.me.recorded.enabled {
+                    if mode.records() && self.me.recorded.enabled {
                         self.me
                             .recorded
                             .record_written(index, core::iter::once(part));
@@ -1150,7 +1240,7 @@ where
         if from == to {
             // The solver never emits one, but it is a no-op whatever the state
             // says.
-            if mode == Mode::Rewrite {
+            if mode.records() {
                 test_stat!(self.me, identity_moves);
             }
             self.eliminate(index, place, mode);
@@ -1159,12 +1249,11 @@ where
             // happen, so nothing about the machine changes.
             self.eliminate(index, place, mode);
         } else {
-            if mode == Mode::Rewrite && !state.parts(from).is_empty() && !state.parts(to).is_empty()
-            {
+            if mode.records() && !state.parts(from).is_empty() && !state.parts(to).is_empty() {
                 test_stat!(self.me, near_miss);
             }
             state.copy_into(machine, to, from, &mut scratch);
-            if mode == Mode::Rewrite && self.me.recorded.enabled {
+            if mode.records() && self.me.recorded.enabled {
                 self.me
                     .recorded
                     .record_written(index, scratch.iter().copied());
@@ -1176,10 +1265,11 @@ where
 
     /// Record that the edit at `index` is not going to happen.
     ///
-    /// Only the rewrite records anything: the analysis calls this so the caller
-    /// takes the eliminated transfer, but decides against unsettled states.
+    /// Only a deciding walk records anything: the analysis calls this so the
+    /// caller takes the eliminated transfer, but decides against unsettled
+    /// states.
     fn eliminate(&mut self, index: usize, place: Place, mode: Mode) {
-        if mode != Mode::Rewrite {
+        if !mode.records() {
             return;
         }
 
@@ -1508,10 +1598,11 @@ mod tests {
 
     /// Every level only ever deletes from the list move generation produced.
     ///
-    /// The stronger claim --- that `Global` deletes everything `Local` does ---
-    /// is *not* asserted: the transfer is not monotone, so knowing more on entry
-    /// to a block can cost an elimination inside it. No input has shown the two
-    /// crossing, but nothing rules it out.
+    /// The stronger claim, that a level deletes everything a weaker one does,
+    /// is asserted only between `Local` and `Global`, where no input has shown
+    /// the two crossing. The transfer is not monotone, so knowing more on
+    /// entry to a block can cost an elimination inside it, and `SinglePass` is
+    /// bounded by neither.
     #[test]
     fn the_levels_are_ordered() -> CheckResult<TestInput> {
         Check::new().iters(20_000).run_with(
@@ -1530,7 +1621,18 @@ mod tests {
                 };
                 let local = level_ran(MoveEliminationLevel::Local)?;
                 let global = level_ran(MoveEliminationLevel::Global)?;
+                let single = level_ran(MoveEliminationLevel::SinglePass)?;
 
+                if !is_subsequence(&single.edits, &none.edits) {
+                    return Err(format!(
+                        "`SinglePass` did not merely delete from `None`:\n\
+                         none   = {:?}\nsingle = {:?}",
+                        none.edits, single.edits,
+                    ));
+                }
+                if single.edits.len() > none.edits.len() {
+                    return Err(String::from("`SinglePass` grew the edit list"));
+                }
                 if !is_subsequence(&local.edits, &none.edits) {
                     return Err(format!(
                         "`Local` did not merely delete from `None`:\n\
@@ -1791,16 +1893,20 @@ mod tests {
         assert_eq!(local.stats.eliminated_reloads, 2);
     }
 
-    /// The test the two levels exist to be told apart by. A value spilled in the
+    /// The test the levels exist to be told apart by. A value spilled in the
     /// entry block and reloaded past a diamond: `Local` enters each arm knowing
     /// nothing and keeps both reloads, `Global` carries the entry block's answer
     /// down both arms and drops them.
+    ///
+    /// A diamond has no back edge, so `SinglePass` is `Global` here;
+    /// `only_a_fixpoint_sees_around_a_loop` pins where it is not.
     #[test]
     fn only_a_fixpoint_sees_past_a_diamond() {
         let test_input = TestInput::with_a_value_reloaded_past_a_diamond();
         let none = allocated(&test_input, MoveEliminationLevel::None);
         let local = allocated(&test_input, MoveEliminationLevel::Local);
         let global = allocated(&test_input, MoveEliminationLevel::Global);
+        let single = allocated(&test_input, MoveEliminationLevel::SinglePass);
 
         // One store, and one reload down each arm.
         assert_eq!(count(&none.edits, is_spill), 1);
@@ -1815,6 +1921,10 @@ mod tests {
 
         // Atop an arm, where the edge out of the entry block puts them.
         assert_eq!(global.stats.eliminated_at_block_top, 2);
+
+        assert_eq!(single.edits, global.edits);
+        assert_eq!(single.stats.eliminated_reloads, 2);
+        assert_eq!(single.stats.eliminated_at_block_top, 2);
     }
 
     /// The same separation around a back edge, where the redundant reload lands
@@ -1826,6 +1936,7 @@ mod tests {
         let test_input = TestInput::with_a_value_spilled_inside_a_loop();
         let local = allocated(&test_input, MoveEliminationLevel::Local);
         let global = allocated(&test_input, MoveEliminationLevel::Global);
+        let single = allocated(&test_input, MoveEliminationLevel::SinglePass);
 
         assert_eq!(count(&local.edits, is_reload), 1);
         assert!(local.stats.eliminated_nothing());
@@ -1834,6 +1945,15 @@ mod tests {
         assert_eq!(global.stats.eliminated_reloads, 1);
         assert_eq!(global.stats.eliminated_before_terminator, 1);
         assert!(global.stats.block_revisits > 0, "a loop is walked twice");
+
+        // The head the reload depends on is bottomed, so a single pass is
+        // `Local` here: the price the level pays.
+        assert_eq!(single.edits, local.edits);
+        assert!(single.stats.eliminated_nothing());
+        assert_eq!(
+            single.stats.block_revisits, 0,
+            "a single pass visits each block once",
+        );
     }
 
     /// A store into the slot a value is already in goes --- the redundancy

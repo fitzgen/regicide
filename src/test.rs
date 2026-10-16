@@ -145,11 +145,11 @@ fn gen_operand_constraint(ctx: &mut mutatis::Context) -> mutatis::Result<Operand
 
 /// Generate a level of move elimination.
 fn gen_move_elimination_level(ctx: &mut mutatis::Context) -> mutatis::Result<MoveEliminationLevel> {
-    Ok(match ctx.rng().gen_index(3).unwrap() {
-        0 => MoveEliminationLevel::None,
-        1 => MoveEliminationLevel::Local,
-        _ => MoveEliminationLevel::Global,
-    })
+    let i = ctx
+        .rng()
+        .gen_index(MoveEliminationLevel::ALL.len())
+        .unwrap();
+    Ok(MoveEliminationLevel::ALL[i])
 }
 
 /// Mutate one move-elimination level in place.
@@ -162,17 +162,19 @@ fn mutate_move_elimination_level(
     level: &mut MoveEliminationLevel,
 ) -> mutatis::Result<()> {
     *level = if ctx.shrink() {
-        match *level {
+        let simpler: &[MoveEliminationLevel] = match *level {
             MoveEliminationLevel::None => return Err(mutatis::error::Error::exhausted()),
-            MoveEliminationLevel::Local => MoveEliminationLevel::None,
-            MoveEliminationLevel::Global => {
-                if ctx.rng().gen_bool() {
-                    MoveEliminationLevel::None
-                } else {
-                    MoveEliminationLevel::Local
-                }
+            MoveEliminationLevel::Local => &[MoveEliminationLevel::None],
+            MoveEliminationLevel::SinglePass => {
+                &[MoveEliminationLevel::None, MoveEliminationLevel::Local]
             }
-        }
+            MoveEliminationLevel::Global => &[
+                MoveEliminationLevel::None,
+                MoveEliminationLevel::Local,
+                MoveEliminationLevel::SinglePass,
+            ],
+        };
+        simpler[ctx.rng().gen_index(simpler.len()).unwrap()]
     } else {
         gen_move_elimination_level(ctx)?
     };
@@ -11685,16 +11687,8 @@ mod tests {
             InputOptions::default().dead_move_elimination_level,
         );
 
-        for redundant in [
-            MoveEliminationLevel::None,
-            MoveEliminationLevel::Local,
-            MoveEliminationLevel::Global,
-        ] {
-            for dead in [
-                MoveEliminationLevel::None,
-                MoveEliminationLevel::Local,
-                MoveEliminationLevel::Global,
-            ] {
+        for redundant in MoveEliminationLevel::ALL {
+            for dead in MoveEliminationLevel::ALL {
                 for regs in [false, true] {
                     input.options.redundant_move_elimination_level = redundant;
                     input.options.dead_move_elimination_level = dead;
@@ -11732,8 +11726,9 @@ mod tests {
                 regs.push(options.eliminate_dead_register_moves);
             }
         }
-        assert_eq!(redundant.len(), 3, "only generated {redundant:?}");
-        assert_eq!(dead.len(), 3, "only generated {dead:?}");
+        let all = MoveEliminationLevel::ALL.len();
+        assert_eq!(redundant.len(), all, "only generated {redundant:?}");
+        assert_eq!(dead.len(), all, "only generated {dead:?}");
         assert_eq!(regs.len(), 2, "only generated {regs:?}");
     }
 
