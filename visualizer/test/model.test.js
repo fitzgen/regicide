@@ -156,11 +156,13 @@ test("a block is prefixed by what the embedder called it", () => {
   const prefixes = outlineOf(fixture("block-kinds"))
     .lines.filter((line) => line.kind === "block")
     .map((line) => text(line));
+  // A cold block is a region of its own, which the outline emits after its
+  // parent's own blocks, so `block1` comes last rather than in block order.
   assert.deepEqual(prefixes, [
     "entry block0:",
-    "cold block1:",
     "hot block2:",
     "freq(0.5) block3(v1[r0]):",
+    "cold block1:",
   ]);
 
   // And a block the embedder said nothing about gets no prefix at all.
@@ -817,14 +819,13 @@ test("an event summary names its entities as clickable parts", () => {
   assert.ok(found, "the fixture spills and no SpillPlaced event reached the span");
   assert.equal(
     flat(found.summary),
-    "SpillPlaced at=inst1:early block=block0 slot=slot stack0 span=span0 val=v0",
+    "SpillPlaced at=inst1:early block=block0 span=span0 val=v0",
   );
   assert.deepEqual(
     found.summary.filter((part) => part.entity).map((part) => part.entity),
     [
       { kind: "Inst", index: 1 },
       { kind: "Block", index: 0 },
-      { kind: "SpillSlot", index: 0 },
       { kind: "LiveSpan", index: 0 },
       { kind: "Val", index: 0 },
     ],
