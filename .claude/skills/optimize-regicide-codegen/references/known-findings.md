@@ -30,6 +30,27 @@ Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 > and the warning above still stands for anything older. Its 33,038 captures
 > are **13,928 distinct**, and `counts.py -j 12` over them takes about **6
 > minutes**, not the ~25 the main skill budgets.
+>
+> **Analysis 010 (2026-10-15, regicide `da7b1da`) keeps it again** and is
+> the latest analysis: `~/regalloc2/reports/codegen-analysis-010/`. Its
+> corpus is a fresh capture of the same 29 modules, also **33,038**
+> inputs. `code-quality-012` is the first step-3 session to run against
+> it.
+>
+> **Two things about that corpus you need before quoting any total.**
+> Analysis 010 decoded the capture-name prefix: `u<N>-<M>` is a Wasmtime
+> **`FuncKey`**, with a function-*kind* tag in the top 4 bits and a
+> `StaticModuleIndex` in the low 28 (`wasmtime/crates/environ/src/key.rs`).
+> So:
+>
+> - **Only 67.13% of the 33,038 captures are `DefinedWasmFunction`.** The
+>   other **32.87%** are compiler-generated trampolines —
+>   `ArrayToWasmTrampoline` alone is 28.13%. **Every suite-wide static
+>   total mixes guest code with glue**, including the ones in this file.
+> - **"13,928 distinct" is not the same population as the 22,180 kind-0
+>   captures.** `code-quality-011`'s de-duplication removes far more than
+>   the trampolines. **Check what a total covers before diffing it
+>   against another session's.**
 
 ---
 
@@ -296,25 +317,114 @@ What the code does now, and what to know before changing it:
   analysis 009's **fix #5** — **in scope, no API decision needed**; see the
   correction below.
 
-Open, ranked (measured at `1902b8a`). The session recorded everything here
-as out of scope or needing an API decision; **the 2026-10-14 correction
-above moved item 1 back into scope**, and it is the best-evidenced one:
+Open, ranked — **revised 2026-10-16 after analysis 010 measured this
+session's work end to end** (`~/regalloc2/reports/codegen-analysis-010/`,
+regicide `da7b1da`, which contains this session's change as `231bcdf`).
+**Items 1 and 3 now have measured answers, and both are discouraging.**
 
-1. **A callee-saved cost model** (009 fix #5) — **in scope, needs no API
-   decision**, and is the best-evidenced item (see the correction below).
+> **Read `code-quality-012`'s section above first — it is the later
+> session and it ran against analysis 010.** It already acted on several
+> of these: its attempt 5 implemented and closed item 1's reuse half
+> (see the correction at the top of this file), and its attempt 6 is the
+> first change to move `shootout-xchacha20`, which item 2 below is
+> about. The list here is kept for the items 012 did not reach.
+
+1. **A callee-saved cost model** (009 fix #5) — **in scope and needs no
+   API decision, but analysis 010 surveyed the headroom and it is
+   small.** Counting distinct callee-saved GPRs (`x19`-`x28`) saved in
+   each prologue over **2,567 functions**: regicide uses **fewer on 41,
+   more on 57, the same on 2,469**, with totals within **0.3%** of ion's.
+   `rust-wasmprinter`, the preferred target, has **25 functions that
+   would improve against 28 that could regress**.
+
+   **A single function misled on this, and it was this session's
+   evidence.** `rust-protobuf`'s `encode_varint` saves **6** callee-saved
+   registers against ion's **8** — but it is one of 10 wins in its module
+   against 13 losses. See
+   `reports/codegen-analysis-010/misc/callee-saved-survey.md`.
+
+   **Now closed from the inside too.** `code-quality-012`'s attempt 5
+   implemented the reuse bias exactly as prescribed and measured **9
+   functions better, 3 worse, 388 unchanged** over 400 sampled inputs,
+   for +0.43% compile time — independently corroborating the survey
+   above. **Do not re-open the reuse bias.** What remains untested is a
+   *prologue cost term* pricing the push/pop pair against the spill it
+   would avoid; see the correction at the top of this file.
 2. **The parent region adopts a child loop's locations** (009 fix #1's
    remainder) — **out of scope** (a new pass). Everything reachable by
-   hinting is done.
-3. **Is `-0385`/`-0386` worth optimizing at all?** They are ~50% of the
-   suite's static cost, but **`dotnet-raytracer` is already -1.06% faster
-   than ion on wall time** (robust, 60 samples). 009's fix #5 warns against
-   exactly this. Re-justify against wall time first.
+   hinting is done. **010 sharpens the target:** `shootout-xchacha20`'s
+   cost is now localized to the block — its inner loop is *identical* to
+   ion's (est 260 = 260) and the cost is **+36% estimated cycles in the
+   enclosing middle loop**, split between a **17-access spill block at
+   the loop head** (ion: 0) and a 52-access tail (ion: 30). **It is a
+   register-pressure case, not a boundary one**, so this item is the
+   mechanism that would reach it.
+
+   **`code-quality-012`'s attempt 6 is the first change to move it**
+   (-2.44%), by trading xchacha20's depth-2 reloads for register moves —
+   consistent with the block picture above. It costs the deep-loop
+   targets, and a bundle-depth gate cannot separate them. See that
+   session's open lead.
+3. **Is `-0385`/`-0386` worth optimizing at all? — ANSWERED: no.**
+   Analysis 010 re-justified against wall time as this item asked.
+   `dotnet-raytracer` is **-1.32%** (robust, n=60, p=4.8e-14), i.e. it
+   got *better* and still beats ion; `rust-wasmprinter` is **-3.59%**.
+   **Neither target has a wall-time problem to fix.** Meanwhile this
+   session's **-3.69% static was independently verified at -3.68%** over
+   all 33,038 captures — and bought **0.26 pp** of wall time on the
+   module carrying 82% of the suite's static cost.
 4. **Why attempt 5's re-aimed hints help at depth 5 and hurt at depth 6**
    (-1.3M against +6.0M on `-0385`). A localized answer might reopen the
-   hint family.
+   hint family. Unchanged; needs the dropped branch.
 5. **`tinygo-regex-0156-u0-145`** regressed +0.85% under the kept change
    while *every* plain count improved. One spill in one depth-4 block
-   (+50,000) against -10,000 each in three depth-3 blocks.
+   (+50,000) against -10,000 each in three depth-3 blocks. **Note the
+   benchmark as a whole is no longer a wall-time regression**: 010
+   measures `tinygo-regex` at **+0.90%, not significant** at n=150 (it
+   read +2.56% and significant at n=60 — confirm before filing).
+
+### What analysis 010 measured about this session's change
+
+- **The static claim is sound and independently reproduced**: -3.68%
+  over all 33,038 captures against the -3.69% reported here over 13,928
+  de-duplicated ones, with every metric agreeing in sign and five of six
+  within 0.2 pp.
+- **`build-at` at `4fa422a` vs `231bcdf` shows the change is real and
+  broad where aimed** — `dotnet-raytracer` 801 of 3,967 functions
+  changed, `tinygo-regex` 79 of 265, `rust-protobuf` 112 of 458 — **and
+  absent where not**: in keccak, sieve and xchacha20 every changed
+  function is libc or startup code.
+- **So the xchacha20 +0.45% this session recorded as "a renaming
+  artifact" is confirmed as not the change's doing**: its
+  85%-of-samples function `__original_main` changed by **-1
+  instruction**, while the benchmark moved 0.88 pp.
+- **Suite wall time: geomean -0.89%, 15 significantly faster, 5 slower.**
+  Only two benchmarks lose by more than half a percent, and one of those
+  is unmeasurable.
+
+### The warning that now sits over all of this
+
+**Analysis 010 found four cases where 4-13% of wall time moves on code
+that is statically identical or statically *worse*:** `shootout-sieve`'s
+kernel (identical, **-4.04%** with alignment forced on both engines),
+`shootout-xchacha20`'s inner loop (identical, +6.73%), and
+`ocaml-raytrace`'s `function[14]` (identical, -12.7% samples) and
+`function[55]` (regicide **worse** by +0.4% est, -5.1% samples).
+
+And the two clearest attributable wins are ones estimated cycles ranks
+**backwards**: `shootout-keccak` scores **+3.6% worse** on the estimate
+and runs **4.74% faster** (ion emits **33 store-to-load-forwarding
+stalls**, regicide **0**), and `rust-wasmprinter`'s worst function by
+instruction count is **-11.4%** by estimate.
+
+**This is not the retired "missing cost-model term" finding** (009
+§15/§21 retired that for lack of a witness, and these are
+microarchitectural effects a model of moves and memory cannot
+represent). It does mean **a session gating on estimated cycles is using
+an instrument that is silent or inverted on much of what now moves the
+suite** — so pair every static gate with a wall-time check on
+`shootout-keccak`, `rust-protobuf` and `shootout-sieve`, which are
+cheap, robust and highly significant.
 
 ## Earlier session: `code-quality-010` (2026-10-09, base `7e8f866`)
 

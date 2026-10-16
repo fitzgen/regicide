@@ -394,6 +394,68 @@ candidates, in order:
 The baseline `cargo test --all-features` at `7e8f866`: 428 + 8 passed, 10
 ignored. At `757d59f`: 430 + 8.
 
+## Does the replay harness's speedup reach the real compiler? (2026-10-15)
+
+**Partly answered, and the controlled experiment has not been run.**
+Analysis 010 measured the whole suite's compilation phase at `da7b1da`
+(all three `compile-speedups-006` commits landed) against ion:
+
+| | geomean vs ion, 29 modules |
+| --- | ---: |
+| analysis 009, at `4fa422a` (before) | **+173%** |
+| analysis 010, at `da7b1da` (after) | **+166%** |
+
+Right direction and roughly the right size for a ~2% allocator speedup
+diluted across whole-module compilation — **but it is not a controlled
+measurement**, and note it predates `compile-speedups-007`'s much larger
+-10.24% (see that session below, whose gains are not in these numbers): sightglass was updated between the two runs
+(`fc2da43` → `32b5ef2`, which also changed the significance test) and
+**both engines were rebuilt**.
+
+Analysis 009 had flagged exactly this gap ("ion was rebuilt too, so part
+of that bias may be Cranelift's rather than regicide's — a `build-at`
+comparison would separate it, and was not done"). **`scripts/build-at`
+is the fix and it is this skill's to run:** build at `231bcdf` and at
+`da7b1da`, which differ *only* by these three commits with Wasmtime held
+fixed, and time `wasmtime compile` on the same modules. Analysis 010
+built those exact two revisions and confirmed they produce identical
+code, so the timing would isolate the compile-time change cleanly.
+
+Still slower than ion on **29 of 29** modules at `da7b1da`: `hashset`
++660%, `tinygo-regex` +319%, libsodium ~+275-296%,
+`starlingmonkey-markdown` +230%, `rust-wasmprinter` +229%,
+`shootout-switch` +65%, `ocaml-raytrace` +64%.
+
+## A third of every corpus capture is a trampoline (2026-10-15)
+
+**Relevant to every census and every "typical/" set this skill builds —
+and it applies retroactively**: `compile-speedups-007` established that
+the `codegen-analysis-010` corpus is **byte-identical to 009's**, so the
+split below describes the corpora sessions 006 and 007 censused too, not
+only the newest one.
+Analysis 010 decoded the capture-name prefix: `u<N>-<M>` is a Wasmtime
+**`FuncKey`** (`wasmtime/crates/environ/src/key.rs`), with a
+function-*kind* tag in the top 4 bits and a `StaticModuleIndex` in the
+low 28 — **not** a module index, which is what the bit pattern suggests.
+
+Over the 33,038 captures of the `codegen-analysis-010` corpus:
+
+| kind | share |
+| --- | ---: |
+| `DefinedWasmFunction` | **67.13%** |
+| `ArrayToWasmTrampoline` | 28.13% |
+| `WasmToArrayTrampoline` | 3.18% |
+| `ComponentTrampoline` | 0.82% |
+| `WasmToBuiltinTrampoline` | 0.45% |
+| `ModuleStartup` + `ResourceDropTrampoline` | 0.28% |
+
+So **32.87% of a corpus is compiler-generated glue** — usually tiny, and
+cheap to allocate. This session's `typical/` set was **13,925 distinct
+inputs** of 33,038 captures; the de-duplication evidently removes most
+of them, but **a census or a per-pass share computed over raw captures
+is counting two populations**. Worth splitting by kind before drawing a
+scaling exponent or a pass share from one.
+
 ## Session `compile-speedups-006` (2026-10-13, base `4fa422a`, tip `1489df3`)
 
 Corpora `codegen-analysis-009` (33,038 inputs; **same file names as 008 but
@@ -406,6 +468,22 @@ Three attempts, three kept; **ten further ideas screened out at no attempt
 cost**. Cumulative, n=12/10, 99% CI, all significant, **no regression on any
 set**, allocation output **byte-identical** everywhere (the session's
 permission to change output was never needed):
+
+> **The byte-identical claim was independently confirmed on 2026-10-15**
+> by `analyze-regicide-codegen` analysis 010
+> (`~/regalloc2/reports/codegen-analysis-010/bisect/experiment-2-compile-time-commits.md`).
+> Instead of replaying a corpus, it built a **real Wasmtime** at
+> `231bcdf` (before these three commits) and at `da7b1da` (after) and
+> compared the compiled artifacts: **0 of 4,890 functions differ across
+> six modules, and all six `.cwasm`s are byte-identical by `md5`.**
+> That is stricter than a function comparison and independent of this
+> session's own harness, so the claim holds through the whole
+> Cranelift pipeline, not just through `examples/run`.
+>
+> **Caveat on reach:** six modules, chosen as that analysis's targets,
+> including the two largest and most allocation-stressing of the timed
+> set (`dotnet-raytracer`, `tinygo-regex`). The other 23 were not
+> checked.
 
 | set | insts | wall |
 | --- | ---: | ---: |
