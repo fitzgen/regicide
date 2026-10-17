@@ -15,8 +15,7 @@ use crate::{
     events::{EventsLog, SplitKind},
     input::{DefUse, InputInst, InputValue},
     live_ranges::{
-        HintPos, HintStrength, LiveBundle, LivePoint, LiveRanges, LiveSpan, RegPreference,
-        SpillWeight,
+        HintPos, HintStrength, LiveBundle, LivePoint, LiveRanges, LiveSpan, SpillWeight,
     },
     machine::{Machine, Reg, RegClass, RegClassMembers, RegGroup, RegUnit},
     output::{OutputInner, RegAllocation},
@@ -312,10 +311,6 @@ where
     /// preferred.
     region_preferences: RegSet,
 
-    /// Scratch space holding the registers `assign_to_non_preferred` tries, in
-    /// order.
-    non_preferred_candidates: Vec<Reg>,
-
     /// `order_class_by_tier`'s output, valid while the class and the region's
     /// two sets are still the ones recorded beside it.
     tier_order: Vec<Reg>,
@@ -355,7 +350,6 @@ where
             region_clobbers: RegSet::new(),
             clobber_bound: EntitySet::new(),
             region_preferences: RegSet::new(),
-            non_preferred_candidates: Vec::new(),
             tier_order: Vec::new(),
             tier_order_class: None,
             tier_order_clobbers: RegSet::new(),
@@ -383,7 +377,6 @@ where
             region_clobbers,
             clobber_bound,
             region_preferences,
-            non_preferred_candidates,
             tier_order,
             tier_order_class,
             tier_order_clobbers,
@@ -407,7 +400,6 @@ where
         region_clobbers.reset();
         clobber_bound.reset();
         region_preferences.reset();
-        non_preferred_candidates.clear();
         tier_order.clear();
         *tier_order_class = None;
         tier_order_clobbers.reset();
@@ -434,7 +426,6 @@ where
             region_clobbers,
             clobber_bound,
             region_preferences,
-            non_preferred_candidates,
             tier_order,
             tier_order_class,
             tier_order_clobbers,
@@ -462,7 +453,6 @@ where
             && region_clobbers.is_reset()
             && clobber_bound.is_reset()
             && region_preferences.is_reset()
-            && non_preferred_candidates.is_empty()
             && tier_order.is_empty()
             && tier_order_class.is_none()
             && tier_order_clobbers.is_reset()
@@ -664,14 +654,16 @@ where
                 }
             );
 
-            if self.assign_to_preferred(input, live_ranges, events, output, entry)? {
-                counts.preferred_assignments.inc();
-                continue;
-            }
-
-            if self.assign_to_non_preferred(input, live_ranges, events, output, entry)? {
-                counts.non_preferred_assignments.inc();
-                continue;
+            match self.assign_to_a_register(input, live_ranges, events, output, entry)? {
+                Some(true) => {
+                    counts.preferred_assignments.inc();
+                    continue;
+                }
+                Some(false) => {
+                    counts.non_preferred_assignments.inc();
+                    continue;
+                }
+                None => {}
             }
 
             if self.assign_via_eviction(input, region_tree, live_ranges, events, output, entry)? {
@@ -786,78 +778,26 @@ where
         self.bundle_priority[bundle]
     }
 
-    fn assign_to_preferred(
+    /// Try to give `entry`'s bundle a register, preferring the ones its hints
+    /// asked for.
+    ///
+    /// The preferred and non-preferred candidates are disjoint and were once
+    /// two passes, which meant resolving the bundle's constraint and walking
+    /// its spans twice whenever the preferred half found nothing. They are one
+    /// candidate list now, in the same order: every register every use asked
+    /// for, then the rest of the ones any use asked for, then everything else
+    /// by tier.
+    ///
+    /// `Ok(None)` when no candidate took it; otherwise whether the winner was
+    /// a preferred one, which is all the caller needs to count it.
+    fn assign_to_a_register(
         &mut self,
         input: &Input<'_, impl InputFunction>,
         live_ranges: &mut LiveRanges<E>,
         events: &mut EventsLog<E>,
         output: &mut OutputInner<E>,
         entry: PqEntry<E>,
-    ) -> IResult<bool> {
-        let bundle = entry.bundle();
-
-        let pref = bundle.preference(live_ranges);
-        if pref.is_empty() {
-            return Ok(false);
-        }
-
-        // If this bundle has a register preference, then that preference had
-        // better match its constraints.
-        if cfg!(debug_assertions) {
-            match bundle.constraint(live_ranges) {
-                OperandConstraint::Any => {
-                    let class = bundle.value_reg_class(live_ranges, input);
-                    debug_assert!(pref.union().is_subset_of(class.member_set(input.machine)));
-                    debug_assert!(matches!(
-                        class.members(input.machine),
-                        RegClassMembers::Regs(_)
-                    ));
-                }
-                OperandConstraint::Reg(rc) => {
-                    debug_assert!(pref.union().is_subset_of(rc.member_set(input.machine)));
-                    debug_assert!(matches!(
-                        rc.members(input.machine),
-                        RegClassMembers::Regs(_)
-                    ));
-                }
-                OperandConstraint::Stack => {
-                    panic!("should not have reg preference with stack constraint")
-                }
-                OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
-            }
-        }
-
-        let assigned = self.region_assignments.try_assign_to_reg(
-            bundle,
-            pref.intersection().iter().chain(
-                pref.union()
-                    .iter()
-                    .filter(|r| !pref.intersection_contains(*r)),
-            ),
-            |r| r.units(input.machine),
-            bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
-        );
-
-        match assigned {
-            None => Ok(false),
-            Some(reg) => {
-                let reg = output.with_repr::<E, _>(reg)?;
-                let alloc = RegAllocation::Reg(reg);
-                bundle.set_reg_allocation(live_ranges, alloc);
-                event!(events, BundleAssignedPreferred { bundle, alloc });
-                Ok(true)
-            }
-        }
-    }
-
-    fn assign_to_non_preferred(
-        &mut self,
-        input: &Input<'_, impl InputFunction>,
-        live_ranges: &mut LiveRanges<E>,
-        events: &mut EventsLog<E>,
-        output: &mut OutputInner<E>,
-        entry: PqEntry<E>,
-    ) -> IResult<bool> {
+    ) -> IResult<Option<bool>> {
         let bundle = entry.bundle();
         let pref = bundle.preference(live_ranges);
 
@@ -865,10 +805,25 @@ where
             OperandConstraint::Any => {
                 // No use constrained this bundle any further than the default
                 // register class of its values, so use that default class.
-                bundle.value_reg_class(live_ranges, input)
+                let class = bundle.value_reg_class(live_ranges, input);
+                debug_assert!(
+                    pref.is_empty() || pref.union().is_subset_of(class.member_set(input.machine)),
+                    "a bundle's preference must sit inside its class",
+                );
+                class
             }
-            OperandConstraint::Reg(rc) => rc,
+            OperandConstraint::Reg(rc) => {
+                debug_assert!(
+                    pref.is_empty() || pref.union().is_subset_of(rc.member_set(input.machine)),
+                    "a bundle's preference must sit inside its class",
+                );
+                rc
+            }
             OperandConstraint::Stack => {
+                debug_assert!(
+                    pref.is_empty(),
+                    "a stack-constrained bundle should have no register preference",
+                );
                 self.stack_bundles.push(bundle);
                 event!(
                     events,
@@ -878,7 +833,9 @@ where
                         forced: true,
                     }
                 );
-                return Ok(true);
+                // Forced to the stack, so no register was tried at all; count
+                // it the way the non-preferred pass used to.
+                return Ok(Some(false));
             }
             OperandConstraint::Reuse(_) => unreachable!("already resolved reuse constraints"),
         };
@@ -918,16 +875,34 @@ where
                     self.tier_order_check = fresh;
                 }
 
-                let candidates = &mut self.non_preferred_candidates;
+                // Chained rather than collected: a preferred candidate takes
+                // the bundle a quarter of the time, and then the tail is never
+                // walked, let alone copied into a buffer.
+                //
+                // The tier order is cached per region, so its first tier holds
+                // every register the region clobbers anywhere. A bundle live
+                // across one of those clobbers cannot hold that register, and
+                // asking costs an interference query per candidate, so the
+                // tail drops them instead.
                 let clobbered = self.bundle_clobbered[bundle].unwrap_or(RegSet::new());
-                order_non_preferred_candidates(&self.tier_order, pref, &clobbered, candidates);
                 let assigned = self.region_assignments.try_assign_to_reg(
                     bundle,
-                    candidates.iter().copied(),
+                    pref.intersection()
+                        .iter()
+                        .chain(
+                            pref.union()
+                                .iter()
+                                .filter(|&r| !pref.intersection_contains(r)),
+                        )
+                        .chain(
+                            self.tier_order
+                                .iter()
+                                .copied()
+                                .filter(|&r| !pref.union_contains(r) && !clobbered.contains(r)),
+                        ),
                     |r| r.units(input.machine),
                     bundle.spans(live_ranges).map(|s| s.query(live_ranges)),
                 );
-                candidates.clear();
                 assigned
                     .map(|reg| output.with_repr::<E, _>(reg).map(RegAllocation::Reg))
                     .transpose()?
@@ -950,18 +925,30 @@ where
         };
 
         match assigned {
-            None => Ok(false),
+            None => Ok(None),
             Some(alloc) => {
                 bundle.set_reg_allocation(live_ranges, alloc);
-                event!(
-                    events,
-                    BundleAssignedNonPreferred {
-                        bundle,
-                        alloc,
-                        preference: *bundle.preference(live_ranges).union(),
-                    }
-                );
-                Ok(true)
+                // Which half of the candidate list won decides both the event
+                // and the counter, exactly as the two separate passes did.
+                let preferred = match alloc {
+                    RegAllocation::Reg(reg) => bundle
+                        .preference(live_ranges)
+                        .union_contains(reg.with_repr32()),
+                    RegAllocation::RegGroup(_) => false,
+                };
+                if preferred {
+                    event!(events, BundleAssignedPreferred { bundle, alloc });
+                } else {
+                    event!(
+                        events,
+                        BundleAssignedNonPreferred {
+                            bundle,
+                            alloc,
+                            preference: *bundle.preference(live_ranges).union(),
+                        }
+                    );
+                }
+                Ok(Some(preferred))
             }
         }
     }
@@ -1802,31 +1789,6 @@ fn order_class_by_tier(
     }
 }
 
-/// Fill `candidates` with the registers of `ordered` that neither `pref`
-/// names nor `clobbered` rules out.
-///
-/// `ordered` is `order_class_by_tier`'s output, and dropping entries cannot
-/// reorder the rest, so the tier order survives.
-///
-/// The tier order is cached per region, so its first tier holds every
-/// register the region clobbers anywhere. A bundle live across one of those
-/// clobbers cannot hold that register, and asking costs an interference
-/// query per candidate, so drop them here instead.
-fn order_non_preferred_candidates(
-    ordered: &[Reg],
-    pref: &RegPreference,
-    clobbered: &RegSet,
-    candidates: &mut Vec<Reg>,
-) {
-    candidates.clear();
-    candidates.extend(
-        ordered
-            .iter()
-            .copied()
-            .filter(|&r| !pref.union_contains(r) && !clobbered.contains(r)),
-    );
-}
-
 /// Is `bundle` one that splitting cannot help, so that once it fails to get a
 /// register whole it should go to the stack whole?
 ///
@@ -2451,6 +2413,7 @@ impl EvictionCost {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::live_ranges::RegPreference;
     use crate::machine::RegGroup;
     use std::{vec, vec::Vec};
 
@@ -3377,7 +3340,7 @@ mod tests {
     /// A bundle with no usable hint tries clobbered registers first, and within
     /// each tier leaves registers some other bundle prefers for last.
     #[test]
-    fn non_preferred_candidates_avoid_other_bundles_hints() {
+    fn candidates_lead_with_this_bundles_hints_then_follow_the_tiers() {
         let reg = |i: usize| Reg::try_new(i).unwrap();
         let set = |indices: &[usize]| {
             let mut set = RegSet::new();
@@ -3401,24 +3364,54 @@ mod tests {
         // are wanted.
         assert_eq!(ordered, [1, 2, 0, 5, 3, 4].map(reg));
 
-        let mut candidates = Vec::new();
+        // The chain `assign_to_a_register` tries: the registers every use
+        // asked for, then the rest of the ones any use asked for, then the
+        // tier order without them and without the bundle's own clobbers.
+        let candidates = |pref: &RegPreference, clobbered: &RegSet| -> Vec<Reg> {
+            pref.intersection()
+                .iter()
+                .chain(
+                    pref.union()
+                        .iter()
+                        .filter(|&r| !pref.intersection_contains(r)),
+                )
+                .chain(
+                    ordered
+                        .iter()
+                        .copied()
+                        .filter(|&r| !pref.union_contains(r) && !clobbered.contains(r)),
+                )
+                .collect()
+        };
         let none = RegSet::new();
-        order_non_preferred_candidates(&ordered, &pref, &none, &mut candidates);
 
-        // r4 drops out: the bundle's own hint has already tried it.
-        assert_eq!(candidates, [1, 2, 0, 5, 3].map(reg));
+        // r4 first, because the bundle asked for it; then the tier order
+        // without it.
+        assert_eq!(candidates(&pref, &none), [4, 1, 2, 0, 5, 3].map(reg));
 
-        // Dropping entries cannot reorder the rest, whatever the bundle wants.
+        // Moving entries to the front cannot reorder the rest, whatever the
+        // bundle wants. One hint means every wanted register is in the
+        // intersection, so r1 and r3 lead in the order the preference holds
+        // them.
         let mut other = RegPreference::new();
         other.add_hint(set(&[1, 3]), HintStrength::Settled);
-        order_non_preferred_candidates(&ordered, &other, &none, &mut candidates);
-        assert_eq!(candidates, [2, 0, 5, 4].map(reg));
+        assert_eq!(candidates(&other, &none), [1, 3, 2, 0, 5, 4].map(reg));
 
-        // A register the bundle is live across a clobber of drops out too:
-        // it is in the first tier only because the region clobbers it
-        // somewhere, and this bundle could never hold it.
-        order_non_preferred_candidates(&ordered, &pref, &set(&[1, 5]), &mut candidates);
-        assert_eq!(candidates, [2, 0, 3].map(reg));
+        // Two hints that overlap in one register: that register is what every
+        // use asked for, so it leads, ahead of the ones only one use wanted.
+        // Taking the union alone would try r1 or r5 first and give the bundle
+        // a register half its uses have to move away from.
+        let mut split = RegPreference::new();
+        split.add_hint(set(&[1, 3]), HintStrength::Settled);
+        split.add_hint(set(&[3, 5]), HintStrength::Settled);
+        assert_eq!(split.intersection().iter().collect::<Vec<_>>(), [reg(3)]);
+        assert_eq!(candidates(&split, &none), [3, 1, 5, 2, 0, 4].map(reg));
+
+        // A register the bundle is live across a clobber of drops out of the
+        // tail: it is in the first tier only because the region clobbers it
+        // somewhere, and this bundle could never hold it. r4 still leads,
+        // because what the bundle asked for is tried whatever the tiers say.
+        assert_eq!(candidates(&pref, &set(&[1, 5])), [4, 2, 0, 3].map(reg));
     }
 
     /// Within a region a weight is a hinted-span count times one block weight,
