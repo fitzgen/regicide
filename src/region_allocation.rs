@@ -919,7 +919,8 @@ where
                 }
 
                 let candidates = &mut self.non_preferred_candidates;
-                order_non_preferred_candidates(&self.tier_order, pref, candidates);
+                let clobbered = self.bundle_clobbered[bundle].unwrap_or(RegSet::new());
+                order_non_preferred_candidates(&self.tier_order, pref, &clobbered, candidates);
                 let assigned = self.region_assignments.try_assign_to_reg(
                     bundle,
                     candidates.iter().copied(),
@@ -1791,17 +1792,29 @@ fn order_class_by_tier(
     }
 }
 
-/// Fill `candidates` with the registers of `ordered` that `pref` does not name.
+/// Fill `candidates` with the registers of `ordered` that neither `pref`
+/// names nor `clobbered` rules out.
 ///
 /// `ordered` is `order_class_by_tier`'s output, and dropping entries cannot
 /// reorder the rest, so the tier order survives.
+///
+/// The tier order is cached per region, so its first tier holds every
+/// register the region clobbers anywhere. A bundle live across one of those
+/// clobbers cannot hold that register, and asking costs an interference
+/// query per candidate, so drop them here instead.
 fn order_non_preferred_candidates(
     ordered: &[Reg],
     pref: &RegPreference,
+    clobbered: &RegSet,
     candidates: &mut Vec<Reg>,
 ) {
     candidates.clear();
-    candidates.extend(ordered.iter().copied().filter(|&r| !pref.union_contains(r)));
+    candidates.extend(
+        ordered
+            .iter()
+            .copied()
+            .filter(|&r| !pref.union_contains(r) && !clobbered.contains(r)),
+    );
 }
 
 /// Is `bundle` one that splitting cannot help, so that once it fails to get a
@@ -3379,7 +3392,8 @@ mod tests {
         assert_eq!(ordered, [1, 2, 0, 5, 3, 4].map(reg));
 
         let mut candidates = Vec::new();
-        order_non_preferred_candidates(&ordered, &pref, &mut candidates);
+        let none = RegSet::new();
+        order_non_preferred_candidates(&ordered, &pref, &none, &mut candidates);
 
         // r4 drops out: the bundle's own hint has already tried it.
         assert_eq!(candidates, [1, 2, 0, 5, 3].map(reg));
@@ -3387,8 +3401,14 @@ mod tests {
         // Dropping entries cannot reorder the rest, whatever the bundle wants.
         let mut other = RegPreference::new();
         other.add_hint(set(&[1, 3]), HintStrength::Settled);
-        order_non_preferred_candidates(&ordered, &other, &mut candidates);
+        order_non_preferred_candidates(&ordered, &other, &none, &mut candidates);
         assert_eq!(candidates, [2, 0, 5, 4].map(reg));
+
+        // A register the bundle is live across a clobber of drops out too:
+        // it is in the first tier only because the region clobbers it
+        // somewhere, and this bundle could never hold it.
+        order_non_preferred_candidates(&ordered, &pref, &set(&[1, 5]), &mut candidates);
+        assert_eq!(candidates, [2, 0, 3].map(reg));
     }
 
     /// Within a region a weight is a hinted-span count times one block weight,
