@@ -1328,8 +1328,19 @@ where
         let mut scalars = core::mem::take(&mut self.me.scalars);
 
         // A late definition overwrites an early one landing on it, not the
-        // other way around, so the phases cannot be run in operand order.
-        for early in [true, false] {
+        // other way around, so the phases cannot be run in operand order --
+        // but an early definition is rare (204 instructions in 142,410 on a
+        // sample), and without one the early pass finds nothing and only the
+        // late pass is worth walking.
+        let early_phases: &[bool] = if input_inst
+            .operands()
+            .any(|op| op.kind() == DefUse::Def && op.pos().is_early())
+        {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for &early in early_phases {
             for (i, op) in input_inst.operands().enumerate() {
                 if op.kind() != DefUse::Def || op.pos().is_early() != early {
                     continue;
