@@ -480,6 +480,14 @@ where
     /// block's parameter list.
     param_of: SecondaryMap<Val<E>, Option<(Block<E>, usize)>>,
 
+    /// Each block's first and last live points.
+    ///
+    /// `Block::start_point` and `end_point` each look the block up in the
+    /// function and convert an instruction index, and `emit_half_moves` asks
+    /// for both once per span -- many times per block, and from a loop over
+    /// values rather than over blocks, so no cursor helps.
+    block_points: SecondaryMap<Block<E>, Option<(LivePoint<E>, LivePoint<E>)>>,
+
     /// Scratch for the pass's walk over every value's spans.
     spans: Vec<LiveSpan<E>>,
 
@@ -573,6 +581,7 @@ where
             outgoing_positions: Vec::new(),
             outgoing_edges: SecondaryMap::new(EntityRange::empty()),
             param_of: SecondaryMap::new(None),
+            block_points: SecondaryMap::new(None),
             spans: Vec::new(),
             keyed_spans: Vec::new(),
             reservation_in_outs: Vec::new(),
@@ -601,6 +610,7 @@ where
             outgoing_positions,
             outgoing_edges,
             param_of,
+            block_points,
             spans,
             keyed_spans,
             reservation_in_outs,
@@ -625,6 +635,7 @@ where
         outgoing_positions.clear();
         outgoing_edges.reset();
         param_of.reset();
+        block_points.reset();
         spans.clear();
         keyed_spans.clear();
         reservation_in_outs.clear();
@@ -652,6 +663,7 @@ where
             outgoing_positions,
             outgoing_edges,
             param_of,
+            block_points,
             spans,
             keyed_spans,
             reservation_in_outs,
@@ -676,6 +688,7 @@ where
             && outgoing_positions.is_empty()
             && outgoing_edges.is_reset()
             && param_of.is_reset()
+            && block_points.is_reset()
             && spans.is_empty()
             && keyed_spans.is_empty()
             && reservation_in_outs.is_empty()
@@ -895,8 +908,11 @@ where
         self.enter_pass(MovePass::IndexFunction);
         let func = input.func;
 
+        self.block_points.reserve(func.len_blocks());
         for block in rpo.iter() {
             let input_block = func.block(block.with_repr32());
+
+            self.block_points[block] = Some((block.start_point(input), block.end_point(input)));
 
             for (index, param) in input_block.params().enumerate() {
                 let param = output.with_repr::<E, _>(param)?;
@@ -1107,6 +1123,8 @@ where
 
         for (i, span) in value_spans.iter().copied().enumerate() {
             let block = span.block(func, live_ranges);
+            let (block_start, block_end) = self.block_points[block]
+                .expect("`index_function` records every reachable block's points");
             let start = span.start(live_ranges);
             let end = span.end(live_ranges);
 
@@ -1126,7 +1144,9 @@ where
             //
             // We need to emit the destination half of the moves for each
             // incoming edge to this block.
-            if span_is_live_in_to_block(input, liveness, val, block, start) {
+            // This span is live-in to its block: it begins at the block's
+            // start point and its value is live there.
+            if start == block_start && block.is_live_in(liveness, val) {
                 // Check whether the value is a parameter of this block.
                 let param = self.param_of[val].filter(|&(b, _)| b == block);
 
@@ -1187,7 +1207,7 @@ where
             // TODO: Investigate creating the whole `BatchMove` right now,
             // rather than let `resolve` join the halves together later. That
             // might be faster.
-            if start != block.start_point(input) {
+            if start != block_start {
                 let incoming = incoming_allocation(
                     input,
                     live_ranges,
@@ -1242,7 +1262,10 @@ where
             //
             // We need to emit the source half of the move for each of this
             // block's outgoing edges.
-            if span_is_live_out_of_block(input, liveness, val, block, end) {
+            // And live-out: it reaches the block's end point and its value
+            // is live past it. `span_is_live_out_of_block` asks the same
+            // question where the block's points are not already to hand.
+            if end == block_end && block.is_live_out(liveness, val) {
                 // `index_function` worked these out once per edge; this loop
                 // runs once per live-out span, which is many times per block.
                 let outgoing = self.outgoing_edges[block];
@@ -3132,20 +3155,6 @@ where
     E: EntityRepr,
 {
     end == block.end_point(input) && block.is_live_out(liveness, val)
-}
-
-/// Is a span for `val` that begins at `start` live-in to the given `block`?
-fn span_is_live_in_to_block<E>(
-    input: &Input<'_, impl InputFunction>,
-    liveness: &Liveness<E>,
-    val: Val<E>,
-    block: Block<E>,
-    start: LivePoint<E>,
-) -> bool
-where
-    E: EntityRepr,
-{
-    start == block.start_point(input) && block.is_live_in(liveness, val)
 }
 
 /// Is `a` a better source than `b` for a value that is in both places at once?
