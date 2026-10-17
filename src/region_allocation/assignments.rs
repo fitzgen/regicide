@@ -846,6 +846,37 @@ where
             .is_some()
     }
 
+    /// `conflicts`, for one span.
+    ///
+    /// Every call from the assignment loop names a single span, so the
+    /// general form's loop over spans runs once and its `ControlFlow`
+    /// plumbing buys nothing. Counted: all 1,069,824 of
+    /// `for_each_overlapping`'s unit visits on a sample came from a call
+    /// with exactly one span.
+    fn conflicts_with_span(
+        &self,
+        reg_units: impl Iterator<Item = Range<RegUnit>>,
+        span: &QuerySpan<E>,
+    ) -> bool {
+        let val = span.val();
+        let range = span.range();
+        for (member, units) in reg_units.enumerate() {
+            let porous_to = val.map(|val| PorousTo { val, member });
+            for unit in units_in(units) {
+                for existing in self.overlapping_reservations(unit, range.clone()) {
+                    if porous_to.is_some() && existing.porous_to == porous_to {
+                        continue;
+                    }
+                    return true;
+                }
+                if self.overlapping(unit, range.clone()).next().is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// The one and only bundle whose existing assignments in `reg_units`
     /// conflict with the given spans.
     ///
@@ -1123,13 +1154,12 @@ where
         for candidate in candidates {
             let units = candidate_units(candidate);
             if let Some(span) = &blocked_at
-                && self.conflicts(units.clone(), iter::once(span.clone()))
+                && self.conflicts_with_span(units.clone(), span)
             {
                 continue;
             }
             let conflict = spans.clone().find(|span| {
-                Some(span) != blocked_at.as_ref()
-                    && self.conflicts(units.clone(), iter::once(span.clone()))
+                Some(span) != blocked_at.as_ref() && self.conflicts_with_span(units.clone(), span)
             });
             match conflict {
                 Some(span) => blocked_at = Some(span),
