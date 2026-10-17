@@ -80,14 +80,18 @@ impl Context {
     }
 }
 
+/// Which of a `Context`'s inner contexts holds the last allocation.
+///
+/// `run_dispatch` selects only `Context32`; the narrow variants remain
+/// because `Output` still knows how to read a context holding one, and
+/// because what they cost and bought is recorded where the dispatch happens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WhichContext {
     #[cfg(feature = "entity-repr-8")]
+    #[expect(dead_code, reason = "`run_dispatch` does not select a narrow repr")]
     Context8,
-    // `run_dispatch` no longer selects this one, for the reasons given there,
-    // but `Output` still knows how to read a context that holds it.
     #[cfg(feature = "entity-repr-16")]
-    #[expect(dead_code, reason = "`run_dispatch` does not select the `u16` tier")]
+    #[expect(dead_code, reason = "`run_dispatch` does not select a narrow repr")]
     Context16,
     Context32,
 }

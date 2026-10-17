@@ -122,29 +122,19 @@ pub fn run<'a>(context: &'a mut Context, input: &Input<impl InputFunction>) -> R
     Ok(Output::new(context))
 }
 
-/// Solve `input` under the narrowest entity representation it fits in.
+/// Solve `input` under `u32`.
 ///
-/// `u16` is deliberately not among the representations tried, though it still
-/// exists and `Output` still reads a context that holds one. A `LivePoint`
-/// packs into `EntityRepr::Wide`, which maxes out at `u32`, so
-/// `LivePoint<u16>` is the same four bytes as `LivePoint<u32>`, and `UseData`
-/// and `LiveBundleData` barely shrink either. The tier paid for narrowing
-/// conversions at every boundary and got almost no smaller working set back.
-/// `u8`, which really does halve a point, stays.
+/// The narrow representations still exist, and `Output` still reads a context
+/// holding one, but neither is tried. They were meant to buy locality, and
+/// they do not buy enough of it: a `LivePoint` packs into
+/// `EntityRepr::Wide`, which maxes out at `u32`, so `LivePoint<u16>` is the
+/// same four bytes as `LivePoint<u32>`. `u8` does halve a point, but a
+/// narrower entity also means a fallible conversion at every boundary with
+/// the `u32`-indexed input, and the attempt is abandoned outright when some
+/// entity derived during allocation -- a span, a use, a bundle -- outgrows
+/// the representation, which the up-front check cannot predict.
 fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Result<()> {
     assert!(context.is_reset());
-
-    #[cfg(feature = "entity-repr-8")]
-    if entity_repr_can_likely_fit::<u8>(input) {
-        context.which = Some(WhichContext::Context8);
-        match run_inner(&mut context.context8, input) {
-            Ok(()) => return Ok(()),
-            Err(()) => match context.context8.output.take_error() {
-                InternalError::EntityReprTooSmall => {}
-                InternalError::Error(e) => return Err(e),
-            },
-        }
-    }
 
     context.which = Some(WhichContext::Context32);
     match run_inner(&mut context.context32, input) {
@@ -154,6 +144,25 @@ fn run_dispatch(context: &mut Context, input: &Input<impl InputFunction>) -> Res
             InternalError::Error(e) => Err(e),
         },
     }
+}
+
+/// The largest instruction index `E` can describe.
+///
+/// Both the `Inst<E>` entity and the `LivePoint<E>` packing have to hold an
+/// index, and which of the two binds depends on `E`, so this takes the
+/// smaller. `run_dispatch` allocates under `u32` alone now, but the narrow
+/// representations are still usable, and `live_ranges`'s tests pin down that
+/// the one-past-the-end point every block exit needs stays representable in
+/// each of them.
+#[cfg(test)]
+fn max_representable_inst_index<E>() -> usize
+where
+    E: EntityRepr,
+{
+    core::cmp::min(
+        entity::Inst::<E>::MAX_REPRESENTABLE.index(),
+        live_ranges::LivePoint::<E>::MAX_INST_INDEX,
+    )
 }
 
 /// Drop the edits that redundant- and dead-move elimination proved unnecessary,
@@ -190,28 +199,6 @@ where
     context
         .move_generation
         .remove_and_insert_edits(&dead.to_remove, &hoisted.inserted);
-}
-
-/// Is `E` likely wide enough to describe this allocation problem?
-#[cfg(any(feature = "entity-repr-8", feature = "entity-repr-16"))]
-fn entity_repr_can_likely_fit<E>(input: &Input<impl InputFunction>) -> bool
-where
-    E: EntityRepr,
-{
-    input.func.len_values() <= Val::<E>::MAX_REPRESENTABLE.index() + 1
-        && input.func.len_insts() <= max_representable_inst_index::<E>()
-        && input.machine.num_registers() <= Reg::<E>::MAX_REPRESENTABLE.index() + 1
-}
-
-#[cfg(any(feature = "entity-repr-8", feature = "entity-repr-16"))]
-fn max_representable_inst_index<E>() -> usize
-where
-    E: EntityRepr,
-{
-    core::cmp::min(
-        entity::Inst::<E>::MAX_REPRESENTABLE.index(),
-        live_ranges::LivePoint::<E>::MAX_INST_INDEX,
-    )
 }
 
 fn run_inner<E>(context: &mut ContextInner<E>, input: &Input<impl InputFunction>) -> IResult<()>
