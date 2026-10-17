@@ -526,6 +526,7 @@ where
 }
 
 /// What `hinted_at` hands back for a span with no hints.
+#[cfg(test)]
 static EMPTY_REG_SET: RegSet = RegSet::new();
 
 /// The registers a span wants where it starts, and where it ends.
@@ -1453,6 +1454,7 @@ where
 
     /// The registers hinted at one end of this span.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn hinted_at(self, live_ranges: &LiveRanges<E>, pos: HintPos) -> &RegSet {
         match live_ranges.spans[self].hints {
             Some(hints) => live_ranges.hints[hints].at(pos),
@@ -1645,10 +1647,16 @@ where
             debug_assert!(live_ranges.span_bundle[span].is_none());
             live_ranges.span_bundle[span] = Some(bundle);
 
-            for end in [HintPos::Start, HintPos::End] {
-                let hinted = *span.hinted_at(live_ranges, end);
-                if !hinted.is_empty() {
-                    preference.add_hint(hinted, HintStrength::Settled);
+            // Few spans carry a hint, which is why hints live out of line;
+            // asking the span is cheaper than copying two empty 64-byte sets
+            // out of the arena to find they are empty.
+            if let Some(hints) = live_ranges.spans[span].hints {
+                let hints = live_ranges.hints[hints];
+                for end in [HintPos::Start, HintPos::End] {
+                    let hinted = *hints.at(end);
+                    if !hinted.is_empty() {
+                        preference.add_hint(hinted, HintStrength::Settled);
+                    }
                 }
             }
         }
