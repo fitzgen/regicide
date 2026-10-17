@@ -463,6 +463,19 @@ where
     /// A pure function of the edge, asked for once per span crossing it.
     edge_positions: Vec<PackedMovePosition<E>>,
 
+    /// Where each block's outgoing edges' moves go, in the order the block
+    /// lists its successors, with `outgoing_edges` giving each block's run.
+    ///
+    /// `edge_positions` answers the same question, but `edges` is sorted by
+    /// successor, so reaching an entry of it from a `(pred, index)` pair would
+    /// need a search. The live-out half of `emit_value_half_moves` walks a
+    /// block's successors once per live-out span, which is many times per
+    /// block.
+    outgoing_positions: Vec<PackedMovePosition<E>>,
+
+    /// Each block's run of `outgoing_positions`.
+    outgoing_edges: SecondaryMap<Block<E>, EntityRange<Edge<E>>>,
+
     /// For a block parameter, the block it belongs to and its index in that
     /// block's parameter list.
     param_of: SecondaryMap<Val<E>, Option<(Block<E>, usize)>>,
@@ -557,6 +570,8 @@ where
             edges: PrimaryMap::new(),
             incoming_edges: SecondaryMap::new(EntityRange::empty()),
             edge_positions: Vec::new(),
+            outgoing_positions: Vec::new(),
+            outgoing_edges: SecondaryMap::new(EntityRange::empty()),
             param_of: SecondaryMap::new(None),
             spans: Vec::new(),
             keyed_spans: Vec::new(),
@@ -583,6 +598,8 @@ where
             edges,
             incoming_edges,
             edge_positions,
+            outgoing_positions,
+            outgoing_edges,
             param_of,
             spans,
             keyed_spans,
@@ -605,6 +622,8 @@ where
         edges.reset();
         incoming_edges.reset();
         edge_positions.clear();
+        outgoing_positions.clear();
+        outgoing_edges.reset();
         param_of.reset();
         spans.clear();
         keyed_spans.clear();
@@ -630,6 +649,8 @@ where
             edges,
             incoming_edges,
             edge_positions,
+            outgoing_positions,
+            outgoing_edges,
             param_of,
             spans,
             keyed_spans,
@@ -652,6 +673,8 @@ where
             && edges.is_reset()
             && incoming_edges.is_reset()
             && edge_positions.is_empty()
+            && outgoing_positions.is_empty()
+            && outgoing_edges.is_reset()
             && param_of.is_reset()
             && spans.is_empty()
             && keyed_spans.is_empty()
@@ -882,18 +905,22 @@ where
 
             // Only reachable predecessors matter: an unreachable block has no
             // live ranges, and so nothing to move along its edges.
+            let outgoing_start = self.outgoing_positions.len();
             for (index, succ) in input_block.successors().enumerate() {
                 let index = u16::try_from(index).unwrap();
                 let succ = output.with_repr::<E, _>(succ)?;
-                self.edges.push(
-                    output,
-                    EdgeData {
-                        succ,
-                        pred: block,
-                        index,
-                    },
-                )?;
+                let edge = EdgeData {
+                    succ,
+                    pred: block,
+                    index,
+                };
+                self.edges.push(output, edge)?;
+                self.outgoing_positions.push(edge_position(input, edge)?);
             }
+            self.outgoing_edges[block] = EntityRange {
+                start: output.entity::<Edge<E>>(outgoing_start)?,
+                end: output.entity::<Edge<E>>(self.outgoing_positions.len())?,
+            };
         }
 
         self.edges.as_mut_slice().sort_unstable();
@@ -1216,18 +1243,11 @@ where
             // We need to emit the source half of the move for each of this
             // block's outgoing edges.
             if span_is_live_out_of_block(input, liveness, val, block, end) {
-                let input_block = func.block(block.with_repr32());
-                for (index, succ) in input_block.successors().enumerate() {
-                    let index = u16::try_from(index).unwrap();
-                    let succ = output.with_repr::<E, _>(succ)?;
-                    let pos = edge_position(
-                        input,
-                        EdgeData {
-                            succ,
-                            pred: block,
-                            index,
-                        },
-                    )?;
+                // `index_function` worked these out once per edge; this loop
+                // runs once per live-out span, which is many times per block.
+                let outgoing = self.outgoing_edges[block];
+                for i in outgoing.start.index()..outgoing.end.index() {
+                    let pos = self.outgoing_positions[i];
                     self.emit_source(counts, events, pos, val, alloc);
                 }
             }
