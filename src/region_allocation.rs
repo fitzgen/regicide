@@ -1065,6 +1065,11 @@ where
                 .units(machine)
         };
 
+        // A register this bundle is live across a clobber of cannot hold it
+        // whoever is evicted, and pricing a victim is the most expensive
+        // thing done per candidate here.
+        let clobbered = self.bundle_clobbered[bundle].unwrap_or(RegSet::new());
+
         let evicted = match rc.members(machine) {
             RegClassMembers::Regs(regs) => self
                 .region_assignments
@@ -1072,7 +1077,12 @@ where
                     bundle,
                     pref.union()
                         .iter()
-                        .chain(regs.iter().copied().filter(|r| !pref.union_contains(*r))),
+                        .filter(|r| !clobbered.contains(*r))
+                        .chain(
+                            regs.iter()
+                                .copied()
+                                .filter(|r| !pref.union_contains(*r) && !clobbered.contains(*r)),
+                        ),
                     |r| r.units(machine),
                     max_cost,
                     |victim, reg| {
