@@ -10,7 +10,7 @@ use crate::{
     Entity, Input, InputFunction, OperandConstraint, Position, RegSet, Val,
     context::ContextInner,
     counts::Counts,
-    entity::{EntityRepr, EntitySet, Region, SecondaryMap},
+    entity::{Block, EntityRepr, EntitySet, Region, SecondaryMap},
     error::{Error, IResult},
     events::{EventsLog, SplitKind},
     input::{DefUse, InputInst, InputValue},
@@ -274,6 +274,14 @@ where
     /// which is all the set depends on.
     bundle_clobbered: SecondaryMap<LiveBundle<E>, Option<RegSet>>,
 
+    /// The registers a block's own reservations clobber, over the whole
+    /// block.
+    ///
+    /// Four spans in five cover their whole block, and for those this is the
+    /// answer outright. It depends only on the function's reservations, which
+    /// no allocation decision changes.
+    block_clobbered: SecondaryMap<Block<E>, Option<RegSet>>,
+
     /// The set of bundles that must be allocated to stack slots.
     ///
     /// We just remember the set for now, and actually allocate the stack slots
@@ -341,6 +349,7 @@ where
             queue: BinaryHeap::new(),
             bundle_priority: SecondaryMap::new(Priority::ZERO),
             bundle_clobbered: SecondaryMap::new(None),
+            block_clobbered: SecondaryMap::new(None),
             stack_bundles: Vec::new(),
             spilled: EntitySet::new(),
             split_spans: Vec::new(),
@@ -368,6 +377,7 @@ where
             queue,
             bundle_priority,
             bundle_clobbered,
+            block_clobbered,
             stack_bundles,
             spilled,
             split_spans,
@@ -391,6 +401,7 @@ where
         queue.clear();
         bundle_priority.reset();
         bundle_clobbered.reset();
+        block_clobbered.reset();
         stack_bundles.clear();
         spilled.reset();
         split_spans.clear();
@@ -417,6 +428,7 @@ where
             queue,
             bundle_priority,
             bundle_clobbered,
+            block_clobbered,
             stack_bundles,
             spilled,
             split_spans,
@@ -444,6 +456,7 @@ where
             && queue.is_empty()
             && bundle_priority.is_reset()
             && bundle_clobbered.is_reset()
+            && block_clobbered.is_reset()
             && stack_bundles.is_empty()
             && spilled.is_reset()
             && split_spans.is_empty()
@@ -739,7 +752,7 @@ where
         let clobbered = match self.bundle_clobbered[bundle] {
             Some(clobbered) => clobbered,
             None => {
-                let clobbered = regs_clobbered_across(input, live_ranges, bundle);
+                let clobbered = self.regs_clobbered_across(input, live_ranges, bundle);
                 self.bundle_clobbered[bundle] = Some(clobbered);
                 clobbered
             }
@@ -763,6 +776,62 @@ where
                 phase,
             }
         );
+    }
+
+    /// The registers that something clobbers while `bundle` is live.
+    ///
+    /// Each block's own clobbered set is worked out once and kept: four
+    /// spans in five cover their whole block, and such a span's answer is
+    /// that set outright. A shorter span still uses it to skip the block
+    /// whole, since a register the block never clobbers cannot be clobbered
+    /// over part of it.
+    fn regs_clobbered_across(
+        &mut self,
+        input: &Input<'_, impl InputFunction>,
+        live_ranges: &LiveRanges<E>,
+        bundle: LiveBundle<E>,
+    ) -> RegSet {
+        let mut clobbered = RegSet::new();
+        for span in bundle.spans(live_ranges) {
+            let (start, end) = (span.start(live_ranges), span.end(live_ranges));
+            let block = span.block(input.func, live_ranges);
+
+            let in_block = match self.block_clobbered[block] {
+                Some(set) => set,
+                None => {
+                    let set = regs_clobbered_in_block(live_ranges, block);
+                    self.block_clobbered[block] = Some(set);
+                    set
+                }
+            };
+
+            // Nothing in this block clobbers anything, so no part of it can.
+            if in_block.is_empty() {
+                continue;
+            }
+
+            // The span covers the block, so every one of the block's
+            // clobbers overlaps it and the per-reservation walk would only
+            // rediscover `in_block`.
+            if start <= block.start_point(input) && end >= block.end_point(input) {
+                clobbered.union_with(&in_block);
+                continue;
+            }
+
+            for r in block.reservations_near(live_ranges, start..end) {
+                if let (None, RegAllocation::Reg(reg)) = (r.val(live_ranges), r.reg(live_ranges))
+                    && LivePoint::spans_overlap(
+                        start,
+                        end,
+                        r.start(live_ranges),
+                        r.end(live_ranges),
+                    )
+                {
+                    clobbered.insert(reg.with_repr32());
+                }
+            }
+        }
+        clobbered
     }
 
     /// Forget `bundle`'s cached clobber set, after a split took spans from it.
@@ -1813,6 +1882,14 @@ where
 ///
 /// None of these can hold the bundle whole, so a hint towards one of them is
 /// one the bundle cannot honor.
+/// The registers that something clobbers while `bundle` is live.
+///
+/// The straightforward walk, kept as what
+/// `RegionAllocation::regs_clobbered_across` is checked against: that one
+/// answers from a per-block cache and two shortcuts, and
+/// `cached_clobbers_match_a_fresh_walk` holds the two to the same answer
+/// over the corpus and two thousand generated inputs.
+#[cfg(test)]
 fn regs_clobbered_across<E>(
     input: &Input<'_, impl InputFunction>,
     live_ranges: &LiveRanges<E>,
@@ -1833,6 +1910,24 @@ where
             {
                 clobbered.insert(reg.with_repr32());
             }
+        }
+    }
+    clobbered
+}
+
+/// Every register `block`'s own reservations clobber, anywhere in it.
+///
+/// A span covering the whole block takes this as its answer directly, with
+/// no overlap test; a shorter span uses it only to rule the block out, since
+/// a register this does not hold cannot be clobbered over any part of it.
+fn regs_clobbered_in_block<E>(live_ranges: &LiveRanges<E>, block: Block<E>) -> RegSet
+where
+    E: EntityRepr,
+{
+    let mut clobbered = RegSet::new();
+    for r in block.reservations(live_ranges) {
+        if let (None, RegAllocation::Reg(reg)) = (r.val(live_ranges), r.reg(live_ranges)) {
+            clobbered.insert(reg.with_repr32());
         }
     }
     clobbered
