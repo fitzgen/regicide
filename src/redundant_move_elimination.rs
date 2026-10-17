@@ -235,11 +235,18 @@ where
             ScalarAllocation::Stack(_) => true,
         };
         if alone {
-            // Most locations hold nothing, and even an empty `drain` costs more
-            // than the check.
-            let range = self.range_of(loc);
-            if !range.is_empty() {
-                self.facts.drain(range);
+            // Most locations hold nothing, and even an empty `drain` costs
+            // more than the check. Finding where the run would start is also
+            // enough to find that there is no run, so the walk that measures
+            // its length only happens when there is one to measure.
+            let lo = self.facts.partition_point(|&(other, _)| other < loc);
+            if self.facts.get(lo).is_some_and(|&(other, _)| other == loc) {
+                let hi = lo
+                    + self.facts[lo..]
+                        .iter()
+                        .take_while(|&&(other, _)| other == loc)
+                        .count();
+                self.facts.drain(lo..hi);
             }
             return;
         }
