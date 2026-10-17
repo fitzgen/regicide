@@ -1083,23 +1083,36 @@ impl<E: EntityRepr> OutputInner<E> {
 
         for block in rpo.iter() {
             for u in block.uses(live_ranges) {
-                // A fixed operand's allocation was already filled in by
-                // `reserve_block_inst_allocs`.
-                if u.is_fixed(live_ranges, func, machine) {
-                    continue;
-                }
-
                 let inst = u.point(live_ranges).inst();
                 let operand = u.operand(live_ranges);
+                let range = self.inst_allocs[inst];
+                let index = range.start.index() + operand;
+                debug_assert!(index < range.end.index());
+
+                // A fixed operand's allocation was already filled in by
+                // `reserve_block_inst_allocs`, which is what left anything
+                // other than `UNALLOCATED` here. Reading that back is the
+                // same question as `Use::is_fixed`, which resolves the
+                // operand's constraint afresh to answer it.
+                let slot = &mut self.operand_allocs.as_mut_slice()[index];
+                if *slot != UNALLOCATED {
+                    debug_assert!(
+                        u.is_fixed(live_ranges, func, machine),
+                        "only a fixed operand is filled in before the scatter",
+                    );
+                    continue;
+                }
+                debug_assert!(
+                    !u.is_fixed(live_ranges, func, machine),
+                    "a fixed operand must have been filled in before the scatter",
+                );
+
                 let alloc = u
                     .span(live_ranges)
                     .allocation(live_ranges, spill_slots)
                     .expect("a use's span holds its value somewhere");
 
-                let range = self.inst_allocs[inst];
-                let index = range.start.index() + operand;
-                debug_assert!(index < range.end.index());
-                self.operand_allocs.as_mut_slice()[index] = alloc.with_repr32();
+                *slot = alloc.with_repr32();
             }
         }
 
