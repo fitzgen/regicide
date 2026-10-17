@@ -62,18 +62,38 @@ where
     }
 
     pub fn find(&mut self, entry: E) -> E {
-        let mut entry = entry;
-        while let Some(e) = self.map[entry]
-            && e != entry
+        // Path compression keeps most entries one step from their root, so
+        // the walk below usually takes no steps or one. Settling those here
+        // avoids touching `stack`, which is a heap allocation the common
+        // case has no use for.
+        let Some(parent) = self.map[entry] else {
+            return entry;
+        };
+        if parent == entry {
+            return entry;
+        }
+        let Some(grandparent) = self.map[parent] else {
+            return parent;
+        };
+        if grandparent == parent {
+            self.map[entry] = Some(parent);
+            return parent;
+        }
+
+        let mut root = grandparent;
+        while let Some(e) = self.map[root]
+            && e != root
         {
-            self.stack.push(entry);
-            entry = e;
+            self.stack.push(root);
+            root = e;
         }
-        debug_assert!(self.map[entry].is_none_or(|e| e == entry));
+        debug_assert!(self.map[root].is_none_or(|e| e == root));
         for e in self.stack.drain(..) {
-            self.map[e] = Some(entry);
+            self.map[e] = Some(root);
         }
-        entry
+        self.map[entry] = Some(root);
+        self.map[parent] = Some(root);
+        root
     }
 
     pub fn union(&mut self, a: E, b: E) -> E {
