@@ -3628,9 +3628,7 @@ fn another_tie_follows<'a>(input_inst: &impl InputInst<'a>, index: usize) -> boo
 /// Does some definition of this instruction tie itself to its `index`th
 /// operand?
 fn is_reuse_target<'a>(input_inst: &impl InputInst<'a>, index: usize) -> bool {
-    input_inst
-        .operands()
-        .any(|op| op.constraint() == OperandConstraint::Reuse(index))
+    input_inst.operands().any(|op| op.is_reuse_of(index))
 }
 
 #[cfg(test)]

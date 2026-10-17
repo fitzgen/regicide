@@ -500,6 +500,29 @@ where
         )
     }
 
+    /// Is this operand `Reuse(index)`?
+    ///
+    /// The same question as `self.constraint() == OperandConstraint::Reuse(i)`,
+    /// but asked of the packed bits. Decoding a constraint builds a `RegClass`
+    /// for the much more common `Reg` tag, through a checked entity
+    /// conversion, and whoever asks this is scanning every operand of an
+    /// instruction to find a tie.
+    #[inline]
+    pub(crate) fn is_reuse_of(self, index: usize) -> bool {
+        // An index too large to be a payload is one no operand can name, so no
+        // operand reuses it. Checking that first also keeps the shift below in
+        // range.
+        let Ok(index) = u64::try_from(index) else {
+            return false;
+        };
+        if index > PAYLOAD_MAX {
+            return false;
+        }
+        let tag = (self.bits >> TAG_SHIFT) & TAG_MAX;
+        let payload = (self.bits >> PAYLOAD_SHIFT) & PAYLOAD_MAX;
+        tag == TAG_REUSE && payload == index
+    }
+
     /// The value that is defined or used by this operand, if any.
     #[inline]
     pub fn val(self) -> Option<Val<E>> {
@@ -1589,6 +1612,30 @@ mod tests {
         operand_packing_round_trips::<u8>();
         operand_packing_round_trips::<u16>();
         operand_packing_round_trips::<u32>();
+    }
+
+    /// `is_reuse_of` reads the packed bits instead of decoding a constraint,
+    /// so it has to agree with the decoded answer everywhere, including on the
+    /// indices no operand can name.
+    #[test]
+    fn is_reuse_of_agrees_with_the_decoded_constraint() {
+        let indices = [
+            0,
+            1,
+            MAX_OPERANDS_PER_INST - 2,
+            MAX_OPERANDS_PER_INST - 1,
+            MAX_OPERANDS_PER_INST,
+            usize::MAX,
+        ];
+        for operand in every_operand::<u32>() {
+            for index in indices {
+                assert_eq!(
+                    operand.is_reuse_of(index),
+                    operand.constraint() == OperandConstraint::Reuse(index),
+                    "{operand:?} against {index}",
+                );
+            }
+        }
     }
 
     /// `Operand` derives `PartialEq` and `Hash` on its raw bits, which is a lie
