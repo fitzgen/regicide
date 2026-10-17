@@ -2389,9 +2389,17 @@ where
         unusable: &'a RegSet,
     ) -> impl Iterator<Item = LiveSpan<E>> + 'a {
         self.spans(live_ranges).filter(move |span| {
+            // Most spans carry no hint at all -- that is why hints live out
+            // of line -- and such a span wants nothing, whatever `unusable`
+            // holds. Asking the span settles it without reading either of
+            // the two 64-byte sets.
+            let Some(hints) = live_ranges.spans[*span].hints else {
+                return false;
+            };
+            let hints = &live_ranges.hints[hints];
             [HintPos::Start, HintPos::End]
                 .iter()
-                .any(|&end| !span.hinted_at(live_ranges, end).is_subset_of(unusable))
+                .any(|&end| !hints.at(end).is_subset_of(unusable))
         })
     }
 
