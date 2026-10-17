@@ -268,7 +268,7 @@ const STACK_ACCESS_SCALE: f32 = 0.5;
 ///
 /// For what it's worth: for their equivalent constants, LLVM uses `25` and
 /// regalloc3 uses `200`.
-const SPILL_WEIGHT_ADJUST: usize = 25;
+const SPILL_WEIGHT_ADJUST: usize = 100;
 
 /// Cost scale for a value that is always cheaper to rematerialize than to keep
 /// in a register: holding a register across its live range buys nothing at all.

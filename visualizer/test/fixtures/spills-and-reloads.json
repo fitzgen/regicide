@@ -735,7 +735,7 @@
         "spans": [
           0
         ],
-        "spillWeight": 0.037037037
+        "spillWeight": 0.009803922
       },
       {
         "allocation": {
@@ -751,7 +751,7 @@
         "spans": [
           1
         ],
-        "spillWeight": 0.03846154
+        "spillWeight": 0.00990099
       },
       {
         "allocation": null,
@@ -791,7 +791,7 @@
         "spans": [
           4
         ],
-        "spillWeight": 0.03846154
+        "spillWeight": 0.00990099
       },
       {
         "allocation": {
@@ -807,7 +807,7 @@
         "spans": [
           5
         ],
-        "spillWeight": 0.03846154
+        "spillWeight": 0.00990099
       }
     ],
     "insts": [

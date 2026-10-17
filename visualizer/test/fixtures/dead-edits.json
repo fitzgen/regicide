@@ -874,7 +874,7 @@
         "spans": [
           0
         ],
-        "spillWeight": 0.01923077
+        "spillWeight": 0.004950495
       },
       {
         "allocation": {
@@ -890,7 +890,7 @@
         "spans": [
           1
         ],
-        "spillWeight": 0.035714287
+        "spillWeight": 0.009708738
       },
       {
         "allocation": {
@@ -904,7 +904,7 @@
         "spans": [
           2
         ],
-        "spillWeight": 0.01923077
+        "spillWeight": 0.004950495
       },
       {
         "allocation": {
@@ -918,7 +918,7 @@
         "spans": [
           4
         ],
-        "spillWeight": 0.01923077
+        "spillWeight": 0.004950495
       },
       {
         "allocation": {
@@ -932,7 +932,7 @@
         "spans": [
           6
         ],
-        "spillWeight": 0.01923077
+        "spillWeight": 0.004950495
       },
       {
         "allocation": {
@@ -978,7 +978,7 @@
         "spans": [
           7
         ],
-        "spillWeight": 0.03846154
+        "spillWeight": 0.00990099
       }
     ],
     "insts": [
