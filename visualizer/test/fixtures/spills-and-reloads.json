@@ -537,6 +537,38 @@
     },
     {
       "dst": {
+        "reg": 1
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "slot": 0
+      },
+      "val": 0
+    },
+    {
+      "dst": {
+        "reg": 4
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "slot": 1
+      },
+      "val": 1
+    },
+    {
+      "dst": {
         "slot": 0
       },
       "kind": "MoveResolved",
@@ -564,38 +596,6 @@
       },
       "src": {
         "reg": 4
-      },
-      "val": 1
-    },
-    {
-      "dst": {
-        "reg": 1
-      },
-      "kind": "MoveResolved",
-      "pos": {
-        "point": {
-          "inst": 3,
-          "pos": "early"
-        }
-      },
-      "src": {
-        "slot": 0
-      },
-      "val": 0
-    },
-    {
-      "dst": {
-        "reg": 4
-      },
-      "kind": "MoveResolved",
-      "pos": {
-        "point": {
-          "inst": 3,
-          "pos": "early"
-        }
-      },
-      "src": {
-        "slot": 1
       },
       "val": 1
     },
@@ -1712,7 +1712,7 @@
             36,
             48,
             49,
-            51,
+            53,
             55,
             56
           ],
@@ -1727,7 +1727,7 @@
             42,
             45,
             50,
-            52,
+            54,
             57,
             58
           ],
@@ -1742,8 +1742,8 @@
             44,
             46,
             47,
-            53,
-            54,
+            51,
+            52,
             59,
             60,
             61

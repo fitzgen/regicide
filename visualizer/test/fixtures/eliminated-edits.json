@@ -415,76 +415,76 @@
     },
     {
       "dst": {
+        "reg": 0
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "slot": 0
+      },
+      "val": 0
+    },
+    {
+      "dst": {
+        "reg": 0
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "point": {
+          "inst": 4,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "slot": 0
+      },
+      "val": 0
+    },
+    {
+      "dst": {
+        "reg": 0
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "departure": {
+          "inst": 3,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "reg": 0
+      },
+      "val": 0
+    },
+    {
+      "dst": {
+        "reg": 0
+      },
+      "kind": "MoveResolved",
+      "pos": {
+        "departure": {
+          "inst": 4,
+          "pos": "early"
+        }
+      },
+      "src": {
+        "reg": 0
+      },
+      "val": 0
+    },
+    {
+      "dst": {
         "slot": 0
       },
       "kind": "MoveResolved",
       "pos": {
         "point": {
           "inst": 1,
-          "pos": "early"
-        }
-      },
-      "src": {
-        "reg": 0
-      },
-      "val": 0
-    },
-    {
-      "dst": {
-        "reg": 0
-      },
-      "kind": "MoveResolved",
-      "pos": {
-        "point": {
-          "inst": 3,
-          "pos": "early"
-        }
-      },
-      "src": {
-        "slot": 0
-      },
-      "val": 0
-    },
-    {
-      "dst": {
-        "reg": 0
-      },
-      "kind": "MoveResolved",
-      "pos": {
-        "departure": {
-          "inst": 3,
-          "pos": "early"
-        }
-      },
-      "src": {
-        "reg": 0
-      },
-      "val": 0
-    },
-    {
-      "dst": {
-        "reg": 0
-      },
-      "kind": "MoveResolved",
-      "pos": {
-        "point": {
-          "inst": 4,
-          "pos": "early"
-        }
-      },
-      "src": {
-        "slot": 0
-      },
-      "val": 0
-    },
-    {
-      "dst": {
-        "reg": 0
-      },
-      "kind": "MoveResolved",
-      "pos": {
-        "departure": {
-          "inst": 4,
           "pos": "early"
         }
       },
@@ -1649,7 +1649,7 @@
             26,
             29,
             38,
-            39,
+            43,
             44,
             45
           ],
@@ -1661,7 +1661,7 @@
             32,
             33,
             36,
-            40,
+            39,
             41,
             46,
             47,
@@ -1675,8 +1675,8 @@
             34,
             35,
             37,
+            40,
             42,
-            43,
             49,
             50,
             51,
@@ -1813,7 +1813,7 @@
             38,
             39,
             40,
-            42,
+            43,
             45,
             47,
             50,

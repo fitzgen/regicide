@@ -395,8 +395,8 @@
       },
       "kind": "MoveResolved",
       "pos": {
-        "departure": {
-          "inst": 2,
+        "point": {
+          "inst": 3,
           "pos": "early"
         }
       },
@@ -411,8 +411,8 @@
       },
       "kind": "MoveResolved",
       "pos": {
-        "point": {
-          "inst": 3,
+        "departure": {
+          "inst": 2,
           "pos": "early"
         }
       },
@@ -1562,7 +1562,7 @@
             25,
             28,
             33,
-            34,
+            35,
             38,
             39
           ],
@@ -1573,7 +1573,7 @@
             26,
             27,
             29,
-            35,
+            34,
             36,
             40,
             41

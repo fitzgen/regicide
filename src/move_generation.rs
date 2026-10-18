@@ -1946,9 +1946,22 @@ where
         // One destination can be asked for multiple times: two spans beginning
         // at one point can share an allocation, and a value can be both live
         // across an edge and passed as an argument on it. In either case, we
-        // only need to move a value into the destination once.
-        dests.sort_unstable();
-        dests.dedup();
+        // only need to put a value into a destination once.
+        //
+        // That used to be a sort and a `dedup` here, over every destination.
+        // It need not be, because both paths out of the loop below already
+        // collapse a repeat:
+        //
+        // * a move goes to `batch_moves`, which `sequentialize_batch` sorts
+        //   and dedups by `(src, dst)` once the groups are expanded -- and a
+        //   repeated destination resolves to the same source, since the
+        //   source is a function of the key, so it expands identically;
+        // * a rematerialization goes to `remats`, which `sequentialize`
+        //   dedups.
+        //
+        // Both lists are far shorter than this one: 1,252 remats and one
+        // position's worth of moves at a time, against 158,615 destinations
+        // on a sample.
 
         for (key, dst) in dests.drain(..) {
             let src = self.sources.get(&key).copied();
@@ -2057,7 +2070,17 @@ where
         // nothing themselves, but they might overwrite something that needed to
         // be read.
         let mut remats = core::mem::take(&mut self.remats);
-        remats.sort_unstable_by_key(|&(pos, _)| pos);
+        remats.sort_unstable();
+        // Two destinations asking for one value in one register at one point
+        // want a single recomputation, not two. `resolve` no longer dedups
+        // its destinations, so this is where such a repeat is collapsed.
+        //
+        // It removes nothing on the corpus -- 0 of 70,999 remats over 13,925
+        // inputs -- because the 61 duplicated destinations there all take the
+        // move path. Kept anyway, and not asserted away: nothing rules out a
+        // duplicated destination for a rematerializable value, and this list
+        // is 1,252 entries against the 158,615 `resolve` used to sort.
+        remats.dedup();
         let result = (|| -> IResult<()> {
             for &(pos, remat) in remats.iter() {
                 let edit =
@@ -4876,6 +4899,48 @@ mod tests {
                             return Err(format!(
                                 "the move of {val:?} at {pos:?} writes {dst:?}, which was never \
                              logged as a destination",
+                            ));
+                        }
+                    }
+
+                    Ok(())
+                },
+            )
+    }
+
+    /// One value is never recomputed into one register twice at one point.
+    ///
+    /// `resolve` does not deduplicate its destinations -- two spans can ask
+    /// for the same value in the same place -- so `sequentialize` dedups the
+    /// rematerializations instead.
+    ///
+    /// **This test cannot fail today**, and is honest about that: no input
+    /// in the corpus or from the generator produces a duplicated destination
+    /// that rematerializes (0 of 70,999 remats over 13,925 corpus inputs),
+    /// so removing that `dedup` passes the whole suite. It states the
+    /// invariant where a future input that does trip it will be caught,
+    /// rather than leaving the property unwritten.
+    #[cfg(feature = "visualizer")]
+    #[test]
+    fn a_value_is_rematerialized_once_per_place() -> CheckResult<TestInput> {
+        Check::new()
+            .min_iters(2_000)
+            .min_duration(std::time::Duration::from_secs(2))
+            .run_with(
+                m::default::<TestInput>(),
+                crate::test::corpus(),
+                |test_input: &TestInput| -> Result<(), String> {
+                    let Some(context) = generate(test_input)? else {
+                        return Ok(());
+                    };
+                    let ctx = &context.context32;
+
+                    let mut seen = BTreeSet::new();
+                    for (pos, remat) in ctx.move_generation.remats.iter().copied() {
+                        if !seen.insert((pos, remat.val, remat.dest)) {
+                            return Err(format!(
+                                "{:?} is rematerialized into {:?} at {pos:?} more than once",
+                                remat.val, remat.dest,
                             ));
                         }
                     }
