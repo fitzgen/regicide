@@ -22,8 +22,13 @@ where
 {
     #[inline]
     pub fn new(label: T) -> Self {
+        // `log::debug!` rather than `crate::trace!`: the latter compiles to
+        // nothing without `trace-log`, which would make a build carrying
+        // `timing` alone log nothing at all. Pass shares have to be
+        // measurable on a build shaped like production, which does not run
+        // the trace logging.
         if cfg!(feature = "timing") {
-            crate::trace!("Start timing: {label}");
+            ::log::debug!("Start timing: {label}");
         }
 
         Self {
@@ -46,7 +51,7 @@ where
         {
             let elapsed = self.start.elapsed();
             let millis = elapsed.as_secs_f64() * 1000.0;
-            crate::trace!("Finish timing: {}: {millis:.3}ms", self.label);
+            ::log::debug!("Finish timing: {}: {millis:.3}ms", self.label);
         }
     }
 }
