@@ -109,6 +109,112 @@ Deltas follow the analysis skill's convention: (regicide - ion) / ion, so
 > `reports/code-quality-012/unsuccessful/05-reuse-committed-registers.md`
 > (the measurement) in the `regicide-code-quality` worktree.
 
+## Latest session: `code-quality-013` (2026-10-16/19, base `e9175ed`)
+
+`reports/code-quality-013/report.md` in the `regicide-code-quality`
+worktree. Against **analysis 011** (`~/regalloc2/reports/codegen-analysis-011/`,
+which measured **`e9175ed`** — that session's exact base). Branch
+`code-quality-013`. Twenty attempts across three budgets (seventeen
+implemented, plus seventeen findings closed by probes); **four kept**.
+
+**Suite estimated cycles -0.06%**, moves -2.56%, reloads -1.47%, spill
+slots -2.35%, better 1,003 / worse 328 — and **compile time -2.70%
+instructions / -4.43% wall** (p=6.8e-08, quiet host), which is the
+session's larger result.
+
+| # | idea | verdict | result |
+| --- | --- | --- | --- |
+| 6 | **`SPILL_WEIGHT_ADJUST` 25 -> 100** | **kept** | corpus **-0.06%**, every module improves; countMatches **-4.41%**, `machine.add` **-10.67%**; compile **-1.25%** |
+| 15 | **skip registers a bundle's own clobbers rule out** (non-preferred scan) | **kept** | allocation **byte-identical on all 13,928 inputs**; compile **-0.68%** |
+| 16 | **the same filter for the eviction scan** | **kept** | byte-identical; compile **-0.84%** |
+| 1/7 | **prefer a free cut in a bundle with few spans** | **kept by the user's decision** | **xchacha20 -2.44%**, corpus +0.00%, wasmprinter guard +1.16% |
+| 2 | queue the heaviest bundle first (weight replaces `size`) | dropped | **+6.45%**; countMatches sheds 464 spills / 471 reloads and *still* costs +6.58% |
+| 3 | weight as a tie-break *below* the span count | dropped | screened -0.05% but puts edits in xchacha20's byte-identical kernel |
+| 17 | the clobber filter on the *preferred* scan | dropped | byte-identical, compile **+0.01%**: a preference holds a handful of registers, not a class |
+| 9, 10, 11, 12 | `STACK_ACCESS_SCALE`, both remat scales, `HINT_YIELDS_TO_HEAVIER_FACTOR`, the clobber-bound threshold | dropped | all flat or inert; **the cost-constant sweep is now complete** |
+
+What the code does now, and what to know before changing it:
+
+- **The cost-model constants are swept and only one paid.**
+  `normalize_spill_weight`'s `K` is **100** (LLVM uses 25, regalloc3 200);
+  the bundles competing for one register differ in length far more than in
+  use count, so at 25 a long bundle's weight was dominated by its length.
+  The win is confined to the 2,848 inputs that spill (-0.084%); the 11,080
+  that do not are -0.000%. `STACK_ACCESS_SCALE` is an **exact no-op** at
+  0.25 and 0.4 (a reuse-tied `Any` use is pinned at zero by the floor
+  assertion), both remat scales are flat in both directions, and
+  `MOVE_COST` is bounded by an assertion below and inverts a kept change
+  above. **Do not re-sweep these.**
+- **Pruning impossible candidates from a register scan is a real
+  compile-time lever, and the size is candidates-per-call, not the
+  fraction.** `order_class_by_tier`'s first tier holds every register the
+  *region* clobbers, so a bundle live across one of those clobbers is
+  offered them anyway — 46% of countMatches' unhinted attempts and 73% of
+  wasmprinter's have that tier entirely unusable, a median of 47
+  registers. Filtering it is **-0.68%**; the same filter on eviction, where
+  each candidate costs a victim pricing, is **-0.84%**. The same filter on
+  the *preferred* scan is **+0.01%**, because a preference holds about
+  three registers. All three leave the allocation byte-identical.
+- **`-0385` is not register-pressured, and the phrase has misled five
+  sessions.** **Zero** of its stack arrivals at joins are forced by having
+  more than 26 values live; its peak per-instruction operand count is 14 of
+  26. The file is *busy*, not *short*. countMatches is the one target with
+  genuine over-subscription (38% of its join stack-arrivals forced), which
+  is why it is the one that responded to attempt 6.
+- **Every static "too much spilling" signal on this corpus is one
+  population.** Six independent routes — analysis 011 fix #1's own
+  prescription, the relayed-hint branch, clobber-bound bundles, the split
+  ladder, `split_depth`'s unsplit spillers, and 011's own survey — all land
+  on `has_nothing_to_split_for`'s zero-weight carriers: **98-99% of spilled
+  bundles have no uses at all**. Before building anything aimed at reducing
+  spills here, split the target population by use weight.
+- **Changes that reorder the queue improve every loop depth except the
+  deepest, which pays more than all the others together.** Three
+  independent changes, three inputs, one shape (attempt 2 on `-0386`:
+  depths 0-5 improve, depth 6 is +198M). The register file mediates the
+  cost downhill, and no gate at the firing site sees it.
+- **A strong variance probe does not predict the sign.** Attempt 2's key
+  reordered **61-72%** of comparable pairs — close to the 79-80% that
+  preceded 012's -4.80% — and measured **+6.45%**. The near-zero direction
+  is still reliable; the strong direction says only that a key *can*
+  matter.
+- **`BundleSplitFailed` is one event per ladder rung, not a retry.** No
+  bundle ever fails twice at the same rung on either target; every
+  two-failure bundle has the sequence `(BetweenSpans, WithinSpan)`, one
+  walk down the ladder. Analysis 011 fix #1 reads the 5,292 > 3,023 ratio
+  as "the same bundles retried and failing"; it is arithmetic.
+- **Analysis 011's static table reverses moves and reloads.** It reports
+  moves at 71.9% of edit cost and reloads at 18.6%; re-measured with the
+  `STACK_COST = 5` scaling (and checked against the corpus's own
+  `est_cycles` column) it is **reloads 51.4%, moves 39.8%**. Its derived
+  claim "eliminating every reload in the suite is worth 1.28%" is really
+  **6.41%**.
+- **The free-cut family is closed at six attempts** (012's 6, 9, 13; 013's
+  1, 5, 7). Every changed decision is an *unbalancing* — there is no
+  tie-break-only variant, because two equidistant cuts never differ in
+  whether they sit at a hole — and use balance is identical in 229 of 243
+  changed decisions, so the span count is the only discriminator. The
+  kept version bounds it at `spans <= 4`.
+
+Open, ranked (measured at `e155fd2`):
+
+1. **The parent adopting a child loop's locations** — now sized and
+   written up as a scoping decision:
+   `reports/code-quality-013/proposals/parent-adopts-child-locations.md`.
+   **82% of edit cost on the two heaviest inputs is on a loop boundary**,
+   and **83% of loop-entry cost serves no register the loop body reads**.
+   Needs a new pass; see the proposal for the shape and the caveat.
+2. **Redundant-move elimination is 43% of compile time** on
+   `rust-wasmprinter-0028-u0-21` (89ms of 206ms, 2.6x the allocator), with
+   a fixpoint arena **10.4x** the facts it settles on. That is
+   `optimize-regicide-compile-time`'s, not this skill's; the numbers are in
+   `reports/code-quality-013/unsuccessful/18-redundant-move-elimination-cost.md`.
+3. **A prologue cost term** (the open item at the top). Still untouched.
+4. **Ask whether this corpus is worth more static work.** Analysis 011's
+   own fix #3, and this session is the fifth consecutive one to reach it:
+   98.6% of the static model is two modules, one robustly but slightly
+   faster than ion already and one unmeasurable on this host.
+
 ## Latest session: `code-quality-012` (2026-10-15, base `da7b1da`)
 
 `reports/code-quality-012/report.md` in the `regicide-code-quality` worktree.

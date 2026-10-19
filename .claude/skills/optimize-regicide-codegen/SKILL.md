@@ -682,6 +682,7 @@ over 10⁹ instructions).
 | fell | fails on compile time | see "Compile-time budget" |
 | fell | fails on checker or tests | **drop**. Not negotiable |
 | flat or rose | any | **drop**. Not worth the churn, even if a corpus total improved by accident; record what it did |
+| **byte-identical on the whole corpus**, compile time significantly down | pass | **keep**. A change that provably cannot alter an allocation is not churn; demonstrate the identity over all inputs (`diff_counts.py` reporting every input unchanged, and `compare.py` reporting identical counts), not just the screen set |
 
 An attempt whose screen already fails (targets flat or worse, or a
 screened corpus well past tolerance) may be dropped **at the screen**,
@@ -721,6 +722,20 @@ baseline) and each heavy input.
   read its insts verdict.)
 - **Over budget**: keep only if the estimated-cycles win is large and broad,
   and say so with both numbers in the write-up.
+- **Pruning candidates a scan can never use is in scope and can pay.**
+  code-quality-013's attempts 15 and 16 removed the registers a bundle's
+  own clobbers rule out from the non-preferred and eviction scans:
+  **-0.68%** and **-0.84%** instructions with the allocation byte-identical
+  on all 13,928 inputs. Size such a prune by **candidates removed per
+  call**, not by the fraction — the same filter on the *preferred* scan
+  removes 22-45% of a three-register preference and measures **+0.01%**.
+- **If you profile and land on `eliminate redundant moves`, hand it over.**
+  It is **43%** of compile time on `rust-wasmprinter-0028-u0-21` (89ms of
+  206ms, 2.6x region allocation), with a fixpoint arena **10.4x** the
+  facts it settles on. That is a dataflow pass, not an allocation
+  decision: it belongs to `optimize-regicide-compile-time`, which has the
+  profiling tooling. Numbers in code-quality-013's
+  `unsuccessful/18-redundant-move-elimination-cost.md`.
 - **A new heavy outlier** (a superlinear blowup on some input): drop or
   rework. One codegen win cost a function 35 s → 146 s of compile time
   before (known-findings).
@@ -792,9 +807,12 @@ same fixtures, so run them too:
 (cd visualizer && node --test test/*.test.js) 2>&1 | grep -E '^ℹ (pass|fail)|^✖'
 ```
 
-The glob is required: `node --test test/` fails with `MODULE_NOT_FOUND` and
-reports one failing "test" and zero passing, which reads exactly like a
-regression from the change under test.
+The glob is required: `node --test test/` resolves the directory as a module
+to *require* rather than searching it, so it fails with `MODULE_NOT_FOUND`
+and reports one failing "test" and zero passing, which reads exactly like a
+regression from the change under test. `visualizer/package.json`'s `test`
+script had that bug until `4967219`; `npm test` is now equivalent to the
+line above and exits 0.
 
 The clean baseline is **124 pass, 2 fail** ("an event summary names its
 entities as clickable parts" and "a block is prefixed by what the embedder
@@ -1029,6 +1047,27 @@ Then tell the user where the report is and summarize the cumulative result.
   moved by *exactly* the amounts the cheap rule moved them, and it cost
   +3.18% compile time to learn nothing. When the variance probe says
   near-constant, stop there.
+- **Take the variance probe where the value is *consumed*, not where it is
+  computed.** code-quality-013's attempt 11 probed
+  `HINT_YIELDS_TO_HEAVIER_FACTOR` by counting eviction comparisons with a
+  light-enough victim: 283 -> 448 at half the factor, which reads as a
+  strongly varying key. But `hints_yield_below` is `0.0` unless the
+  *placer* is clobber-bound, five lines above, so the rule's real reach is
+  **46 -> 83**. Measured: **+0.00%**. The gate on the branch above the
+  comparison is part of the population.
+- **Before believing a probe's total, check its single largest
+  contributor against a weighted edit count.** Two probes in
+  code-quality-013 inflated by counting *occurrences of a pattern* rather
+  than *work the pattern causes*: the one above, and one that found
+  60-81% of block parameters are never read and weighted them at 1.2M on
+  `-0385` — where the block it pointed at has **zero edits**, so the
+  number was not a cost at all. One `grep` for `edit:` in that block, or
+  one `edit_costs.py` run, ends either in a minute.
+- **A strong variance probe does not predict the sign.** It says a key
+  *can* matter, not which way. code-quality-013's attempt 2 reordered
+  **61-72%** of comparable pairs — close to the 79-80% that preceded
+  012's -4.80% — and measured **+6.45%**. The near-zero direction remains
+  reliable: it has predicted a no-op every time it has been run.
 - **The variance probe predicts the outcome in both directions.** It is ten
   lines in `allocate_region` printing the old key beside the candidate, and
   code-quality-012 ran it on two keys with opposite results: use weight x
