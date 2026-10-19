@@ -377,21 +377,46 @@ where
     })
 }
 
-/// The admissible cut nearest the middle of `spans`, preferring the lower of
-/// two equidistant cuts.
+/// How many spans a bundle may have before balance outweighs a free cut.
+///
+/// Unbalancing costs `O(spans)` splits instead of `O(log spans)`, so the
+/// bound is where that difference starts to bite: with a handful of spans
+/// both halves are nearly minimal already and there is next to nothing left
+/// to peel.
+const FREE_CUT_MAX_SPANS: usize = 4;
+
+/// The admissible cut nearest the middle of `spans`, preferring a free one
+/// in a short bundle, then the lower of two equidistant cuts.
 ///
 /// A balanced cut is what matters: the halves are requeued and split again,
 /// so a cut near one end peels one span at a time and takes `O(spans)` splits
 /// where halving takes `O(log spans)`. Where the bundle first ran into
 /// something does not predict a good cut and is not consulted.
+///
+/// A cut between two spans that touch leaves the value live across it, so the
+/// halves need a move between them whenever they land in different registers;
+/// between two that do not touch it is dead there and the cut is free. That is
+/// worth preferring only while balance is cheap to give up, which is what
+/// `FREE_CUT_MAX_SPANS` bounds.
 pub fn cut_near_middle<E>(spans: &[Range<LivePoint<E>>], uses: &[SplitUse<E>]) -> Option<usize>
 where
     E: EntityRepr,
 {
     let middle = spans.len() / 2;
+    let prefer_free = spans.len() <= FREE_CUT_MAX_SPANS;
+    let free = |cut: usize| spans[cut].start != spans[cut - 1].end;
+
     let mut best: Option<usize> = None;
     for cut in between_span_cuts(spans, uses) {
-        if best.is_none_or(|best| cut.abs_diff(middle) < best.abs_diff(middle)) {
+        let better = match best {
+            None => true,
+            Some(best) => match (prefer_free && free(cut), prefer_free && free(best)) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => cut.abs_diff(middle) < best.abs_diff(middle),
+            },
+        };
+        if better {
             best = Some(cut);
         }
     }
@@ -2474,6 +2499,31 @@ mod tests {
             cut_near_middle(&straddling, &use_at_mid),
             Some(1),
             "a tie goes to the lower cut",
+        );
+    }
+
+    /// A free cut beats a balanced one while the bundle is short, and loses
+    /// to it once the bundle is long enough for peeling to cost something.
+    #[test]
+    fn a_free_cut_wins_only_while_the_bundle_is_short() {
+        // Four spans, so the middle is 2, and every gap admits a cut. The
+        // first gap is a liveness hole and the rest touch.
+        let short = [span(0, 2), span(3, 5), span(5, 7), span(7, 9)];
+        assert_eq!(
+            cut_near_middle(&short, &[]),
+            Some(1),
+            "the free cut, though the middle is balanced",
+        );
+
+        // The same shape with enough spans that unbalancing would peel.
+        let long: Vec<_> = core::iter::once(span(0, 2))
+            .chain((0..FREE_CUT_MAX_SPANS as u8).map(|i| span(3 + 2 * i, 5 + 2 * i)))
+            .collect();
+        assert!(long.len() > FREE_CUT_MAX_SPANS);
+        assert_eq!(
+            cut_near_middle(&long, &[]),
+            Some(long.len() / 2),
+            "balance wins once the bundle is long",
         );
     }
 
