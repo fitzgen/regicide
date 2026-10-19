@@ -488,6 +488,24 @@ the probe measured what it claimed. The same session used it to *reject* a
 target: `resolve`'s per-destination hash lookup was only **+0.14%**, though
 the 8% around it had looked promising.
 
+**A marginal-cost probe needs a side-effect-free target.** `-008` tried
+to double `IntervalSet::try_union` and `check_disjoint` and got
+**crashes, not numbers**: the first consumes its sets and rewrites the
+arena, the second writes the `boundaries` scratch its caller then reads.
+The technique silently assumes the function's only output is its return
+value. Where it is not, use a ceiling probe that deletes the work, or
+`#[inline(never)]` plus a profiler. The failure mode is at least loud.
+
+**Divide a probe by its call count before believing it.** A probe says
+what the work costs, not what removing the *overhead around* it would
+save. `-008` probed the eviction path's conflict walk at **+2.38%**,
+specialized it exactly as the same change had won in `try_assign`, and
+measured **-0.01%**: that walk runs 239,355 times against
+`try_assign`'s 1,069,824, so an identical per-call saving is 4.5x less
+in total. Count the calls first. (The first explanation for that null
+result -- "eviction is rare but heavy" -- was backwards, and the
+counters said so. Count rather than reason.)
+
 **Sanity-check a probe against the structure it claims to bound.** A
 ceiling probe whose wrong output changes control flow measures something
 else entirely: making `block_call_arg` return the first argument read
@@ -614,6 +632,34 @@ Kinds of optimization, roughly in order of how often they pay off here:
   profile names `push_mut<Option<LiveSpan<u32>>>` and `capacity`, never a
   pass. These containers serve every pass, so a line there outweighs any
   single pass.
+  `-008` went one level further down and found the session's largest win
+  there. **Read what the entity *types* cost, not just the containers**:
+  `run_dispatch` tried `u8`, then `u16`, then `u32`, on the assumption
+  that a narrower entity means a smaller working set. It does not.
+  **`LivePoint<u16>` is the same four bytes as `LivePoint<u32>`**,
+  because `LivePoint` packs into `EntityRepr::Wide` and `Wide` maxes out
+  at `u32`; `UseData` and `LiveBundleData` barely shrink either. The
+  `u16` tier paid for fallible `with_repr32` conversions at 165 call
+  sites and got nothing back. Dropping it was **-5.42%**, and dropping
+  `u8` as well a further **-1.55%**.
+
+  **One `#[cfg(test)]` test printing `size_of` for every `(type, repr)`
+  pair answered in a single compile** what six sessions of profiling had
+  not, because the cost shows up as `try_from` (2.5% self) and
+  `from_bits` (1.9%) -- rows with no pass name on them. Print them all
+  at once; do not binary-search sizes one compile at a time.
+
+  **A tiered "try narrow, fall back" scheme also hides its cost in the
+  retries.** Counters put **17-20% of `u8` attempts** at
+  `EntityReprTooSmall` *after doing real work* -- **1.9-2.7% of all
+  allocation time** that neither the profile nor the timing log shows as
+  waste, because an abandoned attempt looks exactly like ordinary
+  allocation. Any "optimistic attempt, fall back on failure" structure
+  needs a counter on **wall time spent in abandoned runs**, not just a
+  count of failures. Note also that the up-front feasibility test
+  predicted the wrong thing: it bounds values, insts and registers,
+  while what overflows is a span, use or bundle *derived during*
+  allocation.
 - **Don't recompute.** Does a later pass rebuild something an earlier pass
   already had (liveness, RPO, block-to-region maps, use lists)? Could it be
   kept in the `Context` and reused?
@@ -663,10 +709,35 @@ Kinds of optimization, roughly in order of how often they pay off here:
   of spans are ever hinted -- took it from **144 bytes to 16** and was
   **-2.91% wall on `typical/`, -16.12% on heavy/00**, against only -0.60%
   insts.
+  **A padding probe prices growth, not a split.** It ranks maps well --
+  `-008` found `LiveSpanData` worth **35x per byte** what
+  `LiveBundleData` is (+24 B costs +0.22% insts and **+5.79% wall on
+  heavy/00**; +192 B of `LiveBundleData` costs +0.05%). It does **not**
+  say what moving a field out would buy, because a split adds an
+  indirection the padding never had. `-008` tried three and all lost:
+  `LiveBundleData::preference` (192 of 240 B) **+0.64%**,
+  `LiveSpanData::hints` (4 of 24 B, **0.1% of the map's reads**)
+  **+0.39%**, and `LiveSpanData::uses` abandoned (below). The second
+  should have worked by every heuristic. It did not, because 24 B to
+  20 B crosses no boundary once alignment is counted, where `-007`'s
+  span hints went **144 B to 16 B**.
 - **Split or group by access pattern.** Which fields of a `PrimaryMap<K, V>`
   are read together in the hot loop? Keep those together in `V` and move
   the cold ones into a `SecondaryMap<K, V2>`. Fields always read together
   belong in one `SecondaryMap<K, (A, B)>`, not two maps.
+
+  Before splitting, check three things `-008` learned the hard way:
+  **(a)** the remainder must cross a useful size boundary, not just
+  shrink; **(b)** count the *reads*, not the bytes -- a field read six
+  times per entry is the wrong thing to put behind a pointer
+  (`LiveBundleData::preference` is read 277,084 times against 47,856
+  writes); **(c)** check nothing **reorders the map in place**.
+  `live_ranges::construct` sorts each block's spans with
+  `sort_unstable_by_key` over `self.spans.as_mut_slice()`, which would
+  silently desynchronise any `SecondaryMap<LiveSpan, _>` -- the data
+  moves and the keys do not. That is what blocked moving
+  `LiveSpanData::uses` (8 of 24 bytes, 9.6% of reads) out, and it is
+  the one place where the per-byte payoff is highest.
 - **Allocation churn.** Reuse buffers kept in the `Context` (it is reset
   between functions, not rebuilt, so cleared vectors keep their capacity),
   avoid `collect()` into a temporary that is immediately iterated, and use
@@ -693,6 +764,19 @@ packing a sort key that is already stored inline in the sorted elements
 (twice: `-004`'s `resolve` keys at +0.4%, `-006`'s `dests` at +0.24%);
 and skipping a sort when the data is already sorted, where the lists are
 short (twice, both flat).
+
+`-008` closed four more, each with measurements rather than a guess, so
+**do not re-attempt these without new evidence**: memoizing
+`reuse_aware_constraint` (a dense flat-array memo is **+0.30%**, a
+`HashMap` one +6.4%, because the repeated calls are the *cheap* ones);
+moving a cold field out of `LiveBundleData` or `LiveSpanData` into a
+`SecondaryMap` (three tries, +0.64% / +0.39% / blocked); making
+`resolve`'s `dests` sort cheaper (four tries -- stable merge +0.33%,
+index sort +2.12%, per-value runs +0.81%, no dense key to bucket on --
+before the sort was deleted outright); and `SecondaryMap::grow_to`,
+where 82% of growths add one element but reserve-ahead is **+1.00%**
+and pre-sizing is noise, because the cost is writing 8.6M defaults.
+
 See `references/known-findings.md`.
 
 **Two of those are now three-time losers, and both have the same shape:**
@@ -710,6 +794,26 @@ instance already in the tree: `last_ending_by` walked up to four `next`
 links before descending, averaged **2.03 steps, and still fell through to
 the descent 24.2% of the time**, paying for both. Cutting the walk to a
 single step was -0.22% of `typical/` and -0.47% on heavy/00.
+
+**The family is now eight losses, and the rule that survives all of
+them is sharper than the list.** `-008` added three: an "is there any
+`Reuse` at all?" test before `is_reuse_target`'s scan (**flat**),
+settling the same per instruction and passing it down (**flat**), and
+an `is_empty()` test before `overlapping_reservations`' search
+(**+0.31%**) even though **44.7% of unit visits find that map empty**.
+
+*A pre-test pays only when the work it skips is long **and** the test
+is cheaper than the work's own early exit.* Rust's slice searches
+already exit immediately on an empty slice -- `partition_point` on
+nothing is a length load and a return -- so there is nothing left to
+skip, and the test only adds an unpredictable branch. In the first two
+cases the pre-test **was the same scan** the function would do anyway.
+
+What *does* work on such a function is making each visit cheaper rather
+than skipping visits: `-008` took **-1.49%** from `reuse_aware_constraint`
+by comparing packed operand bits instead of decoding an
+`OperandConstraint` (which built a `RegClass` per operand through a
+checked entity conversion).
 
 **Sweep such a bound rather than tuning it.** Sweeping that one over
 0,1,2,3,4,6,8,12,16 put 0 and 1 within 0.00% of each other and was
@@ -1118,6 +1222,40 @@ narrow the measurement to the input set where the change applies (for
 example the heavy input that exercises the changed code). Never keep a change
 on a run that was not significant.
 
+### Layout noise on a single heavy input
+
+**Before dropping a change that regresses one heavy input by under about
+half a percent, run the null test.** `-008` nearly lost a good change
+this way. Attempt 8 measured a significant **+0.34% on heavy/01**, which
+the table above says to drop. But the pass it touched is **3.1% of that
+input**, so +0.34% of the whole would need that pass to be 11% slower --
+and the `timing` log showed it *flat*, while **region allocate**, a pass
+the change does not touch, moved by ~5 ms.
+
+The null test settled it: the same code shape with the optimization
+disabled, computing exactly what the baseline computed, measured
+**-0.385%, +0.398%, +0.180%** on the three heavy inputs. **A change that
+computes the same thing moved them by +/-0.4% through layout alone.**
+
+`--insts` has ~0.02% CV on a single heavy input, so `compare.py` reports
+a 0.2-0.4% layout shift as "SIGNIFICANT (SLOWER)" at p=0.0002. It is
+statistically significant and causally meaningless. On `typical/` this
+does not arise, because 13,925 inputs average the layout lottery out; on
+*one* input there is nothing to average.
+
+So, for a sub-0.5% regression on a single heavy set:
+
+1. Check the `timing` log. If the regressing input barely runs the pass
+   you changed, suspect layout immediately.
+2. Run the null test. If it reproduces the regression, the measurement
+   is telling you nothing about your change.
+3. `#[inline(never)]` and moving the branch elsewhere do **not** help --
+   `-008` tried both; the sensitivity is inherent.
+
+This also means a sub-0.1% figure on one heavy input is **below the
+noise floor** and should not be reported as an effect in either
+direction.
+
 ## Git
 
 - Work on your own branch (see Setup). **Never push, pull, or fetch.**
@@ -1285,6 +1423,20 @@ Then tell the user where the report is and summarize the cumulative result.
   Note that **`timeout` is not installed on this host**: to bound a run,
   `cargo test --no-run` and execute the test binary in the background,
   polling its log.
+- **An empty heredoc body truncates the file.**
+  `cat >> report.md <<'EOF'` followed immediately by `EOF` writes
+  nothing and leaves the file **empty**. `-008` lost `report.md` that
+  way mid-session and rebuilt it from the per-attempt files, which were
+  intact. Append with a non-empty body, or edit with Python.
+- **A test that hangs forever rather than failing.** Already noted
+  below for `timeout`; `-008` adds that a *mutation* can do this too.
+- **Re-blessing a fixture can touch more files than the failure named.**
+  `-008`'s attempt 16 reordered the visualizer event log; the test
+  named one fixture, but `REGICIDE_BLESS_FIXTURE=1` rewrote **six**.
+  Check `git status` after blessing, and verify each: comparing the
+  JSON as a *multiset* of events proved all six were pure reorderings
+  with nothing added or removed, which is what made the change safe to
+  keep.
 - **Parsing `--insts` with a bare `grep`.** `run` prints `insts-retired`
   once per input *and* again under `=== totals`, so a single-input set
   gets double-counted. Use

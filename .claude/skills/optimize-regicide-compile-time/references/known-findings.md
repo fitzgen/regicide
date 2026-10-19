@@ -740,3 +740,275 @@ across every pass rather than concentrated in one.
 The baseline `cargo test --all-features` at `da7b1da`: **433 + 8 passed, 10
 ignored**, exit 0, ~100 s. At `157ff2d`: **433 + 8** (two tests extended,
 none added).
+
+## Session `compile-speedups-008` (2026-10-16/19, base `e9175ed`, tip `9b4cf92`)
+
+Corpora `codegen-analysis-011` -- **byte-identical to `010`'s and
+`009`'s** (331 sampled files `cmp`-equal; only `README.md` differs), so
+sessions 006-008 all ran the same inputs. 13,925 distinct inputs under
+1e10 insts, three heavy inputs of about a second. Report:
+`reports/compilation-speedup-008/`.
+
+**Sixteen attempts, fifteen kept**; 15 screens and 52 probes besides.
+Cumulative, n=12/10, 99% CI, **significant on both metrics for all four
+sets**, no regression anywhere:
+
+| set | insts | wall |
+| --- | ---: | ---: |
+| `typical/` (13,925) | **-15.58%** | **-7.53%** |
+| heavy/00 `starlingmonkey-markdown-15922` | **-10.14%** | **-6.65%** |
+| heavy/01 `starlingmonkey-markdown-14982` | -5.69% | -6.40% |
+| heavy/02 `hashset-0004` | **-9.75%** | **-9.43%** |
+
+Allocation output byte-identical everywhere except six inputs from
+attempt 1 (a register swap with **bit-identical estimated cycles**).
+
+### The headline: the narrow entity representations were costing, not saving
+
+**`LivePoint<u16>` is the same four bytes as `LivePoint<u32>`.** A
+`LivePoint` packs into `EntityRepr::Wide`, and `Wide` maxes out at
+`u32`, so the `u16` tier paid for fallible `with_repr32` conversions at
+165 call sites and got **no smaller working set** for the two types that
+dominate it. Sizes:
+
+| type | `u8` | `u16` | `u32` |
+| --- | ---: | ---: | ---: |
+| `LivePoint` | 2 | **4** | **4** |
+| `UseData` | 6 | **8** | **8** |
+| `LiveSpanData` | 8 | 16 | 24 |
+| `LiveBundleData` | 224 | **224** | 240 |
+
+Dropping the `u16` tier was **-5.42%**; dropping `u8` as well a further
+**-1.55%**. `run_dispatch` now goes straight to `u32`.
+
+**The tiered fallback also hid its cost.** Counters put **17-20% of `u8`
+attempts** at `EntityReprTooSmall` *after doing real work*, costing
+**1.9-2.7% of all allocation time**. Neither the profile nor the timing
+log shows that as waste -- an abandoned attempt looks like ordinary
+allocation. And the up-front check predicted the wrong thing:
+`entity_repr_can_likely_fit` bounds values, insts and registers, while
+what overflows is a span, use or bundle *derived during allocation*.
+
+One `size_of` test answered in minutes what six sessions of profiling
+had not, because the cost shows as `try_from` (2.5% self) and
+`from_bits` (1.9%) -- rows with no pass name on them.
+
+### What worked, largest first (typical insts)
+
+| change | typical | where |
+| --- | ---: | --- |
+| **Do not try the `u16` entity representation** | **-5.42%** | `lib.rs` (`run_dispatch`) |
+| **Work out each block's clobbered registers once, not per span** | **-1.86%** (heavy/02 **-7.41%**) | `region_allocation.rs` |
+| Allocate under `u32` alone (drop the `u8` tier too) | -1.55% | `lib.rs` |
+| Compare packed operand bits instead of decoding a constraint | -1.49% | `input.rs`, `live_ranges.rs` |
+| **Ask whether a span has hints before reading two 64-byte sets** | -1.05% | `live_ranges.rs` |
+| Same, in `LiveBundle::new`'s preference building | -0.85% | `live_ranges.rs` |
+| Index each block's outgoing edge positions | -0.84% | `move_generation.rs` |
+| Read back which operands reservation collection already filled | -0.76% | `output.rs` |
+| Settle a short union-find path without the scratch stack | -0.73% | `union_find.rs` |
+| Index each block's first and last live points | -0.53% | `move_generation.rs` |
+| **Stop sorting 158,615 destinations to remove 61 duplicates** | -0.51% | `move_generation.rs` |
+| Measure a clobbered run's length only when there is one | -0.43% | `redundant_move_elimination.rs` |
+| Fuse the preferred and non-preferred assignment passes | -0.31% | `region_allocation.rs` |
+| Skip RME's early-definition pass when there is none (0.14% have one) | -0.24% | `redundant_move_elimination.rs` |
+| Specialize the conflict query to its single span | -0.17% | `assignments.rs` |
+
+### Layout noise is +/-0.4% on a single heavy input
+
+**The most important methodological finding of the session.** Attempt 8
+showed a significant **+0.34% regression on heavy/01**, which the
+decision rule says to drop. But RME is only 3.1% of that input, and the
+timing log showed RME *flat* while **region allocate** -- a pass the
+change does not touch -- moved by ~5 ms.
+
+A **null test** settled it: the same code shape with the optimization
+disabled, computing exactly what the baseline computed, measured
+**-0.385%, +0.398%, +0.180%** on the three heavy inputs. A change that
+computes *the same thing* moves them by +/-0.4% through code layout
+alone.
+
+`--insts` has ~0.02% CV on one heavy input, so `compare.py` calls a
+0.2-0.4% layout shift "SIGNIFICANT" at p=0.0002. On `typical/` this does
+not arise -- 13,925 inputs average the lottery out; on a *single* input
+there is nothing to average.
+
+**Rule: when a change regresses one heavy input but not `typical/`, and
+the regression is under about half a percent, run the null test before
+dropping it.** Cross-check the timing log: if the regressing input
+barely runs the pass you touched, suspect layout at once. This
+retroactively means attempt 6's +0.014% was never meaningful either.
+
+### A padding probe prices growth, not a split
+
+Padding **ranks maps** well. On this tree, per byte:
+
+| map | probe | per byte |
+| --- | --- | ---: |
+| `LiveSpanData` | +24 B = **+0.22% insts, +5.79% wall on heavy/00** | 0.0092%/B |
+| `LiveBundleData` | +192 B = +0.05% insts | 0.0003%/B |
+
+`LiveSpanData` is **35x** more valuable per byte. But padding does
+**not** price a *split*, because a split adds an indirection the padding
+never had. Three out-of-lining attempts, all rejected:
+
+| field moved out | bytes | share of reads | result |
+| --- | ---: | ---: | --- |
+| `LiveBundleData::preference` (3 `RegSet`s) | 192 of 240 | — | **+0.64%** |
+| `LiveSpanData::uses` | 8 of 24 | 9.6% | abandoned: `construct` sorts spans in place, desynchronising any side map |
+| `LiveSpanData::hints` | 4 of 24 | **0.1%** | **+0.39%** |
+
+The third should have worked by every heuristic -- coldest possible
+field, already an `Option` slot, in the valuable map. It did not,
+because 24 B to 20 B crosses no useful boundary once alignment is
+counted. `-007`'s span hints won by going **144 B to 16 B**.
+
+**Before splitting a field out, check the remainder crosses a boundary,
+and count the reads: `LiveBundleData::preference` is read 277,084 times
+against 47,856 writes.** A field read six times per entry is the wrong
+thing to put behind a pointer.
+
+### A marginal-cost probe needs a side-effect-free target
+
+Doubling `IntervalSet::try_union` and `check_disjoint` both **crashed**
+rather than returning numbers -- each writes arena scratch the caller
+then reads. The technique assumes purity. Where a function writes shared
+state, use a ceiling probe that deletes the work, or `#[inline(never)]`
+plus a profiler.
+
+Related: **a probe says what the work costs, not what removing the
+overhead around it would save.** Specializing the eviction path's
+conflict walk, probed at +2.38%, measured **-0.01%**: that walk runs
+239,355 times against `try_assign`'s 1,069,824, so the same per-call
+saving is 4.5x less in total. Divide the probe by the call count before
+believing it. (My first explanation for that null result was backwards,
+and the counters said so -- count rather than reason.)
+
+### "Cheap pre-test in front of a short search" -- now eight losses
+
+Two more this session, both on `reuse_aware_constraint`: an "is there
+any `Reuse` at all?" test before `is_reuse_target`'s scan (**flat**),
+and settling that per instruction and passing it down (**flat**). In
+both cases the pre-test *is the same scan*. An eighth: an `is_empty()`
+test before `overlapping_reservations`' search, though **44.7% of unit
+visits find that map empty** -- `partition_point` on an empty slice is
+already a length load and an exit.
+
+**The rule that survives all eight: a pre-test pays only when the work
+it skips is long *and* the test is cheaper than the work's own early
+exit.** Rust's slice searches already exit immediately on empty.
+
+What *did* work on the same function was making each visit cheaper:
+comparing packed operand bits instead of decoding a constraint (which
+built a `RegClass` per operand through a checked conversion), **-1.49%**.
+
+### `reuse_aware_constraint`: memoization refuted
+
+`-007`'s top open candidate, carried for two sessions. The probe is
+real -- **+2.90%** at this tip, and **80.5% of 586,194 calls repeat an
+`(inst, operand)` pair**. Two ceiling probes kill it anyway:
+
+| memo | result |
+| --- | ---: |
+| `HashMap<(usize, usize), OperandConstraint>` | **+6.41%** |
+| dense `Vec<Option<OperandConstraint>>` | **+0.30%** |
+
+Both skip the whole computation on a hit, so a real implementation can
+only be slower. **The repeated calls are the cheap ones**: 97.3% find no
+tie and exit after a scan attempt 3 already made cheap, while the
+probe's total is made of the expensive 2.7%. Dividing the probe by the
+call count gives "106 instructions per call", which makes a 5-instruction
+lookup look free; that reasoning is wrong twice over. See
+`reports/compilation-speedup-008/misc/reuse-memo-refuted.md`.
+
+### Move generation and ion: the sort was the wrong target
+
+`resolve` sorted and deduplicated **every destination** to remove
+**61 of 158,615 (0.04%)**. Ion never deduplicates because its per-vreg
+loop visits each `(vreg, edge)` once; regicide emits destinations from
+several reasons and two can want one move.
+
+Attempt 16 removed both. The move path's duplicates are caught by
+`sequentialize_batch`'s existing `dedup_by_key` -- **exactly as many,
+on every set** -- and the remat path got the `dedup` it never had, on a
+**1,252-entry** list instead of a 158,615-entry one. **-0.51%**, output
+byte-identical, six visualizer fixtures re-blessed (each verified to
+hold an identical *multiset* of events, reordered only).
+
+Three earlier attempts to make that sort cheaper all lost: a stable
+merge to exploit its 28,599 ascending runs (+0.33%), sorting 8-byte
+indices instead of 32-byte pairs (**+2.12%** for the index sort alone),
+and per-value runs (+0.81%). **It was never the right thing to speed
+up.**
+
+Two detailed write-ups in `reports/compilation-speedup-008/analysis/`:
+
+- `per-vreg-scoping.md` -- **the prize has collapsed.** `resolve` is now
+  **1.27%** of allocation, against the 3.2% the restructure was sized
+  against, because attempt 16 took the sort. The blocker is exactly one
+  pass, `EmitReservationHalfMoves`, which iterates by block and touches
+  `sources` 13,261 times (6.4% of writes). `emit_spills` is **not** a
+  blocker in release -- its only read is inside a `debug_assert!` -- and
+  spill placement is already value-ordered. **The four-pass refactor is
+  no longer worth starting.**
+- `duplicate-destinations.md` -- duplicates are **3,789 of 9,382,938**
+  on `typical/`, **none** has ever taken the remat path, and the new
+  `remats.dedup()` removes **0 of 112,950**. Its property test cannot
+  fail today and says so, following `-006`'s `dedup_by_key` precedent.
+
+### Verification notes
+
+- **`cargo test --all-features --no-run` earned its place again**: it
+  caught a `#[cfg(test)]`-only use of a helper that `cargo build` was
+  happy to see deleted.
+- **A mutation that does not apply looks like a coverage gap.**
+  `cargo fmt` reflowed a line onto one, so the match string no longer
+  existed and the suite ran unmutated. `grep -c MUTANT` before believing
+  a pass.
+- **Two kept attempts have thin coverage, and the write-ups say so.**
+  Attempt 14 (span hints) is caught by exactly one test, and that by way
+  of recorded event fixtures; its real check is an equivalence *proof*
+  (an unhinted span's sets are empty, and the empty set is a subset of
+  everything) plus the byte-identical gate. Attempt 16's `remats.dedup()`
+  cannot be made to fail at all.
+- **A hanging `cat >> file <<'EOF'` with an empty body truncates it.** I
+  lost `report.md` that way and rebuilt it from the per-attempt files.
+
+### Where the time goes at `9b4cf92` (`typical/` proxy, timing log)
+
+region allocate 23.9%, generate moves 16.8%, coalesce 16.8%, live ranges
+12.7%, RME 12.2%, DME 4.9%, liveness 3.3%, everything else 9.4%.
+
+**Almost unchanged in share from `-007` after a 15.6% cut**, which is the
+clearest statement of the session's shape: the wins were spread across
+every pass and under them, in the entity machinery and shared
+containers, rather than concentrated anywhere.
+
+Scaling: pooled log-log slope of insts against bytes is **1.67** (1.72 at
+`-006`), per family 1.41 to 3.10. Still superlinear.
+
+**Status:** open, but thin. Ranked candidates:
+
+1. `check_disjoint`'s ~1.5% (`-006`'s measurement; this session could
+   not re-probe it, since doubling it crashes -- see above). 62% of its
+   expensive walks are genuine multi-interval merges, so it needs a
+   better merge, not a fast path.
+2. `-005`'s bounded-skip cursors in `try_assign`, untried across four
+   sessions. Note three cursor designs have already lost here.
+3. `LiveSpanData` is the map where a removed byte is worth the most
+   (0.0092%/byte). Anything that removes one **without adding an
+   indirection** is worth more than it looks; `construct`'s in-place
+   sort is the obstacle to touching `uses`.
+4. Route (2) of `analysis/per-vreg-scoping.md`: move fixed-definition
+   sources before `emit_half_moves`, so the reservation pass stops
+   writing to `sources`. Changes which source wins a merge, so it needs
+   the codegen-quality gate.
+
+**Closed this session, do not re-attempt without new evidence:**
+memoizing `reuse_aware_constraint`; splitting cold fields out of
+`LiveBundleData` or `LiveSpanData`; `resolve`'s `dests` sort (removed);
+`SecondaryMap::grow_to` (the cost is writing 8.6M defaults, and
+reserve-ahead is +1.00%); the per-vreg scoping refactor.
+
+The baseline `cargo test --all-features` at `e9175ed`: **439 + 8 passed,
+10 ignored**, exit 0, ~100 s. At `9b4cf92`: **441 + 8** (two tests added,
+two extended).
