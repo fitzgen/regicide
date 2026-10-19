@@ -2512,26 +2512,23 @@ mod tests {
     use crate::machine::RegGroup;
     use std::{vec, vec::Vec};
 
-    #[cfg(feature = "visualizer")]
-    use crate::{context::Context, events::Event, input::InputValue, test::TestInput};
-    #[cfg(feature = "visualizer")]
+    use crate::{context::Context, test::TestInput};
     use mutatis::{
         check::{Check, CheckResult},
         mutators as m,
     };
+    use std::{format, string::String};
+
     #[cfg(feature = "visualizer")]
-    use std::{
-        collections::{BTreeMap, BTreeSet},
-        format,
-        string::String,
-    };
+    use crate::{events::Event, input::InputValue};
+    #[cfg(feature = "visualizer")]
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// Run every phase up through region allocation.
     ///
     /// Returns `None` when allocation gave up on this input, e.g. because the
     /// function needs more registers at once than the machine has; there is no
     /// complete event log to check in that case.
-    #[cfg(feature = "visualizer")]
     fn allocate(test_input: &TestInput) -> Result<Option<Context>, String> {
         let mut context = Context::new();
         assert!(context.is_reset());
