@@ -372,17 +372,6 @@
     {
       "kind": "ParallelMoveBatchSolved",
       "num_input_moves": 1,
-      "num_solved_moves": 0,
-      "pos": {
-        "departure": {
-          "inst": 5,
-          "pos": "early"
-        }
-      }
-    },
-    {
-      "kind": "ParallelMoveBatchSolved",
-      "num_input_moves": 1,
       "num_solved_moves": 1,
       "pos": {
         "criticalEdge": {
@@ -1409,12 +1398,12 @@
     {
       "buckets": [
         {
-          "count": 3,
+          "count": 2,
           "hi": 1,
           "lo": 1
         }
       ],
-      "count": 3,
+      "count": 2,
       "id": "parallel-moves-per-solve",
       "max": 1,
       "mean": 1.0,
@@ -1439,9 +1428,9 @@
             23,
             26,
             29,
+            33,
             34,
-            35,
-            36
+            35
           ],
           [
             1,
@@ -1449,7 +1438,7 @@
           ],
           [
             3,
-            36
+            35
           ]
         ]
       },
@@ -1477,8 +1466,7 @@
           [
             25,
             27,
-            30,
-            33
+            30
           ],
           [
             2,
@@ -1548,8 +1536,8 @@
             29,
             30,
             32,
-            35,
-            36
+            34,
+            35
           ]
         ]
       },
@@ -1597,8 +1585,8 @@
             28,
             29,
             32,
-            35,
-            36
+            34,
+            35
           ]
         ]
       },
@@ -1665,7 +1653,7 @@
         6
       ],
       "CriticalEdgeEdit": [
-        36
+        35
       ],
       "HalfMoveDest": [
         24,
@@ -1679,7 +1667,7 @@
       ],
       "MoveEmitted": [
         32,
-        35
+        34
       ],
       "MoveResolved": [
         28,
@@ -1688,8 +1676,7 @@
       ],
       "ParallelMoveBatchSolved": [
         31,
-        33,
-        34
+        33
       ],
       "SpanConstructed": [
         0,

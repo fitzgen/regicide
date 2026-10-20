@@ -1986,6 +1986,15 @@ where
             };
 
             event!(events, MoveResolved { pos, val, src, dst });
+
+            // The solver drops a move whose source and destination overlap, and
+            // group expansion pairs the two sides index-wise, so an equal pair
+            // expands to equal scalar pairs and every one of them is discarded.
+            // Most of this loop's moves are such a pair.
+            if src == dst {
+                continue;
+            }
+
             self.batch_moves.push((pos, BatchMove { src, dst, val }));
         }
 

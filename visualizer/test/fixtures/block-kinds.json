@@ -505,50 +505,6 @@
     {
       "kind": "ParallelMoveBatchSolved",
       "num_input_moves": 1,
-      "num_solved_moves": 0,
-      "pos": {
-        "point": {
-          "inst": 2,
-          "pos": "early"
-        }
-      }
-    },
-    {
-      "kind": "ParallelMoveBatchSolved",
-      "num_input_moves": 1,
-      "num_solved_moves": 0,
-      "pos": {
-        "departure": {
-          "inst": 2,
-          "pos": "early"
-        }
-      }
-    },
-    {
-      "kind": "ParallelMoveBatchSolved",
-      "num_input_moves": 1,
-      "num_solved_moves": 0,
-      "pos": {
-        "point": {
-          "inst": 3,
-          "pos": "early"
-        }
-      }
-    },
-    {
-      "kind": "ParallelMoveBatchSolved",
-      "num_input_moves": 1,
-      "num_solved_moves": 0,
-      "pos": {
-        "departure": {
-          "inst": 3,
-          "pos": "early"
-        }
-      }
-    },
-    {
-      "kind": "ParallelMoveBatchSolved",
-      "num_input_moves": 1,
       "num_solved_moves": 1,
       "pos": {
         "point": {
@@ -1602,12 +1558,12 @@
     {
       "buckets": [
         {
-          "count": 5,
+          "count": 1,
           "hi": 1,
           "lo": 1
         }
       ],
-      "count": 5,
+      "count": 1,
       "id": "parallel-moves-per-solve",
       "max": 1,
       "mean": 1.0,
@@ -1659,9 +1615,7 @@
             32,
             35,
             40,
-            42,
-            45,
-            46
+            42
           ],
           [
             1,
@@ -1671,9 +1625,7 @@
             34,
             36,
             41,
-            43,
-            47,
-            48
+            43
           ],
           [
             2,
@@ -1682,8 +1634,8 @@
             38,
             39,
             44,
-            49,
-            50
+            45,
+            46
           ],
           [
             3,
@@ -1773,7 +1725,7 @@
             42,
             43,
             44,
-            50
+            46
           ]
         ]
       },
@@ -1820,7 +1772,7 @@
             28,
             39,
             44,
-            50
+            46
           ]
         ]
       },
@@ -1920,7 +1872,7 @@
         38
       ],
       "MoveEmitted": [
-        50
+        46
       ],
       "MoveResolved": [
         40,
@@ -1930,11 +1882,7 @@
         44
       ],
       "ParallelMoveBatchSolved": [
-        45,
-        46,
-        47,
-        48,
-        49
+        45
       ],
       "SpanConstructed": [
         0,
