@@ -130,6 +130,13 @@ pub enum Error {
         inst: Inst,
     },
 
+    /// Blocks are not indexed in the order their instructions run.
+    BlocksOutOfLayoutOrder {
+        /// The [`Block`] whose instructions run before those of a block with a
+        /// smaller index.
+        block: Block,
+    },
+
     /// An instruction appears in more than one block.
     InstInMultipleBlocks {
         /// An [`Inst`] that appears in more than one block.
@@ -594,6 +601,11 @@ impl fmt::Debug for Error {
             Self::NonContiguousInsts { block, inst } => write!(
                 f,
                 "{inst:?} does not immediately follow the instruction before it in {block:?}"
+            ),
+            Self::BlocksOutOfLayoutOrder { block } => write!(
+                f,
+                "{block:?} runs before a block with a smaller index, but blocks must be \
+                 indexed in the order their instructions run"
             ),
             Self::InstInMultipleBlocks { inst } => {
                 write!(f, "{inst:?} appears in more than one block")

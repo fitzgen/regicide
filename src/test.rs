@@ -12218,6 +12218,30 @@ mod tests {
     }
 
     #[test]
+    fn reject_blocks_indexed_out_of_layout_order() {
+        let mut func = valid_func(2, 1);
+        let first = Block::try_new(0).unwrap();
+        let second = Block::try_new(1).unwrap();
+
+        // Swap the two blocks' instructions, so that the higher-indexed block
+        // holds the earlier ones. Every instruction is still in exactly one
+        // block and the runs still partition the index space; only the order
+        // of the two runs against the two block indices changes.
+        let first_insts = mem::take(&mut func.blocks[first].insts);
+        let second_insts = mem::replace(&mut func.blocks[second].insts, first_insts);
+        func.blocks[first].insts = second_insts;
+        for (block, block_data) in func.blocks.iter() {
+            for &inst in &block_data.insts {
+                func.inst_blocks[inst] = Some(block);
+            }
+        }
+
+        // The run that sorts second holds `first`'s instructions, and `first`
+        // has the smaller index, so it is the block blamed.
+        assert_invalid!(&func, Error::BlocksOutOfLayoutOrder { block: b } if b == first);
+    }
+
+    #[test]
     fn reject_an_instruction_that_no_block_contains() {
         let mut func = valid_func(1, 2);
         let block = Block::try_new(0).unwrap();

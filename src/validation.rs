@@ -327,10 +327,17 @@ where
     // immediately after `a` starts within `a` too.
     runs.sort_unstable();
     for pair in runs.windows(2) {
-        let (_, previous_last, _) = pair[0];
-        let (first, _, _) = pair[1];
+        let (_, previous_last, previous_block) = pair[0];
+        let (first, _, block) = pair[1];
         if first <= previous_last {
             return output.error(Error::InstInMultipleBlocks { inst: first });
+        }
+
+        // Several passes take the blocks a program point range covers to be the
+        // block index range between its ends, which holds only while the two
+        // orders agree. `LiveSpan::blocks` is the one that reads it most.
+        if block <= previous_block {
+            return output.error(Error::BlocksOutOfLayoutOrder { block });
         }
     }
 
