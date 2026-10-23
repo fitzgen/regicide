@@ -1012,3 +1012,76 @@ reserve-ahead is +1.00%); the per-vreg scoping refactor.
 The baseline `cargo test --all-features` at `e9175ed`: **439 + 8 passed,
 10 ignored**, exit 0, ~100 s. At `9b4cf92`: **441 + 8** (two tests added,
 two extended).
+
+## Session `compile-speedups-011` (2026-10-20/22, base `eeec4e7`)
+
+Kept `5d29121` (self-move filter) and `d42ffc5` (a validation fix).
+Dropped the block-shaped move generation and the cross-block span, both
+tagged.
+
+### `coalescing.md` §5.2 is CLOSED. Do not attempt it a fourth time.
+
+Three sessions sized the cross-block span at **47% of spans**. That
+figure is reproduced **exactly** by a version that applies no safety
+test, and that version is invalid. On the largest `smm-big` input
+(fewer spans is better):
+
+| variant | spans | removed | valid? |
+| --- | ---: | ---: | --- |
+| merge disabled | 49,527 | - | yes |
+| **no safety test** (ceiling) | **24,882** | **49.8%** | **NO** |
+| predecessor half only | 32,031 | 35.3% | NO |
+| successor half only | 41,361 | 16.5% | NO |
+| **both halves, correct** | **48,515** | **2.0%** | yes |
+| session 010's blanket restriction | 48,515 | 2.0% | yes |
+
+Both halves of the safety test are load-bearing. A **per-value** test
+(refuse only when the value is live along another edge) gives
+**byte-identical reach** to the blanket clause, because a block with
+several predecessors nearly always has the carried value live-in along
+more than one of them.
+
+So session 010's restriction is within **0.0%** of the real constraint
+on this corpus. The merge is legal only where no other edge at either
+end still needs a span, and those are precisely not the joins and splits
+worth merging. Session 010 already measured a merge of this reach as net
+negative (+2.65% machinery against -1.2% of merging).
+
+**Sessions 009 and 010 both concluded that move generation's span-shaped
+consumption was what forced the restriction.** It was not. This session
+made move generation block-shaped (byte-identical, tag
+`regicide-speedup-011/block-shaped-move-generation`, +1.93%) and the
+restriction still could not be lifted.
+
+### `move-generation.md` recommendation 1 landed, and is the session's win
+
+`if src == dst { continue; }` in `resolve`: **-3.06% insts, -3.32% wall**
+on `typical/`, significant on both, byte-identical allocation. 88.7% of
+the batch moves the loop formed were self-moves the solver discarded.
+Re-blesses four visualizer fixtures, removing 11
+`ParallelMoveBatchSolved` events, every one `num_input_moves: 1,
+num_solved_moves: 0`, with none added.
+
+Recommendation 2 (do not emit the destination) is implemented in the
+dropped phase-1 tag and is **byte-identical but +1.93%**, because ion's
+filter can only fire on a self-loop while spans are block-local.
+
+### A validation gap neither the corpus nor the fuzzer could find
+
+`LiveSpan::blocks` (in the tagged work) reads a span's block run off the
+**block index range** between its ends. That needs blocks indexed in the
+order their instructions run, which `validate_insts` did not check.
+
+Neither gate could falsify it: the corpus satisfies it, and
+`TestFunction::ensure_unique_insts_in_layout` renumbers instructions by
+**iterating blocks in index order**, so every fuzzer-generated function
+satisfies it by construction. A `debug_assert` would never have fired.
+`d42ffc5` makes it a stated input requirement.
+
+**General rule:** before relying on the fuzzer to check an invariant
+about input *shape*, read the generator and confirm it can produce a
+counterexample.
+
+The baseline `cargo test --all-features` at `d42ffc5`: **442 + 8
+passed, 10 ignored** (one validation test added); bare `cargo test`
+**391 + 8**.
